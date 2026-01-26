@@ -24655,16 +24655,13 @@ defineTool({
   parameters: {
     type: "object",
     properties: {
-      module: {
-        type: "string",
-        description: "Module name to list."
-      }
+      module: { type: "string", description: "Module name to list." }
     },
     required: ["module"],
     additionalProperties: false
   },
   execute: async (args, ctx) => {
-    const runtime = ctx.runtime;
+    const runtime = ctx?.runtime;
     if (!runtime)
       return {
         title: "list_variables_xml",
@@ -24673,18 +24670,84 @@ defineTool({
       };
 
     const requestedModule = String(args?.module ?? "");
+    const modules = ctx?.moduleMap;
 
-    const module = [...ctx.moduleMap.values()].find(
-      (m) => m.name == args.module
-    ).module;
+    const moduleNameOf = (mod, info) =>
+      String((info?.name ?? mod?._name ?? "") || "").trim();
+
+    const availableModules = (() => {
+      try {
+        if (!(modules instanceof Map)) return [];
+        const names = [];
+        for (const [mod, info] of modules.entries()) {
+          const n = moduleNameOf(mod, info);
+          if (n) names.push(n);
+        }
+        return Array.from(new Set(names)).sort((a, b) => a.localeCompare(b));
+      } catch {
+        return [];
+      }
+    })();
+
+    if (requestedModule === "") {
+      const vars = [];
+      for (const v of runtime._variables) vars.push(v);
+      const xml = await variablesXML(ctx, vars);
+      return {
+        title: `list_variables_xml (${vars.length} variables)`,
+        output: xml,
+        metadata: {
+          count: vars.length,
+          module: "",
+          allModules: true
+        }
+      };
+    }
+
+    let targetModule = null;
+    if (modules instanceof Map) {
+      for (const [mod, info] of modules.entries()) {
+        if (moduleNameOf(mod, info) === requestedModule) {
+          targetModule = mod;
+          break;
+        }
+      }
+    }
+
+    if (!targetModule) {
+      const mainMissing = requestedModule === "main";
+      const hint = mainMissing
+        ? `No "main" module exists in this runtime's moduleMap (common after Lopecode conversion). A module must be chosen.`
+        : `Module not found: "${requestedModule}". A module must be chosen.`;
+
+      const sample = availableModules.slice(0, 25);
+      return {
+        title: "list_variables_xml failed",
+        output:
+          `Error: ${hint}\n` +
+          `Requested module: "${requestedModule}"\n` +
+          (availableModules.length
+            ? `Available modules (sample):\n` +
+              sample.map((d) => `- ${d}`).join("\n")
+            : `Available modules: (unavailable)`),
+        metadata: {
+          error: true,
+          notFound: true,
+          needsModuleSelection: true,
+          requestedModule,
+          availableModules,
+          mainMissing
+        }
+      };
+    }
+
     const vars = [];
     for (const v of runtime._variables) {
-      if (v._module !== module) continue;
+      if (v?._module !== targetModule) continue;
       vars.push(v);
     }
 
     const xml = await variablesXML(ctx, vars);
-
     return {
       title: `list_variables_xml (${vars.length} variables)`,
       output: xml,
@@ -24696,7 +24759,131 @@ defineTool({
   }
 })
 )};
-const _l8141c = function _138(){return(
+const _test_listVariablesXMLTool = function _test_listVariablesXMLTool(globalRuntime,createToolContext,resolveRuntimeModules,listVariablesXMLTool,summarizeJS){return(
+(async () => {
+  const runtime = globalRuntime;
+  const debug = {
+    when: new Date().toISOString(),
+    tool: "list_variables_xml",
+    requested: { module: "main" },
+    runtime: {
+      exists: !!runtime,
+      variablesType: runtime
+        ? Object.prototype.toString.call(runtime._variables)
+        : null,
+      variablesIsIterable: runtime
+        ? !!(
+            runtime._variables &&
+            typeof runtime._variables[Symbol.iterator] === "function"
+          )
+        : null,
+      variablesLength:
+        runtime && Array.isArray(runtime._variables)
+          ? runtime._variables.length
+          : null
+    }
+  };
+
+  let ctx;
+  try {
+    ctx = await createToolContext({
+      sessionId: "test",
+      messageId: "test",
+      agent: "assistant",
+      callId: "test_listVariablesXMLTool_lopecode_debug",
+      runtime
+    });
+  } catch (e) {
+    debug.phase = "createToolContext";
+    debug.error = { message: String(e?.message ?? e), name: e?.name ?? null };
+    throw new Error(
+      "listVariablesXMLTool debug (createToolContext failed)\n" +
+        JSON.stringify(debug, null, 2)
+    );
+  }
+
+  let modules;
+  try {
+    modules = await resolveRuntimeModules(runtime);
+    const moduleNamesSample = [];
+    if (modules instanceof Map) {
+      for (const [mod, info] of modules.entries()) {
+        const name =
+          String((info?.name ?? mod?._name ?? "main") || "main").trim() ||
+          "main";
+        moduleNamesSample.push(name);
+        if (moduleNamesSample.length >= 50) break;
+      }
+    }
+    debug.modules = {
+      resolvedType: Object.prototype.toString.call(modules),
+      isMap: modules instanceof Map,
+      size: typeof modules?.size === "number" ? modules.size : null,
+      namesSample: moduleNamesSample
+    };
+  } catch (e) {
+    debug.phase = "resolveRuntimeModules";
+    debug.error = { message: String(e?.message ?? e), name: e?.name ?? null };
+    throw new Error(
+      "listVariablesXMLTool debug (resolveRuntimeModules failed)\n" +
+        JSON.stringify(debug, null, 2)
+    );
+  }
+
+  try {
+    const hasMain =
+      modules instanceof Map &&
+      (() => {
+        for (const [mod, info] of modules.entries()) {
+          const n = String((info?.name ?? mod?._name ?? "") || "").trim();
+          if (n === "main") return true;
+        }
+        return false;
+      })();
+
+    debug.detected = { hasMain };
+
+    const r = await listVariablesXMLTool.execute({ module: "main" }, ctx);
+
+    debug.result = {
+      title: String(r?.title ?? ""),
+      hasMetadataError: !!r?.metadata?.error,
+      metadata: r?.metadata ?? null,
+      outputPreview: summarizeJS(String(r?.output ?? ""), { max_size: 2000 })
+    };
+
+    if (hasMain) {
+      if (r?.metadata?.error) throw new Error("tool returned metadata.error");
+      if (!String(r?.output ?? "").includes("<variable"))
+        throw new Error('unexpected output: missing "<variable"');
+      return "pass";
+    } else {
+      if (!r?.metadata?.error)
+        throw new Error("expected tool to error when main module is missing");
+      const out = String(r?.output ?? "").toLowerCase();
+      if (
+        !(
+          out.includes("module must be chosen") ||
+          out.includes("needs") ||
+          out.includes("choose")
+        )
+      )
+        throw new Error(
+          "expected error output to signal module selection requirement"
+        );
+      return "pass";
+    }
+  } catch (e) {
+    debug.phase = debug.phase || "execute";
+    debug.error = { message: String(e?.message ?? e), name: e?.name ?? null };
+    debug.stack = String(e?.stack ?? "");
+    throw new Error(
+      "listVariablesXMLTool debug\n" + JSON.stringify(debug, null, 2)
+    );
+  }
+})()
+)};
+const _1lffp95 = function _139(){return(
 "anon_variable_jljerlkwjer"
 )};
 const _upsertVariablesTool = function _upsertVariablesTool(defineTool,parseVariablesXML,resolveRuntimeModules){return(
@@ -25145,7 +25332,7 @@ const _test_tools_getVariableValueTool_module_scoped = function _test_tools_getV
 const _tool_module_target_smoke = function _tool_module_target_smoke(){return(
 0
 )};
-const _1m6khu3 = function _145(md){return(
+const _10y0v5i = function _146(md){return(
 md`#### runtime tools`
 )};
 const _runtimeTools = function _runtimeTools(listModulesTool,createModuleTool,runTestsTool,evalTool,searchVariablesTool){return(
@@ -26138,14 +26325,15 @@ export default function define(runtime, observer) {
   main.variable(observer()).define(["md"], _og5i8d);
   main.variable(observer("variableTools")).define("variableTools", ["listVariablesXMLTool","upsertVariablesTool","deleteVariableTool","getVariableValueTool"], _variableTools);
   main.variable(observer("listVariablesXMLTool")).define("listVariablesXMLTool", ["defineTool","variablesXML"], _listVariablesXMLTool);
-  main.variable(observer()).define(_l8141c);
+  main.variable(observer("test_listVariablesXMLTool")).define("test_listVariablesXMLTool", ["globalRuntime","createToolContext","resolveRuntimeModules","listVariablesXMLTool","summarizeJS"], _test_listVariablesXMLTool);
+  main.variable(observer()).define(_1lffp95);
   main.variable(observer("upsertVariablesTool")).define("upsertVariablesTool", ["defineTool","parseVariablesXML","resolveRuntimeModules"], _upsertVariablesTool);
   main.variable(observer("deleteVariableTool")).define("deleteVariableTool", ["defineTool"], _deleteVariableTool);
   main.variable(observer("getVariableValueTool")).define("getVariableValueTool", ["defineTool","resolveRuntimeModules","getPromiseState","summarizeJS"], _getVariableValueTool);
   main.variable(observer("pending_value")).define("pending_value", _pending_value);
   main.variable(observer("test_tools_getVariableValueTool_module_scoped")).define("test_tools_getVariableValueTool_module_scoped", ["createToolContext","globalRuntime","getVariableValueTool"], _test_tools_getVariableValueTool_module_scoped);
   main.variable(observer("tool_module_target_smoke")).define("tool_module_target_smoke", _tool_module_target_smoke);
-  main.variable(observer()).define(["md"], _1m6khu3);
+  main.variable(observer()).define(["md"], _10y0v5i);
   main.variable(observer("runtimeTools")).define("runtimeTools", ["listModulesTool","createModuleTool","runTestsTool","evalTool","searchVariablesTool"], _runtimeTools);
   main.variable(observer("listModulesTool")).define("listModulesTool", ["defineTool","resolveRuntimeModules"], _listModulesTool);
   main.variable(observer("createModuleTool")).define("createModuleTool", ["defineTool","resolveRuntimeModules"], _createModuleTool);
