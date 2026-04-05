@@ -4612,7 +4612,7 @@ export default function define(runtime, observer) {
   data-encoding="base64"
   data-mime="application/json;charset=utf-8"
 >
-eyJAdG9tbGFya3dvcnRoeS9saW51eC1zYmMiOlt7InBpbm5lZCI6ZmFsc2V9XSwiQHRvbWxhcmt3b3J0aHkvY2xhdWRlLWNvZGUtcGFpcmluZyI6eyJ2aWV3b2Ygdm9pY2VFbmFibGVkIjp7InBpbm5lZCI6dHJ1ZX19fQ==
+eyJAdG9tbGFya3dvcnRoeS9saW51eC1zYmMiOlt7InBpbm5lZCI6ZmFsc2V9LG51bGwseyJwaW5uZWQiOnRydWV9LHsicGlubmVkIjp0cnVlfSx7InBpbm5lZCI6dHJ1ZX1dLCJAdG9tbGFya3dvcnRoeS9jbGF1ZGUtY29kZS1wYWlyaW5nIjp7InZpZXdvZiB2b2ljZUVuYWJsZWQiOnsicGlubmVkIjp0cnVlfX19
 </script>
 <script id="@tomlarkworthy/editor-5" 
   type="text/plain"
@@ -10412,7 +10412,8 @@ const _1906fzv = function _memRead(_uart_rx_buffer,translate,memReadRaw,trap,UAR
     const _rx = _uart_rx_buffer;
     return (cpu, mem, addr, size, accessType) => {
         // accessType: 0=fetch, 1=load
-        const t = translate(cpu, mem, addr, accessType || 1, memReadRaw);
+        // Bug fix: use accessType directly, not accessType || 1 (which converts fetch 0 to load 1)
+        const t = translate(cpu, mem, addr, accessType !== undefined ? accessType : 1, memReadRaw);
         if (!t.ok) {
             trap(cpu, t.fault, addr);
             return 0;
@@ -10715,15 +10716,29 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
         funct3: d.funct3
     };
 });};
-const _8lg64f = function _step(tick,memRead,cpu,mem,decode,tickTimer,clint,execute,memWrite) {
+const _8lg64f = function _step(tick,tickTimer,cpu,clint,memRead,mem,decode,execute,memWrite) {
     const t = tick;
     // ONLY depend on tick button
     if (t === 0)
         return null;
     // skip initial
-    const inst = memRead(cpu, mem, cpu.pc, 4, 0) >>> 0;
-    const d = decode(inst);
     tickTimer(cpu, clint);
+    const savedPC = cpu.pc;
+    const inst = memRead(cpu, mem, cpu.pc, 4, 0) >>> 0;
+    if (cpu.pc !== savedPC) {
+        // Fetch fault took a trap
+        cpu.value = cpu;
+        mem.value = mem;
+        clint.value = clint;
+        return {
+            inst: 0,
+            pc: savedPC,
+            newPC: cpu.pc,
+            cycle: cpu.cycle,
+            fetchFault: true
+        };
+    }
+    const d = decode(inst);
     const info = execute(d, cpu, mem, memRead, memWrite);
     cpu.value = cpu;
     mem.value = mem;
@@ -10927,7 +10942,11 @@ const _cz5yzw = function _runN(cpu,tickTimer,clint,memRead,mem,execute,decode,me
         btn.onclick = () => {
             for (let i = 0; i < count && !cpu.halted; i++) {
                 tickTimer(cpu, clint);
+                const savedPC = cpu.pc;
                 const inst = memRead(cpu, mem, cpu.pc, 4, 0) >>> 0;
+                if (cpu.pc !== savedPC)
+                    continue;
+                // fetch fault took a trap, skip execute
                 execute(decode(inst), cpu, mem, memRead, memWrite);
             }
             div.value = cpu.cycle;
@@ -11056,7 +11075,11 @@ const _cz5yzw = function _runN(cpu,tickTimer,clint,memRead,mem,execute,decode,me
         _uart_buffer.length = 0;
         for (let i = 0; i < 10000000 && !cpu.halted; i++) {
             tickTimer(cpu, clint);
+            const savedPC = cpu.pc;
             const inst = memRead(cpu, mem, cpu.pc, 4, 0) >>> 0;
+            if (cpu.pc !== savedPC)
+                continue;
+            // fetch fault took a trap, skip execute
             execute(decode(inst), cpu, mem, memRead, memWrite);
         }
         div.value = cpu.cycle;
@@ -12113,6 +12136,28 @@ const _1uqb731 = function __fw_verify(mem,firmware_bytes) {
         fwSize: firmware_bytes ? firmware_bytes.byteLength : 'null'
     };
 };
+const _7b7811 = function _anonymous() {return (undefined);};
+const _7b7811 = function _anonymous() {return (undefined);};
+const _7b7811 = function _anonymous() {return (undefined);};
+const _7b7811 = function _anonymous() {return (undefined);};
+const _7b7811 = function _anonymous() {return (undefined);};
+const _17qo5pv = function _TODO(md) {return (md`## Boot Status & TODO
+
+**Current state**: Linux kernel boots through init, but crashes with:
+\`Unable to handle kernel access to user memory without uaccess routines at virtual address 000100e8\`
+
+**Root cause**: After \`sret\` to user-mode init, the kernel page fault handler runs at epc=0x100e8 (init code) but the kernel is still in S-mode when it tries to access user memory. This is because \`sstatus.SUM\` (Supervisor User Memory access, bit 18) is not set when the kernel handles the instruction page fault for init's code.
+
+**Bugs fixed this session**:
+1. ~~\`accessType || 1\` in memRead converted fetch (0) to load (1), checking wrong page permissions~~
+2. ~~Double-trap on instruction fetch fault: memRead returned 0 after page fault, but run loop still executed decode(0), causing spurious SIGILL that overwrote the real fault~~
+
+**Next steps**:
+1. Fix the \`translate\` function: when S-mode accesses a U-mode page for instruction fetch, it should be allowed (kernel page fault handler needs to read user pages). Check SUM bit handling for fetch vs load/store
+2. OR: the kernel expects to handle the page fault and map the page, but our page fault handler path has an issue — the fault address 0x100e8 is correct but the kernel can't copy-on-write/demand-page because it can't access user memory
+3. Add \`/dev/console\` to initramfs so init has stdin/stdout/stderr (\`Warning: unable to open an initial console\`)
+4. Get a shell prompt working with console input
+`);};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -12141,7 +12186,7 @@ export default function define(runtime, observer) {
   $def("_1906fzv", "memRead", ["_uart_rx_buffer","translate","memReadRaw","trap","UART_BASE","CLINT_BASE","clint"], _1906fzv);  
   $def("_1enwif7", "memWrite", ["translate","memReadRaw","trap","UART_BASE","_uart_buffer","CLINT_BASE","clint","RAM_BASE"], _1enwif7);  
   $def("_1ii1fdo", "execute", ["trap"], _1ii1fdo);  
-  $def("_8lg64f", "step", ["tick","memRead","cpu","mem","decode","tickTimer","clint","execute","memWrite"], _8lg64f);  
+  $def("_8lg64f", "step", ["tick","tickTimer","cpu","clint","memRead","mem","decode","execute","memWrite"], _8lg64f);  
   $def("_1ln84p2", "viewof tick", ["Inputs"], _1ln84p2);  
   main.variable(observer("tick")).define("tick", ["Generators", "viewof tick"], (G, _) => G.input(_));  
   $def("_1815zu", "registers_display", ["step","cpu","REG_NAMES","Inputs"], _1815zu);  
@@ -12189,7 +12234,13 @@ export default function define(runtime, observer) {
   $def("_1ppl1zl", "_loop_check", ["memReadRaw","mem","disassemble"], _1ppl1zl);  
   $def("_1knhjmc", "_caller_check", ["memReadRaw","mem","disassemble","cpu"], _1knhjmc);  
   $def("_w89dlb", "_dtb_check", ["DTB_ADDR","RAM_BASE","mem","dtb"], _w89dlb);  
-  $def("_1uqb731", "_fw_verify", ["mem","firmware_bytes"], _1uqb731);
+  $def("_1uqb731", "_fw_verify", ["mem","firmware_bytes"], _1uqb731);  
+  $def("_7b7811", null, [], _7b7811);  
+  $def("_7b7811", null, [], _7b7811);  
+  $def("_7b7811", null, [], _7b7811);  
+  $def("_7b7811", null, [], _7b7811);  
+  $def("_7b7811", null, [], _7b7811);  
+  $def("_17qo5pv", "TODO", ["md"], _17qo5pv);
   return main;
 }</script>
 
