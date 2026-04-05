@@ -10069,7 +10069,7 @@ const _izm6sb = function _initSystem($0,RAM_BASE,DTB_ADDR,$1,firmware_bytes,dtb,
         notify
     };
 };
-const _vqev79 = function _continuous_run(_uart_buffer,initSystem,tickTimer,memRead,execute,decode,memWrite) {
+const _vqev79 = function _continuous_run(globalThis,_uart_buffer,initSystem,tickTimer,memRead,execute,decode,memWrite) {
     const div = document.createElement('div');
     const controls = document.createElement('div');
     controls.style.display = 'flex';
@@ -10090,9 +10090,33 @@ const _vqev79 = function _continuous_run(_uart_buffer,initSystem,tickTimer,memRe
     controls.appendChild(status);
     div.appendChild(controls);
     const term = document.createElement('pre');
-    term.style.cssText = 'font-family:"Courier New",monospace;font-size:14px;line-height:1.4;background:#000;color:#0f0;padding:16px;border-radius:6px;min-height:120px;max-height:400px;overflow-y:auto;white-space:pre-wrap;border:1px solid #333;margin:0';
+    term.style.cssText = 'font-family:"Courier New",monospace;font-size:14px;line-height:1.4;background:#000;color:#0f0;padding:16px;border-radius:6px;min-height:120px;max-height:400px;overflow-y:auto;white-space:pre-wrap;border:1px solid #333;border-bottom:none;border-bottom-left-radius:0;border-bottom-right-radius:0;margin:0';
     term.textContent = '(no output yet)';
     div.appendChild(term);
+    // Terminal input
+    const inputRow = document.createElement('div');
+    inputRow.style.cssText = 'display:flex;background:#000;border:1px solid #333;border-top:1px solid #222;border-bottom-left-radius:6px;border-bottom-right-radius:6px;padding:4px 8px;align-items:center;gap:6px';
+    const prompt = document.createElement('span');
+    prompt.style.cssText = 'color:#0f0;font-family:"Courier New",monospace;font-size:14px';
+    prompt.textContent = '>';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Type command, press Enter...';
+    input.style.cssText = 'flex:1;font-family:"Courier New",monospace;font-size:14px;padding:4px 6px;background:#0a0a0a;color:#0f0;border:1px solid #333;border-radius:3px;outline:none';
+    inputRow.appendChild(prompt);
+    inputRow.appendChild(input);
+    div.appendChild(inputRow);
+    const rx = globalThis.__uart_rx = globalThis.__uart_rx || [];
+    input.onkeydown = e => {
+        if (e.key === 'Enter') {
+            const text = input.value;
+            for (const ch of text)
+                rx.push(ch.charCodeAt(0));
+            rx.push(10);
+            input.value = '';
+            e.preventDefault();
+        }
+    };
     let running = false;
     let rafId = null;
     let cyclesPerFrame = 50000;
@@ -10631,21 +10655,24 @@ const _4385qu = function _disassembly_view(step,runN,reset,RAM_BASE,cpu,memReadR
 };
 const _17qo5pv = function _TODO(md) {return (md`## Boot Status & TODO
 
-**Current state**: 🎉 **Continuous execution working!** Adaptive rAF loop boots OpenSBI → Linux → BusyBox shell at ~12 MHz with live terminal output.
+**Current state**: 🎉 **Full interactive terminal working!** Boots OpenSBI → Linux → BusyBox shell with keyboard input at ~10 MHz.
 
 **Working configurations**:
 - \`busybox-boot.bin\` + 48MB RAM → boots to BusyBox shell ✅
-- Continuous execution with adaptive batching (~12 MHz, ~156K cycles/frame) ✅
+- Continuous execution with adaptive batching (~10 MHz, ~100K cycles/frame) ✅
 - Pause/resume without losing CPU state ✅
 - Live terminal output with scrollback ✅
-- UART output (tx) working ✅
-- Timer interrupts & real kernel timestamps (rdtime) ✅
+- Integrated terminal input in continuous_run ✅
+- UART output (tx) via 16550A MMIO ✅
+- UART input (rx) via PLIC interrupt → 8250 driver ✅
+- Timer interrupts (STIP) via CLINT ✅
+- PLIC (Platform Level Interrupt Controller) for external interrupts ✅
+- Console switch from SBI earlycon → ttyS0 ✅
 
-**Next steps**:
-1. **Wire stdin** — connect keyboard input to UART rx buffer so the shell is interactive
-2. **Speed optimizations** — consider Web Worker for execution, or WFI detection to idle when kernel sleeps
-3. Fix 64MB DTB issue (OpenSBI SBI_ERR_INVALID_PARAM with 64MB)
-4. Clean up debug cells (many leftover from previous sessions)
+**TODO**:
+- Clean up debug/diagnostic cells (many leftover from previous sessions)
+- Rebuild BusyBox with minimal config for faster boot (initramfs unpacking is slow)
+- Performance: ~16s kernel time gap during initramfs decompression
 `);};
 const _yhq1yn = function _anonymous(md) {return (md`:::writing{variant=“standard” id=“48152”}
 
@@ -11497,7 +11524,7 @@ const _h84f9j = function _memReadRaw(RAM_BASE) {return ((mem, addr, size) => {
         return 0;
     }
 });};
-const _1906fzv = function _memRead(_uart_rx_buffer,globalThis,translate,memReadRaw,trap,UART_BASE,CLINT_BASE,clint) {
+const _1906fzv = function _memRead(_uart_rx_buffer,globalThis,translate,memReadRaw,trap,UART_BASE,PLIC_BASE,CLINT_BASE,clint) {
     const _rx = _uart_rx_buffer;
     const uart = globalThis.__uart_state = globalThis.__uart_state || {
         ier: 0,
@@ -11508,6 +11535,25 @@ const _1906fzv = function _memRead(_uart_rx_buffer,globalThis,translate,memReadR
         dll: 1,
         dlm: 0
     };
+    // Initialize THRE pending flag
+    if (uart.thre_ip === undefined)
+        uart.thre_ip = false;
+    const plic = globalThis.__plic_state = globalThis.__plic_state || {
+        priority: new Uint32Array(32),
+        pending: 0,
+        enable: [
+            0,
+            0
+        ],
+        threshold: [
+            0,
+            0
+        ],
+        claimed: [
+            0,
+            0
+        ]
+    };
     return (cpu, mem, addr, size, accessType) => {
         const t = translate(cpu, mem, addr, accessType !== undefined ? accessType : 1, memReadRaw);
         if (!t.ok) {
@@ -11515,8 +11561,10 @@ const _1906fzv = function _memRead(_uart_rx_buffer,globalThis,translate,memReadR
             return 0;
         }
         const pa = t.pa;
-        if (pa >= UART_BASE && pa < UART_BASE + 8) {
-            const reg = pa - UART_BASE;
+        const upa = pa >>> 0;
+        // UART
+        if (upa >= UART_BASE >>> 0 && upa < UART_BASE + 8 >>> 0) {
+            const reg = upa - (UART_BASE >>> 0);
             const dlab = uart.lcr >> 7 & 1;
             if (reg === 0) {
                 if (dlab)
@@ -11526,11 +11574,16 @@ const _1906fzv = function _memRead(_uart_rx_buffer,globalThis,translate,memReadR
             if (reg === 1)
                 return dlab ? uart.dlm : uart.ier;
             if (reg === 2) {
-                // IIR: bit 0 = 0 means interrupt pending, 1 = no interrupt
-                // Only signal RX data available when data exists AND IER bit 0 set
+                // IIR priority: Line Status > RDA > THRE > Modem
                 if (_rx.length > 0 && uart.ier & 1)
                     return 4;
-                return 1;    // no interrupt pending (safe default)
+                // RDA
+                if (uart.thre_ip && uart.ier & 2) {
+                    uart.thre_ip = false;
+                    return 2;
+                }
+                // THRE (one-shot)
+                return 1;    // no interrupt
             }
             if (reg === 3)
                 return uart.lcr;
@@ -11544,8 +11597,50 @@ const _1906fzv = function _memRead(_uart_rx_buffer,globalThis,translate,memReadR
                 return uart.scr;
             return 0;
         }
-        if (pa >= CLINT_BASE && pa < CLINT_BASE + 65536) {
-            const off = pa - CLINT_BASE;
+        // PLIC
+        if (upa >= PLIC_BASE >>> 0 && upa < PLIC_BASE + 67108864 >>> 0) {
+            const off = upa - (PLIC_BASE >>> 0);
+            if (off < 4096) {
+                const src = off >> 2;
+                return src < 32 ? plic.priority[src] : 0;
+            }
+            if (off === 4096)
+                return plic.pending;
+            if (off === 8192)
+                return plic.enable[0];
+            if (off === 8320)
+                return plic.enable[1];
+            if (off === 2097152)
+                return plic.threshold[0];
+            if (off === 2097156) {
+                const enabled = plic.pending & plic.enable[0];
+                for (let i = 1; i < 32; i++) {
+                    if (enabled >> i & 1) {
+                        plic.pending &= ~(1 << i);
+                        plic.claimed[0] = i;
+                        return i;
+                    }
+                }
+                return 0;
+            }
+            if (off === 2101248)
+                return plic.threshold[1];
+            if (off === 2101252) {
+                const enabled = plic.pending & plic.enable[1];
+                for (let i = 1; i < 32; i++) {
+                    if (enabled >> i & 1) {
+                        plic.pending &= ~(1 << i);
+                        plic.claimed[1] = i;
+                        return i;
+                    }
+                }
+                return 0;
+            }
+            return 0;
+        }
+        // CLINT
+        if (upa >= CLINT_BASE >>> 0 && upa < CLINT_BASE + 65536 >>> 0) {
+            const off = upa - (CLINT_BASE >>> 0);
             if (off === 0)
                 return clint.msip;
             if (off === 16384)
@@ -11561,8 +11656,7 @@ const _1906fzv = function _memRead(_uart_rx_buffer,globalThis,translate,memReadR
         return memReadRaw(mem, pa, size);
     };
 };
-const _1enwif7 = function _memWrite(globalThis,translate,memReadRaw,trap,UART_BASE,_uart_buffer,CLINT_BASE,clint,RAM_BASE) {
-    // Share uart state with memRead via globalThis
+const _1enwif7 = function _memWrite(globalThis,translate,memReadRaw,trap,UART_BASE,_uart_buffer,PLIC_BASE,CLINT_BASE,clint,RAM_BASE) {
     const uart = globalThis.__uart_state = globalThis.__uart_state || {
         ier: 0,
         iir: 1,
@@ -11572,6 +11666,24 @@ const _1enwif7 = function _memWrite(globalThis,translate,memReadRaw,trap,UART_BA
         dll: 1,
         dlm: 0
     };
+    if (uart.thre_ip === undefined)
+        uart.thre_ip = false;
+    const plic = globalThis.__plic_state = globalThis.__plic_state || {
+        priority: new Uint32Array(32),
+        pending: 0,
+        enable: [
+            0,
+            0
+        ],
+        threshold: [
+            0,
+            0
+        ],
+        claimed: [
+            0,
+            0
+        ]
+    };
     return (cpu, mem, addr, size, val) => {
         const t = translate(cpu, mem, addr, 2, memReadRaw);
         if (!t.ok) {
@@ -11579,9 +11691,10 @@ const _1enwif7 = function _memWrite(globalThis,translate,memReadRaw,trap,UART_BA
             return;
         }
         const pa = t.pa;
-        // UART ns16550a
-        if (pa >= UART_BASE && pa < UART_BASE + 8) {
-            const reg = pa - UART_BASE;
+        const upa = pa >>> 0;
+        // UART
+        if (upa >= UART_BASE >>> 0 && upa < UART_BASE + 8 >>> 0) {
+            const reg = upa - (UART_BASE >>> 0);
             const dlab = uart.lcr >> 7 & 1;
             if (reg === 0) {
                 if (dlab) {
@@ -11589,6 +11702,8 @@ const _1enwif7 = function _memWrite(globalThis,translate,memReadRaw,trap,UART_BA
                     return;
                 }
                 _uart_buffer.push(String.fromCharCode(val & 255));
+                uart.thre_ip = true;
+                // Flag for IIR, but DON'T trigger PLIC here
                 return;
             }
             if (reg === 1) {
@@ -11596,12 +11711,19 @@ const _1enwif7 = function _memWrite(globalThis,translate,memReadRaw,trap,UART_BA
                     uart.dlm = val & 255;
                     return;
                 }
+                const oldIer = uart.ier;
                 uart.ier = val & 15;
+                // Only trigger PLIC on IER THRE 0→1 transition (serial8250_start_tx)
+                if (uart.ier & 2 && !(oldIer & 2)) {
+                    uart.thre_ip = true;
+                    if (plic.claimed[0] !== 1 && plic.claimed[1] !== 1) {
+                        plic.pending |= 2;
+                    }
+                }
                 return;
             }
             if (reg === 2)
                 return;
-            // FCR: ignore FIFO control writes
             if (reg === 3) {
                 uart.lcr = val & 255;
                 return;
@@ -11614,11 +11736,43 @@ const _1enwif7 = function _memWrite(globalThis,translate,memReadRaw,trap,UART_BA
                 uart.scr = val & 255;
                 return;
             }
-            return;    // ignore other writes
+            return;
+        }
+        // PLIC
+        if (upa >= PLIC_BASE >>> 0 && upa < PLIC_BASE + 67108864 >>> 0) {
+            const off = upa - (PLIC_BASE >>> 0);
+            if (off < 4096) {
+                const src = off >> 2;
+                if (src < 32)
+                    plic.priority[src] = val;
+                return;
+            }
+            if (off === 4096) {
+                plic.pending = val;
+                return;
+            }
+            if (off >= 8192 && off < 12288) {
+                const ctx = off - 8192 >> 7;
+                if (ctx < 2)
+                    plic.enable[ctx] = val;
+                return;
+            }
+            if (off >= 2097152 && off < 2162688) {
+                const ctx = off - 2097152 >> 12;
+                const reg = off - 2097152 & 4095;
+                if (ctx < 2) {
+                    if (reg === 0)
+                        plic.threshold[ctx] = val;
+                    if (reg === 4)
+                        plic.claimed[ctx] = 0;
+                }
+                return;
+            }
+            return;
         }
         // CLINT
-        if (pa >= CLINT_BASE && pa < CLINT_BASE + 65536) {
-            const off = pa - CLINT_BASE;
+        if (upa >= CLINT_BASE >>> 0 && upa < CLINT_BASE + 65536 >>> 0) {
+            const off = upa - (CLINT_BASE >>> 0);
             if (off === 0)
                 clint.msip = val;
             else if (off === 16384)
@@ -11917,7 +12071,7 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
         funct3: d.funct3
     };
 });};
-const _1qlsaqt = function _tickTimer(trap) {
+const _1qlsaqt = function _tickTimer(globalThis,trap) {
     let prevMtimecmpLo = -1;
     let prevMtimecmpHi = -1;
     let csrUpdateCounter = 0;
@@ -11925,62 +12079,77 @@ const _1qlsaqt = function _tickTimer(trap) {
         clint.mtime_lo = clint.mtime_lo + 1 | 0;
         if (clint.mtime_lo === 0)
             clint.mtime_hi = clint.mtime_hi + 1 | 0;
-        // Update time/cycle CSRs only every 64 cycles (lazy update)
         if ((++csrUpdateCounter & 63) === 0) {
             cpu.csrs.set(3073, clint.mtime_lo);
             cpu.csrs.set(3201, clint.mtime_hi);
             cpu.csrs.set(3072, cpu.cycle | 0);
             cpu.csrs.set(3200, 0);
         }
-        // Detect mtimecmp change → clear STIP
         if (clint.mtimecmp_lo !== prevMtimecmpLo || clint.mtimecmp_hi !== prevMtimecmpHi) {
             cpu.csrs.set(836, (cpu.csrs.get(836) || 0) & ~32);
             prevMtimecmpLo = clint.mtimecmp_lo;
             prevMtimecmpHi = clint.mtimecmp_hi;
         }
-        // Timer pending: mtime >= mtimecmp
-        const timerPending = clint.mtime_hi >>> 0 > clint.mtimecmp_hi >>> 0 || clint.mtime_hi >>> 0 === clint.mtimecmp_hi >>> 0 && clint.mtime_lo >>> 0 >= clint.mtimecmp_lo >>> 0;
-        if (!timerPending)
-            return false;
-        // fast path: no timer, skip all checks
-        const mip = cpu.csrs.get(836) || 0;
-        cpu.csrs.set(836, mip | 128);
-        // MTIP
-        if (!(mip & 32)) {
-            // Set STIP, re-arm timer
-            cpu.csrs.set(836, (cpu.csrs.get(836) || 0) | 32);
-            clint.mtimecmp_lo = clint.mtime_lo + 100000 | 0;
-            clint.mtimecmp_hi = clint.mtime_hi;
-            if (clint.mtimecmp_lo >>> 0 < clint.mtime_lo >>> 0)
-                clint.mtimecmp_hi++;
-            prevMtimecmpLo = clint.mtimecmp_lo;
-            prevMtimecmpHi = clint.mtimecmp_hi;
+        // PLIC: only set pending for RX data (not THRE)
+        const plic = globalThis.__plic_state;
+        const uart = globalThis.__uart_state;
+        const rx = globalThis.__uart_rx;
+        if (plic && uart && rx) {
+            if (rx.length > 0 && uart.ier & 1 && plic.claimed[0] !== 1 && plic.claimed[1] !== 1) {
+                plic.pending |= 2;
+            }
+            const s_enabled = plic.pending & plic.enable[1];
+            let hasInt = false;
+            for (let i = 1; i < 32 && !hasInt; i++) {
+                if (s_enabled >> i & 1 && plic.priority[i] > plic.threshold[1])
+                    hasInt = true;
+            }
+            if (hasInt) {
+                cpu.csrs.set(836, (cpu.csrs.get(836) || 0) | 512);
+            } else {
+                cpu.csrs.set(836, (cpu.csrs.get(836) || 0) & ~512);
+            }
         }
-        // S-mode interrupt delivery
+        // Timer
+        const timerPending = clint.mtime_hi >>> 0 > clint.mtimecmp_hi >>> 0 || clint.mtime_hi >>> 0 === clint.mtimecmp_hi >>> 0 && clint.mtime_lo >>> 0 >= clint.mtimecmp_lo >>> 0;
+        if (timerPending) {
+            const mip = cpu.csrs.get(836) || 0;
+            cpu.csrs.set(836, mip | 128);
+            if (!(mip & 32)) {
+                cpu.csrs.set(836, (cpu.csrs.get(836) || 0) | 32);
+                clint.mtimecmp_lo = clint.mtime_lo + 100000 | 0;
+                clint.mtimecmp_hi = clint.mtime_hi;
+                if (clint.mtimecmp_lo >>> 0 < clint.mtime_lo >>> 0)
+                    clint.mtimecmp_hi++;
+                prevMtimecmpLo = clint.mtimecmp_lo;
+                prevMtimecmpHi = clint.mtimecmp_hi;
+            }
+        }
         const newMip = cpu.csrs.get(836) || 0;
         const sie = cpu.csrs.get(260) || 0;
         const sstatus = cpu.csrs.get(256) || 0;
         const sieGlobal = sstatus >> 1 & 1;
         const canFireS = cpu.priv < 1 || cpu.priv === 1 && sieGlobal;
-        if (newMip & 32 && sie & 32 && canFireS) {
-            // Sync CSRs before trap
+        if (!canFireS)
+            return false;
+        if (newMip & 512 && sie & 512) {
+            trap(cpu, 2147483648 | 9 | 0, 0);
+            return true;
+        }
+        if (newMip & 32 && sie & 32) {
             cpu.csrs.set(3073, clint.mtime_lo);
             cpu.csrs.set(3201, clint.mtime_hi);
-            trap(cpu, 2147483653 | 0, 0);
+            trap(cpu, 2147483648 | 5 | 0, 0);
             return true;
         }
-        if (newMip & 2 && sie & 2 && canFireS) {
-            trap(cpu, 2147483649 | 0, 0);
-            return true;
-        }
-        if (newMip & 512 && sie & 512 && canFireS) {
-            trap(cpu, 2147483657 | 0, 0);
+        if (newMip & 2 && sie & 2) {
+            trap(cpu, 2147483648 | 1 | 0, 0);
             return true;
         }
         const mie = cpu.csrs.get(772) || 0;
         const mstatus = cpu.csrs.get(768) || 0;
         if (clint.msip && mie & 8 && (cpu.priv < 3 || mstatus & 8)) {
-            trap(cpu, 2147483651 | 0, 0);
+            trap(cpu, 2147483648 | 3 | 0, 0);
             return true;
         }
         return false;
@@ -12148,6 +12317,7 @@ const _dl9wv8 = function _buildDTB(INITRD_ADDR,initramfs,MEMORY_SIZE) {
             cells.forEach((c, i) => dv.setUint32(i * 4, c));
             prop(name, d);
         };
+        // phandle 1 = cpu-intc, phandle 2 = plic
         beginNode('');
         propU32('#address-cells', 2);
         propU32('#size-cells', 2);
@@ -12192,6 +12362,28 @@ const _dl9wv8 = function _buildDTB(INITRD_ADDR,initramfs,MEMORY_SIZE) {
         propU32('#size-cells', 2);
         propStr('compatible', 'simple-bus');
         propEmpty('ranges');
+        // PLIC
+        beginNode('plic@c000000');
+        propStr('compatible', 'sifive,plic-1.0.0');
+        propU32('#interrupt-cells', 1);
+        propEmpty('interrupt-controller');
+        propCells('reg', [
+            0,
+            201326592,
+            0,
+            67108864
+        ]);
+        propU32('riscv,ndev', 31);
+        // interrupts-extended: context 0 = M-mode ext (11), context 1 = S-mode ext (9)
+        propCells('interrupts-extended', [
+            1,
+            11,
+            1,
+            9
+        ]);
+        propU32('phandle', 2);
+        endNode();
+        // CLINT
         beginNode('clint@2000000');
         propStr('compatible', 'riscv,clint0');
         propCells('reg', [
@@ -12207,7 +12399,7 @@ const _dl9wv8 = function _buildDTB(INITRD_ADDR,initramfs,MEMORY_SIZE) {
             7
         ]);
         endNode();
-        // Serial without interrupts-extended — forces polling mode
+        // Serial with PLIC interrupt
         beginNode('serial@10000000');
         propStr('compatible', 'ns16550a');
         propCells('reg', [
@@ -12217,9 +12409,15 @@ const _dl9wv8 = function _buildDTB(INITRD_ADDR,initramfs,MEMORY_SIZE) {
             256
         ]);
         propU32('clock-frequency', 3686400);
+        propU32('interrupt-parent', 2);
+        // phandle of PLIC
+        propCells('interrupts', [1]);
+        // IRQ 1
         endNode();
         endNode();
+        // soc
         endNode();
+        // root
         u32(FDT_END);
         const strBytes = new TextEncoder().encode(strings.join('\0') + '\0');
         const structBytes = new Uint8Array(struct.length * 4);
@@ -12250,56 +12448,59 @@ const _dl9wv8 = function _buildDTB(INITRD_ADDR,initramfs,MEMORY_SIZE) {
     };
 };
 const _kkhz14 = function _dtb(buildDTB) {return (buildDTB());};
-const _1pfm3qb = function _buildInitramfs() {return (() => {
-    // Build a cpio "newc" format archive with /dev directory and /dev/console device node
-    // This overlays on the built-in initramfs to add the missing console device
-    const entries = [];
+const _1pfm3qb = function _buildInitramfs() {
     const cpioEntry = (name, mode, nlink, devmajor, devminor, rdevmajor, rdevminor, data) => {
         const nameBytes = new TextEncoder().encode(name);
         const namesize = nameBytes.length + 1;
-        // include null terminator
         const filesize = data ? data.length : 0;
-        // Header: 6 byte magic + 13 fields of 8 hex chars each = 110 bytes
-        const header = `070701` + `00000000` + // ino (will vary)
-        `${ mode.toString(16).padStart(8, '0') }` + `00000000` + // uid
-        `00000000` + // gid
-        `${ nlink.toString(16).padStart(8, '0') }` + `00000000` + // mtime
-        `${ filesize.toString(16).padStart(8, '0') }` + `${ devmajor.toString(16).padStart(8, '0') }` + `${ devminor.toString(16).padStart(8, '0') }` + `${ rdevmajor.toString(16).padStart(8, '0') }` + `${ rdevminor.toString(16).padStart(8, '0') }` + `${ namesize.toString(16).padStart(8, '0') }` + `00000000`;
-        // checksum
+        const header = `070701` + `00000000` + `${ mode.toString(16).padStart(8, '0') }` + `00000000` + `00000000` + `${ nlink.toString(16).padStart(8, '0') }` + `00000000` + `${ filesize.toString(16).padStart(8, '0') }` + `${ devmajor.toString(16).padStart(8, '0') }` + `${ devminor.toString(16).padStart(8, '0') }` + `${ rdevmajor.toString(16).padStart(8, '0') }` + `${ rdevminor.toString(16).padStart(8, '0') }` + `${ namesize.toString(16).padStart(8, '0') }` + `00000000`;
         const headerBytes = new TextEncoder().encode(header);
-        // name + null, padded to 4-byte boundary (header + name aligned to 4)
         const nameAligned = Math.ceil((110 + namesize) / 4) * 4;
-        const namePad = nameAligned - 110 - namesize;
-        // data padded to 4-byte boundary
         const dataAligned = Math.ceil(filesize / 4) * 4;
-        const dataPad = dataAligned - filesize;
         const total = nameAligned + dataAligned;
         const buf = new Uint8Array(total);
         buf.set(headerBytes, 0);
         buf.set(nameBytes, 110);
-        // null terminator + padding are already 0
         if (data)
             buf.set(data, nameAligned);
         return buf;
     };
-    let ino = 1;
-    // /dev directory - mode 0040755 (S_IFDIR | 0755)
-    entries.push(cpioEntry('dev', 16877, 2, 0, 0, 0, 0, null));
-    // /dev/console - mode 0020600 (S_IFCHR | 0600), rdev major=5 minor=1
-    entries.push(cpioEntry('dev/console', 8576, 1, 0, 0, 5, 1, null));
-    // TRAILER!!! - end of archive
-    entries.push(cpioEntry('TRAILER!!!', 0, 1, 0, 0, 0, 0, null));
-    // Concatenate and pad to 512-byte boundary
-    const totalLen = entries.reduce((s, e) => s + e.length, 0);
-    const padded = Math.ceil(totalLen / 512) * 512;
-    const result = new Uint8Array(padded);
-    let offset = 0;
-    for (const e of entries) {
-        result.set(e, offset);
-        offset += e.length;
-    }
-    return result;
-});};
+    return () => {
+        const entries = [];
+        // /dev directory
+        entries.push(cpioEntry('dev', 16877, 2, 0, 0, 0, 0, null));
+        // /dev/console - char device major=5, minor=1
+        entries.push(cpioEntry('dev/console', 8576, 1, 0, 0, 5, 1, null));
+        // /dev/ttyS0 - char device major=4, minor=64
+        entries.push(cpioEntry('dev/ttyS0', 8630, 1, 0, 0, 4, 64, null));
+        // Override /init with a script that properly opens the console and starts a shell
+        const initScript = `#!/bin/sh
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+
+echo
+echo "=== Linux booted ==="
+echo
+
+exec setsid /bin/sh -l </dev/console >/dev/console 2>/dev/console
+`;
+        const initData = new TextEncoder().encode(initScript);
+        entries.push(cpioEntry('init', 33261, 1, 0, 0, 0, 0, initData));
+        // TRAILER
+        entries.push(cpioEntry('TRAILER!!!', 0, 1, 0, 0, 0, 0, null));
+        // Concat and pad to 512-byte boundary
+        const totalLen = entries.reduce((s, e) => s + e.length, 0);
+        const padded = Math.ceil(totalLen / 512) * 512;
+        const result = new Uint8Array(padded);
+        let offset = 0;
+        for (const e of entries) {
+            result.set(e, offset);
+            offset += e.length;
+        }
+        return result;
+    };
+};
 const _qa8b6o = function _initramfs(buildInitramfs) {return (buildInitramfs());};
 const _wj13w2 = function _memdump(memReadRaw,mem) {return ((addr, count) => {
     const lines = [];
@@ -12815,6 +13016,116 @@ const _1r8ulzp = function __pte_debug(cpu,memReadRaw,mem) {
         pte0_flags: flags(pte0)
     };
 };
+const _1golzpf = function _PLIC_BASE() {return (201326592);};
+const _13tmeye = function _initramfs_debug(initramfs) {
+    const data = initramfs;
+    const entries = [];
+    let pos = 0;
+    while (pos < data.length - 110) {
+        const header = new TextDecoder().decode(data.slice(pos, pos + 110));
+        if (!header.startsWith('070701'))
+            break;
+        const namesize = parseInt(header.slice(94, 102), 16);
+        const filesize = parseInt(header.slice(54, 62), 16);
+        const mode = parseInt(header.slice(14, 22), 16);
+        const nameStart = pos + 110;
+        const name = new TextDecoder().decode(data.slice(nameStart, nameStart + namesize - 1));
+        const dataStart = Math.ceil((nameStart + namesize) / 4) * 4;
+        let preview = '';
+        if (filesize > 0 && filesize < 500) {
+            preview = new TextDecoder().decode(data.slice(dataStart, dataStart + Math.min(filesize, 200)));
+        }
+        entries.push({
+            name,
+            mode: '0o' + mode.toString(8),
+            filesize,
+            preview: preview.slice(0, 100)
+        });
+        if (name === 'TRAILER!!!')
+            break;
+        pos = Math.ceil((dataStart + filesize) / 4) * 4;
+    }
+    return entries;
+};
+const _tqdpyu = function _cpu_int_debug(cpu) {
+    const c = cpu;
+    const mip = c.csrs.get(836) || 0;
+    const sie = c.csrs.get(260) || 0;
+    const sstatus = c.csrs.get(256) || 0;
+    const sieGlobal = sstatus >> 1 & 1;
+    return {
+        priv: c.priv,
+        mip_hex: '0x' + (mip >>> 0).toString(16),
+        sie_hex: '0x' + (sie >>> 0).toString(16),
+        sstatus_hex: '0x' + (sstatus >>> 0).toString(16),
+        sieGlobal,
+        seip: mip >> 9 & 1,
+        seie: sie >> 9 & 1,
+        canFireS: c.priv < 1 || c.priv === 1 && sieGlobal
+    };
+};
+const _wlv6il = function _dev_log(md) {return (md`## Architecture & Dev Log
+
+### Hardware Map
+| Device | Address | Size | IRQ | Notes |
+|--------|---------|------|-----|-------|
+| **RAM** | \`0x80000000\` | 48MB | — | Main memory, firmware loaded at base |
+| **CLINT** | \`0x02000000\` | 64KB | — | Timer (mtime/mtimecmp) + software interrupts |
+| **PLIC** | \`0x0C000000\` | 64MB | — | Platform interrupt controller, SiFive spec |
+| **UART** | \`0x10000000\` | 8 bytes | PLIC #1 | NS16550A compatible, 3.6864 MHz clock |
+
+### Interrupt Architecture
+\`\`\`
+UART rx data → tickTimer sets PLIC pending (source 1)
+                → PLIC checks enable/priority/threshold
+                → Sets SEIP in mip (CSR 0x344)
+                → CPU takes S-mode external interrupt (scause 0x80000009)
+                → Kernel PLIC handler claims IRQ → reads UART IIR
+                → 8250 driver reads RHR (rx chars) or processes THRE (tx drain)
+                → Kernel writes PLIC complete → claimed cleared
+\`\`\`
+
+### UART (NS16550A) Key Details
+- **IIR priority**: RDA (0x04) > THRE (0x02) > no interrupt (0x01)
+- **THRE is one-shot**: \`thre_ip\` flag set on THR write or IER THRE enable; cleared when IIR reads it
+- **PLIC trigger**: Only on IER THRE 0→1 transition (not on every THR write) — prevents interrupt storm during console_write polling
+- **LSR**: Always reports THRE+TEMT (bits 5,6) since our virtual transmitter is instant
+- **Console output path** (printk): Polling mode — writes directly to THR, checks LSR THRE between chars
+- **TTY output path** (user-space write): Interrupt-driven — chars go to xmit buffer, THRE interrupt drains them
+
+### PLIC Implementation
+- 2 contexts: M-mode (ctx 0, threshold=7 blocks all) and S-mode (ctx 1)
+- Claim/complete handshake prevents re-entrant interrupts
+- tickTimer only sets pending when IRQ is not currently claimed
+- 31 interrupt sources (only source 1 = UART is used)
+
+### DTB Structure
+\`\`\`
+/ (riscv-lopecode)
+├── chosen: earlycon=sbi console=ttyS0, initrd address
+├── cpus/cpu@0: rv32ima, sv32, cpu-intc (phandle 1)
+├── memory@80000000: 48MB
+└── soc
+    ├── plic@c000000: sifive,plic-1.0.0 (phandle 2)
+    ├── clint@2000000: riscv,clint0
+    └── serial@10000000: ns16550a, interrupt-parent=plic, interrupts=<1>
+\`\`\`
+
+### Boot Sequence
+1. OpenSBI (M-mode) at \`0x80000000\` — firmware entry, sets up SBI interface
+2. Kernel (S-mode) at \`0x80400000\` — Linux 6.1, earlycon=sbi for early output
+3. PLIC probed — "mapped 31 interrupts with 1 handlers for 2 contexts"
+4. 8250 serial probed — ttyS0 at MMIO 0x10000000, IRQ 1
+5. Console switches sbi0 → ttyS0
+6. Initramfs unpacked (slow: BusyBox defconfig is large)
+7. /init runs (our overlay script) → mounts proc/sys/dev → exec /bin/sh (BusyBox ash)
+
+### Key Bugs Found & Fixed
+- **IIR infinite THRE loop**: Returning THRE on every IIR read caused 8250 handler to loop forever. Fix: one-shot \`thre_ip\` flag, cleared on read.
+- **PLIC interrupt storm**: Triggering PLIC pending on every THR write caused thousands of interrupts per console_write. Fix: only trigger on IER THRE 0→1 transition.
+- **Missing SEIE**: Without PLIC in DTB, kernel never enabled S-mode external interrupts (bit 9 in sie). Fix: added PLIC to DTB.
+- **Stale globalThis references**: Replacing objects on globalThis broke closures in memRead/memWrite. Fix: always mutate in place, never replace.
+`);};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -12833,7 +13144,7 @@ export default function define(runtime, observer) {
   main.variable(observer("firmware")).define("firmware", ["Generators", "viewof firmware"], (G, _) => G.input(_));  
   $def("_xrwa1k", "firmware_bytes", ["firmware"], _xrwa1k);  
   $def("_izm6sb", "initSystem", ["mutable cpu","RAM_BASE","DTB_ADDR","mutable mem","firmware_bytes","dtb","initramfs","INITRD_ADDR","mutable clint","_uart_buffer"], _izm6sb);  
-  $def("_vqev79", "continuous_run", ["_uart_buffer","initSystem","tickTimer","memRead","execute","decode","memWrite"], _vqev79);  
+  $def("_vqev79", "continuous_run", ["globalThis","_uart_buffer","initSystem","tickTimer","memRead","execute","decode","memWrite"], _vqev79);  
   $def("_4adjjk", "viewof reset", ["Inputs","DTB_ADDR","mutable cpu","MEMORY_SIZE","firmware_bytes","hello_program","dtb","RAM_BASE","mutable mem","mutable clint","_uart_buffer"], _4adjjk);  
   main.variable(observer("reset")).define("reset", ["Generators", "viewof reset"], (G, _) => G.input(_));  
   $def("_cz5yzw", "viewof runN", ["cpu","DTB_ADDR","mem","firmware_bytes","dtb","RAM_BASE","initramfs","INITRD_ADDR","clint","_uart_buffer","tickTimer","memRead","execute","decode","memWrite","Event"], _cz5yzw);  
@@ -12875,10 +13186,10 @@ export default function define(runtime, observer) {
   $def("_1ez5qqc", "trap", [], _1ez5qqc);  
   $def("_j38254", "translate", [], _j38254);  
   $def("_h84f9j", "memReadRaw", ["RAM_BASE"], _h84f9j);  
-  $def("_1906fzv", "memRead", ["_uart_rx_buffer","globalThis","translate","memReadRaw","trap","UART_BASE","CLINT_BASE","clint"], _1906fzv);  
-  $def("_1enwif7", "memWrite", ["globalThis","translate","memReadRaw","trap","UART_BASE","_uart_buffer","CLINT_BASE","clint","RAM_BASE"], _1enwif7);  
+  $def("_1906fzv", "memRead", ["_uart_rx_buffer","globalThis","translate","memReadRaw","trap","UART_BASE","PLIC_BASE","CLINT_BASE","clint"], _1906fzv);  
+  $def("_1enwif7", "memWrite", ["globalThis","translate","memReadRaw","trap","UART_BASE","_uart_buffer","PLIC_BASE","CLINT_BASE","clint","RAM_BASE"], _1enwif7);  
   $def("_1ii1fdo", "execute", ["trap"], _1ii1fdo);  
-  $def("_1qlsaqt", "tickTimer", ["trap"], _1qlsaqt);  
+  $def("_1qlsaqt", "tickTimer", ["globalThis","trap"], _1qlsaqt);  
   $def("_8lg64f", "step", ["tick","tickTimer","cpu","clint","memRead","mem","decode","execute","memWrite"], _8lg64f);  
   $def("_wcmejm", "hello_program", [], _wcmejm);  
   $def("_dl9wv8", "buildDTB", ["INITRD_ADDR","initramfs","MEMORY_SIZE"], _dl9wv8);  
@@ -12903,7 +13214,11 @@ export default function define(runtime, observer) {
   $def("_1l8t63p", "_dtb_mem_debug", ["dtb","MEMORY_SIZE","RAM_BASE"], _1l8t63p);  
   $def("_1dpvlv3", "_crash_debug", ["memReadRaw","mem","disassemble"], _1dpvlv3);  
   $def("_1zf79z", "_sum_debug", ["cpu","translate","mem","memReadRaw"], _1zf79z);  
-  $def("_1r8ulzp", "_pte_debug", ["cpu","memReadRaw","mem"], _1r8ulzp);
+  $def("_1r8ulzp", "_pte_debug", ["cpu","memReadRaw","mem"], _1r8ulzp);  
+  $def("_1golzpf", "PLIC_BASE", [], _1golzpf);  
+  $def("_13tmeye", "initramfs_debug", ["initramfs"], _13tmeye);  
+  $def("_tqdpyu", "cpu_int_debug", ["cpu"], _tqdpyu);  
+  $def("_wlv6il", "dev_log", ["md"], _wlv6il);
   return main;
 }</script>
 
