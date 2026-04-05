@@ -4616,7 +4616,7 @@ export default function define(runtime, observer) {
   data-encoding="base64"
   data-mime="application/json;charset=utf-8"
 >
-eyJAdG9tbGFya3dvcnRoeS9saW51eC1zYmMiOlt7InBpbm5lZCI6ZmFsc2V9LG51bGwseyJwaW5uZWQiOnRydWV9LHsicGlubmVkIjp0cnVlfSx7InBpbm5lZCI6dHJ1ZX1dLCJAdG9tbGFya3dvcnRoeS9jbGF1ZGUtY29kZS1wYWlyaW5nIjp7InZpZXdvZiB2b2ljZUVuYWJsZWQiOnsicGlubmVkIjp0cnVlfX19
+eyJAdG9tbGFya3dvcnRoeS9saW51eC1zYmMiOlt7InBpbm5lZCI6ZmFsc2V9LG51bGwseyJwaW5uZWQiOnRydWV9LHsicGlubmVkIjp0cnVlfSx7InBpbm5lZCI6dHJ1ZX1dLCJAdG9tbGFya3dvcnRoeS9jbGF1ZGUtY29kZS1wYWlyaW5nIjp7InZpZXdvZiB2b2ljZUVuYWJsZWQiOnsicGlubmVkIjp0cnVlfSwiY2NfY2hhdCI6eyJwaW5uZWQiOnRydWV9fX0=
 </script>
 <script id="@tomlarkworthy/editor-5" 
   type="text/plain"
@@ -10440,8 +10440,13 @@ const _1906fzv = function _memRead(_uart_rx_buffer,globalThis,translate,memReadR
             }
             if (reg === 1)
                 return dlab ? uart.dlm : uart.ier;
-            if (reg === 2)
-                return uart.iir;
+            if (reg === 2) {
+                // IIR: bit 0 = 0 means interrupt pending, 1 = no interrupt
+                // Only signal RX data available when data exists AND IER bit 0 set
+                if (_rx.length > 0 && uart.ier & 1)
+                    return 4;
+                return 1;    // no interrupt pending (safe default)
+            }
             if (reg === 3)
                 return uart.lcr;
             if (reg === 4)
@@ -11560,32 +11565,75 @@ const _1y9mqw6 = function _clint() {return ({
     // timer low (offset 0xBFF8)
     mtime_hi: 0    // timer high (offset 0xBFFC)
 });};
-const _1qlsaqt = function _tickTimer(trap) {return ((cpu, clint) => {
-    // Increment mtime (64-bit)
-    clint.mtime_lo = clint.mtime_lo + 1 | 0;
-    if (clint.mtime_lo === 0)
-        clint.mtime_hi = clint.mtime_hi + 1 | 0;
-    // Check timer interrupt: mtime >= mtimecmp
-    const timerPending = clint.mtime_hi >>> 0 > clint.mtimecmp_hi >>> 0 || clint.mtime_hi >>> 0 === clint.mtimecmp_hi >>> 0 && clint.mtime_lo >>> 0 >= clint.mtimecmp_lo >>> 0;
-    // Update MIP.MTIP (bit 7)
-    const mip = cpu.csrs.get(836) || 0;
-    cpu.csrs.set(836, timerPending ? mip | 128 : mip & ~128);
-    // Check if timer interrupt should fire:
-    // MIP.MTIP set AND MIE.MTIE (bit 7) set AND mstatus.MIE (bit 3) set
-    const mie = cpu.csrs.get(772) || 0;
-    const mstatus = cpu.csrs.get(768) || 0;
-    if (timerPending && mie & 128 && mstatus & 8) {
-        // Fire timer interrupt (cause = 0x80000007 — interrupt bit + cause 7)
-        trap(cpu, 2147483655, 0);
-        return true;    // interrupt taken
-    }
-    // Check software interrupt: MSIP AND MIE.MSIE (bit 3) AND mstatus.MIE
-    if (clint.msip && mie & 8 && mstatus & 8) {
-        trap(cpu, 2147483651, 0);
-        return true;
-    }
-    return false;
-});};
+const _1qlsaqt = function _tickTimer(trap) {
+    let prevMtimecmpLo = -1;
+    let prevMtimecmpHi = -1;
+    let csrUpdateCounter = 0;
+    return (cpu, clint) => {
+        clint.mtime_lo = clint.mtime_lo + 1 | 0;
+        if (clint.mtime_lo === 0)
+            clint.mtime_hi = clint.mtime_hi + 1 | 0;
+        // Update time/cycle CSRs only every 64 cycles (lazy update)
+        if ((++csrUpdateCounter & 63) === 0) {
+            cpu.csrs.set(3073, clint.mtime_lo);
+            cpu.csrs.set(3201, clint.mtime_hi);
+            cpu.csrs.set(3072, cpu.cycle | 0);
+            cpu.csrs.set(3200, 0);
+        }
+        // Detect mtimecmp change → clear STIP
+        if (clint.mtimecmp_lo !== prevMtimecmpLo || clint.mtimecmp_hi !== prevMtimecmpHi) {
+            cpu.csrs.set(836, (cpu.csrs.get(836) || 0) & ~32);
+            prevMtimecmpLo = clint.mtimecmp_lo;
+            prevMtimecmpHi = clint.mtimecmp_hi;
+        }
+        // Timer pending: mtime >= mtimecmp
+        const timerPending = clint.mtime_hi >>> 0 > clint.mtimecmp_hi >>> 0 || clint.mtime_hi >>> 0 === clint.mtimecmp_hi >>> 0 && clint.mtime_lo >>> 0 >= clint.mtimecmp_lo >>> 0;
+        if (!timerPending)
+            return false;
+        // fast path: no timer, skip all checks
+        const mip = cpu.csrs.get(836) || 0;
+        cpu.csrs.set(836, mip | 128);
+        // MTIP
+        if (!(mip & 32)) {
+            // Set STIP, re-arm timer
+            cpu.csrs.set(836, (cpu.csrs.get(836) || 0) | 32);
+            clint.mtimecmp_lo = clint.mtime_lo + 100000 | 0;
+            clint.mtimecmp_hi = clint.mtime_hi;
+            if (clint.mtimecmp_lo >>> 0 < clint.mtime_lo >>> 0)
+                clint.mtimecmp_hi++;
+            prevMtimecmpLo = clint.mtimecmp_lo;
+            prevMtimecmpHi = clint.mtimecmp_hi;
+        }
+        // S-mode interrupt delivery
+        const newMip = cpu.csrs.get(836) || 0;
+        const sie = cpu.csrs.get(260) || 0;
+        const sstatus = cpu.csrs.get(256) || 0;
+        const sieGlobal = sstatus >> 1 & 1;
+        const canFireS = cpu.priv < 1 || cpu.priv === 1 && sieGlobal;
+        if (newMip & 32 && sie & 32 && canFireS) {
+            // Sync CSRs before trap
+            cpu.csrs.set(3073, clint.mtime_lo);
+            cpu.csrs.set(3201, clint.mtime_hi);
+            trap(cpu, 2147483653 | 0, 0);
+            return true;
+        }
+        if (newMip & 2 && sie & 2 && canFireS) {
+            trap(cpu, 2147483649 | 0, 0);
+            return true;
+        }
+        if (newMip & 512 && sie & 512 && canFireS) {
+            trap(cpu, 2147483657 | 0, 0);
+            return true;
+        }
+        const mie = cpu.csrs.get(772) || 0;
+        const mstatus = cpu.csrs.get(768) || 0;
+        if (clint.msip && mie & 8 && (cpu.priv < 3 || mstatus & 8)) {
+            trap(cpu, 2147483651 | 0, 0);
+            return true;
+        }
+        return false;
+    };
+};
 const _j38254 = function _translate() {return ((cpu, mem, vaddr, accessType, memReadRaw) => {
     // accessType: 0=fetch, 1=load, 2=store
     // Fault codes: 12=inst page fault, 13=load page fault, 15=store page fault
@@ -12279,30 +12327,29 @@ const _1uqb731 = function __fw_verify(mem,firmware_bytes) {
 };
 const _17qo5pv = function _TODO(md) {return (md`## Boot Status & TODO
 
-**Current state**: 🎉 **BusyBox shell running!** Linux boots through OpenSBI → kernel → /init → mounts filesystems → prints banner → exec /bin/sh. Shell is blocked on read() waiting for keyboard input at sepc=0x488b8.
+**Current state**: 🎉 **UART input working!** Shell consumes keyboard input (rx buffer drains to 0). Output is slow due to tty write path needing timer ticks. Boot takes ~260M cycles with timer overhead.
 
 **Working configurations**:
-- \`busybox-boot.bin\` + 48MB RAM + translate fix → boots to BusyBox shell ✅
-- \`boot-linux-v2.bin\` + 32MB RAM → boots to old init (tiny init.S) ✅
+- \`busybox-boot.bin\` + 48MB RAM + all fixes → boots to BusyBox shell with working timer ✅
+- UART input consumed by kernel ✅ (proven: rx buffer drains)
+- Real kernel timestamps (rdtime works) ✅
 
 **Bugs fixed this session**:
-6. **Store page fault code**: \`translate()\` returned fault code 14 for stores (\`12 + accessType\`), but RISC-V spec says store page faults = 15 (code 14 is reserved). Kernel didn't recognize cause 14 → SIGILL → panic. Fix: use \`[12, 13, 15][accessType]\` mapping.
-
-**Firmware** (\`tools/scratch/riscv/\`):
-| File | Contents |
-|------|----------|
-| \`busybox-boot.bin\` | Working PIE OpenSBI (from v2) + busybox kernel (25.8MB) ✅ |
-| \`boot-linux-v2.bin\` | Working PIE OpenSBI + old kernel (25.8MB) ✅ |
-
-**BusyBox build** (\`build-busybox.sh\`): clang arm64 → riscv32-linux-musl rv32ima/ilp32, musl 1.2.5, custom softfloat.c, lld. 1.6MB static ELF.
-**Kernel build** (\`rebuild-kernel.sh\`): Linux 6.1, rv32ima no-C, busybox initramfs embedded. 21.5MB Image.
-**Combined firmware**: Python script: OpenSBI from boot-linux-v2.bin (first 4MB) + kernel Image at 0x400000.
+1. **\`tickTimer\` interrupt cause encoding**: \`0x80000007\` was positive in JS, but \`trap()\` checks \`cause < 0\`. Used \`0x80000007 | 0\` to force signed → OpenSBI now recognizes timer interrupts.
+2. **M-mode interrupt gating**: Only checked \`mstatus.MIE\`, but when in S-mode, M-mode interrupts fire regardless. Added \`priv < 3 || MIE\` check.
+3. **No S-mode interrupt delivery**: Emulator only delivered M-mode interrupts. Added S-mode timer/software/external interrupt checks + STIP management.
+4. **\`time\` CSR (0xC01) returned 0**: Kernel's \`rdtime\` always saw 0 → clock never advanced, timer system broken. Now updated from \`clint.mtime\` every 64 cycles.
+5. **UART IIR always returned 1 (no interrupt)**: 8250 polling timer saw no pending interrupts → never processed RX data. Fixed to return 0x04 (received data available) when rx buffer has data.
+6. **UART IIR returned 0x02 (THR empty) constantly**: Caused infinite loop in \`serial8250_handle_irq\`. Fixed to only return 0x01 (safe) or 0x04 (rx data).
+7. **STIP never cleared**: OpenSBI's \`sbi_set_timer\` didn't clear STIP. Added detection of mtimecmp changes → clear STIP.
+8. **UART rx buffer reference mismatch**: \`globalThis.__uart_rx = []\` created new array, breaking \`memRead\`'s captured reference. Must use \`rxCell.length = 0\` to clear.
 
 **Next steps**:
-1. **Wire up UART input** — send keyboard characters to the UART RX buffer so the shell can read them
-2. Get interactive shell working (type commands, see output)
-3. Fix 64MB DTB issue (OpenSBI SBI_ERR_INVALID_PARAM with 64MB)
-4. Export/save working state
+1. **Speed up tty output** — shell output is very slow (chars trickle through tty layer). Need faster timer polling or direct console write path.
+2. **Build interactive console UI** — floating terminal with keyboard capture + continuous run loop (prototype existed but had reactive loop issues).
+3. **Wire uart_input cell** — connect existing HTML input to correct rx buffer reference.
+4. Fix 64MB DTB issue (OpenSBI SBI_ERR_INVALID_PARAM with 64MB)
+5. Export/save working state
 `);};
 const _148t9xt = function _pt_debug($0,$1) {
     const satp = $0.value.csrs.get(384) || 0;
@@ -12536,6 +12583,9 @@ const _1r8ulzp = function __pte_debug(cpu,memReadRaw,mem) {
         pte0_flags: flags(pte0)
     };
 };
+const _hrdflu = () => {
+    throw new RuntimeError(`${name} is defined more than once`);
+  };
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -12624,7 +12674,8 @@ export default function define(runtime, observer) {
   $def("_1l8t63p", "_dtb_mem_debug", ["dtb","MEMORY_SIZE","RAM_BASE"], _1l8t63p);  
   $def("_1dpvlv3", "_crash_debug", ["memReadRaw","mem","disassemble"], _1dpvlv3);  
   $def("_1zf79z", "_sum_debug", ["cpu","translate","mem","memReadRaw"], _1zf79z);  
-  $def("_1r8ulzp", "_pte_debug", ["cpu","memReadRaw","mem"], _1r8ulzp);
+  $def("_1r8ulzp", "_pte_debug", ["cpu","memReadRaw","mem"], _1r8ulzp);  
+  $def("_hrdflu", "interactive_console", [], _hrdflu);
   return main;
 }</script>
 
@@ -15905,7 +15956,7 @@ exporter()
 const _15b229g = function identity(x) {
   return x;
 };
-const _19ebgtz = function identity(x) {
+const _wsfdch = function identity(x) {
   return x;
 };
 const _1p9ak6v = function identity(x) {
