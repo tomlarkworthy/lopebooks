@@ -3136,6 +3136,7 @@ function handleListVariables(cmd, runtime) {
 const _15uwot5 = function _cc_handle_list_cells(cc_find_module){return(
 function handleListCells(cmd, runtime) {
     var moduleName = cmd.params.module;
+    var maxLen = cmd.params.maxDefinitionLength;
     var targetModule = cc_find_module(runtime, moduleName);
     if (!targetModule)
         return {
@@ -3147,7 +3148,8 @@ function handleListCells(cmd, runtime) {
         var v = entry[1];
         var defStr = '';
         try {
-            defStr = String(v._definition).slice(0, 2000);
+            var raw = String(v._definition);
+            defStr = maxLen === 0 ? raw : raw.slice(0, maxLen || 2000);
         } catch (e) {
         }
         cells.push({
@@ -3879,7 +3881,8 @@ Inputs.input([
 const _tt702v = function _cc_module(thisModule){return(
 thisModule()
 )};
-const _1tgi7r0 = function _voiceEnabled(Event) {return (function () {
+const _1tgi7r0 = function _voiceEnabled(Event){return(
+function () {
     var span = document.createElement('span');
     span.className = 'cc-voice-toggle';
     span.style.cssText = 'font-size:20px;opacity:0.4;transition:opacity 0.15s;line-height:1;cursor:pointer;flex-shrink:0;user-select:none;align-self:center;';
@@ -3892,7 +3895,8 @@ const _1tgi7r0 = function _voiceEnabled(Event) {return (function () {
         span.dispatchEvent(new Event('input'));
     };
     return span;
-}());};
+}()
+)};
 const _1x5l625 = function identity(x) {
   return x;
 };
@@ -10497,51 +10501,72 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
     const x = cpu.x;
     const rs1v = x[d.rs1], rs2v = x[d.rs2];
     let nextPC = cpu.pc + 4;
+    const startPC = cpu.pc;
+    // save to detect traps during mem access
     switch (d.opcode) {
     case 55:
         x[d.rd] = d.imm;
         break;
+    // LUI
     case 23:
         x[d.rd] = cpu.pc + d.imm | 0;
         break;
+    // AUIPC
     case 111:
         x[d.rd] = cpu.pc + 4;
         nextPC = cpu.pc + d.imm | 0;
         break;
+    // JAL
     case 103:
         x[d.rd] = cpu.pc + 4;
         nextPC = rs1v + d.imm & ~1;
         break;
+    // JALR
     case 99: {
+            // BRANCH
             const taken = d.funct3 === 0 ? rs1v === rs2v : d.funct3 === 1 ? rs1v !== rs2v : d.funct3 === 4 ? rs1v < rs2v : d.funct3 === 5 ? rs1v >= rs2v : d.funct3 === 6 ? rs1v >>> 0 < rs2v >>> 0 : d.funct3 === 7 ? rs1v >>> 0 >= rs2v >>> 0 : false;
             if (taken)
                 nextPC = cpu.pc + d.imm | 0;
         }
         break;
     case 3: {
+            // LOAD
             const addr = rs1v + d.imm | 0;
             const sz = d.funct3 & 3;
             const bytes = sz === 0 ? 1 : sz === 1 ? 2 : 4;
             let val = memRead(cpu, mem, addr, bytes, 1);
+            if (cpu.pc !== startPC) {
+                nextPC = cpu.pc;
+                break;
+            }
+            // trap during load
             if (d.funct3 & 4 && bytes < 4)
                 val = val & (bytes === 1 ? 255 : 65535);
             x[d.rd] = val;
         }
         break;
     case 35: {
+            // STORE
             const addr = rs1v + d.imm | 0;
             const sz = d.funct3 & 3;
             const bytes = sz === 0 ? 1 : sz === 1 ? 2 : 4;
             memWrite(cpu, mem, addr, bytes, rs2v);
+            if (cpu.pc !== startPC) {
+                nextPC = cpu.pc;
+                break;
+            }    // trap during store
         }
         break;
     case 19: {
+            // OP-IMM
             const shamt = d.imm & 31;
             x[d.rd] = d.funct3 === 0 ? rs1v + d.imm | 0 : d.funct3 === 1 ? rs1v << shamt : d.funct3 === 2 ? rs1v < d.imm ? 1 : 0 : d.funct3 === 3 ? rs1v >>> 0 < d.imm >>> 0 ? 1 : 0 : d.funct3 === 4 ? rs1v ^ d.imm : d.funct3 === 5 ? d.funct7 & 32 ? rs1v >> shamt : rs1v >>> shamt : d.funct3 === 6 ? rs1v | d.imm : rs1v & d.imm;
         }
         break;
     case 51: {
+            // OP
             if (d.funct7 === 1) {
+                // M extension
                 const a = rs1v, b = rs2v;
                 const au = a >>> 0, bu = b >>> 0;
                 switch (d.funct3) {
@@ -10582,23 +10607,39 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
         }
         break;
     case 47: {
+            // ATOMIC
             if (d.funct3 === 2) {
                 const addr = rs1v;
                 const f5 = d.funct7 >> 2;
                 if (f5 === 2) {
+                    // LR.W
                     x[d.rd] = memRead(cpu, mem, addr, 4, 1);
+                    if (cpu.pc !== startPC) {
+                        nextPC = cpu.pc;
+                        break;
+                    }
                     cpu.lr_addr = addr;
                     cpu.lr_valid = true;
                 } else if (f5 === 3) {
+                    // SC.W
                     if (cpu.lr_valid && cpu.lr_addr === addr) {
                         memWrite(cpu, mem, addr, 4, rs2v);
+                        if (cpu.pc !== startPC) {
+                            nextPC = cpu.pc;
+                            break;
+                        }
                         x[d.rd] = 0;
                     } else {
                         x[d.rd] = 1;
                     }
                     cpu.lr_valid = false;
                 } else {
+                    // AMO
                     const old = memRead(cpu, mem, addr, 4, 1);
+                    if (cpu.pc !== startPC) {
+                        nextPC = cpu.pc;
+                        break;
+                    }
                     let result;
                     switch (f5 & 31) {
                     case 1:
@@ -10633,6 +10674,10 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
                         break;
                     }
                     memWrite(cpu, mem, addr, 4, result);
+                    if (cpu.pc !== startPC) {
+                        nextPC = cpu.pc;
+                        break;
+                    }
                     x[d.rd] = old;
                 }
             } else {
@@ -10642,9 +10687,11 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
         }
         break;
     case 115: {
+            // SYSTEM
             const csr = d.imm & 4095;
             if (d.funct3 === 0) {
                 if (d.inst === 807403635) {
+                    // mret
                     const mstatus = cpu.csrs.get(768) || 0;
                     const mpie = mstatus >> 7 & 1;
                     const mpp = mstatus >> 11 & 3;
@@ -10652,6 +10699,7 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
                     cpu.priv = mpp;
                     nextPC = cpu.csrs.get(833) || 0;
                 } else if (d.inst === 270532723) {
+                    // sret
                     const sstatus = cpu.csrs.get(256) || 0;
                     const spie = sstatus >> 5 & 1;
                     const spp = sstatus >> 8 & 1;
@@ -10661,17 +10709,18 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
                     cpu.priv = spp;
                     nextPC = cpu.csrs.get(321) || 0;
                 } else if (d.imm === 0) {
+                    // ecall
                     trap(cpu, cpu.priv === 0 ? 8 : cpu.priv === 1 ? 9 : 11, 0);
                     nextPC = cpu.pc;
                 } else if (d.imm === 1) {
+                    // ebreak
                     trap(cpu, 3, cpu.pc);
                     nextPC = cpu.pc;
                 } else if (d.inst === 273678451 || d.inst >>> 25 === 9) {
                 }
             } else {
-                // CSR access
                 if (csr === 21) {
-                    // seed CSR (Zkr): return random with ES16 status (bits 31:30 = 0b11)
+                    // seed CSR
                     x[d.rd] = 3221225472 | Math.random() * 65535 >>> 0;
                 } else {
                     const csrPriv = csr >> 8 & 3;
@@ -10698,6 +10747,7 @@ const _1ii1fdo = function _execute(trap) {return ((d, cpu, mem, memRead, memWrit
         break;
     case 15:
         break;
+    // FENCE
     default:
         trap(cpu, 2, d.inst);
         nextPC = cpu.pc;
@@ -10930,34 +10980,13 @@ const _4adjjk = function _reset(Inputs,DTB_ADDR,$0,MEMORY_SIZE,firmware_bytes,he
         return Date.now();
     }
 }));};
-const _cz5yzw = function _runN(cpu,tickTimer,clint,memRead,mem,execute,decode,memWrite,Event,DTB_ADDR,firmware_bytes,dtb,RAM_BASE,_uart_buffer) {
+const _cz5yzw = function _runN(cpu,DTB_ADDR,mem,firmware_bytes,dtb,RAM_BASE,clint,_uart_buffer,tickTimer,memRead,execute,decode,memWrite,Event) {
     const div = document.createElement('div');
     div.style.display = 'flex';
     div.style.gap = '8px';
     div.style.flexWrap = 'wrap';
     const MISA = 1075056897;
-    const makeBtn = (label, count) => {
-        const btn = document.createElement('button');
-        btn.textContent = label;
-        btn.onclick = () => {
-            for (let i = 0; i < count && !cpu.halted; i++) {
-                tickTimer(cpu, clint);
-                const savedPC = cpu.pc;
-                const inst = memRead(cpu, mem, cpu.pc, 4, 0) >>> 0;
-                if (cpu.pc !== savedPC)
-                    continue;
-                // fetch fault took a trap, skip execute
-                execute(decode(inst), cpu, mem, memRead, memWrite);
-            }
-            div.value = cpu.cycle;
-            div.dispatchEvent(new Event('input', { bubbles: true }));
-        };
-        return btn;
-    };
-    const debugBtn = document.createElement('button');
-    debugBtn.textContent = 'Boot 10M';
-    debugBtn.style.background = '#ff6';
-    debugBtn.onclick = () => {
+    const initCPU = () => {
         cpu.x = new Int32Array(32);
         cpu.pc = 2147483648;
         cpu.priv = 3;
@@ -11073,23 +11102,84 @@ const _cz5yzw = function _runN(cpu,tickTimer,clint,memRead,mem,execute,decode,me
         clint.mtime_lo = 0;
         clint.mtime_hi = 0;
         _uart_buffer.length = 0;
-        for (let i = 0; i < 10000000 && !cpu.halted; i++) {
+    };
+    const runCycles = count => {
+        for (let i = 0; i < count && !cpu.halted; i++) {
             tickTimer(cpu, clint);
             const savedPC = cpu.pc;
             const inst = memRead(cpu, mem, cpu.pc, 4, 0) >>> 0;
             if (cpu.pc !== savedPC)
                 continue;
-            // fetch fault took a trap, skip execute
             execute(decode(inst), cpu, mem, memRead, memWrite);
         }
         div.value = cpu.cycle;
         div.dispatchEvent(new Event('input', { bubbles: true }));
     };
-    div.appendChild(debugBtn);
-    div.appendChild(makeBtn('Run 10K', 10000));
-    div.appendChild(makeBtn('Run 100K', 100000));
-    div.appendChild(makeBtn('Run 1M', 1000000));
-    div.appendChild(makeBtn('Run 10M', 10000000));
+    const makeBootBtn = (label, count, color) => {
+        const btn = document.createElement('button');
+        btn.textContent = label;
+        btn.style.background = color || '#ff6';
+        btn.onclick = () => {
+            initCPU();
+            runCycles(count);
+        };
+        return btn;
+    };
+    const makeRunBtn = (label, count) => {
+        const btn = document.createElement('button');
+        btn.textContent = label;
+        btn.onclick = () => runCycles(count);
+        return btn;
+    };
+    div.appendChild(makeBootBtn('Boot 10M', 10000000));
+    div.appendChild(makeBootBtn('Boot 200M', 200000000, '#f96'));
+    div.appendChild(makeRunBtn('Run 10K', 10000));
+    div.appendChild(makeRunBtn('Run 100K', 100000));
+    div.appendChild(makeRunBtn('Run 1M', 1000000));
+    div.appendChild(makeRunBtn('Run 10M', 10000000));
+    // Trace button: boot with logging around init entry (0x100e8)
+    const traceBtn = document.createElement('button');
+    traceBtn.textContent = 'Boot+Trace init';
+    traceBtn.style.background = '#6ff';
+    traceBtn.onclick = () => {
+        initCPU();
+        window._initTrace = [];
+        const trace = window._initTrace;
+        for (let i = 0; i < 200000000 && !cpu.halted; i++) {
+            tickTimer(cpu, clint);
+            const savedPC = cpu.pc;
+            // Trace when PC is near 0x100e8 or privilege changes around it
+            if (cpu.pc >= 65536 && cpu.pc <= 66048) {
+                trace.push({
+                    cycle: cpu.cycle,
+                    pc: '0x' + cpu.pc.toString(16),
+                    priv: cpu.priv,
+                    spp: (cpu.csrs.get(256) || 0) >> 8 & 1,
+                    sepc: '0x' + ((cpu.csrs.get(321) || 0) >>> 0).toString(16),
+                    sstatus: '0x' + ((cpu.csrs.get(256) || 0) >>> 0).toString(16)
+                });
+                if (trace.length > 200)
+                    break;
+            }
+            const inst = memRead(cpu, mem, cpu.pc, 4, 0) >>> 0;
+            if (cpu.pc !== savedPC) {
+                if (savedPC >= 65536 && savedPC <= 66048) {
+                    trace.push({
+                        cycle: cpu.cycle,
+                        event: 'fetch_fault',
+                        savedPC: '0x' + savedPC.toString(16),
+                        newPC: '0x' + cpu.pc.toString(16),
+                        priv: cpu.priv
+                    });
+                }
+                continue;
+            }
+            execute(decode(inst), cpu, mem, memRead, memWrite);
+        }
+        div.value = cpu.cycle;
+        div.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    div.appendChild(traceBtn);
     div.value = 0;
     return div;
 };
@@ -12136,28 +12226,81 @@ const _1uqb731 = function __fw_verify(mem,firmware_bytes) {
         fwSize: firmware_bytes ? firmware_bytes.byteLength : 'null'
     };
 };
-const _7b7811 = function _anonymous() {return (undefined);};
-const _7b7811 = function _anonymous() {return (undefined);};
-const _7b7811 = function _anonymous() {return (undefined);};
-const _7b7811 = function _anonymous() {return (undefined);};
-const _7b7811 = function _anonymous() {return (undefined);};
 const _17qo5pv = function _TODO(md) {return (md`## Boot Status & TODO
 
-**Current state**: Linux kernel boots through init, but crashes with:
-\`Unable to handle kernel access to user memory without uaccess routines at virtual address 000100e8\`
+**Current state**: Linux kernel boots through init successfully! Init runs in U-mode and makes syscalls, but is stuck in a write() loop getting \`-EBADF\` because there's no \`/dev/console\`.
 
-**Root cause**: After \`sret\` to user-mode init, the kernel page fault handler runs at epc=0x100e8 (init code) but the kernel is still in S-mode when it tries to access user memory. This is because \`sstatus.SUM\` (Supervisor User Memory access, bit 18) is not set when the kernel handles the instruction page fault for init's code.
-
-**Bugs fixed this session**:
+**Bugs fixed**:
 1. ~~\`accessType || 1\` in memRead converted fetch (0) to load (1), checking wrong page permissions~~
 2. ~~Double-trap on instruction fetch fault: memRead returned 0 after page fault, but run loop still executed decode(0), causing spurious SIGILL that overwrote the real fault~~
+3. ~~**Load/store page fault clobbered by execute()**: When a load/store caused a page fault inside \`execute()\`, \`trap()\` correctly set \`cpu.pc = stvec\` and \`cpu.priv = S-mode\`, but execute continued and overwrote \`cpu.pc\` with \`nextPC\` (sequential PC+4). This caused the CPU to jump to the user address in S-mode instead of the kernel trap handler, triggering "Unable to handle kernel access to user memory without uaccess routines". Fix: check if \`cpu.pc !== startPC\` after every \`memRead\`/\`memWrite\` in execute to detect traps.~~
 
 **Next steps**:
-1. Fix the \`translate\` function: when S-mode accesses a U-mode page for instruction fetch, it should be allowed (kernel page fault handler needs to read user pages). Check SUM bit handling for fetch vs load/store
-2. OR: the kernel expects to handle the page fault and map the page, but our page fault handler path has an issue — the fault address 0x100e8 is correct but the kernel can't copy-on-write/demand-page because it can't access user memory
-3. Add \`/dev/console\` to initramfs so init has stdin/stdout/stderr (\`Warning: unable to open an initial console\`)
-4. Get a shell prompt working with console input
+1. Add \`/dev/console\` to initramfs so init has stdin/stdout/stderr (\`Warning: unable to open an initial console\`)
+2. Get a shell prompt working with console input
 `);};
+const _148t9xt = function _pt_debug($0,$1) {
+    const satp = $0.value.csrs.get(384) || 0;
+    const m = $1.value;
+    const mode = satp >>> 31 & 1;
+    const ppn = satp & 4194303;
+    const ptBase = ppn * 4096;
+    const RAM_BASE = 2147483648;
+    const vaddr = 65768;
+    const vpn1 = vaddr >>> 22 & 1023;
+    const vpn0 = vaddr >>> 12 & 1023;
+    const pte1Addr = ptBase + vpn1 * 4;
+    const off1 = pte1Addr - RAM_BASE >>> 0;
+    if (off1 + 4 > m.length)
+        return {
+            error: 'L1 PTE out of bounds',
+            off1,
+            memLen: m.length,
+            satp: '0x' + (satp >>> 0).toString(16)
+        };
+    const pte1 = new DataView(m.buffer, off1, 4).getUint32(0, true);
+    const v1 = pte1 & 1, r1 = pte1 >> 1 & 1, w1 = pte1 >> 2 & 1, x1 = pte1 >> 3 & 1, u1 = pte1 >> 4 & 1, a1 = pte1 >> 6 & 1, d1 = pte1 >> 7 & 1;
+    let res = {
+        satp: '0x' + (satp >>> 0).toString(16),
+        vpn1,
+        vpn0,
+        pte1: '0x' + (pte1 >>> 0).toString(16),
+        L1: {
+            V: v1,
+            R: r1,
+            W: w1,
+            X: x1,
+            U: u1,
+            A: a1,
+            D: d1
+        }
+    };
+    if (v1 && !(r1 || x1)) {
+        const pt0PPN = pte1 >>> 10 & 4194303;
+        const pt0Base = pt0PPN * 4096;
+        const off0 = pt0Base + vpn0 * 4 - RAM_BASE >>> 0;
+        if (off0 + 4 > m.length)
+            return {
+                ...res,
+                error: 'L0 out of bounds'
+            };
+        const pte0 = new DataView(m.buffer, off0, 4).getUint32(0, true);
+        const v0 = pte0 & 1, r0 = pte0 >> 1 & 1, w0 = pte0 >> 2 & 1, x0 = pte0 >> 3 & 1, u0 = pte0 >> 4 & 1, a0 = pte0 >> 6 & 1, d0 = pte0 >> 7 & 1;
+        res.pte0 = '0x' + (pte0 >>> 0).toString(16);
+        res.L0 = {
+            V: v0,
+            R: r0,
+            W: w0,
+            X: x0,
+            U: u0,
+            A: a0,
+            D: d0
+        };
+        res.physPage = '0x' + ((pte0 >>> 10 & 4194303) * 4096).toString(16);
+    }
+    return res;
+};
+const _itnp4a = function _anonymous(_computeNow) {return (_computeNow('pt_debug'));};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -12194,7 +12337,7 @@ export default function define(runtime, observer) {
   $def("_1rh5oqw", "last_instruction", ["step","md","REG_NAMES"], _1rh5oqw);  
   $def("_4adjjk", "viewof reset", ["Inputs","DTB_ADDR","mutable cpu","MEMORY_SIZE","firmware_bytes","hello_program","dtb","RAM_BASE","mutable mem","mutable clint","_uart_buffer"], _4adjjk);  
   main.variable(observer("reset")).define("reset", ["Generators", "viewof reset"], (G, _) => G.input(_));  
-  $def("_cz5yzw", "viewof runN", ["cpu","tickTimer","clint","memRead","mem","execute","decode","memWrite","Event","DTB_ADDR","firmware_bytes","dtb","RAM_BASE","_uart_buffer"], _cz5yzw);  
+  $def("_cz5yzw", "viewof runN", ["cpu","DTB_ADDR","mem","firmware_bytes","dtb","RAM_BASE","clint","_uart_buffer","tickTimer","memRead","execute","decode","memWrite","Event"], _cz5yzw);  
   main.variable(observer("runN")).define("runN", ["Generators", "viewof runN"], (G, _) => G.input(_));  
   $def("_1q7elrb", "disassemble", ["decode","REG_NAMES"], _1q7elrb);  
   $def("_4385qu", "disassembly_view", ["step","runN","reset","RAM_BASE","cpu","memReadRaw","mem","disassemble"], _4385qu);  
@@ -12235,12 +12378,9 @@ export default function define(runtime, observer) {
   $def("_1knhjmc", "_caller_check", ["memReadRaw","mem","disassemble","cpu"], _1knhjmc);  
   $def("_w89dlb", "_dtb_check", ["DTB_ADDR","RAM_BASE","mem","dtb"], _w89dlb);  
   $def("_1uqb731", "_fw_verify", ["mem","firmware_bytes"], _1uqb731);  
-  $def("_7b7811", null, [], _7b7811);  
-  $def("_7b7811", null, [], _7b7811);  
-  $def("_7b7811", null, [], _7b7811);  
-  $def("_7b7811", null, [], _7b7811);  
-  $def("_7b7811", null, [], _7b7811);  
-  $def("_17qo5pv", "TODO", ["md"], _17qo5pv);
+  $def("_17qo5pv", "TODO", ["md"], _17qo5pv);  
+  $def("_148t9xt", "pt_debug", ["mutable cpu","mutable mem"], _148t9xt);  
+  $def("_itnp4a", null, ["_computeNow"], _itnp4a);
   return main;
 }</script>
 
@@ -26197,7 +26337,7 @@ export default function define(runtime, observer) {
 >
 {
   "mains": ["@tomlarkworthy/lopepage","@tomlarkworthy/linux-sbc"],
-  "hash": "#view=R100(S50(@tomlarkworthy/linux-sbc),S25(@tomlarkworthy/module-selection),S25(@tomlarkworthy/claude-code-pairing))&open=@tomlarkworthy/claude-code-pairing&cc=LOPE-62142-DFWF",
+  "hash": "#view=R100(S50(@tomlarkworthy/linux-sbc),S25(@tomlarkworthy/module-selection),S25(@tomlarkworthy/claude-code-pairing))&open=@tomlarkworthy/claude-code-pairing&cc=LOPE-56499-BGLD",
   "headless": true
 }
 </script>
