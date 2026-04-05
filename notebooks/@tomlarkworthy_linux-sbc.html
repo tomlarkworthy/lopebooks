@@ -10233,7 +10233,7 @@ const _o1wodf = function _REG_NAMES() {return ([
     't5',
     't6'
 ]);};
-const _1bep8s9 = function _MEMORY_SIZE() {return (32 * 1024 * 1024);};
+const _1bep8s9 = function _MEMORY_SIZE() {return (48 * 1024 * 1024);};
 const _4hk4tg = function _RAM_BASE() {return (2147483648);};
 const _bwky93 = function _cpu() {return ({
     x: new Int32Array(32),
@@ -11588,18 +11588,21 @@ const _1qlsaqt = function _tickTimer(trap) {return ((cpu, clint) => {
 });};
 const _j38254 = function _translate() {return ((cpu, mem, vaddr, accessType, memReadRaw) => {
     // accessType: 0=fetch, 1=load, 2=store
+    // Fault codes: 12=inst page fault, 13=load page fault, 15=store page fault
+    const pageFault = [
+        12,
+        13,
+        15
+    ][accessType];
     const satp = cpu.csrs.get(384) || 0;
     const mode = satp >>> 31 & 1;
-    // No translation in M-mode or when satp.MODE=0
     if (cpu.priv === 3 || mode === 0)
         return {
             pa: vaddr,
             ok: true
         };
     const ppn = satp & 4194303;
-    // 22-bit PPN
     let ptBase = ppn << 12;
-    // physical address of root page table
     const vpn1 = vaddr >>> 22 & 1023;
     const vpn0 = vaddr >>> 12 & 1023;
     const offset = vaddr & 4095;
@@ -11610,13 +11613,12 @@ const _j38254 = function _translate() {return ((cpu, mem, vaddr, accessType, mem
         return {
             pa: 0,
             ok: false,
-            fault: 12 + accessType
+            fault: pageFault
         };
-    // V bit not set
+    // V=0
     const r1 = pte1 >> 1 & 1, w1 = pte1 >> 2 & 1, x1 = pte1 >> 3 & 1;
     if (r1 || x1) {
-        // Superpage (4MB) — leaf at level 1
-        // Check permissions
+        // Superpage (4MB) leaf at level 1
         if (accessType === 0 && !x1)
             return {
                 pa: 0,
@@ -11635,13 +11637,12 @@ const _j38254 = function _translate() {return ((cpu, mem, vaddr, accessType, mem
                 ok: false,
                 fault: 15
             };
-        // U-mode check
         const u1 = pte1 >> 4 & 1;
         if (cpu.priv === 0 && !u1)
             return {
                 pa: 0,
                 ok: false,
-                fault: 12 + accessType
+                fault: pageFault
             };
         if (cpu.priv === 1 && u1) {
             const sstatus = cpu.csrs.get(256) || 0;
@@ -11649,15 +11650,15 @@ const _j38254 = function _translate() {return ((cpu, mem, vaddr, accessType, mem
                 return {
                     pa: 0,
                     ok: false,
-                    fault: 12 + accessType
-                };    // SUM bit
+                    fault: pageFault
+                };    // SUM
         }
-        // Misaligned superpage check: PPN[0] must be 0
+        // Misaligned superpage: PPN[0] must be 0
         if (pte1 >> 10 & 1023)
             return {
                 pa: 0,
                 ok: false,
-                fault: 12 + accessType
+                fault: pageFault
             };
         const ppn1 = pte1 >>> 20 & 4095;
         const pa = ppn1 << 22 | vpn0 << 12 | offset;
@@ -11674,17 +11675,17 @@ const _j38254 = function _translate() {return ((cpu, mem, vaddr, accessType, mem
         return {
             pa: 0,
             ok: false,
-            fault: 12 + accessType
+            fault: pageFault
         };
+    // V=0
     const r0 = pte0 >> 1 & 1, w0 = pte0 >> 2 & 1, x0 = pte0 >> 3 & 1;
     if (!r0 && !x0)
         return {
             pa: 0,
             ok: false,
-            fault: 12 + accessType
+            fault: pageFault
         };
-    // Non-leaf at level 0 is invalid
-    // Check permissions
+    // Non-leaf at level 0
     if (accessType === 0 && !x0)
         return {
             pa: 0,
@@ -11703,13 +11704,12 @@ const _j38254 = function _translate() {return ((cpu, mem, vaddr, accessType, mem
             ok: false,
             fault: 15
         };
-    // U-mode check
     const u0 = pte0 >> 4 & 1;
     if (cpu.priv === 0 && !u0)
         return {
             pa: 0,
             ok: false,
-            fault: 12 + accessType
+            fault: pageFault
         };
     if (cpu.priv === 1 && u0) {
         const sstatus = cpu.csrs.get(256) || 0;
@@ -11717,8 +11717,8 @@ const _j38254 = function _translate() {return ((cpu, mem, vaddr, accessType, mem
             return {
                 pa: 0,
                 ok: false,
-                fault: 12 + accessType
-            };
+                fault: pageFault
+            };    // SUM
     }
     const ppn_full = pte0 >>> 10 & 4194303;
     const pa = ppn_full << 12 | offset;
@@ -12279,19 +12279,30 @@ const _1uqb731 = function __fw_verify(mem,firmware_bytes) {
 };
 const _17qo5pv = function _TODO(md) {return (md`## Boot Status & TODO
 
-**Current state**: Linux kernel boots through init with working console! Init runs in U-mode, opens /dev/console successfully, and write() returns 48 bytes (the boot message). No more EBADF or "unable to open initial console".
+**Current state**: 🎉 **BusyBox shell running!** Linux boots through OpenSBI → kernel → /init → mounts filesystems → prints banner → exec /bin/sh. Shell is blocked on read() waiting for keyboard input at sepc=0x488b8.
 
-**Bugs fixed**:
-1. ~~\`accessType || 1\` in memRead converted fetch (0) to load (1), checking wrong page permissions~~
-2. ~~Double-trap on instruction fetch fault: memRead returned 0 after page fault, but run loop still executed decode(0), causing spurious SIGILL that overwrote the real fault~~
-3. ~~**Load/store page fault clobbered by execute()**: When a load/store caused a page fault inside \`execute()\`, \`trap()\` correctly set \`cpu.pc = stvec\` and \`cpu.priv = S-mode\`, but execute continued and overwrote \`cpu.pc\` with \`nextPC\` (sequential PC+4). Fix: check if \`cpu.pc !== startPC\` after every \`memRead\`/\`memWrite\` in execute to detect traps.~~
-4. ~~**Missing /dev/console**: Added buildInitramfs cpio overlay with /dev/console (char 5,1) loaded at INITRD_ADDR, DTB linux,initrd-start/end~~
-5. ~~**UART IRQ crash**: Removed interrupts-extended from serial DTB node, forcing polling mode. Added full ns16550a register emulation (IER, IIR, LCR, MCR, MSR, SCR, DLL/DLM).~~
+**Working configurations**:
+- \`busybox-boot.bin\` + 48MB RAM + translate fix → boots to BusyBox shell ✅
+- \`boot-linux-v2.bin\` + 32MB RAM → boots to old init (tiny init.S) ✅
+
+**Bugs fixed this session**:
+6. **Store page fault code**: \`translate()\` returned fault code 14 for stores (\`12 + accessType\`), but RISC-V spec says store page faults = 15 (code 14 is reserved). Kernel didn't recognize cause 14 → SIGILL → panic. Fix: use \`[12, 13, 15][accessType]\` mapping.
+
+**Firmware** (\`tools/scratch/riscv/\`):
+| File | Contents |
+|------|----------|
+| \`busybox-boot.bin\` | Working PIE OpenSBI (from v2) + busybox kernel (25.8MB) ✅ |
+| \`boot-linux-v2.bin\` | Working PIE OpenSBI + old kernel (25.8MB) ✅ |
+
+**BusyBox build** (\`build-busybox.sh\`): clang arm64 → riscv32-linux-musl rv32ima/ilp32, musl 1.2.5, custom softfloat.c, lld. 1.6MB static ELF.
+**Kernel build** (\`rebuild-kernel.sh\`): Linux 6.1, rv32ima no-C, busybox initramfs embedded. 21.5MB Image.
+**Combined firmware**: Python script: OpenSBI from boot-linux-v2.bin (first 4MB) + kernel Image at 0x400000.
 
 **Next steps**:
-1. Build busybox as a static RV32IMA binary for the initramfs
-2. Replace simple init.S with busybox-based /init that sets up console and spawns a shell
-3. Get an interactive shell prompt working with console input/output
+1. **Wire up UART input** — send keyboard characters to the UART RX buffer so the shell can read them
+2. Get interactive shell working (type commands, see output)
+3. Fix 64MB DTB issue (OpenSBI SBI_ERR_INVALID_PARAM with 64MB)
+4. Export/save working state
 `);};
 const _148t9xt = function _pt_debug($0,$1) {
     const satp = $0.value.csrs.get(384) || 0;
@@ -12407,6 +12418,124 @@ const _1pfm3qb = function _buildInitramfs() {return (() => {
 });};
 const _1a07c42 = function _INITRD_ADDR() {return (2176843776);};
 const _qa8b6o = function _initramfs(buildInitramfs) {return (buildInitramfs());};
+const _13xbwth = function __fw_debug(firmware_bytes,mem) {
+    const fwSize = firmware_bytes ? firmware_bytes.byteLength : 0;
+    const koff = 4194304;
+    const memKernel = Array.from(mem.slice(koff, koff + 8)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+    let fwKernel = 'n/a';
+    if (firmware_bytes && firmware_bytes.byteLength > koff + 8) {
+        const fw = new Uint8Array(firmware_bytes);
+        fwKernel = Array.from(fw.slice(koff, koff + 8)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+    }
+    return {
+        fwSize,
+        memKernel,
+        fwKernel,
+        memSize: mem.length
+    };
+};
+const _aglwam = function __opensbi_debug(memReadRaw,mem,disassemble) {
+    // Disassemble around PC 0x80005184 where OpenSBI is stuck
+    const base = 2147504496;
+    const lines = [];
+    for (let addr = base; addr < base + 80; addr += 4) {
+        const inst = memReadRaw(mem, addr, 4) >>> 0;
+        const arrow = addr === 2147504516 ? '>>>' : '   ';
+        lines.push(`${ arrow } 0x${ addr.toString(16) }: 0x${ inst.toString(16).padStart(8, '0') } ${ disassemble(inst) }`);
+    }
+    // Also check OpenSBI entry to verify it's intact
+    const entry = memReadRaw(mem, 2147483648, 4) >>> 0;
+    return `entry=0x${ entry.toString(16).padStart(8, '0') }\n` + lines.join('\n');
+};
+const _1l8t63p = function __dtb_mem_debug(dtb,MEMORY_SIZE,RAM_BASE) {
+    // Check what the DTB memory region looks like  
+    const dtbBytes = dtb;
+    // Search for memory size in DTB (should be after RAM_BASE 0x80000000)
+    const hex = Array.from(dtbBytes.slice(0, Math.min(200, dtbBytes.length))).map(b => b.toString(16).padStart(2, '0')).join(' ');
+    // Also check with 64MB
+    return {
+        dtbSize: dtbBytes.length,
+        MEMORY_SIZE,
+        memSizeHex: '0x' + MEMORY_SIZE.toString(16),
+        RAM_BASE_hex: '0x' + RAM_BASE.toString(16)
+    };
+};
+const _1dpvlv3 = function __crash_debug(memReadRaw,mem,disassemble) {
+    // The direct read at phys 0x807e50ac gave the RIGHT answer (0x00052023)
+    // But the loop was wrong — it was adding 0x40000000 spuriously
+    // The crash EPC 0xc03e50ac is at phys 0x807e50ac  
+    // 0x00052023 = sw zero, 0(a0) — NOT an illegal instruction!
+    // So the SIGILL isn't from this instruction directly
+    // Let me check what the actual crash instruction decode is
+    const crashInst = memReadRaw(mem, 2155761836, 4) >>> 0;
+    // Check a wider area and look for unusual instructions
+    const lines = [];
+    for (let addr = 2155761808; addr <= 2155761856; addr += 4) {
+        const inst = memReadRaw(mem, addr, 4) >>> 0;
+        const arrow = addr === 2155761836 ? '>>>' : '   ';
+        const virt = 3221225472 + (addr - 2151677952);
+        lines.push(`${ arrow } 0x${ virt.toString(16) }: 0x${ inst.toString(16).padStart(8, '0') } ${ disassemble(inst) }`);
+    }
+    // Check the instruction the kernel reported: "code 0x4" means ILL_ILLOPC
+    return `Crash inst at 0xc03e50ac: 0x${ crashInst.toString(16).padStart(8, '0') } = ${ disassemble(crashInst) }\nNote: signal 4 code 0x4 = SIGILL ILL_ILLOPC\n\n` + lines.join('\n');
+};
+const _1zf79z = function __sum_debug(cpu,translate,mem,memReadRaw) {
+    // Check what sstatus SUM bit and page table say about addr 0x198680
+    const sstatus = cpu.csrs.get(256) || 0;
+    const sum = sstatus >> 18 & 1;
+    const vaddr = 1672832;
+    const result = translate(cpu, mem, vaddr, 2, memReadRaw);
+    // 2=store
+    return {
+        sstatus_hex: '0x' + (sstatus >>> 0).toString(16),
+        SUM_bit: sum,
+        priv: cpu.priv,
+        translate_result: result,
+        vaddr_hex: '0x' + vaddr.toString(16)
+    };
+};
+const _1r8ulzp = function __pte_debug(cpu,memReadRaw,mem) {
+    // Check page table for vaddr 0x198680
+    const satp = cpu.csrs.get(384) || 0;
+    const ppn = satp & 4194303;
+    const ptBase = ppn << 12;
+    const vaddr = 1672832;
+    const vpn1 = vaddr >>> 22 & 1023;
+    const vpn0 = vaddr >>> 12 & 1023;
+    const pte1Addr = ptBase + vpn1 * 4;
+    const pte1 = memReadRaw(mem, pte1Addr, 4) >>> 0;
+    const pte1_V = pte1 & 1;
+    const pte1_R = pte1 >> 1 & 1;
+    const pte1_X = pte1 >> 3 & 1;
+    const isLeaf1 = pte1_R || pte1_X;
+    let pte0 = 0, pte0Addr = 0;
+    if (!isLeaf1 && pte1_V) {
+        const ptBase0 = (pte1 >>> 10 & 4194303) << 12;
+        pte0Addr = ptBase0 + vpn0 * 4;
+        pte0 = memReadRaw(mem, pte0Addr, 4) >>> 0;
+    }
+    const flags = pte => ({
+        V: pte & 1,
+        R: pte >> 1 & 1,
+        W: pte >> 2 & 1,
+        X: pte >> 3 & 1,
+        U: pte >> 4 & 1,
+        G: pte >> 5 & 1,
+        A: pte >> 6 & 1,
+        D: pte >> 7 & 1
+    });
+    return {
+        satp: '0x' + satp.toString(16),
+        vaddr: '0x' + vaddr.toString(16),
+        vpn1,
+        vpn0,
+        pte1: '0x' + pte1.toString(16),
+        pte1_flags: flags(pte1),
+        isLeaf1,
+        pte0: '0x' + pte0.toString(16),
+        pte0_flags: flags(pte0)
+    };
+};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -12486,10 +12615,16 @@ export default function define(runtime, observer) {
   $def("_1uqb731", "_fw_verify", ["mem","firmware_bytes"], _1uqb731);  
   $def("_17qo5pv", "TODO", ["md"], _17qo5pv);  
   $def("_148t9xt", "pt_debug", ["mutable cpu","mutable mem"], _148t9xt);  
-  $def("_itnp4a", null, ["_computeNow"], _itnp4a);  
+  $def("_itnp4a", "_itnp4a", ["_computeNow"], _itnp4a);  
   $def("_1pfm3qb", "buildInitramfs", [], _1pfm3qb);  
   $def("_1a07c42", "INITRD_ADDR", [], _1a07c42);  
-  $def("_qa8b6o", "initramfs", ["buildInitramfs"], _qa8b6o);
+  $def("_qa8b6o", "initramfs", ["buildInitramfs"], _qa8b6o);  
+  $def("_13xbwth", "_fw_debug", ["firmware_bytes","mem"], _13xbwth);  
+  $def("_aglwam", "_opensbi_debug", ["memReadRaw","mem","disassemble"], _aglwam);  
+  $def("_1l8t63p", "_dtb_mem_debug", ["dtb","MEMORY_SIZE","RAM_BASE"], _1l8t63p);  
+  $def("_1dpvlv3", "_crash_debug", ["memReadRaw","mem","disassemble"], _1dpvlv3);  
+  $def("_1zf79z", "_sum_debug", ["cpu","translate","mem","memReadRaw"], _1zf79z);  
+  $def("_1r8ulzp", "_pte_debug", ["cpu","memReadRaw","mem"], _1r8ulzp);
   return main;
 }</script>
 
@@ -15770,7 +15905,7 @@ exporter()
 const _15b229g = function identity(x) {
   return x;
 };
-const _wsfdch = function identity(x) {
+const _19ebgtz = function identity(x) {
   return x;
 };
 const _1p9ak6v = function identity(x) {
