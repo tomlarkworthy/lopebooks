@@ -10363,7 +10363,7 @@ const _fileSyncLastSeen = function _fileSyncLastSeen(directory){
   void directory;
   return new window.Map();
 };
-const _filesToNotebook = function _filesToNotebook(directory, notebookId, currentModules, fileSyncLastSeen, readFile, probeDefine, exportModuleJS, tag, getFileAttachmentsMap, invalidation)
+const _filesToNotebook = function _filesToNotebook(directory, notebookId, currentModules, fileSyncLastSeen, readFile, probeDefine, exportModuleJS, tag, getFileAttachmentsMap, runtime_, invalidation)
 {
   if (!directory) return "Waiting for directory...";
 
@@ -10391,8 +10391,7 @@ const _filesToNotebook = function _filesToNotebook(directory, notebookId, curren
     if (!syncableSet.has(info.name)) continue;
     nameToModule.set(info.name, info.module);
     const vars = new window.Map();
-    const rt = info.module._runtime;
-    for (const v of rt._variables) {
+    for (const v of runtime_._variables) {
       if (v._module !== info.module) continue;
       if (v._name) vars.set(v._name, v);
       if (v.pid) vars.set("__pid__" + v.pid, v);
@@ -10403,10 +10402,12 @@ const _filesToNotebook = function _filesToNotebook(directory, notebookId, curren
   let pollTimer;
   // Track pids seen from .js files — only delete pids we've previously seen
   const knownFilePids = new window.Map();
+  // Track modules found on disk — for detecting additions and removals
+  let knownDiskModules = null; // null = first scan (no deletions)
 
   // FileAttachment helpers
   const getModuleFA = (mod) => {
-    for (const v of mod._runtime._variables) {
+    for (const v of runtime_._variables) {
       if (v._module === mod && v._name === "FileAttachment" && v._value) return v._value;
     }
     return null;
@@ -10571,10 +10572,109 @@ const _filesToNotebook = function _filesToNotebook(directory, notebookId, curren
     }
   };
 
+  // Scan the notebook directory for all .js module files
+  const scanDiskModules = async () => {
+    const diskModules = new Set();
+    try {
+      const notebookDir = await getSubDir(directory, prefix.slice(0, -1));
+      for await (const [orgName, orgHandle] of notebookDir) {
+        if (orgHandle.kind !== "directory") continue;
+        if (orgName.startsWith("@")) {
+          // Scoped modules: @org/name
+          for await (const [fname, fhandle] of orgHandle) {
+            if (fhandle.kind === "file" && fname.endsWith(".js")) {
+              diskModules.add(orgName + "/" + fname.slice(0, -3));
+            }
+          }
+        } else if (orgName === "d") {
+          // Observable hash modules: d/hash@version
+          for await (const [fname, fhandle] of orgHandle) {
+            if (fhandle.kind === "file" && fname.endsWith(".js")) {
+              diskModules.add("d/" + fname.slice(0, -3));
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Directory doesn't exist yet — no modules on disk
+    }
+    return diskModules;
+  };
+
   const poll = async () => {
+    // Poll existing syncable modules
     for (const moduleId of syncableModules) {
       await pollModule(moduleId);
     }
+
+    // Scan disk for new/removed modules
+    const diskModules = await scanDiskModules();
+
+    // ADD: new modules on disk not in the runtime
+    const newOnDisk = [...diskModules].filter(m => !syncableSet.has(m) && !nameToModule.has(m));
+    if (newOnDisk.length) console.log("[file-sync] new modules on disk:", newOnDisk);
+    for (const moduleId of diskModules) {
+      if (syncableSet.has(moduleId)) continue; // already known
+      if (nameToModule.has(moduleId)) continue; // already added by a previous scan
+
+      try {
+        const file = await readFile(directory, prefix + moduleId + ".js");
+        const diskText = await file.text();
+        const blob = new window.Blob([diskText], { type: "text/javascript" });
+        const url = window.URL.createObjectURL(blob);
+        try {
+          const imported = await importShim(url, 'file://@tomlarkworthy/file-sync');
+          if (typeof imported.default === "function") {
+            // Create a new runtime module — unobserved (lopepage visualizer discovers it)
+            const newMod = runtime_.module(imported.default, () => null);
+            runtime_.mains.set(moduleId, newMod);
+            nameToModule.set(moduleId, newMod);
+            syncableModules.push(moduleId);
+            syncableSet.add(moduleId);
+
+            // Index its variables for future pid tracking
+            const vars = new window.Map();
+            for (const v of runtime_._variables) {
+              if (v._module !== newMod) continue;
+              if (v._name) vars.set(v._name, v);
+              if (v.pid) vars.set("__pid__" + v.pid, v);
+            }
+            nameToVars.set(moduleId, vars);
+
+            console.log("[file-sync] added new module from disk: " + moduleId);
+          }
+        } finally {
+          window.URL.revokeObjectURL(url);
+        }
+      } catch (e) {
+        console.error("[file-sync] failed to add module " + moduleId + ":", e);
+      }
+    }
+
+    // REMOVE: modules previously on disk but now gone
+    if (knownDiskModules) {
+      for (const moduleId of knownDiskModules) {
+        if (diskModules.has(moduleId)) continue;
+        if (!nameToModule.has(moduleId)) continue;
+
+        const mod = nameToModule.get(moduleId);
+        // Delete all variables in this module
+        for (const v of [...runtime_._variables]) {
+          if (v._module === mod) {
+            v.delete();
+          }
+        }
+        runtime_.mains.delete(moduleId);
+        nameToModule.delete(moduleId);
+        nameToVars.delete(moduleId);
+        knownFilePids.delete(moduleId);
+        const idx = syncableModules.indexOf(moduleId);
+        if (idx !== -1) syncableModules.splice(idx, 1);
+        syncableSet.delete(moduleId);
+        console.log("[file-sync] removed module: " + moduleId);
+      }
+    }
+    knownDiskModules = diskModules;
   };
 
   pollTimer = setInterval(poll, POLL_MS);
@@ -10620,6 +10720,9 @@ Each module can have a subdirectory of the same name containing binary file atta
 - **Runtime\\u2192Files**: when \`writeModule\` fires, \`exportModuleJS\` returns a \`fileAttachments\` map; each entry is fetched and written to disk
 - **Files\\u2192Runtime**: the poller scans the attachment subdirectory for each module, detects changed files via \`lastModified\`, reads them into blob URLs, and hot-swaps entries in the module\\'s \`FileAttachment\` resolver map
 
+### Module Add/Remove
+After polling existing modules, the poller scans the notebook directory for all \`.js\` files. New modules (not in the runtime) are loaded via \`runtime.module(defineFn, () => null)\` and registered in \`runtime.mains\`. Removed modules (previously on disk but now deleted) have all their variables deleted and are unregistered from \`runtime.mains\`. The first scan only records — no deletions — matching the \`knownFilePids\` safety pattern.
+
 ### Echo Suppression
 Prevents feedback loops between the two sync directions. When file-sync applies a change from disk, it tags the definition with \`__provenance: {source: "file-sync"}\`. The runtime\u2192files listener checks this tag and skips changes it caused.
 
@@ -10632,7 +10735,6 @@ Each cell has a content-hash-based pid (e.g. \`_4ie7s1\`) that survives renames 
 const _doc_todo = function _doc_todo(md){return(
 md`## TODO
 
-- **Module add/remove**: detect new modules appearing on disk or being removed
 - **Notebook re-export handling**: detect when the notebook HTML is re-exported and reconcile
 - **Import cell validation**: verify import bridges survive round-trip correctly
 - **IndexedDB handle persistence**: auto-restore directory handle across page reloads (blocked by cross-fork conflicts on same domain)
@@ -10683,7 +10785,7 @@ export default function define(runtime, observer) {
   $def("_4zqocm", "probeDefine", [], _4zqocm);  
   $def("_notebookToFiles", "notebookToFiles", ["directory","notebookId","onCodeChange","currentModules","exportModuleJS","writeFile","invalidation"], _notebookToFiles);  
   $def("_fileSyncLastSeen", "fileSyncLastSeen", ["directory"], _fileSyncLastSeen);  
-  $def("_filesToNotebook", "filesToNotebook", ["directory","notebookId","currentModules","fileSyncLastSeen","readFile","probeDefine","exportModuleJS","tag","getFileAttachmentsMap","invalidation"], _filesToNotebook);  
+  $def("_filesToNotebook", "filesToNotebook", ["directory","notebookId","currentModules","fileSyncLastSeen","readFile","probeDefine","exportModuleJS","tag","getFileAttachmentsMap","runtime","invalidation"], _filesToNotebook);  
   $def("_syncStatus", "syncStatus", ["directory","syncableModules","notebookToFiles","filesToNotebook","htl"], _syncStatus);  
   $def("_doc_technical", null, ["md"], _doc_technical);  
   $def("_doc_todo", null, ["md"], _doc_todo);  
@@ -10694,6 +10796,7 @@ export default function define(runtime, observer) {
   main.define("exportModuleJS", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("exportModuleJS", _));  
   main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));  
   main.define("onCodeChange", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("onCodeChange", _));  
+  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));  
   main.define("module @tomlarkworthy/local-change-history", async () => runtime.module((await import("/@tomlarkworthy/local-change-history.js?v=4")).default));  
   main.define("tag", ["module @tomlarkworthy/local-change-history", "@variable"], (_, v) => v.import("tag", _));  
   main.define("module @tomlarkworthy/fileattachments", async () => runtime.module((await import("/@tomlarkworthy/fileattachments.js?v=4")).default));  
