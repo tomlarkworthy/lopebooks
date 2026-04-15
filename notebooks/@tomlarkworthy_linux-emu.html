@@ -14331,6 +14331,20 @@ const _te_stub = function(tinyemu_xhr_hook, tinyemu_term_state) {
   window.show_loading = () => {};
   window.graphic_display = () => {};
   window.net_state = null;
+  window.Browser = window.Browser || {
+    wgetRequests: {},
+    fbuf_table: {},
+    fbuf_next_handle: 1,
+    _wgetN: 0,
+    getNextWgetRequestHandle() { return ++this._wgetN; }
+  };
+  window.Runtime = window.Runtime || {
+    dynCall(sig, ptr, args) {
+      const t = window.__te_wasmTable;
+      if (!t) throw new Error("wasmTable not captured");
+      return t.get(ptr).apply(null, args || []);
+    }
+  };
   return { installed: true };
 };
 const _te_glue = async function(tinyemu_globals_stub, tinyemu_asset_base) {
@@ -14351,9 +14365,14 @@ const _te_mod = async function(tinyemu_globals_stub, tinyemu_glue, tinyemu_debug
     Module.printErr = (str) => { dbg.push("[err] " + str); };
     Module.locateFile = (path) => tinyemu_asset_base + path;
     Module.onAbort = (what) => { dbg.push("[onAbort] " + what); reject(new Error("abort: " + what)); };
-    Module.onRuntimeInitialized = () => { dbg.push("[runtime] initialized"); resolve(Module); };
+    Module.onRuntimeInitialized = () => {
+      dbg.push("[runtime] initialized");
+      try { window.__te_wasmTable = Module.wasmTable || window.__te_wasmTable; } catch(e){}
+      resolve(Module);
+    };
     try {
-      const fn = new Function("Module", "window", "self", "document", glue + "\n;return Module;");
+      const fn = new Function("Module", "window", "self", "document",
+        glue + "\n; try { window.__te_wasmTable = (typeof wasmTable !== 'undefined') ? wasmTable : Module.wasmTable; } catch(e){} ;return Module;");
       fn(Module, window, window, document);
     } catch (e) { dbg.push("[construct err] " + e.message); reject(e); }
   });
@@ -14363,12 +14382,13 @@ const _te_vm = async function(tinyemu_module, tinyemu_debug_log, tinyemu_asset_b
   const dbg = tinyemu_debug_log;
   const baseUrl = tinyemu_asset_base + "root-riscv64.cfg";
   dbg.push("[vm_start] calling with baseUrl=" + baseUrl);
+  try { window.__te_wasmTable = Module.wasmTable || window.__te_wasmTable; } catch(e){}
   try {
     Module.ccall("vm_start", null,
       ["string", "number", "string", "string", "number", "number", "number"],
       [baseUrl, 64, "", "", 0, 0, 0]);
     dbg.push("[vm_start] returned");
-  } catch (e) { dbg.push("[vm_start err] " + e.message); throw e; }
+  } catch (e) { dbg.push("[vm_start err] " + e.message + "\n" + (e.stack||"").slice(0,500)); throw e; }
   return { started: true, at: Date.now(), Module };
 };
 const _te_termtxt = function(tinyemu_vm, tinyemu_term_state) {
