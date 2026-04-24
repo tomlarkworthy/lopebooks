@@ -25046,7 +25046,7 @@ async ({anchorId, p0, renderProbe, paramNames, anchorsFn}) => {
     };
 }
 )};
-const _w3f9or = function _svgEditorController(svgEditor_setStatus,$0,svgEditorArgs,svgEditor_createOverlay,htl,rectAnchorsStable,svgPointFromClient,svgEditor_estimateJacobianForAnchor,renderProbe,svgParameterNames,constraintsFromSvg,svgEditor_estimateJacobianForConstraint,getCurrentParams,svgEditor_drawOverlay,pseudoInverseStepMxN,svgEditor_commitParams,svgParameterViewElByName,pickAnchor,Event,svgEditor_setOverlayVisible,svgTemplateVariable,svgEditor_computeOverTarget,svgEditor_syncOverlayToTarget,svgEditor_clearOverlay,invalidation,svgParameterViews)
+const _w3f9or = function _svgEditorController(svgEditor_setStatus,$0,svgEditorArgs,svgEditor_createOverlay,htl,rectAnchorsStable,svgPointFromClient,svgEditor_estimateJacobianForAnchor,renderProbe,svgParameterNames,constraintsFromSvg,svgEditor_estimateJacobianForConstraint,getCurrentParams,svgEditor_drawOverlay,pseudoInverseStepMxN,svgEditor_commitParams,svgParameterViewElByName,pickAnchor,Event,svgEditor_setOverlayVisible,svgTemplateVariable,svgEditor_computeOverTarget,svgEditor_syncOverlayToTarget,svgEditor_clearOverlay,invalidation,svgParameterViews,inverseConfig)
 {
     const state = this ?? {};
     const setStatus = patch => svgEditor_setStatus($0, patch);
@@ -25068,6 +25068,79 @@ const _w3f9or = function _svgEditorController(svgEditor_setStatus,$0,svgEditorAr
         state.rebasing = false;
         state.growPreview = null;
         const LOCK_WEIGHT = 20;
+        const __solveKKT = (A, b, C, damping) => {
+            const m = A.length;
+            const n = m ? A[0].length : (C[0]?.length ?? 0);
+            const k = C.length;
+            if (!n) return [];
+            if (!k) return pseudoInverseStepMxN(A, b);
+            const H = Array.from({ length: n }, () => new Array(n).fill(0));
+            const cVec = new Array(n).fill(0);
+            for (let r = 0; r < m; r++) {
+                const br = +b[r];
+                for (let i = 0; i < n; i++) {
+                    const ari = +A[r][i];
+                    if (!Number.isFinite(ari)) continue;
+                    if (Number.isFinite(br)) cVec[i] += ari * br;
+                    for (let j = i; j < n; j++) {
+                        const arj = +A[r][j];
+                        if (Number.isFinite(arj)) H[i][j] += ari * arj;
+                    }
+                }
+            }
+            const lam = Math.max(+damping || 0, 1e-12);
+            for (let i = 0; i < n; i++) {
+                for (let j = 0; j < i; j++) H[i][j] = H[j][i];
+                H[i][i] += lam;
+            }
+            const N = n + k;
+            const M = Array.from({ length: N }, () => new Array(N).fill(0));
+            const y = new Array(N).fill(0);
+            for (let i = 0; i < n; i++) {
+                for (let j = 0; j < n; j++) M[i][j] = H[i][j];
+                y[i] = cVec[i];
+            }
+            for (let j = 0; j < k; j++) {
+                for (let i = 0; i < n; i++) {
+                    const cij = +C[j][i];
+                    if (Number.isFinite(cij)) { M[i][n + j] = cij; M[n + j][i] = cij; }
+                }
+            }
+            const M2 = M.map(row => row.slice());
+            const y2 = y.slice();
+            for (let p = 0; p < N; p++) {
+                let piv = p, best = Math.abs(M2[p][p]);
+                for (let i = p + 1; i < N; i++) {
+                    const v = Math.abs(M2[i][p]);
+                    if (v > best) { best = v; piv = i; }
+                }
+                if (!Number.isFinite(best) || best < 1e-15) {
+                    const A_full = [...A, ...C.map(r => r.map(v => v * LOCK_WEIGHT))];
+                    const b_full = [...b, ...new Array(k).fill(0)];
+                    return pseudoInverseStepMxN(A_full, b_full);
+                }
+                if (piv !== p) {
+                    [M2[p], M2[piv]] = [M2[piv], M2[p]];
+                    [y2[p], y2[piv]] = [y2[piv], y2[p]];
+                }
+                const app = M2[p][p];
+                for (let i = p + 1; i < N; i++) {
+                    const f = M2[i][p] / app;
+                    if (!Number.isFinite(f)) continue;
+                    y2[i] -= f * y2[p];
+                    for (let j = p; j < N; j++) M2[i][j] -= f * M2[p][j];
+                }
+            }
+            const x = new Array(N).fill(0);
+            for (let i = N - 1; i >= 0; i--) {
+                let s = y2[i];
+                for (let j = i + 1; j < N; j++) s -= M2[i][j] * x[j];
+                const aii = M2[i][i];
+                if (!Number.isFinite(aii) || Math.abs(aii) < 1e-24) return new Array(n).fill(0);
+                x[i] = s / aii;
+            }
+            return x.slice(0, n);
+        };
         const __liveParamNames = () => {
             const flat = [];
             for (const v of svgParameterViews) {
@@ -25276,7 +25349,7 @@ const _w3f9or = function _svgEditorController(svgEditor_setStatus,$0,svgEditorAr
                     dragDetails
                 };
             }
-            const A = [], b = [];
+            const A = [], b = [], C = [];
             for (const d of drags) {
                 const lc = d.lastClient ?? d.startClient;
                 const pNow = svgPointFromClient(overlay, lc.x, lc.y, d.invScreenCTM);
@@ -25298,8 +25371,7 @@ const _w3f9or = function _svgEditorController(svgEditor_setStatus,$0,svgEditorAr
             }
             for (const [lockId, lockData] of state.lockedAnchors) {
                 const J = lockData.jacobian.J;
-                A.push(J[0].map(v => v * LOCK_WEIGHT), J[1].map(v => v * LOCK_WEIGHT));
-                b.push(0, 0);
+                C.push(J[0].slice(), J[1].slice());
             }
             if (state.constraintJacobians) {
                 for (const [cname, cj] of state.constraintJacobians) {
@@ -25310,13 +25382,15 @@ const _w3f9or = function _svgEditorController(svgEditor_setStatus,$0,svgEditorAr
                     }
                 }
             }
-            if (!A.length)
+            if (!A.length && !C.length)
                 return {
                     next: { ...base },
                     dpTotal: new Array(n).fill(0),
                     dragDetails
                 };
-            const dp = pseudoInverseStepMxN(A, b);
+            const dp = C.length
+                ? __solveKKT(A, b, C, +inverseConfig?.damping || 1e-6)
+                : pseudoInverseStepMxN(A, b);
             for (const dd of dragDetails)
                 dd.dp = dp;
             const next = { ...base };
@@ -26601,7 +26675,7 @@ export default function define(runtime, observer) {
   $def("_1qe57gn", "svgEditor_commitParams", ["svgEditor_clampToView","Event"], _1qe57gn);  
   $def("_1t9h400", "svgEditor_anchorFromSvgById", [], _1t9h400);  
   $def("_pehisb", "svgEditor_estimateJacobianForAnchor", ["svgEditor_anchorFromSvgById"], _pehisb);  
-  $def("_w3f9or", "svgEditorController", ["svgEditor_setStatus","viewof svgEditorStatus","svgEditorArgs","svgEditor_createOverlay","htl","rectAnchorsStable","svgPointFromClient","svgEditor_estimateJacobianForAnchor","renderProbe","svgParameterNames","constraintsFromSvg","svgEditor_estimateJacobianForConstraint","getCurrentParams","svgEditor_drawOverlay","pseudoInverseStepMxN","svgEditor_commitParams","svgParameterViewElByName","pickAnchor","Event","svgEditor_setOverlayVisible","svgTemplateVariable","svgEditor_computeOverTarget","svgEditor_syncOverlayToTarget","svgEditor_clearOverlay","invalidation","svgParameterViews"], _w3f9or);  
+  $def("_w3f9or", "svgEditorController", ["svgEditor_setStatus","viewof svgEditorStatus","svgEditorArgs","svgEditor_createOverlay","htl","rectAnchorsStable","svgPointFromClient","svgEditor_estimateJacobianForAnchor","renderProbe","svgParameterNames","constraintsFromSvg","svgEditor_estimateJacobianForConstraint","getCurrentParams","svgEditor_drawOverlay","pseudoInverseStepMxN","svgEditor_commitParams","svgParameterViewElByName","pickAnchor","Event","svgEditor_setOverlayVisible","svgTemplateVariable","svgEditor_computeOverTarget","svgEditor_syncOverlayToTarget","svgEditor_clearOverlay","invalidation","svgParameterViews","inverseConfig"], _w3f9or);  
   $def("_9s2ls", "viewof inverseConfig", ["Inputs"], _9s2ls);  
   main.variable(observer("inverseConfig")).define("inverseConfig", ["Generators", "viewof inverseConfig"], (G, _) => G.input(_));  
   $def("_zhvt9n", "viewof parametricSVGEditorModule", ["thisModule"], _zhvt9n);  
