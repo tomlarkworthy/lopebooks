@@ -26148,31 +26148,52 @@ Inputs.input()
 const _kmivws = function _svgTargetModule(Inputs,parametricSVGEditorModule){return(
 Inputs.input(parametricSVGEditorModule, { label: 'svgTargetModule' })
 )};
-const _bbbfh0 = function _anonymous(md) {return (md`### From Anchors to Recursive affordances
+const _bbbfh0 = function _anonymous(md) {return (md`### Affordance: a CRUD primitive over a parameter window
 
-The primitive is \`affordance(id, {x, y, params, drag})\`. The \`drag\` argument is a spec \`{ dims, render, spawn?, handleRender? }\` that declares how many scalars the node consumes from \`params\`, how to render the segment, and — past the end of the vector — how to spawn a new segment when dragged out and how the spawn handle itself looks.
+\`affordance\` is a one-stop shop for **every** interaction on a living SVG template. Each affordance owns a contiguous slice of the parameter vector, paints itself however the author likes, and routes pointer gestures (click, drag, shift-click) to behaviours (create / read / update / delete) — all framework-mediated. Affordances compose recursively: a segment's render can spawn more affordances inside it.
 
-Inside \`render\` you receive a context object:
+#### The shape
 
+\`\`\`js
+ctx.affordance(id, pos, {
+  handleRender,                          // paint the glyph
+  dims, render,                          // segment with children (recurse)
+  onClick:  api => …,                    // gestures…
+  onDrag:   ({dx, dy, phase}, api) => …,
+  onShiftClick: api => …,
+  spawn:    (dx, dy, cur) => newDims     // sugar for "drag at terminal => appendAfter"
+})
 \`\`\`
-{ parent, params, index, depth, full, anchor, affordance }
+
+The framework hands every handler an \`api\` bound to the affordance's owned slice — the author never indexes into the global vector:
+
+\`\`\`js
+api.params         // read-only snapshot of the owned dims
+api.initial        // snapshot at the start of the current gesture
+api.update(slice)  // write a new slice into the owned offset
+api.delete()       // splice the owned slice out
+api.appendAfter(extraDims)  // insert dims right after the owned window
 \`\`\`
 
-* \`params\` is a **view** of the shared vector — just the \`dims\` slots owned by this node.
-* \`ctx.affordance(childId, childPos)\` recurses into the next slot window. The default \`childDrag\` is the *current* drag, so a linkage self-continues; pass a different \`{dims, render}\` at any depth to swap the affordance.
-* \`ctx.anchor(childId, pos)\` emits a plain drag handle that consumes no slots — useful for tip anchors or purely controlled points.
+#### Mapping gestures to behaviours
 
-#### Distinguishing handles from drags
+UX is decoupled from semantics. A click can mean delete or create or something else — the author chooses the mapping. In the scissor below:
 
-A spawn handle is conceptually different from a drag handle: dragging a regular anchor invokes the Jacobian solver, while dragging a handle appends new slots. The two should look different. \`drag.handleRender(ctx) → svg\` lets the affordance author paint the handle's visible glyph — here, an orange "+" badge sitting at the tip. The runtime tags the underlying \`__anchor\` marker with \`data-kind="handle"\` so the overlay draws it as a translucent dashed hover ring instead of the usual opaque blue circle, letting your glyph show through. \`affordance\` won't be exclusively for spawning in the future, hence the generic name.
+* **Wing** (blue square) — \`onDrag\` projects cursor delta onto the segment normal and writes \`api.update([px, py, w + dw])\` (update).
+* **Mid** (orange diamond) — \`onDrag\` writes \`api.update([px+2dx, py+2dy, w])\` so the midpoint tracks the cursor (update).
+* **Delete dot** (red ✕ next to mid) — \`onClick: api => api.delete()\` (delete).
+* **Tip** (dashed orange "+") — \`spawn(dx, dy, cur)\` returns a fresh \`(dx, dy, w)\` triple and the framework \`api.appendAfter\`s it (create).
 
-#### Drag-to-spawn
+Every other anchor (the lines themselves, anything created via plain \`ctx.anchor\`) still goes through the Jacobian solver — that's the default when no handlers are provided.
 
-Opt in by giving the \`drag\` spec a \`spawn(dx, dy, cur) => newSegment\` function. The terminal anchor (one past the end of the vector) gets a \`__drag\` handler that appends whatever \`spawn\` returns. The \`svgEditor\` controller detects \`__drag\` on the source anchor and delegates the pointer gesture to it — so the tip gets extension UX while every other anchor still goes through the Jacobian solver. The protocol is a single property (\`anchorEl.__drag\`); \`affordance\` discovers the viewof by scanning \`form\` elements for the one whose \`.value\` is referentially the same array, so \`spawn\` only declares what a new segment *is*, not how to write it.
+#### Recursive composition
 
-Each scissor link below consumes \`(dx, dy, w)\`: the pivot moves in 2D and the wing anchor pulls the width perpendicular to the link. With a 12-dim \`viewof scissorParams\` the template builds a 4-link chain; because the spec is declarative the Jacobian solver in \`scissorEditor\` resolves drags for any anchor — wing, pivot, or tip — without per-section code. Drag the orange "+" badge at the end of the chain to spawn a new link via \`scissors.spawn\`.
+\`ctx.affordance(childId, childPos, childOpts)\` from inside \`render\` either:
 
-The dimensionality is **programmable per segment**. If you wrote a different \`{dims, render}\` and passed it as the fourth argument to \`ctx.affordance\` at, say, depth 2, the tail of the chain would switch to that affordance — using its own \`dims\` window — while the parent prefix remains unchanged.`);};
+* **Recurses** into a fresh segment (when \`childOpts\` provides \`dims+render\`) — the child carves its own slice \`[index+dims..index+2·dims)\`.
+* **Inlines a leaf** (when \`childOpts\` is just handlers) — the leaf shares the parent segment's slice, so its handlers update the same \`(dx, dy, w)\` the segment owns.
+
+The default \`childOpts\` is the *current* drag, so a chain self-continues; pass a different spec at any depth to switch affordance type mid-chain. Newly placed widgets are themselves built from \`ctx.affordance\`, so they can contain further affordances — recursion bottoms out at a leaf with no \`dims\`.`);};
 const _y087vt = function _scissorParams(vector) {return (vector([
     -200,
     400
@@ -26235,16 +26256,39 @@ const _3sk8az = function _scissorSvg(htl,affordance,scissorParams) {
             const nextStart = ctx.index + ctx.dims;
             const isLast = nextStart + ctx.dims > ctx.full.length;
             const tipId = isLast ? 'scissor-tip' : `pivot:${ nextStart }`;
+            const wingDrag = ({dx: ddx, dy: ddy, phase}, api) => {
+                if (!api?.initial) return;
+                const [px, py, w0] = api.initial;
+                const ll = Math.sqrt(px * px + py * py) || 1;
+                const nnx = -py / ll, nny = px / ll;
+                const dw = ddx * nnx + ddy * nny;
+                api.update([px, py, Math.max(0, w0 + dw)]);
+            };
+            const midDrag = ({dx: ddx, dy: ddy, phase}, api) => {
+                if (!api?.initial) return;
+                const [px, py, w0] = api.initial;
+                api.update([px + 2 * ddx, py + 2 * ddy, w0]);
+            };
+            const deleteSeg = api => api.delete();
+            const wingGlyph = hctx => htl.svg`<g pointer-events="none">
+        <rect x=${ hctx.parent.x - 5 } y=${ hctx.parent.y - 5 } width="10" height="10" fill="#4af" fill-opacity="0.85" stroke="#fff" stroke-width="1.5"/>
+      </g>`;
+            const midGlyph = hctx => htl.svg`<g pointer-events="none">
+        <polygon points="${ hctx.parent.x },${ hctx.parent.y - 6 } ${ hctx.parent.x + 6 },${ hctx.parent.y } ${ hctx.parent.x },${ hctx.parent.y + 6 } ${ hctx.parent.x - 6 },${ hctx.parent.y }" fill="#fa4" fill-opacity="0.85" stroke="#fff" stroke-width="1.5"/>
+      </g>`;
+            const deleteGlyph = hctx => htl.svg`<g pointer-events="none">
+        <circle cx=${ hctx.parent.x } cy=${ hctx.parent.y } r="6" fill="#e44" fill-opacity="0.85" stroke="#fff" stroke-width="1.2"/>
+        <line x1=${ hctx.parent.x - 3 } y1=${ hctx.parent.y - 3 } x2=${ hctx.parent.x + 3 } y2=${ hctx.parent.y + 3 } stroke="#fff" stroke-width="1.5"/>
+        <line x1=${ hctx.parent.x + 3 } y1=${ hctx.parent.y - 3 } x2=${ hctx.parent.x - 3 } y2=${ hctx.parent.y + 3 } stroke="#fff" stroke-width="1.5"/>
+      </g>`;
             return htl.svg`<g>
         <line x1=${ p.x } y1=${ p.y } x2=${ wA.x } y2=${ wA.y } stroke="#4af" stroke-width="2"/>
         <line x1=${ wA.x } y1=${ wA.y } x2=${ c.x } y2=${ c.y } stroke="#4af" stroke-width="2"/>
         <line x1=${ p.x } y1=${ p.y } x2=${ wB.x } y2=${ wB.y } stroke="#fa4" stroke-width="2"/>
         <line x1=${ wB.x } y1=${ wB.y } x2=${ c.x } y2=${ c.y } stroke="#fa4" stroke-width="2"/>
-        ${ ctx.anchor(`wing:${ ctx.index }`, wA) }
-        ${ ctx.anchor(`mid:${ ctx.index }`, {
-                x: mx,
-                y: my
-            }) }
+        ${ ctx.affordance(`wing:${ ctx.index }`, wA, { handleRender: wingGlyph, onDrag: wingDrag }) }
+        ${ ctx.affordance(`mid:${ ctx.index }`, { x: mx, y: my }, { handleRender: midGlyph, onDrag: midDrag }) }
+        ${ ctx.affordance(`del:${ ctx.index }`, { x: mx + 14 * nx, y: my + 14 * ny }, { handleRender: deleteGlyph, onClick: deleteSeg }) }
         ${ ctx.affordance(tipId, c) }
       </g>`;
         }
@@ -26515,6 +26559,38 @@ const _1kv5rls = function _affordance(anchor,Event){return(
         }
         return null;
     };
+    const writeView = (view, next) => {
+        view.value = next;
+        view.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    const makeApi = (view, index, dims) => ({
+        get params() {
+            const v = view.value;
+            return v.slice(index, index + dims);
+        },
+        update(slice) {
+            const v = view.value;
+            const next = v.slice();
+            const w = Math.min(dims, slice.length);
+            for (let i = 0; i < w; i++) next[index + i] = slice[i];
+            writeView(view, next);
+        },
+        delete() {
+            const v = view.value;
+            writeView(view, [
+                ...v.slice(0, index),
+                ...v.slice(index + dims)
+            ]);
+        },
+        appendAfter(extraDims) {
+            const v = view.value;
+            writeView(view, [
+                ...v.slice(0, index + dims),
+                ...extraDims,
+                ...v.slice(index + dims)
+            ]);
+        }
+    });
     const attachSpawn = (el, spawn, dims) => {
         if (!spawn) return;
         el.__drag = (evt, {overlay}) => {
@@ -26563,15 +26639,66 @@ const _1kv5rls = function _affordance(anchor,Event){return(
                     return;
                 const raw = view.value;
                 const trimmedLen = dims > 0 ? Math.floor(raw.length / dims) * dims : raw.length;
-                const cur = trimmedLen < raw.length ? raw.slice(0, trimmedLen) : raw;
+                if (trimmedLen < raw.length) view.value = raw.slice(0, trimmedLen);
+                const cur = view.value;
                 const seg = spawn(dx, dy, cur);
                 if (!seg)
                     return;
-                view.value = [
-                    ...cur,
-                    ...seg
-                ];
-                view.dispatchEvent(new Event('input', { bubbles: true }));
+                makeApi(view, cur.length, 0).appendAfter(seg);
+            };
+            overlay.addEventListener('pointermove', onMove);
+            overlay.addEventListener('pointerup', onUp);
+            overlay.addEventListener('pointercancel', onUp);
+        };
+    };
+    const attachGesture = (el, handlers, ownIndex, ownDims) => {
+        if (!handlers.onClick && !handlers.onDrag && !handlers.onShiftClick) return;
+        el.__drag = (evt, {overlay}) => {
+            try {
+                overlay.setPointerCapture(evt.pointerId);
+            } catch {
+            }
+            const toLocal = ev => {
+                const pt = overlay.createSVGPoint();
+                pt.x = ev.clientX;
+                pt.y = ev.clientY;
+                return pt.matrixTransform(overlay.getScreenCTM().inverse());
+            };
+            const start = toLocal(evt);
+            const startMod = { shift: !!evt.shiftKey, alt: !!evt.altKey };
+            const dragThreshold = 5;
+            let dragged = false;
+            let initial = null;
+            let cachedView = findParamsView();
+            const buildApi = () => {
+                if (!cachedView) return null;
+                const api = makeApi(cachedView, ownIndex, ownDims);
+                api.initial = initial;
+                return api;
+            };
+            const onMove = e => {
+                const p = toLocal(e);
+                const dx = p.x - start.x, dy = p.y - start.y;
+                if (!dragged && Math.hypot(dx, dy) > dragThreshold) {
+                    dragged = true;
+                    initial = cachedView ? cachedView.value.slice(ownIndex, ownIndex + ownDims) : null;
+                }
+                if (dragged && handlers.onDrag) {
+                    handlers.onDrag({ dx, dy, phase: 'move' }, buildApi());
+                }
+            };
+            const onUp = e => {
+                overlay.removeEventListener('pointermove', onMove);
+                overlay.removeEventListener('pointerup', onUp);
+                overlay.removeEventListener('pointercancel', onUp);
+                const p = toLocal(e);
+                const dx = p.x - start.x, dy = p.y - start.y;
+                if (dragged) {
+                    if (handlers.onDrag) handlers.onDrag({ dx, dy, phase: 'end' }, buildApi());
+                } else {
+                    if (startMod.shift && handlers.onShiftClick) handlers.onShiftClick(buildApi());
+                    else if (handlers.onClick) handlers.onClick(buildApi());
+                }
             };
             overlay.addEventListener('pointermove', onMove);
             overlay.addEventListener('pointerup', onUp);
@@ -26583,31 +26710,47 @@ const _1kv5rls = function _affordance(anchor,Event){return(
         parent,
         drag: currentDrag,
         index,
-        depth
+        depth,
+        apiIndex,
+        apiDims
     }) => {
-        const {dims, render, spawn, handleRender} = currentDrag;
-        if (index + dims > params.length) {
+        const {dims = 0, render, spawn, handleRender, onClick, onDrag, onShiftClick} = currentDrag;
+        const ownIndex = apiIndex !== undefined ? apiIndex : index;
+        const ownDims = apiDims !== undefined ? apiDims : dims;
+        const hasGesture = !!(onClick || onDrag || onShiftClick);
+        const wrapWithVisual = (marker) => {
+            if (!handleRender) return marker;
+            const NS = 'http://www.w3.org/2000/svg';
+            const g = document.createElementNS(NS, 'g');
+            g.classList.add('__handle');
+            g.appendChild(marker);
+            const hctx = {
+                parent,
+                params: params.slice(ownIndex, ownIndex + ownDims),
+                index: ownIndex,
+                depth,
+                dims: ownDims,
+                full: params,
+                anchor
+            };
+            const visual = handleRender(hctx);
+            if (visual) g.appendChild(visual);
+            return g;
+        };
+        if (dims > 0 && index + dims > params.length) {
             const marker = anchor(id, { x: parent.x, y: parent.y, kind: 'handle' });
             attachSpawn(marker, spawn, dims);
-            if (handleRender) {
-                const NS = 'http://www.w3.org/2000/svg';
-                const g = document.createElementNS(NS, 'g');
-                g.classList.add('__handle');
-                g.appendChild(marker);
-                const ctx = {
-                    parent,
-                    params: params.slice(index),
-                    index,
-                    depth,
-                    dims,
-                    full: params,
-                    anchor
-                };
-                const visual = handleRender(ctx);
-                if (visual) g.appendChild(visual);
-                return g;
-            }
-            return marker;
+            attachGesture(marker, { onClick, onDrag, onShiftClick }, ownIndex, ownDims);
+            return wrapWithVisual(marker);
+        }
+        if (!(dims > 0 && render)) {
+            const marker = anchor(id, {
+                x: parent.x,
+                y: parent.y,
+                kind: hasGesture || handleRender ? 'handle' : undefined
+            });
+            attachGesture(marker, { onClick, onDrag, onShiftClick }, ownIndex, ownDims);
+            return wrapWithVisual(marker);
         }
         const view = params.slice(index, index + dims);
         const ctx = {
@@ -26618,13 +26761,18 @@ const _1kv5rls = function _affordance(anchor,Event){return(
             dims,
             full: params,
             anchor,
-            affordance: (childId, childPos, childDrag = currentDrag) => renderAt({
-                id: childId,
-                parent: childPos,
-                drag: childDrag,
-                index: index + dims,
-                depth: depth + 1
-            })
+            affordance: (childId, childPos, childOpts = currentDrag) => {
+                const childIsSegment = childOpts.dims > 0 && childOpts.render;
+                return renderAt({
+                    id: childId,
+                    parent: childPos,
+                    drag: childOpts,
+                    index: childIsSegment ? index + dims : index,
+                    depth: depth + 1,
+                    apiIndex: childIsSegment ? index + dims : index,
+                    apiDims: childIsSegment ? childOpts.dims : dims
+                });
+            }
         };
         return render(ctx);
     };
