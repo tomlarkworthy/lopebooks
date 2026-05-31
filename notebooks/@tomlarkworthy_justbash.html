@@ -12598,7 +12598,456 @@ export default function define(runtime, observer) {
   return main;
 }</script>
 
-<script id="@tomlarkworthy/justbash-terminal" 
+<script id="@tomlarkworthy/justbash-filesync"
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _2e5hhb = function _watchableFs() {
+    const MUTATORS = new Set([
+        'writeFile',
+        'appendFile',
+        'mkdir',
+        'rm',
+        'rmdir',
+        'cp',
+        'mv',
+        'chmod',
+        'symlink',
+        'link',
+        'utimes',
+        'truncate'
+    ]);
+    return function watchableFs(fs) {
+        const listeners = new Set();
+        const emit = (op, args) => {
+            const ev = {
+                op,
+                path: args[0],
+                dest: typeof args[1] === 'string' ? args[1] : undefined
+            };
+            for (const l of listeners) {
+                try {
+                    l(ev);
+                } catch (e) {
+                }
+            }
+        };
+        return new Proxy(fs, {
+            get(target, prop) {
+                if (prop === 'onChange')
+                    return fn => (listeners.add(fn), () => listeners.delete(fn));
+                const val = target[prop];
+                if (typeof val !== 'function')
+                    return val;
+                if (!MUTATORS.has(prop))
+                    return val.bind(target);
+                return function (...args) {
+                    const r = val.apply(target, args);
+                    Promise.resolve(r).then(() => emit(prop, args), () => {
+                    });
+                    return r;
+                };
+            }
+        });
+    };
+};
+const _ibogrw = function _fsDirectoryHandle() {
+    const notFound = path => {
+        const e = new Error(`A requested file or directory could not be found: ${ path }`);
+        e.name = 'NotFoundError';
+        return e;
+    };
+    const join = (base, name) => base === '/' ? '/' + name : base + '/' + name;
+    function fileHandle(fs, path, name) {
+        return {
+            kind: 'file',
+            name,
+            async getFile() {
+                const bytes = await fs.readFileBuffer(path);
+                let lastModified = 0;
+                try {
+                    lastModified = (await fs.stat(path)).mtime.getTime();
+                } catch (e) {
+                }
+                return {
+                    name,
+                    size: bytes.byteLength,
+                    lastModified,
+                    async text() {
+                        return new TextDecoder().decode(bytes);
+                    },
+                    async arrayBuffer() {
+                        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+                    }
+                };
+            },
+            async createWritable() {
+                const chunks = [];
+                return {
+                    async write(data) {
+                        chunks.push(data);
+                    },
+                    async close() {
+                        if (chunks.length === 1 && typeof chunks[0] === 'string') {
+                            await fs.writeFile(path, chunks[0]);
+                            return;
+                        }
+                        const parts = chunks.map(c => typeof c === 'string' ? new TextEncoder().encode(c) : c instanceof ArrayBuffer ? new Uint8Array(c) : c);
+                        const total = parts.reduce((n, p) => n + p.length, 0);
+                        const buf = new Uint8Array(total);
+                        let off = 0;
+                        for (const p of parts) {
+                            buf.set(p, off);
+                            off += p.length;
+                        }
+                        await fs.writeFile(path, buf);
+                    }
+                };
+            }
+        };
+    }
+    return function fsDirectoryHandle(fs, path = '/', name = '') {
+        const handle = {
+            kind: 'directory',
+            name: name || (path === '/' ? '' : path.split('/').filter(Boolean).pop() || ''),
+            async getDirectoryHandle(child, opts = {}) {
+                const full = join(path, child);
+                if (await fs.exists(full)) {
+                    if (!(await fs.stat(full)).isDirectory)
+                        throw notFound(full + ' (not a directory)');
+                } else if (opts.create) {
+                    await fs.mkdir(full, { recursive: true });
+                } else
+                    throw notFound(full);
+                return fsDirectoryHandle(fs, full, child);
+            },
+            async getFileHandle(child, opts = {}) {
+                const full = join(path, child);
+                if (!await fs.exists(full)) {
+                    if (opts.create)
+                        await fs.writeFile(full, '');
+                    else
+                        throw notFound(full);
+                }
+                return fileHandle(fs, full, child);
+            },
+            async removeEntry(child, opts = {}) {
+                await fs.rm(join(path, child), {
+                    recursive: !!opts.recursive,
+                    force: true
+                });
+            },
+            async *entries() {
+                let names;
+                try {
+                    names = await fs.readdir(path);
+                } catch (e) {
+                    return;
+                }
+                for (const n of names.sort()) {
+                    const full = join(path, n);
+                    let st;
+                    try {
+                        st = await fs.stat(full);
+                    } catch (e) {
+                        continue;
+                    }
+                    yield [
+                        n,
+                        st.isDirectory ? fsDirectoryHandle(fs, full, n) : fileHandle(fs, full, n)
+                    ];
+                }
+            },
+            async *keys() {
+                for await (const [n] of handle.entries())
+                    yield n;
+            },
+            async *values() {
+                for await (const [, h] of handle.entries())
+                    yield h;
+            },
+            [Symbol.asyncIterator]() {
+                return handle.entries();
+            }
+        };
+        return handle;
+    };
+};
+const _s03kb1 = function _syncFs(watchableFs,InMemoryFs) {return (watchableFs(new InMemoryFs()));};
+const _103wkzy = function _workspaceDirectory(fsDirectoryHandle,syncFs) {return (fsDirectoryHandle(syncFs));};
+const _14l9wdw = function _syncShell(createSession,syncFs) {return (createSession(syncFs, {
+    cwd: '/',
+    label: 'fs'
+}));};
+const _4i07b0 = function _jbModules(currentModules) {
+    const ids = new Set([
+        '@tomlarkworthy/just-bash',
+        '@tomlarkworthy/justbash-session',
+        '@tomlarkworthy/justbash-terminal',
+        '@tomlarkworthy/justbash',
+        '@tomlarkworthy/justbash-filesync'
+    ]);
+    const m = new Map();
+    for (const [mod, info] of currentModules)
+        if (ids.has(info.name))
+            m.set(mod, info);
+    return m;
+};
+const _1le7x0 = function _jbModuleIds() {return ([
+    '@tomlarkworthy/just-bash',
+    '@tomlarkworthy/justbash-session',
+    '@tomlarkworthy/justbash-terminal',
+    '@tomlarkworthy/justbash',
+    '@tomlarkworthy/justbash-filesync'
+]);};
+const _49b1wn = function _jbRedisassemble(Inputs) {return (Inputs.button('\u27F3 Disassemble modules to virtual fs'));};
+const _z8svk5 = (G, _) => G.input(_);
+const _pxq7gd = async function _jbDisassemble(jbRedisassemble,notebookId,jbModuleIds,exportModuleJS,writeFile,workspaceDirectory) {
+    jbRedisassemble;
+    // re-run when the button is pressed
+    const prefix = notebookId + '/';
+    const written = [];
+    for (const id of jbModuleIds) {
+        try {
+            const {source} = await exportModuleJS(id);
+            await writeFile(workspaceDirectory, prefix + id + '.js', source);
+            written.push({
+                id,
+                bytes: source.length
+            });
+        } catch (e) {
+            written.push({
+                id,
+                error: e.message
+            });
+        }
+    }
+    return {
+        prefix,
+        written,
+        at: new Date().toISOString()
+    };
+};
+const _4bge96 = function _jbApply(jbModules,runtime,probeDefine) {
+    // Build name -> module and name -> {pid/name -> variable} maps, scoped to the 5 justbash modules.
+    const nameToModule = new Map();
+    const nameToVars = new Map();
+    for (const [mod, info] of jbModules) {
+        nameToModule.set(info.name, info.module);
+        const vars = new Map();
+        for (const v of runtime._variables) {
+            if (v._module !== info.module)
+                continue;
+            if (v._name)
+                vars.set(v._name, v);
+            if (v.pid)
+                vars.set('__pid__' + v.pid, v);
+        }
+        nameToVars.set(info.name, vars);
+    }
+    const knownFilePids = new Map();
+    return function applyModule(moduleId, defineFn) {
+        const mod = nameToModule.get(moduleId);
+        if (!mod)
+            return {
+                applied: false,
+                reason: 'module not loaded: ' + moduleId
+            };
+        const existingVars = nameToVars.get(moduleId) || new Map();
+        const cells = probeDefine(defineFn);
+        const seenPids = new Set();
+        let changes = 0;
+        for (const cell of cells) {
+            if (cell.type === 'import')
+                continue;
+            if (!cell.pid)
+                continue;
+            seenPids.add(cell.pid);
+            const existing = existingVars.get('__pid__' + cell.pid);
+            if (!existing) {
+                const v = mod.variable();
+                v.define(cell.name, cell.inputs, cell.definition);
+                v.pid = cell.pid;
+                existingVars.set('__pid__' + cell.pid, v);
+                if (cell.name)
+                    existingVars.set(cell.name, v);
+                changes++;
+                continue;
+            }
+            if (existing._definition) {
+                const existingInputNames = existing._inputs.map(iv => typeof iv === 'string' ? iv : iv._name);
+                const inputsMatch = JSON.stringify(existingInputNames) === JSON.stringify(cell.inputs);
+                const defnMatch = existing._definition.toString() === (cell.definition ? cell.definition.toString() : '');
+                if (inputsMatch && defnMatch)
+                    continue;
+            }
+            existing.define(cell.name, cell.inputs, cell.definition).pid = cell.pid;
+            changes++;
+        }
+        const prevKnown = knownFilePids.get(moduleId);
+        if (prevKnown) {
+            for (const pid of prevKnown) {
+                if (seenPids.has(pid))
+                    continue;
+                const v = existingVars.get('__pid__' + pid);
+                if (!v)
+                    continue;
+                v.delete();
+                existingVars.delete('__pid__' + pid);
+                if (v._name)
+                    existingVars.delete(v._name);
+                changes++;
+            }
+        }
+        knownFilePids.set(moduleId, seenPids);
+        const ordered = [];
+        for (const cell of cells) {
+            if (!cell.pid)
+                continue;
+            const v = existingVars.get('__pid__' + cell.pid);
+            if (v)
+                ordered.push(v);
+        }
+        if (ordered.length) {
+            const orderedSet = new Set(ordered);
+            const arr = [...runtime._variables];
+            let oi = 0;
+            for (let i = 0; i < arr.length; i++)
+                if (orderedSet.has(arr[i]))
+                    arr[i] = ordered[oi++];
+            while (oi < ordered.length)
+                arr.push(ordered[oi++]);
+            runtime._variables.clear();
+            for (const v of arr)
+                runtime._variables.add(v);
+        }
+        return {
+            applied: true,
+            moduleId,
+            changes
+        };
+    };
+};
+const _1y75ecn = async function _jbFilesToNotebook(jbDisassemble, notebookId, htl, jbModuleIds, readFile, workspaceDirectory, invalidation, exportModuleJS, jbApply) {
+    jbDisassemble;
+    const prefix = notebookId + '/';
+    const statusEl = htl.html`<pre style="background:#0b1020;color:#9fe7ff;padding:8px;border-radius:6px;font-size:12px;line-height:1.5;white-space:pre-wrap;margin:0;min-height:1.5em"></pre>`;
+    const lastSeen = new Map();
+    for (const id of jbModuleIds) {
+        try {
+            const f = await readFile(workspaceDirectory, prefix + id + '.js');
+            lastSeen.set(id, f.lastModified);
+        } catch (e) {
+        }
+    }
+    const applied = [];
+    const render = () => {
+        statusEl.textContent = applied.length ? applied.join('\n') : '\u25B6 watching ' + jbModuleIds.length + ' modules for edits\u2026 (none yet)';
+    };
+    const log = m => {
+        applied.unshift(m);
+        if (applied.length > 8)
+            applied.pop();
+        render();
+    };
+    render();
+    let stopped = false;
+    invalidation.then(() => {
+        stopped = true;
+    });
+    (async () => {
+        while (!stopped) {
+            for (const id of jbModuleIds) {
+                let f;
+                try {
+                    f = await readFile(workspaceDirectory, prefix + id + '.js');
+                } catch (e) {
+                    continue;
+                }
+                const prev = lastSeen.get(id);
+                if (prev !== undefined && f.lastModified === prev)
+                    continue;
+                lastSeen.set(id, f.lastModified);
+                const diskText = await f.text();
+                try {
+                    const cur = await exportModuleJS(id);
+                    if (cur.source === diskText)
+                        continue;
+                } catch (e) {
+                }
+                const url = URL.createObjectURL(new Blob([diskText], { type: 'text/javascript' }));
+                try {
+                    const m = await window.importShim(url, 'file://@tomlarkworthy/justbash-filesync');
+                    if (typeof m.default === 'function') {
+                        const r = jbApply(id, m.default);
+                        log(new Date().toLocaleTimeString() + '  \u2935 ' + id.split('/').pop() + ' (' + (r.changes || 0) + ' cell' + (r.changes === 1 ? '' : 's') + ')');
+                    }
+                } catch (e) {
+                    log('\u26A0 ' + id.split('/').pop() + ': ' + e.message);
+                } finally {
+                    URL.revokeObjectURL(url);
+                }
+            }
+            await new Promise(r => setTimeout(r, 1000));
+        }
+    })();
+    return statusEl;
+};
+const _1vqbn7l = function _jbTerminalView(terminal,syncShell) {return (terminal(syncShell, { greeting: 'shared fs \u2014 try: ls @tomlarkworthy_justbash/@tomlarkworthy' }));};
+const _qi9vsg = function _jbFileSyncApp(htl,jbModuleIds,jbDisassemble,$0,jbFilesToNotebook,jbTerminalView) {return (htl.html`<div style="font-family:system-ui,sans-serif;display:flex;flex-direction:column;gap:10px;padding:14px;height:100%;box-sizing:border-box;overflow:auto">
+  <div style="font-weight:600;font-size:15px">justbash ⇄ filesystem sync</div>
+  <div style="font-size:13px;color:#555;line-height:1.45">
+    The notebook's own ${ jbModuleIds.length } modules are disassembled into the shared just-bash virtual filesystem under
+    <code>${ jbDisassemble.prefix }</code>. Edit a <code>.js</code> module file in the shell below and the change is applied to the live runtime — the notebook rewrites itself.
+  </div>
+  <div>${ $0 }</div>
+  <div style="font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#888">live apply log</div>
+  ${ jbFilesToNotebook }
+  <div style="flex:1;min-height:240px;display:flex;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden">${ jbTerminalView }</div>
+</div>`);};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+
+  $def("_2e5hhb", "watchableFs", [], _2e5hhb);  
+  $def("_ibogrw", "fsDirectoryHandle", [], _ibogrw);  
+  main.define("module @tomlarkworthy/just-bash", async () => runtime.module((await import("/@tomlarkworthy/just-bash.js?v=4")).default));  
+  main.define("InMemoryFs", ["module @tomlarkworthy/just-bash", "@variable"], (_, v) => v.import("InMemoryFs", _));  
+  main.define("module @tomlarkworthy/justbash-session", async () => runtime.module((await import("/@tomlarkworthy/justbash-session.js?v=4")).default));  
+  main.define("createSession", ["module @tomlarkworthy/justbash-session", "@variable"], (_, v) => v.import("createSession", _));  
+  main.define("module @tomlarkworthy/justbash-terminal", async () => runtime.module((await import("/@tomlarkworthy/justbash-terminal.js?v=4")).default));  
+  main.define("terminal", ["module @tomlarkworthy/justbash-terminal", "@variable"], (_, v) => v.import("terminal", _));  
+  $def("_s03kb1", "syncFs", ["watchableFs","InMemoryFs"], _s03kb1);  
+  $def("_103wkzy", "workspaceDirectory", ["fsDirectoryHandle","syncFs"], _103wkzy);  
+  $def("_14l9wdw", "syncShell", ["createSession","syncFs"], _14l9wdw);  
+  main.define("module @tomlarkworthy/module-map", async () => runtime.module((await import("/@tomlarkworthy/module-map.js?v=4")).default));  
+  main.define("currentModules", ["module @tomlarkworthy/module-map", "@variable"], (_, v) => v.import("currentModules", _));  
+  $def("_4i07b0", "jbModules", ["currentModules"], _4i07b0);  
+  main.define("notebookId", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("notebookId", _));  
+  main.define("module @tomlarkworthy/file-sync", async () => runtime.module((await import("/@tomlarkworthy/file-sync.js?v=4")).default));  
+  main.define("writeFile", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("writeFile", _));  
+  main.define("readFile", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("readFile", _));  
+  main.define("probeDefine", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("probeDefine", _));  
+  main.define("module @tomlarkworthy/exporter-3", async () => runtime.module((await import("/@tomlarkworthy/exporter-3.js?v=4")).default));  
+  main.define("exportModuleJS", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("exportModuleJS", _));  
+  main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));  
+  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));  
+  main.define("tag", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("tag", _));  
+  $def("_1le7x0", "jbModuleIds", [], _1le7x0);  
+  $def("_49b1wn", "viewof jbRedisassemble", ["Inputs"], _49b1wn);  
+  $def("_z8svk5", "jbRedisassemble", ["Generators","viewof jbRedisassemble"], _z8svk5);  
+  $def("_pxq7gd", "jbDisassemble", ["jbRedisassemble","notebookId","jbModuleIds","exportModuleJS","writeFile","workspaceDirectory"], _pxq7gd);  
+  $def("_4bge96", "jbApply", ["jbModules","runtime","probeDefine"], _4bge96);  
+  $def("_1y75ecn", "jbFilesToNotebook", ["jbDisassemble","notebookId","htl","jbModuleIds","readFile","workspaceDirectory","invalidation","exportModuleJS","jbApply"], _1y75ecn);  
+  $def("_1vqbn7l", "jbTerminalView", ["terminal","syncShell"], _1vqbn7l);  
+  $def("_qi9vsg", "jbFileSyncApp", ["htl","jbModuleIds","jbDisassemble","viewof jbRedisassemble","jbFilesToNotebook","jbTerminalView"], _qi9vsg);
+  return main;
+}
+</script>
+<script id="@tomlarkworthy/justbash-terminal"
   type="text/plain"
   data-mime="application/javascript"
 >
@@ -28225,8 +28674,8 @@ export default function define(runtime, observer) {
 >
 {
   "title": "justbash",
-  "mains": ["@tomlarkworthy/lopepage","@tomlarkworthy/just-bash","@tomlarkworthy/justbash-session","@tomlarkworthy/justbash-terminal","@tomlarkworthy/justbash"],
-  "hash": "#view=S100(@tomlarkworthy/justbash)",
+  "mains": ["@tomlarkworthy/lopepage","@tomlarkworthy/just-bash","@tomlarkworthy/justbash-session","@tomlarkworthy/justbash-terminal","@tomlarkworthy/justbash","@tomlarkworthy/justbash-filesync"],
+  "hash": "#view=R100(S60(@tomlarkworthy/justbash),S40(@tomlarkworthy/justbash-filesync))",
   "headless": true
 }
 </script>
