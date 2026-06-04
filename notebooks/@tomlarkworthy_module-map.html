@@ -16414,10 +16414,11 @@ export default function define(runtime, observer) {
   return main;
 }</script>
 
-<script id="@tomlarkworthy/module-map" 
+<script id="@tomlarkworthy/module-map"
   type="text/plain"
   data-mime="application/javascript"
 >
+
 const _1w9yf3l = function _1(md){return(
 md`# Module map`
 )};
@@ -16458,20 +16459,22 @@ async (
 const _1yso65r = function _5(md){return(
 md`### \`currentModules\``
 )};
-const _1fcoh6x = async function _sync_modules(runtime_variables,moduleMap,_,$0,Event)
-{
-  runtime_variables;
-  const latest = await moduleMap();
-  let dirty = !this || !_.isEqual(new Set(latest.keys()), new Set(this.keys()));
-  if (dirty) {
-    $0.value = latest;
-    $0.dispatchEvent(new Event("input"));
-  }
-  return $0.value;
+const _1fcoh6x = async function _sync_modules($0,moduleSnapshots,runtime,invalidation,Event) {
+    const view = $0;
+    const gen = moduleSnapshots(runtime);
+    invalidation.then(() => {
+        try {
+            gen.return();
+        } catch (e) {
+        }
+    });
+    for await (const snap of gen) {
+        view.value = snap;
+        view.dispatchEvent(new Event('input'));
+    }
+    return view.value;
 };
-const _wi39n0 = async function _currentModules(Inputs,moduleMap){return(
-Inputs.input(await moduleMap())
-)};
+const _wi39n0 = function _currentModules(Inputs,buildModuleSnapshot,runtime) {return (Inputs.input(buildModuleSnapshot(runtime)));};
 const _1gxgyd6 = (G, _) => G.input(_);
 const _1qag34d = function _8(Inputs,currentModules){return(
 Inputs.table([...currentModules.values()], {
@@ -17123,6 +17126,139 @@ const _1pou2g6 = function _submit_summary(resolve_modules,queue,notebookImports,
   notebookImports;
   $0.resolve(summary);
 };
+const _18e6uog = function _buildModuleSnapshot() {return ((runtime, titleCache) => {
+    const records = new Map();
+    const titleOf = (mod, fallback = null) => (titleCache && titleCache.get(mod)) ?? fallback;
+    const ensure = (mod, rec) => {
+        if (mod && !records.has(mod))
+            records.set(mod, rec);
+    };
+    const builtin = runtime._builtin;
+    const bootloader = runtime.bootloader;
+    if (builtin)
+        ensure(builtin, {
+            name: 'builtin',
+            title: 'Standard library',
+            module: builtin,
+            dependsOn: [],
+            dependedBy: []
+        });
+    if (bootloader)
+        ensure(bootloader, {
+            name: 'bootloader',
+            title: 'Bootloader',
+            module: bootloader,
+            dependsOn: [],
+            dependedBy: []
+        });
+    for (const [name, mod] of runtime.mains || new Map())
+        ensure(mod, {
+            name,
+            module: mod,
+            title: titleOf(mod),
+            dependsOn: [],
+            dependedBy: []
+        });
+    const moduleVars = [];
+    for (const v of runtime._variables) {
+        if (!v._name || !v._name.startsWith('module ') || v._name.startsWith('module <unknown'))
+            continue;
+        moduleVars.push(v);
+        const mod = v._value;
+        // resolved module object, or undefined if not yet loaded (we do not force it)
+        if (mod && typeof mod === 'object')
+            ensure(mod, {
+                type: 'module variable',
+                name: v._name.slice(7),
+                module: mod,
+                variable: v,
+                title: titleOf(mod),
+                dependsOn: [],
+                dependedBy: []
+            });
+    }
+    for (const rec of records.values()) {
+        const t = titleOf(rec.module);
+        if (t != null)
+            rec.title = t;
+    }
+    // cross-links from resolved module-variable imports: host(v._module) -> imported(v._value)
+    for (const v of moduleVars) {
+        const host = records.get(v._module);
+        const imported = v._value && typeof v._value === 'object' ? records.get(v._value) : null;
+        if (host && imported) {
+            host.dependsOn.push(imported.name);
+            imported.dependedBy.push(host.name);
+        }
+    }
+    return records;
+});};
+const _1t52h3o = function _moduleSnapshots(buildModuleSnapshot,moduleTitle,forcePeek) {return (function moduleSnapshots(runtime, {background = true, titles = true, settleMs = 1500} = {}) {
+    if (!runtime || !runtime._variables)
+        throw 'Invalid runtime passed to moduleSnapshots';
+    return async function* () {
+        const titleCache = new Map();
+        // module -> resolved title (filled lazily, in the background)
+        const scheduledTitle = new Set();
+        // modules whose title fetch has started
+        const scheduledLoad = new Set();
+        // `module *` variables we have already nudged to load
+        let resolveWake;
+        let wake = new Promise(r => resolveWake = r);
+        const bump = () => {
+            const r = resolveWake;
+            wake = new Promise(res => resolveWake = res);
+            r();
+        };
+        const snapshot = () => buildModuleSnapshot(runtime, titleCache);
+        const sig = m => [...m.values()].map(r => `${ r.name }:${ r.title ?? '' }:${ (r.dependsOn || []).length }`).sort().join('|');
+        // Kick off the slow work (titles, loading not-yet-resolved modules) WITHOUT blocking emission.
+        const schedule = snap => {
+            if (titles) {
+                for (const rec of snap.values()) {
+                    if (rec.title != null || scheduledTitle.has(rec.module))
+                        continue;
+                    scheduledTitle.add(rec.module);
+                    Promise.race([
+                        moduleTitle(rec.module),
+                        new Promise(res => setTimeout(() => res(null), settleMs))
+                    ]).then(t => {
+                        if (t != null) {
+                            titleCache.set(rec.module, t);
+                            bump();
+                        }
+                    }).catch(() => {
+                    });
+                }
+            }
+            if (background) {
+                for (const v of runtime._variables) {
+                    if (!v._name || !v._name.startsWith('module ') || v._name.startsWith('module <unknown'))
+                        continue;
+                    if (v._value && typeof v._value === 'object' || scheduledLoad.has(v))
+                        continue;
+                    scheduledLoad.add(v);
+                    Promise.resolve(forcePeek(v)).then(bump, bump);
+                }
+            }
+        };
+        let lastSig = '';
+        while (true) {
+            const next = snapshot();
+            schedule(next);
+            const s = sig(next);
+            if (s !== lastSig) {
+                lastSig = s;
+                yield next;
+            }
+            // wake on title/load settlement, with a periodic re-scan so live module add/remove is picked up
+            await Promise.race([
+                wake,
+                new Promise(r => setTimeout(r, 3000))
+            ]);
+        }
+    }();
+});};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -17140,8 +17276,8 @@ export default function define(runtime, observer) {
   $def("_1sznqfl", null, ["md"], _1sznqfl);  
   $def("_1798myt", "moduleMap", ["runtime","keepalive","myModule","viewof queue"], _1798myt);  
   $def("_1yso65r", null, ["md"], _1yso65r);  
-  $def("_1fcoh6x", "sync_modules", ["runtime_variables","moduleMap","_","viewof currentModules","Event"], _1fcoh6x);  
-  $def("_wi39n0", "viewof currentModules", ["Inputs","moduleMap"], _wi39n0);  
+  $def("_1fcoh6x", "sync_modules", ["viewof currentModules","moduleSnapshots","runtime","invalidation","Event"], _1fcoh6x);  
+  $def("_wi39n0", "viewof currentModules", ["Inputs","buildModuleSnapshot","runtime"], _wi39n0);  
   $def("_1gxgyd6", "currentModules", ["Generators","viewof currentModules"], _1gxgyd6);  
   $def("_1qag34d", null, ["Inputs","currentModules"], _1qag34d);  
   $def("_1xamz8j", null, ["md"], _1xamz8j);  
@@ -17189,9 +17325,12 @@ export default function define(runtime, observer) {
   main.define("observeVariable", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observe", "observeVariable", _));  
   main.define("spectralCircleOrder", ["module @tomlarkworthy/spectral-layout", "@variable"], (_, v) => v.import("spectralCircleOrder", _));  
   main.define("improveOrderSifting", ["module @tomlarkworthy/spectral-layout", "@variable"], (_, v) => v.import("improveOrderSifting", _));  
-  main.define("bestOfRandomOrders", ["module @tomlarkworthy/spectral-layout", "@variable"], (_, v) => v.import("bestOfRandomOrders", _));
+  main.define("bestOfRandomOrders", ["module @tomlarkworthy/spectral-layout", "@variable"], (_, v) => v.import("bestOfRandomOrders", _));  
+  $def("_18e6uog", "buildModuleSnapshot", [], _18e6uog);  
+  $def("_1t52h3o", "moduleSnapshots", ["buildModuleSnapshot","moduleTitle","forcePeek"], _1t52h3o);
   return main;
-}</script>
+}
+</script>
 
 <script id="@tomlarkworthy/module-selection" 
   type="text/plain"
