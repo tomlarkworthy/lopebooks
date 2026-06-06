@@ -17531,310 +17531,246 @@ It's an effecient alternative to [moduleMap](https://observablehq.com/@tomlarkwo
 const _1eaa9lr = function _currentModules(modules){return(
 modules()
 )};
-const _1fx8jm6 = function _modules(runtime,forcePeek,moduleTitle)
-{
-  const _runtime = runtime;
-  // default: the current runtime
-  return function modules({runtime = _runtime, titleTimeoutMs = 2000, rescanMs = 1000, load = true} = {}) {
-    if (!runtime || !runtime._variables)
-      throw 'Invalid runtime passed to modules';
-    return async function* () {
-      const records = new Map();
-      // module -> fully-formed record (title resolved before it lands here)
-      const watchers = new Map();
-      // module -> cancel fn (stops its title watcher + deletes its helper)
-      const helpers = new Set();
-      // our title-forcing peeker variables — excluded from module ownership
-      const peeking = new Set();
-      // unresolved `module X` variables being force-loaded
-      let pending = false, wake = null, dirty = true;
-      const bump = () => {
-        pending = true;
-        if (wake) {
-          const w = wake;
-          wake = null;
-          w();
-        }
-      };
-      const touch = () => {
-        dirty = true;
-        bump();
-      };
-      // records changed -> emit a new snapshot
-      // Live candidate modules: Map<module, {name, variable?, title?}>. Side effect: force-loads
-      // unresolved `module X` variables so their modules become resolvable on a later scan. Our own
-      // title-forcing helper variables are excluded so they never keep a deleted module alive.
-      const scan = () => {
-        const out = new Map();
-        const put = (m, r) => {
-          if (m && !out.has(m))
-            out.set(m, r);
-        };
-        const builtin = runtime._builtin, bootloader = runtime.bootloader;
-        if (builtin)
-          put(builtin, {
-            name: 'builtin',
-            title: 'Standard library'
-          });
-        if (bootloader)
-          put(bootloader, {
-            name: 'bootloader',
-            title: 'Bootloader'
-          });
-        for (const [name, mod] of runtime.mains || new Map())
-          put(mod, { name });
-        // main modules: variable-graph roots — own (non-helper) variables but aren't imported
-        // (nor builtin/bootloader). Catches the top-level main of a plain runtime where
-        // runtime.mains is empty (matches moduleMap).
-        const imported = new Set((runtime._modules || new Map()).values());
-        const owners = new Set();
-        for (const v of runtime._variables)
-          if (v._module && !helpers.has(v))
-            owners.add(v._module);
-        for (const m of owners)
-          if (m !== builtin && m !== bootloader && !imported.has(m))
-            put(m, { name: 'main' });
-        // imported modules carried by `module X` variables
-        for (const v of runtime._variables) {
-          if (!v._name || !v._name.startsWith('module ') || v._name.startsWith('module <unknown'))
-            continue;
-          const mod = v._value;
-          if (mod && typeof mod === 'object')
-            put(mod, {
-              name: v._name.slice(7),
-              variable: v
-            });
-          else if (load && !peeking.has(v)) {
-            peeking.add(v);
-            Promise.resolve(forcePeek(v)).then(() => peeking.delete(v), () => peeking.delete(v)).then(bump);
-          }
-        }
-        return out;
-      };
-      // Reconcile the snapshot with the live runtime each scan.
-      const reconcile = () => {
-        const cand = scan();
-        // DELETE: drop modules no longer present; cancel their title watcher + helper.
-        for (const m of [...watchers.keys()]) {
-          if (!cand.has(m)) {
-            const cancel = watchers.get(m);
-            watchers.delete(m);
-            if (records.delete(m))
-              touch();
+const _1fx8jm6 = function _modules(runtime,observeVariable,moduleTitle) {
+    const _runtime = runtime;
+    // default: the current runtime
+    return function modules({runtime = _runtime, titleTimeoutMs = 2000, rescanMs = 1000, load = true} = {}) {
+        if (!runtime || !runtime._variables)
+            throw 'Invalid runtime passed to modules';
+        return async function* () {
+            const records = new Map();
+            // module -> fully-formed record (title resolved before it lands here)
+            const watchers = new Map();
+            // module -> cancel fn (stops its title watch)
+            const peeking = new Map();
+            // unresolved `module X` variable -> stop fn (its force-load observer)
+            let pending = false, wake = null, dirty = true;
+            const bump = () => {
+                pending = true;
+                if (wake) {
+                    const w = wake;
+                    wake = null;
+                    w();
+                }
+            };
+            const touch = () => {
+                dirty = true;
+                bump();
+            };
+            // Live candidate modules: Map<module, {name, variable?, title?}>. Side effect: force-loads
+            // unresolved `module X` variables via observe (which marks them reachable) so their modules
+            // become resolvable on a later scan.
+            const scan = () => {
+                const out = new Map();
+                const put = (m, r) => {
+                    if (m && !out.has(m))
+                        out.set(m, r);
+                };
+                const builtin = runtime._builtin, bootloader = runtime.bootloader;
+                if (builtin)
+                    put(builtin, {
+                        name: 'builtin',
+                        title: 'Standard library'
+                    });
+                if (bootloader)
+                    put(bootloader, {
+                        name: 'bootloader',
+                        title: 'Bootloader'
+                    });
+                for (const [name, mod] of runtime.mains || new Map())
+                    put(mod, { name });
+                // main modules: variable-graph roots — own variables but aren't imported (nor builtin/
+                // bootloader). Catches the top-level main of a plain runtime where runtime.mains is empty.
+                const imported = new Set((runtime._modules || new Map()).values());
+                const owners = new Set();
+                for (const v of runtime._variables)
+                    if (v._module)
+                        owners.add(v._module);
+                for (const m of owners)
+                    if (m !== builtin && m !== bootloader && !imported.has(m))
+                        put(m, { name: 'main' });
+                // imported modules carried by `module X` variables
+                for (const v of runtime._variables) {
+                    if (!v._name || !v._name.startsWith('module ') || v._name.startsWith('module <unknown'))
+                        continue;
+                    const mod = v._value;
+                    if (mod && typeof mod === 'object')
+                        put(mod, {
+                            name: v._name.slice(7),
+                            variable: v
+                        });
+                    else if (load && !peeking.has(v))
+                        peeking.set(v, observeVariable(v, {
+                            fulfilled: bump,
+                            error: bump
+                        }));
+                }
+                return out;
+            };
+            // Reconcile the snapshot with the live runtime each scan.
+            const reconcile = () => {
+                const cand = scan();
+                // DELETE: drop modules no longer present; cancel their title watcher.
+                for (const m of [...watchers.keys()]) {
+                    if (!cand.has(m)) {
+                        const cancel = watchers.get(m);
+                        watchers.delete(m);
+                        if (records.delete(m))
+                            touch();
+                        try {
+                            cancel();
+                        } catch (e) {
+                        }
+                    }
+                }
+                // CREATE: start a persistent title watch for each new module. The module enters `records`
+                // only once its title resolves (or the timeout fires). Later title changes update in place.
+                for (const [m, c] of cand) {
+                    if (watchers.has(m))
+                        continue;
+                    if (c.title != null) {
+                        // static title (builtin / bootloader)
+                        records.set(m, {
+                            name: c.name,
+                            title: c.title,
+                            module: m,
+                            variable: c.variable
+                        });
+                        watchers.set(m, () => {
+                        });
+                        touch();
+                        continue;
+                    }
+                    const apply = title => {
+                        if (!watchers.has(m))
+                            return;
+                        // module was pruned -> ignore late title callbacks
+                        const t = title ?? c.name;
+                        const prev = records.get(m);
+                        if (!prev) {
+                            records.set(m, {
+                                name: c.name,
+                                title: t,
+                                module: m,
+                                variable: c.variable
+                            });
+                            touch();
+                        } else if (prev.title !== t) {
+                            records.set(m, {
+                                ...prev,
+                                title: t
+                            });
+                            touch();
+                        }
+                    };
+                    const cancel = moduleTitle(m, apply);
+                    watchers.set(m, () => {
+                        try {
+                            cancel();
+                        } catch (e) {
+                        }
+                    });
+                    // title never resolved within the budget -> show the name so the module isn't withheld.
+                    setTimeout(() => {
+                        if (watchers.has(m) && !records.has(m))
+                            apply(null);
+                    }, titleTimeoutMs);
+                }
+            };
+            let stopped = false;
+            (async () => {
+                while (!stopped) {
+                    try {
+                        reconcile();
+                    } catch (e) {
+                    }
+                    await new Promise(r => setTimeout(r, rescanMs));
+                }
+            })();
             try {
-              cancel();
-            } catch (e) {
+                while (true) {
+                    pending = false;
+                    if (dirty) {
+                        dirty = false;
+                        yield new Map(records);
+                    }
+                    // cumulative snapshot
+                    if (!pending)
+                        await new Promise(resolve => {
+                            wake = resolve;
+                            if (pending) {
+                                wake = null;
+                                resolve();
+                            }
+                        });
+                }
+            } finally {
+                stopped = true;
+                for (const cancel of watchers.values()) {
+                    try {
+                        cancel();
+                    } catch (e) {
+                    }
+                }
+                for (const stop of peeking.values()) {
+                    try {
+                        stop();
+                    } catch (e) {
+                    }
+                }
             }
-          }
-        }
-        // CREATE: start a persistent title watch for each new module. The module enters `records`
-        // only once its title resolves (or the timeout fires) — fully-formed. Later title changes
-        // update the record in place.
-        for (const [m, c] of cand) {
-          if (watchers.has(m))
-            continue;
-          if (c.title != null) {
-            // static title (builtin / bootloader)
-            records.set(m, {
-              name: c.name,
-              title: c.title,
-              module: m,
-              variable: c.variable
-            });
-            watchers.set(m, () => {
-            });
-            touch();
-            continue;
-          }
-          const apply = title => {
-            if (!watchers.has(m))
-              return;
-            // module was pruned -> ignore late title callbacks
-            const t = title ?? c.name;
-            const prev = records.get(m);
-            if (!prev) {
-              records.set(m, {
-                name: c.name,
-                title: t,
-                module: m,
-                variable: c.variable
-              });
-              touch();
-            } else if (prev.title !== t) {
-              records.set(m, {
-                ...prev,
-                title: t
-              });
-              touch();
-            }
-          };
-          const {cancel, helper} = moduleTitle(m, apply);
-          if (helper)
-            helpers.add(helper);
-          watchers.set(m, () => {
-            try {
-              cancel();
-            } catch (e) {
-            }
-            if (helper)
-              helpers.delete(helper);
-          });
-          // title never resolved within the budget -> show the name so the module isn't withheld.
-          setTimeout(() => {
-            if (watchers.has(m) && !records.has(m))
-              apply(null);
-          }, titleTimeoutMs);
-        }
-      };
-      let stopped = false;
-      (async () => {
-        while (!stopped) {
-          try {
-            reconcile();
-          } catch (e) {
-          }
-          await new Promise(r => setTimeout(r, rescanMs));
-        }
-      })();
-      try {
-        while (true) {
-          pending = false;
-          if (dirty) {
-            dirty = false;
-            yield new Map(records);
-          }
-          // cumulative snapshot, reflecting adds/deletes/title changes
-          if (!pending) {
-            await new Promise(resolve => {
-              wake = resolve;
-              if (pending) {
-                wake = null;
-                resolve();
-              }
-            });
-          }
-        }
-      } finally {
-        stopped = true;
-        for (const cancel of watchers.values()) {
-          try {
-            cancel();
-          } catch (e) {
-          }
-        }
-      }
-    }();
-  };
+        }();
+    };
 };
-const _u5mxf8 = function _forcePeek(){return(
-() => {
-  return (variable, {
-    forever = false
-  } = {}) => {
-    if (variable._value)
-      return variable._value;
-    let peeker;
-    const promise = new Promise((fulfilled, rejected) => {
-      peeker = variable._module.variable({
-        fulfilled,
-        rejected
-      }).define([variable._name], m => m);
-    });
-    if (!forever)
-      promise.finally(() => peeker.delete());
-    return Promise.race([
-      promise,
-      new Promise((_, r) => setTimeout(r, 1000))
-    ]);
-  };
-}
-)};
-const _19om6rd = function _moduleTitle(observeVariable)
-{
-  return function moduleTitle(module, onTitle) {
-    // Observes a module's title-defining cell and calls onTitle(title|null) on every change.
-    // Returns { cancel, helper }: cancel stops observing; helper is the forcing variable (or null).
-    // A named title cell gets a reachable deriving observer (the helper), which forces the cell to
-    // compute even when nothing else observes it (e.g. a fresh runtime) and re-fires when the cell is
-    // redefined. The caller must exclude `helper` from module-ownership so it doesn't keep a deleted
-    // module alive. An anonymous title cell falls back to a passive observe (works when the cell is
-    // already reachable, e.g. an on-screen notebook). The title cell is tracked by reference;
-    // repositioning so a different cell becomes the title source is not picked up.
-    const rt = module._runtime;
-    const vars = [...rt._variables].filter(v => v && v._module === module && v._definition);
-    const candidates = vars.filter(v => {
-      const n = v._name;
-      if (v._type != 1)
-        return false;
-      if (n == null)
-        return true;
-      if (typeof n !== 'string')
-        return true;
-      if (n.startsWith('dynamic observe '))
-        return false;
-      if (n.startsWith('module '))
-        return false;
-      return true;
-    });
-    if (candidates.length === 0) {
-      onTitle(null);
-      return {
-        cancel: () => {
-        },
-        helper: null
-      };
-    }
-    const first = candidates.find(v => typeof v._id === 'number' && Number.isFinite(v._id)) ? candidates.reduce((a, b) => (a._id ?? Infinity) <= (b._id ?? Infinity) ? a : b) : candidates[0];
-    const extract = v => {
-      if (v == null)
-        return null;
-      if (typeof v === 'string')
-        return v.trim() || null;
-      if (v.tagName) {
-        if (v.tagName == 'H1')
-          return v.textContent;
-        const h1 = v.querySelector?.('h1');
-        if (h1)
-          return (h1.textContent ?? '').trim() || null;
-        return null;
-      }
-      if (v.textContent)
-        return (v.textContent ?? '').trim() || null;
-      return null;
-    };
-    if (typeof first._name === 'string' && first._name) {
-      const peeker = module.variable({
-        fulfilled: value => onTitle(extract(value)),
-        rejected: () => onTitle('Err')
-      }).define([first._name], x => x);
-      let done = false;
-      return {
-        helper: peeker,
-        cancel: () => {
-          if (done)
-            return;
-          done = true;
-          try {
-            peeker.delete();
-          } catch (e) {
-          }
+const _19om6rd = function _moduleTitle(observeVariable) {
+    return function moduleTitle(module, onTitle) {
+        // Observes a module's title-defining cell and calls onTitle(title|null) on every change.
+        // Returns a cancel fn. The fixed observe() forces a lazy title cell to compute (and replays
+        // the current value on attach), so no in-module forcing helper is needed — works for named
+        // and anonymous cells alike, even in a fresh runtime nothing else observes.
+        const rt = module._runtime;
+        const candidates = [...rt._variables].filter(v => {
+            if (!v || v._module !== module || !v._definition || v._type != 1)
+                return false;
+            const n = v._name;
+            if (typeof n === 'string' && (n.startsWith('dynamic observe ') || n.startsWith('module ')))
+                return false;
+            return true;
+        });
+        if (candidates.length === 0) {
+            onTitle(null);
+            return () => {
+            };
         }
-      };
-    }
-    const stop = observeVariable(first, {
-      fulfilled: value => onTitle(extract(value)),
-      error: () => onTitle('Err')
-    });
-    return {
-      helper: null,
-      cancel: () => {
-        try {
-          stop();
-        } catch (e) {
-        }
-      }
+        const first = candidates.reduce((a, b) => (a._id ?? Infinity) <= (b._id ?? Infinity) ? a : b);
+        const extract = v => {
+            if (v == null)
+                return null;
+            if (typeof v === 'string')
+                return v.trim() || null;
+            if (v.tagName) {
+                if (v.tagName == 'H1')
+                    return v.textContent;
+                const h1 = v.querySelector?.('h1');
+                if (h1)
+                    return (h1.textContent ?? '').trim() || null;
+                return null;
+            }
+            if (v.textContent)
+                return (v.textContent ?? '').trim() || null;
+            return null;
+        };
+        const stop = observeVariable(first, {
+            fulfilled: value => onTitle(extract(value)),
+            error: () => onTitle('Err')
+        });
+        return () => {
+            try {
+                stop();
+            } catch (e) {
+            }
+        };
     };
-  };
 };
 const _16wishc = function _6(Inputs,currentModules){return(
 Inputs.table([...currentModules.values()], {
@@ -17987,8 +17923,7 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/observable-runtime-v6", async () => runtime.module((await import("/@tomlarkworthy/observable-runtime-v6.js?v=4")).default));  
   $def("_s7bl1p", null, ["md"], _s7bl1p);  
   $def("_1eaa9lr", "currentModules", ["modules"], _1eaa9lr);  
-  $def("_1fx8jm6", "modules", ["runtime","forcePeek","moduleTitle"], _1fx8jm6);  
-  $def("_u5mxf8", "forcePeek", [], _u5mxf8);  
+  $def("_1fx8jm6", "modules", ["runtime","observeVariable","moduleTitle"], _1fx8jm6);  
   $def("_19om6rd", "moduleTitle", ["observeVariable"], _19om6rd);  
   $def("_16wishc", null, ["Inputs","currentModules"], _16wishc);  
   main.define("observeVariable", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observe", "observeVariable", _));  
@@ -18008,7 +17943,8 @@ export default function define(runtime, observer) {
   $def("_1pyw6cd", "test_reflectsDelete", ["Runtime","modules"], _1pyw6cd);  
   $def("_1wyvqwc", "test_reflectsTitleUpdate", ["Runtime","modules"], _1wyvqwc);
   return main;
-}</script>
+}
+</script>
 <script id="@tomlarkworthy/observable-runtime/runtime.js.gz" 
   type="text/plain"
   data-encoding="base64"
@@ -22252,213 +22188,229 @@ const _1hx65vf = function _no_observer(main)
     variable.delete();
     return symbol;
 };
-const _duwj4o = function _observe(Element,Text,trace_variable,$0,no_observer,queueMicrotask)
+const _1pdsfy5 = function _observe(Element,Text,trace_variable,$0,no_observer,queueMicrotask)
 {
-    return function observe(v, observer, {invalidation, detachNodes = false} = {}) {
-        // --- instrumentation (improved) ---
-        // Give each observe() call a stable id so you can correlate events.
-        const observe_id = `${ v?._name || '<anon>' }@${ Date.now() }@${ Math.random().toString(16).slice(2) }`;
-        const snapshot = (extra = {}) => ({
-            t: Date.now(),
-            observe_id,
-            var_name: v?._name,
-            var_version: v?._version,
-            var_reachable: v?._reachable,
-            has_observer: v?._observer != null,
-            observer_has_node: !!observer?._node,
-            v_value_defined: v?._value !== undefined,
-            v_value_ctor: v?._value?.constructor?.name,
-            v_value_is_node: v?._value instanceof Element || v?._value instanceof Text || false,
-            v_promise: !!v?._promise,
+  return function observe(
+    v,
+    observer,
+    { invalidation, detachNodes = false } = {}
+  ) {
+    // --- instrumentation (improved) ---
+    // Give each observe() call a stable id so you can correlate events.
+    const observe_id = `${v?._name || "<anon>"}@${Date.now()}@${Math.random()
+      .toString(16)
+      .slice(2)}`;
+    const snapshot = (extra = {}) => ({
+      t: Date.now(),
+      observe_id,
+      var_name: v?._name,
+      var_version: v?._version,
+      var_reachable: v?._reachable,
+      has_observer: v?._observer != null,
+      observer_has_node: !!observer?._node,
+      v_value_defined: v?._value !== undefined,
+      v_value_ctor: v?._value?.constructor?.name,
+      v_value_is_node:
+        v?._value instanceof Element || v?._value instanceof Text || false,
+      v_promise: !!v?._promise,
+      ...extra
+    });
+    const emit = (event, extra = {}) => {
+      if (v?._name !== trace_variable) return;
+      try {
+        $0.value = $0.value.concat([
+          snapshot({
+            event,
             ...extra
-        });
-        const emit = (event, extra = {}) => {
-            if (v?._name !== trace_variable)
-                return;
-            try {
-                $0.value = $0.value.concat([snapshot({
-                        event,
-                        ...extra
-                    })]);
-            } catch {
-            }
-        };
-        emit('observe:begin', { detachNodes });
-        const cancels = new Set();
-        let cancelled = false;
-        const cancel = () => {
-            emit('observe:cancel_called');
-            if (cancelled)
-                return;
-            cancelled = true;
-            for (const f of cancels) {
-                try {
-                    f();
-                } catch {
-                }
-            }
-            cancels.clear();
-        };
-        if (invalidation)
-            Promise.resolve(invalidation).then(() => {
-                emit('observe:invalidation_fired');
-                cancel();
-            });
-        const isNode = value => value instanceof Element || value instanceof Text;
-        const stealIfNeeded = (value, reason) => {
-            const canSteal = detachNodes && isNode(value) && observer?._node && observer._node !== value.parentNode;
-            emit('observe:steal_check', {
-                reason,
-                canSteal,
-                value_ctor: value?.constructor?.name,
-                value_parent: value?.parentNode?.constructor?.name
-            });
-            if (canSteal) {
-                try {
-                    value.remove();
-                } catch {
-                }
-                emit('observe:steal_detached', { reason });
-            }
-        };
-        const hasExistingObserver = v && v._observer != null && v._observer?.description !== no_observer.description;
-        // cross realm support
-        emit('observe:hasExistingObserver', { hasExistingObserver });
-        // --- attach/wrap ---
-        if (!hasExistingObserver) {
-            emit('observe:attach:direct_install');
-            if (v && !v._reachable) {
-                v._reachable = true;
-                v._module._runtime._dirty.add(v);
-                v._module._runtime._updates.add(v);
-                emit('observe:attach:marked_reachable');
-            }
-            const previous = v._observer;
-            v._observer = observer;
-            cancels.add(() => {
-                v._observer = previous;
-            });
-        } else {
-            emit('observe:attach:wrap_existing');
-            const prevObserver = v._observer;
-            for (const type of [
-                    'fulfilled',
-                    'rejected',
-                    'pending'
-                ]) {
-                const prev = prevObserver?.[type];
-                prevObserver[type] = (...args) => {
-                    emit(`observe:wrapped:${ type }:called`, { arg0_ctor: args[0]?.constructor?.name });
-                    // old observer first
-                    if (prev) {
-                        try {
-                            Reflect.apply(prev, prevObserver, args);
-                        } catch (e) {
-                            emit(`observe:wrapped:${ type }:prev_error`, { message: String(e) });
-                        }
-                        if (type === 'fulfilled')
-                            stealIfNeeded(args[0], 'wrap_existing:prev_fulfilled');
-                    }
-                    // then tap
-                    try {
-                        if (type === 'fulfilled')
-                            observer.fulfilled?.(args[0], v?._name);
-                        else if (type === 'rejected')
-                            observer.rejected?.(args[0], v?._name);
-                        else
-                            observer.pending?.();
-                        emit(`observe:wrapped:${ type }:tapped_ok`);
-                    } catch (e) {
-                        emit(`observe:wrapped:${ type }:tap_error`, { message: String(e) });
-                    }
-                };
-                cancels.add(() => {
-                    prevObserver[type] = prev;
-                });
-            }
-        }
-        // --- CATCH-UP REPLAY (BUG FIX) ---
-        // Snapshot version to avoid replaying stale results.
-        const versionAtAttach = v?._version;
-        emit('observe:catchup:scheduled', { versionAtAttach });
-        queueMicrotask(() => {
-            emit('observe:catchup:microtask_start', { cancelled });
-            if (cancelled)
-                return;
-            // mimic inspector: mark pending first
-            try {
-                observer.pending?.();
-                emit('observe:catchup:pending_sent');
-            } catch (e) {
-                emit('observe:catchup:pending_error', { message: String(e) });
-            }
-            // IMPORTANT: read CURRENT value at replay time
-            const valueNow = v?._value;
-            emit('observe:catchup:valueNow_snapshot', {
-                valueNow_defined: valueNow !== undefined,
-                valueNow_ctor: valueNow?.constructor?.name,
-                v_version_now: v?._version,
-                valueNow_outerHTML_prefix: v?._observer?._node?.outerHTML
-            });
-            if (valueNow !== undefined) {
-                if (v?._version !== versionAtAttach) {
-                    emit('observe:catchup:stale_skip_valueNow');
-                    return;
-                }
-                stealIfNeeded(valueNow, 'catchup:valueNow');
-                try {
-                    observer.fulfilled?.(valueNow, v?._name);
-                    emit('observe:catchup:fulfilled_sent_valueNow');
-                } catch (e) {
-                    emit('observe:catchup:fulfilled_error_valueNow', { message: String(e) });
-                }
-                return;
-            }
-            // optional fallback: attach-time promise (or current promise)
-            const p = v?._promise;
-            if (!p || typeof p.then !== 'function') {
-                emit('observe:catchup:no_value_no_promise');
-                return;
-            }
-            emit('observe:catchup:await_promise');
-            Promise.resolve(p).then(value => {
-                emit('observe:catchup:promise_fulfilled', {
-                    value_defined: value !== undefined,
-                    value_ctor: value?.constructor?.name,
-                    v_version_now: v?._version
-                });
-                if (cancelled)
-                    return;
-                if (v?._version !== versionAtAttach) {
-                    emit('observe:catchup:stale_skip_promise');
-                    return;
-                }
-                if (value === undefined)
-                    return;
-                stealIfNeeded(value, 'catchup:promise');
-                try {
-                    observer.fulfilled?.(value, v?._name);
-                    emit('observe:catchup:fulfilled_sent_promise');
-                } catch (e) {
-                    emit('observe:catchup:fulfilled_error_promise', { message: String(e) });
-                }
-            }, error => {
-                emit('observe:catchup:promise_rejected', { v_version_now: v?._version });
-                if (cancelled)
-                    return;
-                if (v?._version !== versionAtAttach)
-                    return;
-                try {
-                    observer.rejected?.(error, v?._name);
-                    emit('observe:catchup:rejected_sent_promise');
-                } catch (e) {
-                    emit('observe:catchup:rejected_error_promise', { message: String(e) });
-                }
-            });
-        });
-        emit('observe:end');
-        return cancel;
+          })
+        ]);
+      } catch {}
     };
+    emit("observe:begin", { detachNodes });
+    const cancels = new Set();
+    let cancelled = false;
+    const cancel = () => {
+      emit("observe:cancel_called");
+      if (cancelled) return;
+      cancelled = true;
+      for (const f of cancels) {
+        try {
+          f();
+        } catch {}
+      }
+      cancels.clear();
+    };
+    if (invalidation)
+      Promise.resolve(invalidation).then(() => {
+        emit("observe:invalidation_fired");
+        cancel();
+      });
+    const isNode = (value) => value instanceof Element || value instanceof Text;
+    const stealIfNeeded = (value, reason) => {
+      const canSteal =
+        detachNodes &&
+        isNode(value) &&
+        observer?._node &&
+        observer._node !== value.parentNode;
+      emit("observe:steal_check", {
+        reason,
+        canSteal,
+        value_ctor: value?.constructor?.name,
+        value_parent: value?.parentNode?.constructor?.name
+      });
+      if (canSteal) {
+        try {
+          value.remove();
+        } catch {}
+        emit("observe:steal_detached", { reason });
+      }
+    };
+    const hasExistingObserver =
+      v &&
+      v._observer != null &&
+      v._observer?.description !== no_observer.description;
+    // cross realm support
+    emit("observe:hasExistingObserver", { hasExistingObserver });
+    // --- attach/wrap ---
+    if (!hasExistingObserver) {
+      emit("observe:attach:direct_install");
+      if (v && !v._reachable) {
+        v._reachable = true;
+        v._module._runtime._dirty.add(v);
+        v._module._runtime._updates.add(v);
+        v._module._runtime._compute();
+        emit("observe:attach:marked_reachable");
+      }
+      const previous = v._observer;
+      v._observer = observer;
+      cancels.add(() => {
+        v._observer = previous;
+      });
+    } else {
+      emit("observe:attach:wrap_existing");
+      const prevObserver = v._observer;
+      for (const type of ["fulfilled", "rejected", "pending"]) {
+        const prev = prevObserver?.[type];
+        prevObserver[type] = (...args) => {
+          emit(`observe:wrapped:${type}:called`, {
+            arg0_ctor: args[0]?.constructor?.name
+          });
+          // old observer first
+          if (prev) {
+            try {
+              Reflect.apply(prev, prevObserver, args);
+            } catch (e) {
+              emit(`observe:wrapped:${type}:prev_error`, {
+                message: String(e)
+              });
+            }
+            if (type === "fulfilled")
+              stealIfNeeded(args[0], "wrap_existing:prev_fulfilled");
+          }
+          // then tap
+          try {
+            if (type === "fulfilled") observer.fulfilled?.(args[0], v?._name);
+            else if (type === "rejected")
+              observer.rejected?.(args[0], v?._name);
+            else observer.pending?.();
+            emit(`observe:wrapped:${type}:tapped_ok`);
+          } catch (e) {
+            emit(`observe:wrapped:${type}:tap_error`, { message: String(e) });
+          }
+        };
+        cancels.add(() => {
+          prevObserver[type] = prev;
+        });
+      }
+    }
+    // --- CATCH-UP REPLAY (BUG FIX) ---
+    // Snapshot version to avoid replaying stale results.
+    const versionAtAttach = v?._version;
+    emit("observe:catchup:scheduled", { versionAtAttach });
+    queueMicrotask(() => {
+      emit("observe:catchup:microtask_start", { cancelled });
+      if (cancelled) return;
+      // mimic inspector: mark pending first
+      try {
+        observer.pending?.();
+        emit("observe:catchup:pending_sent");
+      } catch (e) {
+        emit("observe:catchup:pending_error", { message: String(e) });
+      }
+      // IMPORTANT: read CURRENT value at replay time
+      const valueNow = v?._value;
+      emit("observe:catchup:valueNow_snapshot", {
+        valueNow_defined: valueNow !== undefined,
+        valueNow_ctor: valueNow?.constructor?.name,
+        v_version_now: v?._version,
+        valueNow_outerHTML_prefix: v?._observer?._node?.outerHTML
+      });
+      if (valueNow !== undefined) {
+        if (v?._version !== versionAtAttach) {
+          emit("observe:catchup:stale_skip_valueNow");
+          return;
+        }
+        stealIfNeeded(valueNow, "catchup:valueNow");
+        try {
+          observer.fulfilled?.(valueNow, v?._name);
+          emit("observe:catchup:fulfilled_sent_valueNow");
+        } catch (e) {
+          emit("observe:catchup:fulfilled_error_valueNow", {
+            message: String(e)
+          });
+        }
+        return;
+      }
+      // optional fallback: attach-time promise (or current promise)
+      const p = v?._promise;
+      if (!p || typeof p.then !== "function") {
+        emit("observe:catchup:no_value_no_promise");
+        return;
+      }
+      emit("observe:catchup:await_promise");
+      Promise.resolve(p).then(
+        (value) => {
+          emit("observe:catchup:promise_fulfilled", {
+            value_defined: value !== undefined,
+            value_ctor: value?.constructor?.name,
+            v_version_now: v?._version
+          });
+          if (cancelled) return;
+          if (v?._version !== versionAtAttach) {
+            emit("observe:catchup:stale_skip_promise");
+            return;
+          }
+          if (value === undefined) return;
+          stealIfNeeded(value, "catchup:promise");
+          try {
+            observer.fulfilled?.(value, v?._name);
+            emit("observe:catchup:fulfilled_sent_promise");
+          } catch (e) {
+            emit("observe:catchup:fulfilled_error_promise", {
+              message: String(e)
+            });
+          }
+        },
+        (error) => {
+          emit("observe:catchup:promise_rejected", {
+            v_version_now: v?._version
+          });
+          if (cancelled) return;
+          if (v?._version !== versionAtAttach) return;
+          try {
+            observer.rejected?.(error, v?._name);
+            emit("observe:catchup:rejected_sent_promise");
+          } catch (e) {
+            emit("observe:catchup:rejected_error_promise", {
+              message: String(e)
+            });
+          }
+        }
+      );
+    });
+    emit("observe:end");
+    return cancel;
+  };
 };
 const _16ohhcn = function _observeOld(trace_variable,_,no_observer,isnode,toObject,queueMicrotask,getPromiseState)
 {
@@ -22997,7 +22949,7 @@ export default function define(runtime, observer) {
   $def("_ya86a1", null, ["md"], _ya86a1);  
   $def("_tgfgv9", "trace_variable", [], _tgfgv9);  
   $def("_1hx65vf", "no_observer", ["main"], _1hx65vf);  
-  $def("_duwj4o", "observe", ["Element","Text","trace_variable","mutable trace_history","no_observer","queueMicrotask"], _duwj4o);  
+  $def("_1pdsfy5", "observe", ["Element","Text","trace_variable","mutable trace_history","no_observer","queueMicrotask"], _1pdsfy5);  
   $def("_16ohhcn", "observeOld", ["trace_variable","_","no_observer","isnode","toObject","queueMicrotask","getPromiseState"], _16ohhcn);  
   $def("_2kni3y", null, ["md"], _2kni3y);  
   $def("_1utnee9", "descendants", [], _1utnee9);  
