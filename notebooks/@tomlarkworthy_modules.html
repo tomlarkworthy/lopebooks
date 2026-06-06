@@ -27308,108 +27308,126 @@ const _1k18e1n = function _moduleTitle(observeVariable) {
         });
     };
 };
-const _1wix1di = function _modules(forcePeek,moduleTitle) {return (function modules(runtime, {titleTimeoutMs = 2000, rescanMs = 1000, load = true} = {}) {
-    if (!runtime || !runtime._variables)
-        throw 'Invalid runtime passed to modules';
-    return async function* () {
-        const emitted = new Set();
-        const inflight = new Set();
-        const queue = [];
-        let resolveWake, wake = new Promise(r => resolveWake = r);
-        const bump = () => {
-            const r = resolveWake;
-            wake = new Promise(res => resolveWake = res);
-            r();
-        };
-        const candidates = () => {
-            const out = [];
-            const builtin = runtime._builtin, bootloader = runtime.bootloader;
-            if (builtin)
-                out.push({
-                    module: builtin,
-                    name: 'builtin',
-                    title: 'Standard library'
-                });
-            if (bootloader)
-                out.push({
-                    module: bootloader,
-                    name: 'bootloader',
-                    title: 'Bootloader'
-                });
-            for (const [name, mod] of runtime.mains || new Map())
-                out.push({
-                    module: mod,
-                    name
-                });
-            for (const v of runtime._variables) {
-                if (!v._name || !v._name.startsWith('module ') || v._name.startsWith('module <unknown'))
-                    continue;
-                const mod = v._value;
-                if (mod && typeof mod === 'object')
+const _1wix1di = function _modules(runtime,forcePeek,moduleTitle) {
+    const _runtime = runtime;
+    // default: the current runtime
+    return function modules({runtime = _runtime, titleTimeoutMs = 2000, rescanMs = 1000, load = true} = {}) {
+        if (!runtime || !runtime._variables)
+            throw 'Invalid runtime passed to modules';
+        return async function* () {
+            const records = new Map();
+            // module -> fully-formed record, accumulated
+            const emitted = new Set();
+            // modules already in `records`
+            const inflight = new Set();
+            // modules being titled + module-vars being force-loaded
+            // Edge-safe change signal: `pending` latches a change even if it lands while we are
+            // suspended at `yield` (an unguarded promise-wake would lose those edges and stall).
+            let pending = false;
+            let wake = null;
+            const bump = () => {
+                pending = true;
+                if (wake) {
+                    const w = wake;
+                    wake = null;
+                    w();
+                }
+            };
+            const candidates = () => {
+                const out = [];
+                const builtin = runtime._builtin, bootloader = runtime.bootloader;
+                if (builtin)
+                    out.push({
+                        module: builtin,
+                        name: 'builtin',
+                        title: 'Standard library'
+                    });
+                if (bootloader)
+                    out.push({
+                        module: bootloader,
+                        name: 'bootloader',
+                        title: 'Bootloader'
+                    });
+                for (const [name, mod] of runtime.mains || new Map())
                     out.push({
                         module: mod,
-                        name: v._name.slice(7),
-                        variable: v
+                        name
                     });
-                else if (load && !inflight.has(v)) {
-                    inflight.add(v);
-                    Promise.resolve(forcePeek(v)).then(bump, bump);
+                for (const v of runtime._variables) {
+                    if (!v._name || !v._name.startsWith('module ') || v._name.startsWith('module <unknown'))
+                        continue;
+                    const mod = v._value;
+                    if (mod && typeof mod === 'object')
+                        out.push({
+                            module: mod,
+                            name: v._name.slice(7),
+                            variable: v
+                        });
+                    else if (load && !inflight.has(v)) {
+                        inflight.add(v);
+                        Promise.resolve(forcePeek(v)).then(bump, bump);
+                    }
                 }
-            }
-            return out;
-        };
-        const consider = c => {
-            if (emitted.has(c.module) || inflight.has(c.module))
-                return;
-            inflight.add(c.module);
-            const titleP = c.title != null ? Promise.resolve(c.title) : Promise.race([
-                moduleTitle(c.module),
-                new Promise(r => setTimeout(() => r(null), titleTimeoutMs))
-            ]);
-            titleP.then(t => {
-                inflight.delete(c.module);
-                if (emitted.has(c.module))
+                return out;
+            };
+            const consider = c => {
+                if (emitted.has(c.module) || inflight.has(c.module))
                     return;
-                emitted.add(c.module);
-                queue.push({
-                    name: c.name,
-                    title: t ?? c.name,
-                    module: c.module,
-                    variable: c.variable
+                inflight.add(c.module);
+                const titleP = c.title != null ? Promise.resolve(c.title) : Promise.race([
+                    moduleTitle(c.module),
+                    new Promise(r => setTimeout(() => r(null), titleTimeoutMs))
+                ]);
+                titleP.then(t => {
+                    inflight.delete(c.module);
+                    if (emitted.has(c.module))
+                        return;
+                    emitted.add(c.module);
+                    records.set(c.module, {
+                        name: c.name,
+                        title: t ?? c.name,
+                        module: c.module,
+                        variable: c.variable
+                    });
+                    bump();
+                }, () => {
+                    inflight.delete(c.module);
                 });
-                bump();
-            }, () => {
-                inflight.delete(c.module);
-            });
-        };
-        let stopped = false;
-        (async () => {
-            while (!stopped) {
-                for (const c of candidates())
-                    consider(c);
-                await new Promise(r => setTimeout(r, rescanMs));
+            };
+            let stopped = false;
+            (async () => {
+                while (!stopped) {
+                    for (const c of candidates())
+                        consider(c);
+                    await new Promise(r => setTimeout(r, rescanMs));
+                }
+            })();
+            try {
+                let lastSize = -1;
+                while (true) {
+                    pending = false;
+                    if (records.size !== lastSize) {
+                        lastSize = records.size;
+                        yield new Map(records);
+                    }
+                    // cumulative snapshot
+                    if (!pending) {
+                        await new Promise(resolve => {
+                            wake = resolve;
+                            if (pending) {
+                                wake = null;
+                                resolve();
+                            }
+                        });
+                    }
+                }
+            } finally {
+                stopped = true;
             }
-        })();
-        try {
-            while (true) {
-                while (queue.length)
-                    yield queue.shift();
-                await wake;
-            }
-        } finally {
-            stopped = true;
-        }
-    }();
-});};
-const _qujlrg = async function* _currentModules(modules,runtime) {
-    const map = new Map();
-    for await (const record of modules(runtime)) {
-        map.set(record.module, record);
-        yield new Map(map);
-    }
+        }();
+    };
 };
-const _9ayfmc = function _anonymous(md) {return (md`# Modules
-Streaming API over a runtime's modules. \`modules(runtime)\` is an async generator that yields one fully-formed \`{name, title, module}\` record per module as soon as its title resolves — no partial records, no dependency graph. \`currentModules\` accumulates the stream into a live Map.`);};
+const _qujlrg = function _currentModules(modules) {return (modules());};
 const _1xih10s = function _anonymous(Inputs,currentModules) {return (Inputs.table([...currentModules.values()], {
     columns: [
         'name',
@@ -27417,6 +27435,13 @@ const _1xih10s = function _anonymous(Inputs,currentModules) {return (Inputs.tabl
     ],
     format: { name: x => x }
 }));};
+const _82wmiz = function _anonymous(md) {return (md`# Modules
+
+Streaming API over a runtime's modules. \`modules(options?)\` is an async generator that yields a **cumulative \`Map\`** (module → \`{name, title, module, variable}\`) of every fully-formed record known so far, growing as modules resolve. Each yield is a complete snapshot, so a consumer that samples it — Observable may drop intermediate generator values — never loses a module.
+
+Options (all optional, passed as the first argument): \`{ runtime = <current runtime>, titleTimeoutMs = 2000, rescanMs = 1000, load = true }\`. A zero-arg \`modules()\` uses the current runtime.
+
+\`currentModules\` is \`modules()\` — the live Map for the current runtime.`);};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -27429,10 +27454,10 @@ export default function define(runtime, observer) {
   main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));  
   $def("_1exikgz", "forcePeek", [], _1exikgz);  
   $def("_1k18e1n", "moduleTitle", ["observeVariable"], _1k18e1n);  
-  $def("_1wix1di", "modules", ["forcePeek","moduleTitle"], _1wix1di);  
-  $def("_qujlrg", "currentModules", ["modules","runtime"], _qujlrg);  
-  $def("_9ayfmc", null, ["md"], _9ayfmc);  
-  $def("_1xih10s", null, ["Inputs","currentModules"], _1xih10s);
+  $def("_1wix1di", "modules", ["runtime","forcePeek","moduleTitle"], _1wix1di);  
+  $def("_qujlrg", "currentModules", ["modules"], _qujlrg);  
+  $def("_1xih10s", null, ["Inputs","currentModules"], _1xih10s);  
+  $def("_82wmiz", null, ["md"], _82wmiz);
   return main;
 }
 </script>
