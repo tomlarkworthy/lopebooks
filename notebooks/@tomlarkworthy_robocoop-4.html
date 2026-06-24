@@ -29522,11 +29522,35 @@ const _editTools = function _editTools(defineTool, rc4_workspace, currentModules
   const writeText = (p, s) => fs.writeFile(p, new TextEncoder().encode(String(s ?? '')));
   const apply = jbApply({ currentModules, runtime, probeDefine, createModule });
 
+  // Is module `id` already live? (module-map Map is keyed Module->{name}; modules don't expose _name.)
+  const moduleExists = (id) => {
+    try {
+      const cm = currentModules && (typeof currentModules.values === 'function' ? currentModules : currentModules.value);
+      return !!(cm && typeof cm.values === 'function' && [...cm.values()].some((e) => e && e.name === id));
+    } catch (e) { return false; }
+  };
+  // B14 — drop a newly-created VISUAL module into the live lopepage view (the shared surface) so the agent's
+  // creation appears where the human is looking, not behind the module lookup. Fires the same non-destructive
+  // `open=` hash intent the lookup menu uses (sync_layout_from_url merges it via treeSyncGolden → addItem;
+  // existing panes, including this running agent, are preserved). Best-effort; never throws.
+  const surfaceInView = (id) => {
+    try {
+      if (typeof location === 'undefined') return false;
+      let h = (location.hash || '').replace(/^#/, '');
+      const intent = 'open=' + id;
+      h = /(^|&)open=/.test(h) ? h.replace(/(^|&)open=[^&]*/, '$1' + intent) : (h + (h ? '&' : '') + intent);
+      if (('#' + h) === location.hash) return false;   // identical → no hashchange would fire
+      location.hash = h;
+      return true;
+    } catch (e) { return false; }
+  };
+
   // Apply a just-written /notebook module; returns {ok,msg} or null when the path is not a live module file.
   const applyModuleFile = async (path) => {
     const m = /^\/notebook\/(.+)\.js$/.exec(path);
     if (!m) return null;
     const id = m[1];
+    const wasNew = !moduleExists(id);
     let src;
     try { src = await readText(path); } catch (e) { return { ok: false, msg: 'could not read back ' + path }; }
     if (!/export\s+default/.test(src)) return { ok: false, msg: 'written, but not an importable module (no `export default`) — not applied' };
@@ -29539,7 +29563,9 @@ const _editTools = function _editTools(defineTool, rc4_workspace, currentModules
       if (!r.applied) return { ok: false, msg: 'written, but not applied: ' + (r.reason || 'unknown') };
       if (r.changes > 0) { try { const ex = await exportModuleJS(id); await writeText(path, ex.source); } catch (e) {} }
       const n = r.changes || 0;
-      return { ok: true, msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' };
+      // a brand-new module with a display cell → surface it in the shared view (B14)
+      const surfaced = wasNew && /\bviewof\s|\bmd`|\bhtml`/.test(src) && surfaceInView(id);
+      return { ok: true, msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' · opened in the shared view so the human can see it' : '') };
     } catch (e) {
       return { ok: false, msg: 'written, but FAILED TO COMPILE: ' + (e && e.message || e) + ' — live runtime unchanged; fix and re-edit' };
     } finally { URL.revokeObjectURL(url); }
