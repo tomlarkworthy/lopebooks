@@ -29901,23 +29901,36 @@ const _facade = function _facade(html, md, session, $key, $model, $prompt){
     return arg ? name + " " + String(arg).split("/").pop() : (name || "tool");
   };
 
+  // Memoized render: md-parse each message bubble ONCE per content change (cached by message identity in a
+  // WeakMap), reuse the node otherwise, then reconcile with replaceChildren (which reorders the SAME nodes,
+  // no re-parse, no flicker). Prior messages have stable content so they are never re-parsed — a streaming
+  // turn costs O(changed bubbles), not O(n²) full re-parses on every step/text callback.
+  const msgCache = new WeakMap();
+  const renderMsg = (m) => {
+    if (m.role === "user") return bubble("right", C.user, renderContent(m.content));
+    if (m.role === "assistant" && m.content) {
+      let node; try { node = md`${String(m.content)}`; } catch { node = document.createTextNode(String(m.content)); }
+      return bubble("left", C.asst, node);
+    }
+    return null;   // tool messages / empty assistant turns don't show here (they're the agent's terminal)
+  };
   const render = () => {
-    log.innerHTML = "";
+    const desired = [];
     for (const m of session.messages) {
-      if (m.role === "user") {
-        log.append(bubble("right", C.user, renderContent(m.content)));
-      } else if (m.role === "assistant" && m.content) {
-        let node; try { node = md`${String(m.content)}`; } catch { node = document.createTextNode(String(m.content)); }
-        log.append(bubble("left", C.asst, node));
-      }
+      const c = msgCache.get(m);
+      let wrap;
+      if (c && (m.role === "user" || c.key === String(m.content ?? ""))) wrap = c.wrap;   // unchanged → reuse
+      else { wrap = renderMsg(m); msgCache.set(m, { key: String(m.content ?? ""), wrap }); }
+      if (wrap) desired.push(wrap);
     }
     for (const er of errors) {
       const d = document.createElement("div");
       d.style.cssText = "color:" + C.err + ";background:#2d0f0f;border:1px solid " + C.err +
         ";border-radius:8px;padding:6px 10px;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere";
       d.textContent = "⚠ agent error — " + er;
-      log.append(d);
+      desired.push(d);
     }
+    log.replaceChildren(...desired);
     log.scrollTop = log.scrollHeight;
   };
   render();
