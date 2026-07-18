@@ -5500,13 +5500,21 @@ function divToVar(runtime, div) {
   }
 }
 )};
-const _1usw8c2 = function _attachContextManu(Inputs,isOnObservableCom){return(
+const _1usw8c2 = async function _attachContextManu(Inputs,isOnObservableCom,optionsFile){return(
 Inputs.toggle({
   label: "attach menu",
-  value: !isOnObservableCom()
+  value: (await optionsFile.json())?.__attachMenu ?? !isOnObservableCom()
 })
 )};
 const _1oaz8r1 = (G, _) => G.input(_);
+const _pamenu = function _persist_attach_menu($0,attachContextManu,Event){
+  // Bake the global edit-mode flag into cell_options.json so it survives export/fork.
+  // Depends on `viewof options` (element, stable), not `options` (value), so this
+  // write does not re-trigger itself; save_options then persists the attachment.
+  $0.value.__attachMenu = attachContextManu;
+  $0.dispatchEvent(new Event("input"));
+  return "persist_attach_menu";
+};
 const _16ks4jz = function _12(md){return(
 md`## \`cellEditor\` component
 
@@ -5540,7 +5548,7 @@ lookupVariable(
   editorModule
 )
 )};
-const _1q95xt6 = function _cellEditor(cloneDataflow,editorTemplate,shellTemplate,getOption,Event,setOption,createCell,findCell,pinOnCreate){return(
+const _1q95xt6 = function _cellEditor(cloneDataflow,editorTemplate,shellTemplate,getOption,Event,setOption,createCell,findCell,pinOnCreate,dragReorder){return(
 (variable, {
     pinned = undefined
 } = {}) => {
@@ -5629,6 +5637,18 @@ const _1q95xt6 = function _cellEditor(cloneDataflow,editorTemplate,shellTemplate
                             createCell({ cell: findCell(variable) });
                         });
                         hotbar.prepend(add);
+                    }
+                    // Drag the whole hotbar to reorder this cell (alternative to up/down arrows).
+                    if (hotbar && !hotbar.dataset.reorderable) {
+                        hotbar.dataset.reorderable = '1';
+                        hotbar.style.cursor = 'grab';
+                        const grip = document.createElement('span');
+                        grip.className = 'reorder-grip';
+                        grip.textContent = '⠿'; // ⠿ drag handle
+                        grip.title = 'Drag to reorder cell';
+                        grip.style.cssText = 'margin-right: 6px; opacity: 0.55;';
+                        hotbar.prepend(grip);
+                        dragReorder(variable, hotbar);
                     }
                     if (body)
                         syncOpen();
@@ -6122,6 +6142,170 @@ async (cell, amount) =>
     }
   })
 )};
+const _mvbs01 = function _moveCellBeside($0){return(
+async (cell, target, placeAfter = false) =>
+  $0.send({
+    command: "moveCellBeside",
+    args: {
+      cell,
+      target,
+      placeAfter
+    }
+  })
+)};
+const _drag01 = function _dragReorder(runtime,divToVar,findCell,moveCellBeside){return(
+(variable, handle) => {
+  if (!document.getElementById('lope-reorder-style')) {
+    const s = document.createElement('style');
+    s.id = 'lope-reorder-style';
+    s.textContent =
+      'body.lope-reordering, body.lope-reordering * { user-select: none !important; cursor: grabbing !important; }';
+    document.head.appendChild(s);
+  }
+
+  const THRESH = 5;
+  let pointerId = null, dragging = false, startX = 0, startY = 0;
+  let cells = null, ownIndex = -1, scroller = null, indicator = null;
+
+  // Same-module visible cells in DOM order; one entry per rendered .observablehq div.
+  const getModuleCells = () => {
+    const mod = variable._module;
+    const out = [];
+    for (const div of document.querySelectorAll('.observablehq')) {
+      const v = divToVar(runtime, div);
+      if (v && v._module === mod) out.push({ div, v });
+    }
+    return out;
+  };
+
+  const ensureIndicator = () => {
+    if (indicator) return indicator;
+    indicator = document.createElement('div');
+    indicator.style.cssText =
+      'position: fixed; height: 0; z-index: 2147483646; pointer-events: none;' +
+      'border-top: 2px solid var(--theme-foreground-focus, #3b5bdb);';
+    document.body.appendChild(indicator);
+    return indicator;
+  };
+  const removeIndicator = () => { if (indicator) { indicator.remove(); indicator = null; } };
+
+  // gap 0..N: how many cells sit above pointer Y (by their vertical midpoint).
+  const gapAt = (y) => {
+    for (let i = 0; i < cells.length; i++) {
+      const r = cells[i].div.getBoundingClientRect();
+      if (y < r.top + r.height / 2) return i;
+    }
+    return cells.length;
+  };
+
+  const drawIndicator = (g) => {
+    const ind = ensureIndicator();
+    const ref = cells[Math.min(ownIndex, cells.length - 1)].div.getBoundingClientRect();
+    const y = g < cells.length
+      ? cells[g].div.getBoundingClientRect().top
+      : cells[cells.length - 1].div.getBoundingClientRect().bottom;
+    ind.style.left = ref.left + 'px';
+    ind.style.width = ref.width + 'px';
+    ind.style.top = (y - 1) + 'px';
+  };
+
+  const autoScroll = (y) => {
+    if (!scroller) return;
+    const r = scroller.getBoundingClientRect
+      ? scroller.getBoundingClientRect()
+      : { top: 0, bottom: window.innerHeight };
+    const M = 36;
+    let dy = 0;
+    if (y < r.top + M) dy = -Math.ceil((r.top + M - y) / 3);
+    else if (y > r.bottom - M) dy = Math.ceil((y - (r.bottom - M)) / 3);
+    if (dy && scroller.scrollBy) scroller.scrollBy({ top: dy });
+  };
+
+  const beginDrag = () => {
+    cells = getModuleCells();
+    ownIndex = cells.findIndex(c => c.v === variable);
+    if (ownIndex < 0) return false;
+    dragging = true;
+    scroller = cells[ownIndex].div.closest('.lm_content')
+      || document.scrollingElement || document.documentElement;
+    document.body.classList.add('lope-reordering');
+    handle.style.cursor = 'grabbing';
+    return true;
+  };
+
+  const onMove = (e) => {
+    if (pointerId == null) return;
+    if (!dragging) {
+      if (Math.abs(e.clientX - startX) < THRESH && Math.abs(e.clientY - startY) < THRESH) return;
+      if (!beginDrag()) return;
+    }
+    e.preventDefault();
+    drawIndicator(gapAt(e.clientY));
+    autoScroll(e.clientY);
+  };
+
+  const teardown = () => {
+    if (pointerId != null && handle.releasePointerCapture) {
+      try { handle.releasePointerCapture(pointerId); } catch (_) {}
+    }
+    handle.removeEventListener('pointermove', onMove);
+    handle.removeEventListener('pointerup', onUp);
+    handle.removeEventListener('pointercancel', onCancel);
+    handle.style.cursor = '';
+    document.body.classList.remove('lope-reordering');
+    removeIndicator();
+  };
+
+  const onUp = (e) => {
+    const wasDragging = dragging;
+    let target, placeAfter = false, ownDiv = null, doMove = false;
+    if (wasDragging) {
+      ownDiv = cells[ownIndex].div;
+      const g = gapAt(e.clientY);
+      // Drop in own slot (just above or below self) is a no-op.
+      if (g !== ownIndex && g !== ownIndex + 1) {
+        doMove = true;
+        if (g < cells.length) {
+          target = cells[g].v;         // insert before the cell now at the gap
+        } else {
+          target = cells[cells.length - 1].v;  // dropped past the last visible cell
+          placeAfter = true;
+        }
+      }
+    }
+    teardown();
+    pointerId = null; dragging = false; cells = null; ownIndex = -1; scroller = null;
+    if (wasDragging) {
+      // Suppress the click that would otherwise toggle the editor open/closed.
+      const stop = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+      handle.addEventListener('click', stop, { capture: true, once: true });
+      setTimeout(() => handle.removeEventListener('click', stop, { capture: true }), 0);
+      if (doMove) moveCellBeside(findCell(variable, ownDiv), target, placeAfter);
+    }
+  };
+
+  const onCancel = () => {
+    teardown();
+    pointerId = null; dragging = false; cells = null; ownIndex = -1; scroller = null;
+  };
+
+  const onDown = (e) => {
+    if (e.button != null && e.button !== 0) return;
+    if (e.target && e.target.closest && e.target.closest('.add-cell-btn')) return;
+    pointerId = e.pointerId;
+    startX = e.clientX; startY = e.clientY;
+    dragging = false;
+    if (handle.setPointerCapture) { try { handle.setPointerCapture(e.pointerId); } catch (_) {} }
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onCancel);
+  };
+
+  handle.addEventListener('pointerdown', onDown);
+  handle.style.touchAction = 'none';
+  return () => handle.removeEventListener('pointerdown', onDown);
+}
+)};
 const _pinoncr = function _pinOnCreate(){return(
 new Set()  // variable pids to open (pin) their editor as soon as the cell mounts
 )};
@@ -6186,7 +6370,7 @@ const _1rhoxk2 = function _findVariableIndex(runtime){return(
 (variable, variables = runtime._variables) =>
   [...variables].findIndex((vi) => vi === variable)
 )};
-const _2pkmxz = async function _command_processor(command,$0,compile_and_update,remove_variables,$1,findCellIndex,lookupCellByIndex,findVariableIndex,repositionSetElement,runtime,selectVariable,$2,pinOnCreate)
+const _2pkmxz = async function _command_processor(command,$0,compile_and_update,remove_variables,$1,findCellIndex,lookupCellByIndex,findVariableIndex,repositionSetElement,runtime,selectVariable,$2,pinOnCreate,findCell)
 {
     if (command.processed)
         return;
@@ -6242,6 +6426,35 @@ const _2pkmxz = async function _command_processor(command,$0,compile_and_update,
                     });
                 }
             }
+        }
+        result = true;
+    } else if (command.command == 'moveCellBeside') {
+        // Drag-drop reorder: place cell's variables immediately before (or, with
+        // placeAfter, after) the anchor cell that `target` belongs to. Repositions by
+        // variable identity, not cell index, so hidden/import/template variables
+        // between visible cells don't skew the destination. The anchor is resolved to
+        // its whole cell so multi-variable cells (viewof/mutable) aren't split, and a
+        // drop past the last visible cell anchors to it (placeAfter) rather than to the
+        // module's far-off last dynamic variable.
+        const { cell, target, placeAfter } = command.args;
+        const anchorCell = findCell(target);
+        const arr = Array.from(runtime._variables);
+        const groupSet = new Set(cell.variables);
+        const group = arr.filter(v => groupSet.has(v));
+        const without = arr.filter(v => !groupSet.has(v));
+        let insertAt = -1;
+        if (anchorCell?.variables?.length) {
+            const idxs = anchorCell.variables
+                .map(v => without.indexOf(v))
+                .filter(i => i >= 0);
+            if (idxs.length)
+                insertAt = placeAfter ? Math.max(...idxs) + 1 : Math.min(...idxs);
+        }
+        if (insertAt >= 0 && group.length) {
+            without.splice(insertAt, 0, ...group);
+            runtime._variables.clear();
+            without.forEach(v => runtime._variables.add(v));
+            await selectVariable(cell.variables[0], cell.dom);
         }
         result = true;
     }
@@ -6916,12 +7129,13 @@ const _w5q3yf = function _editorModule(thisModule){return(
 thisModule()
 )};
 const _18kaj2p = (G, _) => G.input(_);
-const _yn5gyd = function _editor_jobs(command_processor,submit_summary,save_options)
+const _yn5gyd = function _editor_jobs(command_processor,submit_summary,save_options,persist_attach_menu)
 {
   //editedCell;
   command_processor;
   submit_summary;
   save_options;
+  persist_attach_menu;
   return "editor_jobs";
 };
 const _1whoy5n = function _91(md){return(
@@ -7269,11 +7483,11 @@ export default function define(runtime, observer) {
   $def("_hdieof", "editors", [], _hdieof);  
   $def("_ipx6cz", "auto_attach", ["keepalive","editorModule","syncers","attachContextManu","divToVar","runtime","editors","cellEditor"], _ipx6cz);  
   $def("_1iwobxt", "divToVar", [], _1iwobxt);  
-  $def("_1usw8c2", "viewof attachContextManu", ["Inputs","isOnObservableCom"], _1usw8c2);  
+  $def("_1usw8c2", "viewof attachContextManu", ["Inputs","isOnObservableCom","optionsFile"], _1usw8c2);
   $def("_1oaz8r1", "attachContextManu", ["Generators","viewof attachContextManu"], _1oaz8r1);  
   $def("_16ks4jz", null, ["md"], _16ks4jz);  
   $def("_199ztvl", "hotbarTemplate", ["lookupVariable","editorModule"], _199ztvl);  
-  $def("_1q95xt6", "cellEditor", ["cloneDataflow","editorTemplate","shellTemplate","getOption","Event","setOption","createCell","findCell","pinOnCreate"], _1q95xt6);
+  $def("_1q95xt6", "cellEditor", ["cloneDataflow","editorTemplate","shellTemplate","getOption","Event","setOption","createCell","findCell","pinOnCreate","dragReorder"], _1q95xt6);
   $def("_x5ixji", "hotbar_shell", ["viewof edit","Event","htl","edit"], _x5ixji);  
   $def("_1ed5zb9", "editor_panel", ["viewof editedCell","htl","toolbar","nav","reversibleAttach","combine","code_editor"], _1ed5zb9);  
   $def("_yk7udl", "shellTemplate", ["viewof editedCell","editedCell","selectVariable","viewof edit","edit","hotbar_shell","lookupVariable","editorModule"], _yk7udl);  
@@ -7317,7 +7531,9 @@ export default function define(runtime, observer) {
   $def("_rv7t7x", "code_editor_view", ["EditorView"], _rv7t7x);  
   $def("_xvo1n6", "code_editor", ["code_editor_view"], _xvo1n6);  
   $def("_1imarq2", null, ["md"], _1imarq2);  
-  $def("_470wv4", "moveCell", ["viewof command"], _470wv4);  
+  $def("_470wv4", "moveCell", ["viewof command"], _470wv4);
+  $def("_mvbs01", "moveCellBeside", ["viewof command"], _mvbs01);
+  $def("_drag01", "dragReorder", ["runtime","divToVar","findCell","moveCellBeside"], _drag01);  
   $def("_pinoncr", "pinOnCreate", [], _pinoncr);
   $def("_19znal9", "createCell", ["viewof command"], _19znal9);
   $def("_d9nzys", "deleteCell", ["viewof command"], _d9nzys);  
@@ -7329,7 +7545,7 @@ export default function define(runtime, observer) {
   $def("_dmk8lv", "findCellIndex", [], _dmk8lv);  
   $def("_jy01vb", "lookupCellByIndex", [], _jy01vb);  
   $def("_1rhoxk2", "findVariableIndex", ["runtime"], _1rhoxk2);  
-  $def("_2pkmxz", "command_processor", ["command","viewof edit","compile_and_update","remove_variables","viewof liveCellMap","findCellIndex","lookupCellByIndex","findVariableIndex","repositionSetElement","runtime","selectVariable","viewof command","pinOnCreate"], _2pkmxz);  
+  $def("_2pkmxz", "command_processor", ["command","viewof edit","compile_and_update","remove_variables","viewof liveCellMap","findCellIndex","lookupCellByIndex","findVariableIndex","repositionSetElement","runtime","selectVariable","viewof command","pinOnCreate","findCell"], _2pkmxz);  
   $def("_8iz5z2", null, ["md"], _8iz5z2);  
   $def("_m873d1", "states", [], _m873d1);  
   $def("_mxwoc4", "cellIdFacet", ["codemirror"], _mxwoc4);  
@@ -7363,7 +7579,8 @@ export default function define(runtime, observer) {
   $def("_gbuhyc", "decompiled", ["editedCell","decompile"], _gbuhyc);
   $def("_w5q3yf", "viewof editorModule", ["thisModule"], _w5q3yf);  
   $def("_18kaj2p", "editorModule", ["Generators","viewof editorModule"], _18kaj2p);  
-  $def("_yn5gyd", "editor_jobs", ["command_processor","submit_summary","save_options"], _yn5gyd);  
+  $def("_yn5gyd", "editor_jobs", ["command_processor","submit_summary","save_options","persist_attach_menu"], _yn5gyd);
+  $def("_pamenu", "persist_attach_menu", ["viewof options","attachContextManu","Event"], _pamenu);  
   $def("_1whoy5n", null, ["md"], _1whoy5n);  
   $def("_gk83fp", "compile_and_update", ["compile","runtime","realize","repositionSetElement","decompile"], _gk83fp);  
   $def("_1g3bdxp", null, ["md"], _1g3bdxp);  
