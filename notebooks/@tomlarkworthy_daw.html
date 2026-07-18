@@ -925,7 +925,8 @@ gridContainer(runtime, {
     'viewof pattern',
     'viewof bassCutoff',
     'viewof bassDecay',
-    'scope',
+    'viewof scope',
+    'viewof song',
     'template_drum',
     'drum1',
     'controls',
@@ -969,7 +970,7 @@ gridContainer(runtime, {
         'w': 140,
         'h': 40
       },
-      'scope': {
+      'viewof scope': {
         'x': 720,
         'y': 80,
         'w': 360
@@ -1011,10 +1012,15 @@ gridContainer(runtime, {
       'viewof chord1': {
         'x': 460,
         'y': 540
+      },
+      'viewof song': {
+        'x': 720,
+        'y': 540,
+        'w': 360
       }
     }
   },
-  height: 660
+  height: 760
 })
 )};
 const _hn2uu3 = function _title(md){return(
@@ -1034,7 +1040,9 @@ Audio discipline (no timers anywhere):
 - A **seq** is a pattern grid that listens to the clock and emits *timed* MIDI — a sequencer is a keyboard that plays itself. Instruments can't tell a pattern from a human.
 - Voice functions read knob **elements'** \`.value\` at trigger time, so turning a knob never recomputes the audio path.
 
-Everything speaks **MIDI** over a shared bus. Sources publish named events (\`{source, data, time}\`, raw MIDI bytes, optional scheduled time) onto \`midiBus\`: **keys** (pointer + computer-keyboard piano — the key binding is a plain \`keymap\` literal in its cell), **midiIn** (Web MIDI hardware), and every **seq**. Instruments pick their inputs with the **⌁ chooser** on their faceplate; the selection persists inside the same \`sticky\` patch as the knobs, so rewiring is a click yet the whole patch bay still lives in cell source. **Transformers** are both sink and source: **chord** expands each incoming note into a chord under its own bus name (\`keys1 → chord1 → synth\`) — arpeggiators, transposers and quantizers are the same shape.`
+Everything speaks **MIDI** over a shared bus. Sources publish named events (\`{source, data, time}\`, raw MIDI bytes, optional scheduled time) onto \`midiBus\`: **keys** (pointer + computer-keyboard piano — the key binding is a plain \`keymap\` literal in its cell), **midiIn** (Web MIDI hardware), and every **seq**. Instruments pick their inputs with the **⌁ chooser** on their faceplate; the selection persists inside the same \`sticky\` patch as the knobs, so rewiring is a click yet the whole patch bay still lives in cell source. **Transformers** are both sink and source: **chord** expands each incoming note into a chord under its own bus name (\`keys1 → chord1 → synth\`) — arpeggiators, transposers and quantizers are the same shape. The bus also carries **audio taps**: \`master\` and every synth register their output node under their name, and a **scope** selects which tap it draws.
+
+The **song** cell is the arranger — the sequencer of sequencers. It reuses the persistence plane as the arrangement plane: sticky writes view values to *source*, a scene writes view values to *time*. **⊕** captures a snapshot of its ⌁ targets (patterns, synth patches, chord quality, anything with a value) as a scene with a bar count; while armed, the last tick of each bar applies the next scene's values — the events are marked *transient* so sticky does not commit playback moves to source. The scene list itself is a sticky value, so the whole arrangement survives export.`
 )};
 const _18x0rsh = function _dawModule(thisModule){return(
 thisModule()
@@ -1045,13 +1053,14 @@ const _19o1i4f = function _daw_ctx()
   // `this` = previous value: the context survives any recompute and is never closed
   return this ?? new (window.AudioContext || window.webkitAudioContext)();
 };
-const _1qz528a = function _master(daw_ctx)
+const _1qz528a = function _master(daw_ctx,midiBus)
 {
   const g = this ?? daw_ctx.createGain();
   if (!this) {
     g.gain.value = 0.8;
     g.connect(daw_ctx.destination);
   }
+  midiBus.registerTap('master', g);
   return g;
 };
 const _1cxip4o = function _masterVol(sticky,Inputs){return(
@@ -1079,8 +1088,56 @@ const _1bzzngz = function _analyser(daw_ctx,master)
   }
   return a;
 };
-const _kha09r = function _scope(analyser,invalidation)
-{
+const _mksc6 = function _mkScope(){return(
+(ctx, bus, { tap = 'master', label = 'scope', invalidation } = {}) => {
+  const el = document.createElement('div');
+  el.style.cssText = 'display:inline-flex; flex-direction:column; gap:4px; background:#1c2529; border:1px solid #37474f; border-radius:6px; padding:6px 8px; width:max-content;';
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex; gap:8px; align-items:center; font:10px var(--sans-serif, sans-serif); color:#eceff1;';
+  const name = document.createElement('b');
+  name.textContent = label;
+  const sel = document.createElement('select');
+  sel.style.cssText = 'font:10px inherit; margin-left:auto;';
+  head.append(name, sel);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  let want = tap;
+  let cur = null;
+  const connect = () => {
+    if (cur) {
+      try {
+        cur.disconnect(analyser);
+      } catch (e) {
+      }
+      cur = null;
+    }
+    const node = bus && bus.taps && bus.taps.get(want);
+    if (node) {
+      node.connect(analyser);
+      cur = node;
+    }
+  };
+  const refresh = () => {
+    const names = [...new Set([
+        ...bus && bus.taps ? bus.taps.keys() : [],
+        want
+      ])].filter(n => !n.startsWith('template_') || n === want);
+    sel.innerHTML = '';
+    for (const n of names) {
+      const o = document.createElement('option');
+      o.value = n;
+      o.textContent = n;
+      sel.appendChild(o);
+    }
+    sel.value = want;
+    connect();
+  };
+  sel.addEventListener('input', () => {
+    want = sel.value;
+    connect();
+  });
+  if (bus)
+    bus.addEventListener('taps', refresh);
   const c = document.createElement('canvas');
   c.width = 320;
   c.height = 72;
@@ -1103,10 +1160,48 @@ const _kha09r = function _scope(analyser,invalidation)
     g.stroke();
     raf = requestAnimationFrame(draw);
   };
+  el.append(head, c);
+  refresh();
   draw();
-  invalidation.then(() => cancelAnimationFrame(raf));
-  return c;
-};
+  if (invalidation)
+    invalidation.then(() => {
+      cancelAnimationFrame(raf);
+      if (bus)
+        bus.removeEventListener('taps', refresh);
+      if (cur)
+        try {
+          cur.disconnect(analyser);
+        } catch (e) {
+        }
+    });
+  Object.defineProperty(el, 'value', {
+    get: () => ({ tap: want }),
+    set: p => {
+      if (p && p.tap) {
+        want = p.tap;
+        refresh();
+      }
+    }
+  });
+  return el;
+}
+)};
+const _scp1v = function _scope(sticky,mkScope,daw_ctx,midiBus,invalidation){return(
+sticky(mkScope(daw_ctx, midiBus, {
+  label: 'scope',
+  tap: 'master',
+  invalidation
+}), undefined)
+)};
+const _scp1g = (G, _) => G.input(_);
+const _tsc1v = function _template_scope(sticky,mkScope,daw_ctx,midiBus,invalidation){return(
+sticky(mkScope(daw_ctx, midiBus, {
+  label: 'template_scope',
+  tap: 'master',
+  invalidation
+}), undefined)
+)};
+const _tsc1g = (G, _) => G.input(_);
 const _1efbfap = function _bpm(sticky,Inputs){return(
 sticky(Inputs.range([
   60,
@@ -1583,6 +1678,14 @@ const _bus1a2 = function _midiBus()
     bus.register(name);
     bus.dispatchEvent(new window.CustomEvent('midi', { detail: { source: name, data, time } }));
   };
+  // audio taps: named AudioNodes that scopes/meters can listen to
+  bus.taps = new Map();
+  bus.registerTap = (name, node) => {
+    if (!name || !node || bus.taps.get(name) === node)
+      return;
+    bus.taps.set(name, node);
+    bus.dispatchEvent(new window.CustomEvent('taps'));
+  };
   return bus;
 };
 const _mkpk5 = function _mkInputPicker(){return(
@@ -1902,7 +2005,9 @@ md`## Extending the studio
 2. To sequence it, pick a MIDI note for it: add a row like \`{ name: 'drum1', note: 45 }\` to the drum seq's \`rows\` (✎ on the pattern atom) and map \`45: drum1_voice\` in the kit's \`voices\` literal.
 3. **＋ cell → ⊕ synth / ⊕ seq / ⊕ keys** add a second synth, another pattern, or another keyboard — each registers on the \`midiBus\` under its fresh name and appears in every ⌁ input chooser. A new seq becomes a **fill**: tick its name in the kit's ⌁ (or a synth's) and it plays alongside; use each seq's \`M\` to mute/unmute live.
 4. **Drum rolls**: shift-click a step to ratchet it — the number (2–4) is how many sub-hits fire inside that step.
-5. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\` / \`template_<name>_<part>\`.`
+5. **Arranging**: set the song's ⌁ to the cells that define a section, dial in a sound, **⊕** to capture it as a scene, change things, capture again. Set bar counts, press play — the song walks the scenes in a loop. ▶ auditions a scene, ⟳ re-captures into it. Un-tick *armed* to jam without the song moving values under you.
+6. **⊕ scope** adds another oscilloscope; its select chooses any registered tap (master, each synth) so you can watch one instrument in isolation.
+7. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\` / \`template_<name>_<part>\`.`
 )};
 const _dwctrl = function _controls(gridControls){return(
 gridControls()
@@ -2359,6 +2464,11 @@ const _msy5k4 = function _mkSynth(knob,mkInputPicker){return(
     }
   });
   head.append(led, name, picker, wave);
+  // per-instrument output: voices sum here so scopes can tap this synth alone
+  const outNode = ctx.createGain();
+  outNode.connect(out);
+  if (bus && bus.registerTap)
+    bus.registerTap(label, outNode);
   const k = {
     gain: knob({ label: 'gain', min: 0, max: 1, value: 0.6, step: 0.01 }),
     cutoff: knob({ label: 'cutoff', min: 60, max: 14000, value: 3000, step: 1, log: true }),
@@ -2417,7 +2527,7 @@ const _msy5k4 = function _mkSynth(knob,mkInputPicker){return(
     g.gain.setTargetAtTime(Math.max(0.0001, amp * p.s), t + Math.max(0.002, p.a), Math.max(0.01, p.d / 3));
     o.connect(f);
     f.connect(g);
-    g.connect(out);
+    g.connect(outNode);
     o.start(t);
     live.set(note, { o, g });
     led.style.background = '#3ddc84';
@@ -2445,6 +2555,7 @@ const _msy5k4 = function _mkSynth(knob,mkInputPicker){return(
       if (bus)
         bus.removeEventListener('midi', onBus);
       allOff();
+      outNode.disconnect();
     });
   Object.defineProperty(el, 'value', {
     get: () => ({
@@ -2706,6 +2817,255 @@ sticky(mkSeq($0, {
 }), undefined)
 )};
 const _tsq1g = (G, _) => G.input(_);
+const _mkarr5 = function _mkArranger(mkInputPicker){return(
+(runtime, { clock, targets = [], label = 'song', invalidation } = {}) => {
+  const song = {
+    targets: [...targets],
+    scenes: []
+  };
+  const el = document.createElement('div');
+  el.style.cssText = 'display:inline-flex; flex-direction:column; gap:4px; background:#1c2529; border:1px solid #37474f; border-radius:6px; padding:8px 10px; font:10px var(--sans-serif, sans-serif); color:#eceff1; width:max-content; min-width:230px;';
+  const resolve = n => {
+    for (const v of runtime._variables)
+      if (v._name === 'viewof ' + n && v._value instanceof window.Element)
+        return v._value;
+    return null;
+  };
+  const candidates = () => {
+    const names = new Set();
+    for (const v of runtime._variables) {
+      if (!v._name || !v._name.startsWith('viewof '))
+        continue;
+      const n = v._name.slice(7);
+      if (n === 'playing' || n === 'clock' || n === 'song' || n === 'dawModule' || n === 'station')
+        continue;
+      if (v._value instanceof window.Element)
+        names.add(n);
+    }
+    return names;
+  };
+  const picker = mkInputPicker({
+    get sources() {
+      return candidates();
+    }
+  }, {
+    selected: song.targets,
+    onChange: v => {
+      song.targets = v;
+    }
+  });
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex; gap:6px; align-items:center;';
+  const name = document.createElement('b');
+  name.textContent = label;
+  const armed = document.createElement('input');
+  armed.type = 'checkbox';
+  armed.checked = true;
+  const armLab = document.createElement('label');
+  armLab.title = 'armed: apply scenes on bar boundaries (live, not persisted)';
+  armLab.style.cssText = 'display:flex; gap:3px; align-items:center; cursor:pointer; margin-left:auto;';
+  armLab.append(armed, document.createTextNode('armed'));
+  const capBtn = document.createElement('button');
+  capBtn.textContent = '⊕';
+  capBtn.title = 'capture current values of ⌁ targets as a new scene';
+  capBtn.style.cssText = 'font:9px monospace; cursor:pointer;';
+  head.append(name, picker, armLab, capBtn);
+  const list = document.createElement('div');
+  list.style.cssText = 'display:flex; flex-direction:column; gap:2px;';
+  el.append(head, list);
+  const snapshot = () => {
+    const set = {};
+    for (const n of picker.value) {
+      const t = resolve(n);
+      if (!t)
+        continue;
+      try {
+        const v = JSON.parse(JSON.stringify(t.value));
+        if (v !== undefined)
+          set[n] = v;
+      } catch (e) {
+      }
+    }
+    return set;
+  };
+  let current = -1;
+  const spans = () => song.scenes.map(s => Math.max(1, Math.round(+s.bars) || 1));
+  const sceneIndexAt = bar => {
+    const sp = spans();
+    const total = sp.reduce((a, b) => a + b, 0);
+    if (!total)
+      return -1;
+    let b = (bar % total + total) % total;
+    for (let i = 0; i < sp.length; i++) {
+      if (b < sp[i])
+        return i;
+      b -= sp[i];
+    }
+    return -1;
+  };
+  const paintActive = () => {
+    [...list.children].forEach((row, i) => {
+      row.style.background = i === current ? '#264d33' : 'transparent';
+    });
+  };
+  const apply = i => {
+    const s = song.scenes[i];
+    if (!s)
+      return;
+    for (const [n, v] of Object.entries(s.set || {})) {
+      const t = resolve(n);
+      if (!t)
+        continue;
+      try {
+        t.value = JSON.parse(JSON.stringify(v));
+        // transient: drive the view for playback without sticky committing it
+        const ev = new window.Event('input', { bubbles: true });
+        ev.transient = true;
+        t.dispatchEvent(ev);
+      } catch (err) {
+        console.warn('daw: scene apply failed', n, err);
+      }
+    }
+    current = i;
+    paintActive();
+  };
+  const changed = () => el.dispatchEvent(new window.Event('input', { bubbles: true }));
+  const render = () => {
+    list.innerHTML = '';
+    song.scenes.forEach((s, i) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex; gap:4px; align-items:center; border-radius:3px; padding:1px 3px;';
+      const play = document.createElement('button');
+      play.textContent = '▶';
+      play.title = 'apply this scene now (audition)';
+      play.style.cssText = 'font:8px monospace; cursor:pointer; padding:0 3px;';
+      play.addEventListener('click', () => apply(i));
+      const nm = document.createElement('input');
+      nm.type = 'text';
+      nm.value = s.name || '';
+      nm.placeholder = 'scene ' + (i + 1);
+      nm.style.cssText = 'font:10px inherit; width:9ch; background:#111; color:#eceff1; border:1px solid #37474f; border-radius:3px; padding:0 3px;';
+      nm.addEventListener('input', () => {
+        s.name = nm.value;
+      });
+      const bars = document.createElement('input');
+      bars.type = 'number';
+      bars.min = 1;
+      bars.value = Math.max(1, Math.round(+s.bars) || 1);
+      bars.title = 'bars';
+      bars.style.cssText = 'font:10px inherit; width:4ch; background:#111; color:#eceff1; border:1px solid #37474f; border-radius:3px;';
+      bars.addEventListener('input', () => {
+        s.bars = Math.max(1, Math.round(+bars.value) || 1);
+      });
+      const tcount = document.createElement('span');
+      tcount.title = 'captured targets';
+      tcount.style.cssText = 'color:#90a4ae; font:8px monospace;';
+      tcount.textContent = String(Object.keys(s.set || {}).length);
+      const recap = document.createElement('button');
+      recap.textContent = '⟳';
+      recap.title = 're-capture current values into this scene';
+      recap.style.cssText = 'font:8px monospace; cursor:pointer; padding:0 3px;';
+      recap.addEventListener('click', () => {
+        s.set = snapshot();
+        render();
+        changed();
+      });
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.style.cssText = 'font:8px monospace; cursor:pointer; padding:0 3px;';
+      del.addEventListener('click', () => {
+        song.scenes.splice(i, 1);
+        if (current === i)
+          current = -1;
+        render();
+        changed();
+      });
+      row.append(play, nm, bars, tcount, recap, del);
+      list.appendChild(row);
+    });
+    if (!song.scenes.length) {
+      const hint = document.createElement('span');
+      hint.style.cssText = 'color:#90a4ae;';
+      hint.textContent = 'no scenes — ⊕ captures the ⌁ targets';
+      list.appendChild(hint);
+    }
+    paintActive();
+  };
+  capBtn.addEventListener('click', () => {
+    song.scenes.push({
+      name: 'scene ' + (song.scenes.length + 1),
+      bars: 1,
+      set: snapshot()
+    });
+    render();
+    changed();
+  });
+  const onTick = e => {
+    if (!armed.checked || !song.scenes.length)
+      return;
+    const { stepInBar, stepsPerBar, bar } = e.detail;
+    if (bar === 0 && stepInBar === 0 && current < 0) {
+      // first tick: bring the rack to scene 0 (one-step glitch accepted)
+      const first = sceneIndexAt(0);
+      if (first >= 0)
+        window.queueMicrotask(() => apply(first));
+    } else if (stepInBar === stepsPerBar - 1) {
+      // last step of the bar: flip for bar+1 after the seqs handled this tick
+      const next = sceneIndexAt(bar + 1);
+      if (next >= 0 && next !== current)
+        window.queueMicrotask(() => apply(next));
+    }
+  };
+  const onStop = () => {
+    current = -1;
+    paintActive();
+  };
+  if (clock) {
+    clock.addEventListener('tick', onTick);
+    clock.addEventListener('stop', onStop);
+  }
+  if (invalidation)
+    invalidation.then(() => {
+      if (clock) {
+        clock.removeEventListener('tick', onTick);
+        clock.removeEventListener('stop', onStop);
+      }
+    });
+  Object.defineProperty(el, 'value', {
+    get: () => JSON.parse(JSON.stringify({
+      targets: picker.value,
+      scenes: song.scenes
+    })),
+    set: v => {
+      if (!v)
+        return;
+      if (Array.isArray(v.targets))
+        picker.value = v.targets;
+      if (Array.isArray(v.scenes))
+        song.scenes = JSON.parse(JSON.stringify(v.scenes));
+      render();
+    }
+  });
+  render();
+  return el;
+}
+)};
+const _sng1v = function _song(sticky,mkArranger,runtime,$0,invalidation){return(
+sticky(mkArranger(runtime, {
+  clock: $0,
+  targets: [
+    'pattern',
+    'synthSeq',
+    'synth1',
+    'kit1',
+    'chord1',
+    'bassCutoff',
+    'bassDecay'
+  ],
+  invalidation
+}), undefined)
+)};
+const _sng1g = (G, _) => G.input(_);
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -2722,12 +3082,16 @@ export default function define(runtime, observer) {
   $def("_18x0rsh", "viewof dawModule", ["thisModule"], _18x0rsh);  
   $def("_1kmg14a", "dawModule", ["Generators","viewof dawModule"], _1kmg14a);  
   $def("_19o1i4f", "daw_ctx", [], _19o1i4f);  
-  $def("_1qz528a", "master", ["daw_ctx"], _1qz528a);  
+  $def("_1qz528a", "master", ["daw_ctx","midiBus"], _1qz528a);
   $def("_1cxip4o", "viewof masterVol", ["sticky","Inputs"], _1cxip4o);  
   $def("_12egs9p", "masterVol", ["Generators","viewof masterVol"], _12egs9p);  
   $def("_1r939zp", "masterVolBind", ["master","masterVol"], _1r939zp);  
   $def("_1bzzngz", "analyser", ["daw_ctx","master"], _1bzzngz);  
-  $def("_kha09r", "scope", ["analyser","invalidation"], _kha09r);  
+  $def("_mksc6", "mkScope", [], _mksc6);
+  $def("_scp1v", "viewof scope", ["sticky","mkScope","daw_ctx","midiBus","invalidation"], _scp1v);
+  $def("_scp1g", "scope", ["Generators","viewof scope"], _scp1g);
+  $def("_tsc1v", "viewof template_scope", ["sticky","mkScope","daw_ctx","midiBus","invalidation"], _tsc1v);
+  $def("_tsc1g", "template_scope", ["Generators","viewof template_scope"], _tsc1g);
   $def("_1efbfap", "viewof bpm", ["sticky","Inputs"], _1efbfap);  
   $def("_w2pv3n", "bpm", ["Generators","viewof bpm"], _w2pv3n);  
   $def("_ae8ir", "viewof playing", ["Inputs"], _ae8ir);  
@@ -2793,6 +3157,9 @@ export default function define(runtime, observer) {
   $def("_tsy1g", "template_synth", ["Generators","viewof template_synth"], _tsy1g);
   $def("_tsq1v", "viewof template_seq", ["sticky","mkSeq","viewof clock","midiBus","invalidation"], _tsq1v);
   $def("_tsq1g", "template_seq", ["Generators","viewof template_seq"], _tsq1g);
+  $def("_mkarr5", "mkArranger", ["mkInputPicker"], _mkarr5);
+  $def("_sng1v", "viewof song", ["sticky","mkArranger","runtime","viewof clock","invalidation"], _sng1v);
+  $def("_sng1g", "song", ["Generators","viewof song"], _sng1g);
   main.define("gridContainer", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridContainer", _));
   main.define("gridControls", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridControls", _));
   main.define("sticky", ["module @tomlarkworthy/sticky", "@variable"], (_, v) => v.import("sticky", _));  
@@ -27427,7 +27794,11 @@ const _i2n6lv = function _sticky(runtime,acorn)
         console.warn('sticky: could not apply remembered value', e);
       }
     }
-    const commit = () => {
+    const commit = e => {
+      // transient events (e.g. arranger scene playback) drive the view without
+      // persisting: source keeps the author's resting state
+      if (e && e.transient)
+        return;
       try {
         const self = [...runtime._variables].find(v => v._value === view);
         if (!self)
