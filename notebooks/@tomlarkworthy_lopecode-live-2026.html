@@ -31539,18 +31539,36 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const rc5c_title = function _title(md){return(
+// @tomlarkworthy/robocoop-5-core — the DOM-free brain of robocoop-5.
+//
+// Tight core: exactly what the robocoop-5 modules consume — the tool-use loop (createAgentSession,
+// with the completeGuard veto hook), the OpenRouter client factory, defineTool, composeFooter, and the
+// pure transcript formatters (summarizeTurn, toolLabel). Descended from @tomlarkworthy/robocoop-4-core;
+// robocoop-4 keeps its own copy (with bash tooling and its system prompt) untouched.
+//
+// Exports: truncate, defineTool, createOpenRouterClient, createAgentSession, composeFooter,
+//          summarizeTurn, toolLabel.
+
+const _title = function _title(md){return(
 md`# robocoop-5-core
 The DOM-free brain of robocoop-5: the explicit-completion tool-use loop (\`createAgentSession\`, with
 the \`completeGuard\` veto hook), the OpenRouter client factory, \`defineTool\`, \`composeFooter\` and the
 pure transcript formatters. No bash, no DOM, no fetch at module scope.`
 )};
-const rc5c_doc_truncate = function _doc_truncate(md){return(
+
+const _doc_composeFooter = function _doc_composeFooter(md){return(
+md`### \`composeFooter({workdir, model})\`
+Standard system-prompt footer (working directory + model line) appended by the engine's editable
+prompt view.`
+)};
+
+const _doc_truncate = function _doc_truncate(md){return(
 md`### \`truncate(text, limit)\`
 Head+tail cap: keeps the first and last halves of \`limit\`, replacing the middle with a marker, so a
 1MB \`cat\` can't blow the model context. Returns \`text\` unchanged when within \`limit\`.`
 )};
-const rc5c_truncate = function _truncate(){return(
+
+const _truncate = function _truncate(){return(
   function truncate(text, limit) {
     const s = String(text ?? '');
     if (!limit || s.length <= limit) return s;
@@ -31564,13 +31582,16 @@ const rc5c_truncate = function _truncate(){return(
     );
   }
 )};
-const rc5c_doc_defineTool = function _doc_defineTool(md){return(
+
+
+const _doc_defineTool = function _doc_defineTool(md){return(
 md`### \`defineTool({id, description, parameters, execute})\`
 Normalise a tool: validates the four fields, then wraps \`execute\` so it (a) short-circuits on an
 aborted signal, (b) always resolves to \`{title, output:string, metadata}\`, and (c) turns thrown
 errors into an \`Error: …\` output instead of rejecting. The loop calls \`tool.execute(args, ctx)\`.`
 )};
-const rc5c_defineTool = function _defineTool(){return(
+
+const _defineTool = function _defineTool(){return(
   function defineTool({ id, description, parameters, execute }) {
     if (!id || typeof id !== 'string') throw new Error('Tool must have a string id');
     if (!description || typeof description !== 'string')
@@ -31604,13 +31625,16 @@ const rc5c_defineTool = function _defineTool(){return(
     };
   }
 )};
-const rc5c_doc_createOpenRouterClient = function _doc_createOpenRouterClient(md){return(
+
+
+const _doc_createOpenRouterClient = function _doc_createOpenRouterClient(md){return(
 md`### \`createOpenRouterClient({apiKey, fetch, referer, title, defaultModel})\`
 OpenRouter chat-completions client (OpenAI wire format). Non-streaming today (\`stream:false\`);
 returns \`{message, finish_reason, raw}\` with the assistant message **verbatim** incl. any
 \`tool_calls\`. \`fetch\`/key are pluggable; \`fetch\` defaults to \`globalThis.fetch\`.`
 )};
-const rc5c_createOpenRouterClient = function _createOpenRouterClient(){
+
+const _createOpenRouterClient = function _createOpenRouterClient(){
   return function createOpenRouterClient({
     apiKey = (globalThis.process && globalThis.process.env ? globalThis.process.env.OPENROUTER_API_KEY : undefined),
     fetch = globalThis.fetch,
@@ -31751,7 +31775,10 @@ const rc5c_createOpenRouterClient = function _createOpenRouterClient(){
     return { chat };
   };
 };
-const rc5c_doc_createAgentSession = function _doc_createAgentSession(md){return(
+
+// ── createAgentSession ──────────────────────────────────────────────────────
+
+const _doc_createAgentSession = function _doc_createAgentSession(md){return(
 md`### \`createAgentSession({client, toolsProvider, systemPromptProvider, modelProvider, runCommand, …})\`
 The persistent, live-resolved conversation. \`messages\` persists across \`send()\` calls (one long
 chat). Tools, model and system prompt are re-read from their PROVIDERS at the top of **every step**,
@@ -31764,7 +31791,8 @@ call so it is read on the next step (the model is re-read each step, so switchin
 applies on the next call); \`interrupt()\` aborts the in-flight call without injecting (used to apply a model
 switch immediately); \`abort()\` hard-stops the whole turn. Returns \`{messages, send, abort, reset, interrupt, steer}\`.`
 )};
-const rc5c_createAgentSession = function _createAgentSession(truncate){
+
+const _createAgentSession = function _createAgentSession(truncate){
   function toWireTool(t) {
     return {
       type: 'function',
@@ -31824,14 +31852,19 @@ const rc5c_createAgentSession = function _createAgentSession(truncate){
       type: 'function',
       function: {
         name: completeToolName,
-        description: 'Call this ONLY when the task is fully complete (or you have finished answering) to end ' +
-          'your turn. Put your short summary or final answer in `summary`.',
+        description: 'Call this to END YOUR TURN: when the task is fully complete, when you have finished ' +
+          'answering, or when you are BLOCKED on something only the user can provide (missing information, a ' +
+          'decision, credentials). Put your summary, final answer, or QUESTION TO THE USER in `summary` — the ' +
+          'user cannot see or answer anything until your turn ends, so ending the turn IS how you ask. Never ' +
+          'keep taking tool actions while waiting on the user.',
         parameters: { type: 'object', properties: { summary: { type: 'string', description: 'Short summary / final answer shown to the user.' } }, required: [] },
       },
     } : null;
     const nudge = nudgeMessage ?? ('You ended your turn without calling a tool. If the task is complete, call ' +
-      (completeToolName || 'the completion tool') + ' with a short summary. Otherwise keep going — call a tool ' +
-      'to take the next concrete step; do not just describe what you will do.');
+      (completeToolName || 'the completion tool') + ' with a short summary. If you need information or a ' +
+      'decision from the user, call it with your question as the summary — the user only sees it when your ' +
+      'turn ends. Otherwise keep going — call a tool to take the next concrete step; do not just describe ' +
+      'what you will do.');
 
     const messages = [];
     let currentAbort = null;
@@ -31882,7 +31915,21 @@ const rc5c_createAgentSession = function _createAgentSession(truncate){
 
       const sp = getSystemPrompt();
       if (sp != null) {
-        const m = { role: 'system', content: String(sp) };
+        // Loop-owned operating principles: appended to WHATEVER system prompt the provider supplies, so
+        // they hold even when a host swaps in a domain prompt. Trigger-conditioned — each names when it
+        // applies AND when it does not, to avoid over-application on simple tasks.
+        const LOOP_PRINCIPLES = '\n\nOPERATING PRINCIPLES (always active):\n' +
+          '- Target check before hard-to-undo actions (external mutations, purchases, cancellations, sends, ' +
+          'deletions): name the exact target entity first. If MORE THAN ONE entity could plausibly match the ' +
+          'request, or you have not examined all plausible candidates, resolve the ambiguity before acting — ' +
+          'inspect the candidates, or ask the user when only they can disambiguate. Records you have NOT ' +
+          'opened count as unexamined candidates: a match is only unique once you have surveyed every record ' +
+          'that could contain the target. Never resolve ambiguity by taking the first match. When the survey ' +
+          'is complete and exactly one candidate matches, proceed without asking.\n' +
+          '- Multi-part requests: when a request contains several distinct deliverables or changes, enumerate ' +
+          'them explicitly up front, and before finishing check each part off — partial completion otherwise ' +
+          'passes unnoticed. Skip this for single-part requests.';
+        const m = { role: 'system', content: String(sp) + LOOP_PRINCIPLES };
         if (messages[0]?.role === 'system') messages[0] = m;
         else messages.unshift(m);
       }
@@ -32098,25 +32145,26 @@ const rc5c_createAgentSession = function _createAgentSession(truncate){
     return { messages, send, abort, reset, interrupt, steer, usage };
   };
 };
-const rc5c_doc_composeFooter = function _doc_composeFooter(md){return(
-md`### \`composeFooter({workdir, model})\`
-Standard system-prompt footer (working directory + model line) appended by the engine's editable
-prompt view.`
-)};
-const rc5c_composeFooter = function _composeFooter(){return(
+
+
+const _composeFooter = function _composeFooter(){return(
   function composeFooter({ workdir = '/src', model } = {}) {
     const lines = ['', 'Working directory: ' + workdir];
     if (model) lines.push('Model: ' + model);
     return lines.join('\n');
   }
 )};
-const rc5c_doc_summarizeTurn = function _doc_summarizeTurn(md){return(
+
+// ── result formatters (pure; consumed by the UI) ─────────────────────────────
+
+const _doc_summarizeTurn = function _doc_summarizeTurn(md){return(
 md`### \`summarizeTurn(r)\`
 Pure interpreter of a finished turn result. Returns \`null\` for a clean completion; otherwise a one-line
 "⏹ Agent …" notice explaining why the turn ended (\`max_steps\` / \`aborted\` / \`error\` / stalled) plus a
 tool tally from \`turnMessages\`. DOM-free so the UI imports it and node tests it.`
 )};
-const rc5c_summarizeTurn = function _summarizeTurn(){return(
+
+const _summarizeTurn = function _summarizeTurn(){return(
   function summarizeTurn(r) {
     if (!r || r.finishReason === 'completed') return null;
     const tally = {};
@@ -32132,12 +32180,16 @@ const rc5c_summarizeTurn = function _summarizeTurn(){return(
       + (acts ? ' · ' + acts : '') + '. No final reply — say “continue” to resume or “finish up”.';
   }
 )};
-const rc5c_doc_toolLabel = function _doc_toolLabel(md){return(
+
+const _doc_toolLabel = function _doc_toolLabel(md){return(
 md`### \`toolLabel(name, args)\`
 Pure short label for a tool call, used in the live status line. Pulls a target hint
 (\`path\`/\`file\`/\`name\`/\`id\`/\`module\`) from \`args\` (string JSON or object), basename-trimmed. Never throws.`
 )};
-const rc5c_toolLabel = function _toolLabel(){return(
+
+
+
+const _toolLabel = function _toolLabel(){return(
   function toolLabel(name, args) {
     let arg = '';
     try {
@@ -32154,24 +32206,24 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-
-  $def("rc5c_title", null, ["md"], rc5c_title);  
-  $def("rc5c_doc_truncate", null, ["md"], rc5c_doc_truncate);  
-  $def("rc5c_truncate", "truncate", [], rc5c_truncate);  
-  $def("rc5c_doc_defineTool", null, ["md"], rc5c_doc_defineTool);  
-  $def("rc5c_defineTool", "defineTool", [], rc5c_defineTool);  
-  $def("rc5c_doc_createOpenRouterClient", null, ["md"], rc5c_doc_createOpenRouterClient);  
-  $def("rc5c_createOpenRouterClient", "createOpenRouterClient", [], rc5c_createOpenRouterClient);  
-  $def("rc5c_doc_createAgentSession", null, ["md"], rc5c_doc_createAgentSession);  
-  $def("rc5c_createAgentSession", "createAgentSession", ["truncate"], rc5c_createAgentSession);  
-  $def("rc5c_doc_composeFooter", null, ["md"], rc5c_doc_composeFooter);  
-  $def("rc5c_composeFooter", "composeFooter", [], rc5c_composeFooter);  
-  $def("rc5c_doc_summarizeTurn", null, ["md"], rc5c_doc_summarizeTurn);  
-  $def("rc5c_summarizeTurn", "summarizeTurn", [], rc5c_summarizeTurn);  
-  $def("rc5c_doc_toolLabel", null, ["md"], rc5c_doc_toolLabel);  
-  $def("rc5c_toolLabel", "toolLabel", [], rc5c_toolLabel);
+  $def("rc5c_title", null, ["md"], _title);
+  $def("rc5c_doc_truncate", null, ["md"], _doc_truncate);
+  $def("rc5c_truncate", "truncate", [], _truncate);
+  $def("rc5c_doc_defineTool", null, ["md"], _doc_defineTool);
+  $def("rc5c_defineTool", "defineTool", [], _defineTool);
+  $def("rc5c_doc_createOpenRouterClient", null, ["md"], _doc_createOpenRouterClient);
+  $def("rc5c_createOpenRouterClient", "createOpenRouterClient", [], _createOpenRouterClient);
+  $def("rc5c_doc_createAgentSession", null, ["md"], _doc_createAgentSession);
+  $def("rc5c_createAgentSession", "createAgentSession", ["truncate"], _createAgentSession);
+  $def("rc5c_doc_composeFooter", null, ["md"], _doc_composeFooter);
+  $def("rc5c_composeFooter", "composeFooter", [], _composeFooter);
+  $def("rc5c_doc_summarizeTurn", null, ["md"], _doc_summarizeTurn);
+  $def("rc5c_summarizeTurn", "summarizeTurn", [], _summarizeTurn);
+  $def("rc5c_doc_toolLabel", null, ["md"], _doc_toolLabel);
+  $def("rc5c_toolLabel", "toolLabel", [], _toolLabel);
   return main;
-}</script>
+}
+</script>
 
 <script id="@tomlarkworthy/robocoop-5-engine" 
   type="text/plain"
@@ -32576,7 +32628,7 @@ const _zqho0j = function _session(client,createAgentSession,toolsView,modelView,
     // single tool call is a fabricated summary — nothing ran (observed on mimo: step-1 task_complete
     // announcing modules it never wrote). A genuinely tool-free reply survives the guard: the model just
     // calls task_complete again and it is accepted.
-    completeGuard: ({toolCallsThisTurn}) => toolCallsThisTurn === 0 ? 'REJECTED: you have made NO tool calls this turn, so nothing has been created, changed, or verified \u2014 ' + 'a completion summary now would be fiction. Do the work first with real tool calls (read_file / ' + 'write_file / edit_file / eval_js / \u2026), verify it, then call task_complete describing what you DID. ' + 'If this request truly requires no tool work, call task_complete again to confirm.' : null,
+    completeGuard: ({toolCallsThisTurn}) => toolCallsThisTurn === 0 ? 'REJECTED: you have made NO tool calls this turn, so nothing has been created, changed, or verified \u2014 ' + 'a completion summary now would be fiction. Do the work first with real tool calls (read_file / ' + 'write_file / edit_file / eval_js / \u2026), verify it, then call task_complete describing what you DID. ' + 'If this request truly requires no tool work \u2014 including when you are ASKING THE USER for information ' + 'or a decision only they can provide \u2014 call task_complete again with your answer or question as the ' + 'summary; asking the user is a legitimate tool-free turn.' : null,
     stallNudgeLimit: 2,
     maxStepsPerTurn: 40,
     // Reasoning models spend completion budget on reasoning; give headroom for reasoning + a full write_file.
@@ -32794,7 +32846,7 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         globToRe
     };
 };
-const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefine, createModule, cellHelpers, summarizeJS, rc5_watchBus, observe, importShim, location, rc5_store) {
+const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefine, createModule, cellHelpers, summarizeJS, rc5_watchBus, observe, importShim, location, rc5_store, descendants) {
     const apply = jbApply({
         currentModules,
         runtime,
@@ -32821,8 +32873,6 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
         };
         if (v._error != null)
             return finish({ error: v._error && v._error.message || String(v._error) });
-        if (v._value !== undefined)
-            return finish({ value: v._value });
         if (v._name)
             Promise.resolve().then(() => mod.value(v._name)).then(value => finish({ value }), error => finish({ error: error && error.message || String(error) }));
         else {
@@ -32832,7 +32882,7 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
             } catch (e) {
             }
         }
-        setTimeout(() => finish({ pending: true }), 4000);
+        setTimeout(() => finish(v._value !== undefined ? { value: v._value } : { pending: true }), 4000);
     });
     const probeAndWatch = async id => {
         const mod = resolveModule(id);
@@ -32873,7 +32923,27 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
         const okCount = probe.length - errored.length;
         if (errored.length)
             return ' \xB7 \u26A0 ' + errored.length + ' cell' + (errored.length === 1 ? '' : 's') + ' ERRORING at runtime \u2014 ' + errored.map(e => e.name + ': ' + e.error).join('; ') + ' \u2014 FIX before task_complete (a compile-clean cell can still error when observed)';
-        return ' \xB7 \u2713 all ' + okCount + ' cell' + (okCount === 1 ? '' : 's') + ' compute with no runtime error (auto-watched; changes stream to you)';
+        const vals = probe.filter(r => r.value !== undefined).slice(0, 8).map(r => r.name + '=' + r.value).join(', ');
+        return ' \xB7 \u2713 all ' + okCount + ' cell' + (okCount === 1 ? '' : 's') + ' compute with no runtime error (auto-watched; changes stream to you)' + (vals ? ' \xB7 values: ' + vals + (probe.length > 8 ? ' \u2026(+' + (probe.length - 8) + ' more)' : '') : '');
+    };
+    const downstreamStatus = async id => {
+        const mod = resolveModule(id);
+        if (!mod)
+            return '';
+        const inSeedModule = new Set(varsOf(mod));
+        const seeds = varsOf(mod).filter(v => v._name && !isStructural(v));
+        if (!seeds.length)
+            return '';
+        const dependents = [...descendants(...seeds)].filter(v => !inSeedModule.has(v) && v._name && !isStructural(v));
+        if (!dependents.length)
+            return '';
+        await new Promise(r => setTimeout(r, 150));
+        const parts = await Promise.all(dependents.slice(0, 12).map(async v => {
+            const label = (v._module && v._module._name ? v._module._name + ':' : '') + v._name;
+            const r = await readVar(v._module, v);
+            return label + '=' + (r.error ? '\u26A0 ' + r.error : r.pending ? '\u23F3 still computing' : summ(r.value));
+        }));
+        return ' \xB7 downstream recomputed: ' + parts.join(', ') + (dependents.length > 12 ? ' \u2026(+' + (dependents.length - 12) + ' more)' : '');
     };
     let cmModPromise = null;
     const getCmMod = () => {
@@ -32988,6 +33058,11 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
                 status = probeStatus(await probeAndWatch(id));
             } catch (e) {
             }
+            let downstream = '';
+            try {
+                downstream = await downstreamStatus(id);
+            } catch (e) {
+            }
             let structure = '';
             try {
                 structure = await structureStatus(id);
@@ -32995,7 +33070,7 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
             }
             return {
                 ok: true,
-                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + status + structure
+                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + status + downstream + structure
             };
         } catch (e) {
             keepDraft();
@@ -33840,7 +33915,7 @@ export default function define(runtime, observer) {
   $def("_76otvk", "cellHelpers", ["currentModules","runtime"], _76otvk);  
   $def("_19x8b93", "rc5_store", [], _19x8b93);  
   $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim"], _o37ix1);  
-  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","importShim","location","rc5_store"], _190yjiu);  
+  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","importShim","location","rc5_store","descendants"], _190yjiu);  
   $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus"], _ual70b);  
   $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS"], _qc0bl);  
@@ -33854,6 +33929,7 @@ export default function define(runtime, observer) {
   main.define("createModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("createModule", _));  
   main.define("observe", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observe", _));  
   main.define("importShim", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("importShim", _));  
+  main.define("descendants", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("descendants", _));  
   main.define("currentModules", ["module @tomlarkworthy/module-map", "@variable"], (_, v) => v.import("currentModules", _));  
   main.define("defineTool", ["module @tomlarkworthy/robocoop-5-core", "@variable"], (_, v) => v.import("defineTool", _));  
   main.define("registerTool", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("registerTool", _));  
