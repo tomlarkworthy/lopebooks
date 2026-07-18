@@ -932,7 +932,8 @@ gridContainer(runtime, {
     'viewof synth1',
     'viewof synthSeq',
     'viewof midi1',
-    'viewof keys1'
+    'viewof keys1',
+    'viewof chord1'
   ],
   layout: {
     atoms: {
@@ -964,7 +965,9 @@ gridContainer(runtime, {
       },
       'viewof kit1': {
         'x': 440,
-        'y': 130
+        'y': 130,
+        'w': 140,
+        'h': 40
       },
       'scope': {
         'x': 720,
@@ -1004,6 +1007,10 @@ gridContainer(runtime, {
       'viewof keys1': {
         'x': 20,
         'y': 540
+      },
+      'viewof chord1': {
+        'x': 460,
+        'y': 540
       }
     }
   },
@@ -1019,7 +1026,7 @@ Built from three orthogonal concepts, none of them audio-specific:
 
 - **[sticky](https://observablehq.com/@tomlarkworthy/sticky)** — any view remembers its value in its own source (\`sticky(view, remembered)\`), persisted by a silent definition swap: no recompute, no remount, no audio glitch.
 - **[grid-container](https://observablehq.com/@tomlarkworthy/grid-container)** — the rack. Atoms are live cells; layout and membership are self-rewritten literals. Even the rack controls are a normal cell (\`controls = gridControls()\`) placed on the rack; its **＋ cell → templates** instantiates a copy of any \`template_*\` cell group under a fresh name — add an instrument without typing code.
-- **Observable dataflow** — wiring. Voices are plain function cells; each instrument's \`sources:\` list and the kit's \`voices\` literal are the patch cords, edited like any other cell (✎ on its atom).
+- **Observable dataflow** — structure. Voices are plain function cells; the kit's \`voices\` literal maps MIDI notes to them, edited like any other cell (✎ on its atom).
 
 Audio discipline (no timers anywhere):
 - \`daw_ctx\`/\`master\`/\`analyser\` use the \`this\` idiom — recompute returns the previous instance, so the audio graph is immortal.
@@ -1027,7 +1034,7 @@ Audio discipline (no timers anywhere):
 - A **seq** is a pattern grid that listens to the clock and emits *timed* MIDI — a sequencer is a keyboard that plays itself. Instruments can't tell a pattern from a human.
 - Voice functions read knob **elements'** \`.value\` at trigger time, so turning a knob never recomputes the audio path.
 
-Live input speaks **MIDI**. A MIDI source is any view that dispatches \`midi\` CustomEvents carrying raw MIDI bytes (\`detail.data = [status, note, velocity]\`): **keys** (pointer + computer-keyboard piano — the key binding is a plain \`keymap\` literal in its cell, editable like anything else) and **midiIn** (Web MIDI hardware) both speak it. Instruments like the polyphonic **synth** subscribe to any list of sources — the \`sources:\` list in the cell is the patch cord — and persist their whole patch through one \`sticky\` slot.`
+Everything speaks **MIDI** over a shared bus. Sources publish named events (\`{source, data, time}\`, raw MIDI bytes, optional scheduled time) onto \`midiBus\`: **keys** (pointer + computer-keyboard piano — the key binding is a plain \`keymap\` literal in its cell), **midiIn** (Web MIDI hardware), and every **seq**. Instruments pick their inputs with the **⌁ chooser** on their faceplate; the selection persists inside the same \`sticky\` patch as the knobs, so rewiring is a click yet the whole patch bay still lives in cell source. **Transformers** are both sink and source: **chord** expands each incoming note into a chord under its own bus name (\`keys1 → chord1 → synth\`) — arpeggiators, transposers and quantizers are the same shape.`
 )};
 const _18x0rsh = function _dawModule(thisModule){return(
 thisModule()
@@ -1176,9 +1183,11 @@ const _s71xha = function _stepGrid(Event){return(
   return wrap;
 }
 )};
-const _14j1vyd = function _pattern(sticky,mkSeq,$0,invalidation){return(
+const _14j1vyd = function _pattern(sticky,mkSeq,$0,midiBus,invalidation){return(
 sticky(mkSeq($0, {
   label: 'drums',
+  name: 'drums',
+  bus: midiBus,
   rows: [
     { name: 'kick', note: 36 },
     { name: 'hat', note: 42 },
@@ -1423,8 +1432,10 @@ const _mkclk7 = function _mkClock(){return(
 }
 )};
 const _mkseq3 = function _mkSeq(stepGrid){return(
-(clock, { rows = [], steps = 16, velocity = 100, gate = 0.5, label, invalidation } = {}) => {
+(clock, { rows = [], steps = 16, velocity = 100, gate = 0.5, label, bus = null, name = 'seq', invalidation } = {}) => {
   const grid = stepGrid(rows.map(r => r.name), { steps });
+  if (bus)
+    bus.register(name);
   const el = document.createElement('div');
   el.style.cssText = 'display:inline-flex; flex-direction:column; gap:2px; width:max-content;';
   if (label) {
@@ -1441,8 +1452,15 @@ const _mkseq3 = function _mkSeq(stepGrid){return(
     const pat = grid.value;
     for (const r of rows) {
       if (pat[r.name] && pat[r.name][col]) {
-        el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: [144, r.note & 127, velocity], time: t } }));
-        el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: [128, r.note & 127, 0], time: t + Math.max(0.02, secPerStep * gate) } }));
+        const on = [144, r.note & 127, velocity];
+        const off = [128, r.note & 127, 0];
+        const offT = t + Math.max(0.02, secPerStep * gate);
+        el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: on, time: t } }));
+        el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: off, time: offT } }));
+        if (bus) {
+          bus.publish(name, on, t);
+          bus.publish(name, off, offT);
+        }
       }
     }
   };
@@ -1463,8 +1481,8 @@ const _mkseq3 = function _mkSeq(stepGrid){return(
   return el;
 }
 )};
-const _mkkit9 = function _mkKit(){return(
-(ctx, { voices = {}, sources = [], label = 'kit', invalidation } = {}) => {
+const _mkkit9 = function _mkKit(mkInputPicker){return(
+(ctx, { voices = {}, sources = [], bus = null, inputs = [], label = 'kit', invalidation } = {}) => {
   const el = document.createElement('div');
   el.style.cssText = 'display:inline-flex; gap:6px; align-items:center; font:10px var(--sans-serif, sans-serif); background:#1c2529; color:#eceff1; border:1px solid #37474f; border-radius:6px; padding:6px 10px;';
   const led = document.createElement('span');
@@ -1474,7 +1492,14 @@ const _mkkit9 = function _mkKit(){return(
   const map = document.createElement('span');
   map.style.cssText = 'color:#90a4ae; font-family:monospace;';
   map.textContent = Object.keys(voices).join(' ');
-  el.append(led, name, map);
+  let selected = new Set(inputs);
+  const picker = mkInputPicker(bus, {
+    selected: inputs,
+    onChange: v => {
+      selected = new Set(v);
+    }
+  });
+  el.append(led, name, picker, map);
   let fade = null;
   const flash = () => {
     led.style.background = '#3ddc84';
@@ -1499,11 +1524,260 @@ const _mkkit9 = function _mkKit(){return(
     }
   };
   sources.filter(Boolean).forEach(s => s.addEventListener('midi', onMidi));
+  const onBus = e => {
+    if (selected.has(e.detail.source))
+      onMidi(e);
+  };
+  if (bus)
+    bus.addEventListener('midi', onBus);
   if (invalidation)
-    invalidation.then(() => sources.filter(Boolean).forEach(s => s.removeEventListener('midi', onMidi)));
+    invalidation.then(() => {
+      sources.filter(Boolean).forEach(s => s.removeEventListener('midi', onMidi));
+      if (bus)
+        bus.removeEventListener('midi', onBus);
+    });
   Object.defineProperty(el, 'value', {
-    get: () => Object.keys(voices).map(Number),
-    set: () => {
+    get: () => ({ inputs: picker.value }),
+    set: p => {
+      if (p && Array.isArray(p.inputs))
+        picker.value = p.inputs;
+    }
+  });
+  return el;
+}
+)};
+const _bus1a2 = function _midiBus()
+{
+  // `this` idiom: the bus is immortal, so name-based subscriptions survive remounts
+  if (this)
+    return this;
+  const bus = new window.EventTarget();
+  bus.sources = new Set();
+  bus.register = name => {
+    if (!name || bus.sources.has(name))
+      return;
+    bus.sources.add(name);
+    bus.dispatchEvent(new window.CustomEvent('sources'));
+  };
+  bus.publish = (name, data, time) => {
+    bus.register(name);
+    bus.dispatchEvent(new window.CustomEvent('midi', { detail: { source: name, data, time } }));
+  };
+  return bus;
+};
+const _mkpk5 = function _mkInputPicker(){return(
+(bus, { selected = [], onChange } = {}) => {
+  const sel = new Set(selected);
+  const el = document.createElement('span');
+  el.style.cssText = 'display:inline-flex;';
+  const btn = document.createElement('button');
+  btn.style.cssText = 'font:9px monospace; cursor:pointer; padding:1px 5px; max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+  const paint = () => {
+    btn.textContent = '⌁ ' + (sel.size ? [...sel].join(',') : 'inputs');
+  };
+  let pop = null;
+  const close = () => {
+    if (pop) {
+      pop.remove();
+      pop = null;
+    }
+  };
+  const open = () => {
+    close();
+    pop = document.createElement('div');
+    pop.style.cssText = 'position:fixed; z-index:1000; background:#1c2529; color:#eceff1; border:1px solid #37474f; border-radius:6px; padding:6px 10px; font:10px var(--sans-serif, sans-serif); display:flex; flex-direction:column; gap:3px;';
+    const r = btn.getBoundingClientRect();
+    pop.style.left = r.left + 'px';
+    pop.style.top = r.bottom + 4 + 'px';
+    const names = [...new Set([
+        ...bus && bus.sources || [],
+        ...sel
+      ])].filter(n => !n.startsWith('template_') || sel.has(n));
+    if (!names.length)
+      pop.textContent = 'no sources';
+    for (const n of names) {
+      const lab = document.createElement('label');
+      lab.style.cssText = 'display:flex; gap:5px; align-items:center; cursor:pointer;';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = sel.has(n);
+      cb.addEventListener('input', () => {
+        cb.checked ? sel.add(n) : sel.delete(n);
+        paint();
+        if (onChange)
+          onChange([...sel]);
+        // popover lives on document.body, outside the faceplate — re-dispatch
+        // from the picker so sticky (listening on the faceplate) hears it
+        el.dispatchEvent(new window.Event('input', { bubbles: true }));
+      });
+      lab.append(cb, document.createTextNode(n));
+      pop.appendChild(lab);
+    }
+    pop.addEventListener('pointerleave', close);
+    document.body.appendChild(pop);
+  };
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    pop ? close() : open();
+  });
+  el.appendChild(btn);
+  Object.defineProperty(el, 'value', {
+    get: () => [...sel],
+    set: v => {
+      if (!Array.isArray(v))
+        return;
+      sel.clear();
+      v.forEach(n => sel.add(n));
+      paint();
+      if (onChange)
+        onChange([...sel]);
+    }
+  });
+  paint();
+  return el;
+}
+)};
+const _mkchd2 = function _mkChord(mkInputPicker){return(
+(bus, { name = 'chord', inputs = [], chord = 'min', invalidation } = {}) => {
+  const CHORDS = {
+    maj: [
+      0,
+      4,
+      7
+    ],
+    min: [
+      0,
+      3,
+      7
+    ],
+    '7': [
+      0,
+      4,
+      7,
+      10
+    ],
+    maj7: [
+      0,
+      4,
+      7,
+      11
+    ],
+    min7: [
+      0,
+      3,
+      7,
+      10
+    ],
+    sus4: [
+      0,
+      5,
+      7
+    ],
+    power: [
+      0,
+      7
+    ],
+    oct: [
+      0,
+      12
+    ]
+  };
+  const el = document.createElement('div');
+  el.style.cssText = 'display:inline-flex; gap:6px; align-items:center; font:10px var(--sans-serif, sans-serif); background:#1c2529; color:#eceff1; border:1px solid #37474f; border-radius:6px; padding:6px 10px;';
+  const led = document.createElement('span');
+  led.style.cssText = 'width:7px; height:7px; border-radius:50%; background:#37474f; flex:none;';
+  const title = document.createElement('b');
+  title.textContent = name;
+  let selected = new Set(inputs);
+  const picker = mkInputPicker(bus, {
+    selected: inputs,
+    onChange: v => {
+      selected = new Set(v);
+    }
+  });
+  const sel = document.createElement('select');
+  sel.style.cssText = 'font:10px inherit;';
+  for (const c of Object.keys(CHORDS)) {
+    const o = document.createElement('option');
+    o.value = c;
+    o.textContent = c;
+    sel.appendChild(o);
+  }
+  sel.value = chord;
+  el.append(led, title, picker, sel);
+  let fade = null;
+  const flash = () => {
+    led.style.background = '#3ddc84';
+    window.clearTimeout(fade);
+    fade = window.setTimeout(() => {
+      led.style.background = '#37474f';
+    }, 100);
+  };
+  const active = new Map();
+  let emitting = false;
+  const onBus = e => {
+    // emitting guard breaks transformer cycles; source===name skips own echoes
+    if (emitting || e.detail.source === name || !selected.has(e.detail.source))
+      return;
+    const [st, n, v] = e.detail.data;
+    const c = st & 240;
+    emitting = true;
+    try {
+      if (c === 144 && v > 0) {
+        const notes = (CHORDS[sel.value] || [0]).map(i => n + i).filter(x => x >= 0 && x <= 127);
+        active.set(n, notes);
+        for (const x of notes)
+          bus.publish(name, [
+            144,
+            x,
+            v
+          ], e.detail.time);
+        flash();
+      } else if (c === 128 || c === 144) {
+        const notes = active.get(n) || [n];
+        active.delete(n);
+        for (const x of notes)
+          bus.publish(name, [
+            128,
+            x,
+            0
+          ], e.detail.time);
+      }
+    } finally {
+      emitting = false;
+    }
+  };
+  bus.register(name);
+  bus.addEventListener('midi', onBus);
+  const allOff = () => {
+    for (const [n, notes] of [...active]) {
+      active.delete(n);
+      for (const x of notes)
+        bus.publish(name, [
+          128,
+          x,
+          0
+        ]);
+    }
+  };
+  sel.addEventListener('input', allOff);
+  if (invalidation)
+    invalidation.then(() => {
+      bus.removeEventListener('midi', onBus);
+      allOff();
+    });
+  Object.defineProperty(el, 'value', {
+    get: () => ({
+      chord: sel.value,
+      inputs: picker.value
+    }),
+    set: p => {
+      if (!p)
+        return;
+      if (p.chord && CHORDS[p.chord])
+        sel.value = p.chord;
+      if (Array.isArray(p.inputs))
+        picker.value = p.inputs;
     }
   });
   return el;
@@ -1560,7 +1834,7 @@ sticky(Inputs.range([
   label: 'pitch',
   step: 1,
   value: 120
-}), 343)
+}), 63)
 )};
 const _i2vntw = (G, _) => G.input(_);
 const _1f7glvg = function _template_drum_decay(sticky,Inputs){return(
@@ -1571,7 +1845,7 @@ sticky(Inputs.range([
   label: 'decay',
   step: 0.01,
   value: 0.3
-}), 0.3)
+}), 0.56)
 )};
 const _lp3ewg = (G, _) => G.input(_);
 const _7we2z6 = function _template_drum_hit(Inputs,daw_ctx,template_drum_voice)
@@ -1605,8 +1879,8 @@ const _1tgfsqb = function _extending(md){return(
 md`## Extending the studio
 
 1. **＋ cell → ⊕ drum** on the station copies the whole \`template_drum\` group (faceplate, knobs, hit button, voice function) under a fresh name like \`drum1\` — every cross-reference renamed, no code typed. Its knobs are sticky; hit plays it immediately.
-2. To sequence it, pick a MIDI note for it: add a row like \`{ name: 'drum1', note: 45 }\` to the drum seq's \`rows\` (✎ on the pattern atom) and map \`45: drum1_voice\` in the kit's \`voices\` literal. Wiring is the one deliberately code-shaped step: dataflow references *are* the patch cords.
-3. Melodic instruments subscribe to MIDI sources instead: add a new \`mkSeq\` cell on the clock and list it in a synth's \`sources:\` — or just play it from \`keys\` / hardware \`midiIn\`.
+2. To sequence it, pick a MIDI note for it: add a row like \`{ name: 'drum1', note: 45 }\` to the drum seq's \`rows\` (✎ on the pattern atom) and map \`45: drum1_voice\` in the kit's \`voices\` literal.
+3. **＋ cell → ⊕ keys** adds another keyboard; it registers on the \`midiBus\` under its fresh name and appears in every ⌁ input chooser — connect it with a click. Put a \`mkChord\` between a keyboard and a synth and you have a chord keyboard.
 4. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\` / \`template_<name>_<part>\`.`
 )};
 const _dwctrl = function _controls(gridControls){return(
@@ -1652,7 +1926,7 @@ sticky(Inputs.range([
   label: 'pitch',
   step: 1,
   value: 120
-}), 313)
+}), 296)
 )};
 const _14idqs = (G, _) => G.input(_);
 const _q6ae90 = function _drum1_decay(sticky,Inputs){return(
@@ -1784,6 +2058,8 @@ const _kys9m1 = function _keys(){return(
   octaves = 2,
   base = 48,
   velocity = 100,
+  bus = null,
+  name = 'keys',
   keymap = {
     KeyA: 0,
     KeyW: 1,
@@ -1825,8 +2101,13 @@ const _kys9m1 = function _keys(){return(
   bar.append(downB, octLab, upB, status);
   const board = document.createElement('div');
   board.style.cssText = 'position:relative; height:64px; width:max-content; touch-action:none;';
+  if (bus)
+    bus.register(name);
   const emit = (on, note, vel) => {
-    el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: [on ? 144 : 128, note & 127, on ? vel : 0] } }));
+    const data = [on ? 144 : 128, note & 127, on ? vel : 0];
+    el.dispatchEvent(new window.CustomEvent('midi', { detail: { data } }));
+    if (bus)
+      bus.publish(name, data);
   };
   const fire = () => el.dispatchEvent(new window.Event('input', { bubbles: true }));
   const paint = () => {
@@ -1950,8 +2231,10 @@ const _kys9m1 = function _keys(){return(
 }
 )};
 const _mdn3q7 = function _midiIn(){return(
-({ label = 'MIDI in' } = {}) => {
+({ label = 'MIDI in', bus = null, name = 'midi' } = {}) => {
   const el = document.createElement('div');
+  if (bus)
+    bus.register(name);
   el.style.cssText = 'display:inline-flex; gap:6px; align-items:center; font:11px var(--sans-serif, sans-serif);';
   const led = document.createElement('span');
   led.style.cssText = 'width:8px; height:8px; border-radius:50%; background:#555; display:inline-block; flex:none;';
@@ -1977,7 +2260,10 @@ const _mdn3q7 = function _midiIn(){return(
   };
   const onMsg = e => {
     flash();
-    el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: [...e.data] } }));
+    const data = [...e.data];
+    el.dispatchEvent(new window.CustomEvent('midi', { detail: { data } }));
+    if (bus)
+      bus.publish(name, data);
   };
   const sel = document.createElement('select');
   sel.style.cssText = 'font:11px inherit; max-width:150px;';
@@ -2026,8 +2312,8 @@ const _mdn3q7 = function _midiIn(){return(
   return el;
 }
 )};
-const _msy5k4 = function _mkSynth(knob){return(
-(ctx, out, { label = 'synth', sources = [], invalidation } = {}) => {
+const _msy5k4 = function _mkSynth(knob,mkInputPicker){return(
+(ctx, out, { label = 'synth', sources = [], bus = null, inputs = [], invalidation } = {}) => {
   const el = document.createElement('div');
   el.style.cssText = 'display:inline-flex; flex-direction:column; gap:4px; background:#1c2529; border:1px solid #37474f; border-radius:6px; padding:8px 10px; width:max-content;';
   const head = document.createElement('div');
@@ -2044,7 +2330,14 @@ const _msy5k4 = function _mkSynth(knob){return(
     o.textContent = w;
     wave.appendChild(o);
   }
-  head.append(led, name, wave);
+  let selected = new Set(inputs);
+  const picker = mkInputPicker(bus, {
+    selected: inputs,
+    onChange: v => {
+      selected = new Set(v);
+    }
+  });
+  head.append(led, name, picker, wave);
   const k = {
     gain: knob({ label: 'gain', min: 0, max: 1, value: 0.6, step: 0.01 }),
     cutoff: knob({ label: 'cutoff', min: 60, max: 14000, value: 3000, step: 1, log: true }),
@@ -2118,14 +2411,25 @@ const _msy5k4 = function _mkSynth(knob){return(
       noteoff(d1, t);
   };
   sources.filter(Boolean).forEach(s => s.addEventListener('midi', onMidi));
+  const onBus = e => {
+    if (selected.has(e.detail.source))
+      onMidi(e);
+  };
+  if (bus)
+    bus.addEventListener('midi', onBus);
   const allOff = () => [...live.keys()].forEach(noteoff);
   if (invalidation)
     invalidation.then(() => {
       sources.filter(Boolean).forEach(s => s.removeEventListener('midi', onMidi));
+      if (bus)
+        bus.removeEventListener('midi', onBus);
       allOff();
     });
   Object.defineProperty(el, 'value', {
-    get: patch,
+    get: () => ({
+      ...patch(),
+      inputs: picker.value
+    }),
     set: p => {
       if (!p)
         return;
@@ -2134,15 +2438,19 @@ const _msy5k4 = function _mkSynth(knob){return(
       for (const [n, e] of Object.entries(k))
         if (typeof p[n] === 'number')
           e.value = p[n];
+      if (Array.isArray(p.inputs))
+        picker.value = p.inputs;
     }
   });
   return el;
 }
 )};
-const _ky1v6r = function _keys1(keys){return(
+const _ky1v6r = function _keys1(keys,midiBus){return(
 keys({
   octaves: 2,
   base: 48,
+  bus: midiBus,
+  name: 'keys1',
   keymap: {
     KeyA: 0,
     KeyW: 1,
@@ -2163,20 +2471,24 @@ keys({
 })
 )};
 const _ky1g3s = (G, _) => G.input(_);
-const _md1v5t = function _midi1(midiIn){return(
-midiIn()
+const _md1v5t = function _midi1(midiIn,midiBus){return(
+midiIn({
+  bus: midiBus,
+  name: 'midi1'
+})
 )};
 const _md1g7u = (G, _) => G.input(_);
-const _sy1v8e = function _synth1(sticky,mkSynth,daw_ctx,master,$0,$1,$2,invalidation){return(
+const _sy1v8e = function _synth1(sticky,mkSynth,daw_ctx,master,midiBus,invalidation){return(
 sticky(mkSynth(daw_ctx, master, {
   label: 'poly',
-  sources: [
-    $0,
-    $1,
-    $2
+  bus: midiBus,
+  inputs: [
+    'chord1',
+    'midi1',
+    'synthSeq'
   ],
   invalidation
-}), undefined)
+}), {"wave":"sawtooth","gain":0.59,"cutoff":2252,"res":2.1,"env":0.65,"a":0.021,"d":0.42,"s":0.07,"r":0.05,"inputs":["chord1","midi1","synthSeq"]})
 )};
 const _sy1g2h = (G, _) => G.input(_);
 const _clk1v4 = function _clock(mkClock,daw_ctx,$0,$1,invalidation){return(
@@ -2187,22 +2499,27 @@ mkClock(daw_ctx, {
 })
 )};
 const _clk1g5 = (G, _) => G.input(_);
-const _kit1v2 = function _kit1(mkKit,daw_ctx,$0,kick_voice,hat_voice,bass_voice,invalidation){return(
-mkKit(daw_ctx, {
+const _kit1v2 = function _kit1(sticky,mkKit,daw_ctx,midiBus,kick_voice,hat_voice,bass_voice,invalidation){return(
+sticky(mkKit(daw_ctx, {
   label: 'drums',
-  sources: [$0],
+  bus: midiBus,
+  inputs: [
+    'drums'
+  ],
   voices: {
     36: kick_voice,
     42: hat_voice,
     43: bass_voice
   },
   invalidation
-})
+}), undefined)
 )};
 const _kit1g8 = (G, _) => G.input(_);
-const _sq2v6a = function _synthSeq(sticky,mkSeq,$0,invalidation){return(
+const _sq2v6a = function _synthSeq(sticky,mkSeq,$0,midiBus,invalidation){return(
 sticky(mkSeq($0, {
   label: 'synth seq',
+  name: 'synthSeq',
+  bus: midiBus,
   gate: 0.9,
   rows: [
     { name: 'C4', note: 60 },
@@ -2325,6 +2642,26 @@ sticky(mkSeq($0, {
 })
 )};
 const _sq2g7b = (G, _) => G.input(_);
+const _chd1v = function _chord1(sticky,mkChord,midiBus,invalidation){return(
+sticky(mkChord(midiBus, {
+  name: 'chord1',
+  inputs: [
+    'keys1'
+  ],
+  chord: 'min',
+  invalidation
+}), undefined)
+)};
+const _chd1g = (G, _) => G.input(_);
+const _tk1v9 = function _template_keys(keys,midiBus){return(
+keys({
+  octaves: 2,
+  base: 48,
+  bus: midiBus,
+  name: 'template_keys'
+})
+)};
+const _tk1g0 = (G, _) => G.input(_);
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -2352,7 +2689,7 @@ export default function define(runtime, observer) {
   $def("_ae8ir", "viewof playing", ["Inputs"], _ae8ir);  
   $def("_1vfroho", "playing", ["Generators","viewof playing"], _1vfroho);  
   $def("_s71xha", "stepGrid", ["Event"], _s71xha);
-  $def("_14j1vyd", "viewof pattern", ["sticky","mkSeq","viewof clock","invalidation"], _14j1vyd);
+  $def("_14j1vyd", "viewof pattern", ["sticky","mkSeq","viewof clock","midiBus","invalidation"], _14j1vyd);
   $def("_7a7f2w", "pattern", ["Generators","viewof pattern"], _7a7f2w);
   $def("_wu1p2x", "noiseBuffer", ["daw_ctx"], _wu1p2x);  
   $def("_6ldw81", "kick_voice", ["daw_ctx","master"], _6ldw81);  
@@ -2385,22 +2722,29 @@ export default function define(runtime, observer) {
   $def("_knb4x2", "knob", [], _knb4x2);
   $def("_kys9m1", "keys", [], _kys9m1);
   $def("_mdn3q7", "midiIn", [], _mdn3q7);
-  $def("_msy5k4", "mkSynth", ["knob"], _msy5k4);
+  $def("_bus1a2", "midiBus", [], _bus1a2);
+  $def("_mkpk5", "mkInputPicker", [], _mkpk5);
+  $def("_msy5k4", "mkSynth", ["knob","mkInputPicker"], _msy5k4);
   $def("_mkclk7", "mkClock", [], _mkclk7);
   $def("_mkseq3", "mkSeq", ["stepGrid"], _mkseq3);
-  $def("_mkkit9", "mkKit", [], _mkkit9);
-  $def("_ky1v6r", "viewof keys1", ["keys"], _ky1v6r);
+  $def("_mkkit9", "mkKit", ["mkInputPicker"], _mkkit9);
+  $def("_mkchd2", "mkChord", ["mkInputPicker"], _mkchd2);
+  $def("_ky1v6r", "viewof keys1", ["keys","midiBus"], _ky1v6r);
   $def("_ky1g3s", "keys1", ["Generators","viewof keys1"], _ky1g3s);
-  $def("_md1v5t", "viewof midi1", ["midiIn"], _md1v5t);
+  $def("_md1v5t", "viewof midi1", ["midiIn","midiBus"], _md1v5t);
   $def("_md1g7u", "midi1", ["Generators","viewof midi1"], _md1g7u);
   $def("_clk1v4", "viewof clock", ["mkClock","daw_ctx","viewof playing","viewof bpm","invalidation"], _clk1v4);
   $def("_clk1g5", "clock", ["Generators","viewof clock"], _clk1g5);
-  $def("_kit1v2", "viewof kit1", ["mkKit","daw_ctx","viewof pattern","kick_voice","hat_voice","bass_voice","invalidation"], _kit1v2);
+  $def("_kit1v2", "viewof kit1", ["sticky","mkKit","daw_ctx","midiBus","kick_voice","hat_voice","bass_voice","invalidation"], _kit1v2);
   $def("_kit1g8", "kit1", ["Generators","viewof kit1"], _kit1g8);
-  $def("_sq2v6a", "viewof synthSeq", ["sticky","mkSeq","viewof clock","invalidation"], _sq2v6a);
+  $def("_sq2v6a", "viewof synthSeq", ["sticky","mkSeq","viewof clock","midiBus","invalidation"], _sq2v6a);
   $def("_sq2g7b", "synthSeq", ["Generators","viewof synthSeq"], _sq2g7b);
-  $def("_sy1v8e", "viewof synth1", ["sticky","mkSynth","daw_ctx","master","viewof keys1","viewof midi1","viewof synthSeq","invalidation"], _sy1v8e);
+  $def("_chd1v", "viewof chord1", ["sticky","mkChord","midiBus","invalidation"], _chd1v);
+  $def("_chd1g", "chord1", ["Generators","viewof chord1"], _chd1g);
+  $def("_sy1v8e", "viewof synth1", ["sticky","mkSynth","daw_ctx","master","midiBus","invalidation"], _sy1v8e);
   $def("_sy1g2h", "synth1", ["Generators","viewof synth1"], _sy1g2h);
+  $def("_tk1v9", "viewof template_keys", ["keys","midiBus"], _tk1v9);
+  $def("_tk1g0", "template_keys", ["Generators","viewof template_keys"], _tk1g0);
   main.define("gridContainer", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridContainer", _));
   main.define("gridControls", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridControls", _));
   main.define("sticky", ["module @tomlarkworthy/sticky", "@variable"], (_, v) => v.import("sticky", _));  
