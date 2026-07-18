@@ -1584,7 +1584,8 @@ const _mkseq3 = function _mkSeq(stepGrid){return(
       for (let h = 0; h < hits; h++) {
         const ht = t + h * secPerStep / hits;
         const offT = ht + Math.max(0.02, secPerStep / hits * gate);
-        const on = [144, note, Math.max(1, Math.min(127, r.vel ?? velocity))];
+        const bv = Math.max(1, Math.min(127, r.vel ?? velocity));
+        const on = [144, note, hits > 1 ? Math.max(1, Math.round(bv * (0.55 + 0.45 * (h + 1) / hits))) : bv];
         const off = [128, note, 0];
         el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: on, time: ht } }));
         el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: off, time: offT } }));
@@ -2356,9 +2357,24 @@ const _msy5k4 = function _mkSynth(knob,mkInputPicker){return(
     ...Object.fromEntries(Object.entries(k).map(([n, e]) => [n, e.value]))
   });
   const live = new Map();
+  // fast choke (no release tail): same-note retrigger (rolls) and teardown
+  const kill = (v, t) => {
+    if (v.g.gain.cancelAndHoldAtTime)
+      v.g.gain.cancelAndHoldAtTime(t);
+    else
+      v.g.gain.cancelScheduledValues(t);
+    v.g.gain.setTargetAtTime(0.0001, t, 0.004);
+    v.o.stop(t + 0.05);
+    if (v.o2)
+      v.o2.stop(t + 0.05);
+    v.o.onended = () => v.g.disconnect();
+  };
   const noteoff = (note, at) => {
     const v = live.get(note);
     if (!v)
+      return;
+    // ratchets overlap on/off pairs on one note: only the LAST open releases
+    if (--v.opens > 0)
       return;
     live.delete(note);
     const t = at ?? ctx.currentTime;
@@ -2377,10 +2393,14 @@ const _msy5k4 = function _mkSynth(knob,mkInputPicker){return(
   };
   const noteon = (note, vel, at) => {
     ctx.resume();
-    if (live.has(note))
-      noteoff(note, at);
-    const p = patch();
     const t = at ?? ctx.currentTime + 0.003;
+    const prev = live.get(note);
+    let opens = 1;
+    if (prev) {
+      kill(prev, t);
+      opens = prev.opens + 1;
+    }
+    const p = patch();
     const o = ctx.createOscillator();
     o.type = p.wave;
     o.frequency.value = 440 * 2 ** ((note - 69) / 12);
@@ -2410,7 +2430,7 @@ const _msy5k4 = function _mkSynth(knob,mkInputPicker){return(
     o.start(t);
     if (o2)
       o2.start(t);
-    live.set(note, { o, o2, g });
+    live.set(note, { o, o2, g, opens });
     led.style.background = '#3ddc84';
   };
   const onMidi = e => {
@@ -2429,7 +2449,11 @@ const _msy5k4 = function _mkSynth(knob,mkInputPicker){return(
   };
   if (bus)
     bus.addEventListener('midi', onBus);
-  const allOff = () => [...live.keys()].forEach(noteoff);
+  const allOff = () => {
+    [...live.values()].forEach(v => kill(v, ctx.currentTime));
+    live.clear();
+    led.style.background = '#37474f';
+  };
   if (invalidation)
     invalidation.then(() => {
       sources.filter(Boolean).forEach(s => s.removeEventListener('midi', onMidi));
@@ -3008,6 +3032,7 @@ const _mksmp1 = function _mkSampler(knob,mkInputPicker,sampleStore){return(
       led.style.background = '#37474f';
     }, 100);
   };
+  let cur = null;
   const play = (t, vel = 100, noteIn = null) => {
     if (!buffer)
       return;
@@ -3017,6 +3042,13 @@ const _mksmp1 = function _mkSampler(knob,mkInputPicker,sampleStore){return(
     const s1 = Math.max(k.start.value, k.end.value) * dur;
     if (s1 - s0 < 0.001)
       return;
+    // mono choke: overlapping copies of the same sample comb-filter into glitch
+    if (cur) {
+      cur.g.gain.setTargetAtTime(0.0001, t, 0.004);
+      try {
+        cur.s.stop(t + 0.05);
+      } catch (err) {}
+    }
     const s = ctx.createBufferSource();
     s.buffer = buffer;
     let rate = k.rate.value;
@@ -3028,7 +3060,12 @@ const _mksmp1 = function _mkSampler(knob,mkInputPicker,sampleStore){return(
     s.connect(g);
     g.connect(outNode);
     s.start(t, s0, s1 - s0);
-    s.onended = () => g.disconnect();
+    cur = { s, g };
+    s.onended = () => {
+      g.disconnect();
+      if (cur && cur.s === s)
+        cur = null;
+    };
     flash();
   };
   const loadFile = async n => {
@@ -3210,14 +3247,26 @@ const _mkpd1 = function _mkPads(knob,mkInputPicker,sampleStore){return(
     if (!p.buffer)
       return;
     ctx.resume();
+    const tt = t ?? ctx.currentTime + 0.003;
+    if (p.cur) {
+      p.cur.g.gain.setTargetAtTime(0.0001, tt, 0.004);
+      try {
+        p.cur.s.stop(tt + 0.05);
+      } catch (err) {}
+    }
     const s = ctx.createBufferSource();
     s.buffer = p.buffer;
     const g = ctx.createGain();
     g.gain.value = gainK.value * Math.max(0.05, vel / 127);
     s.connect(g);
     g.connect(outNode);
-    s.start(t ?? ctx.currentTime + 0.003);
-    s.onended = () => g.disconnect();
+    s.start(tt);
+    p.cur = { s, g };
+    s.onended = () => {
+      g.disconnect();
+      if (p.cur && p.cur.s === s)
+        p.cur = null;
+    };
     p.el.style.background = '#2e7d32';
     window.setTimeout(() => {
       p.el.style.background = p.buffer ? '#263238' : '#1c2529';
@@ -3426,9 +3475,17 @@ const _mkdr1 = function _mkDrum(knob,mkInputPicker){return(
       led.style.background = '#37474f';
     }, 90);
   };
+  let cur = null;
   const play = (vel = 110, at = null) => {
     ctx.resume();
     const t = at ?? ctx.currentTime + 0.003;
+    if (cur) {
+      cur.g.gain.cancelScheduledValues(t);
+      cur.g.gain.setTargetAtTime(0.0001, t, 0.004);
+      try {
+        cur.o.stop(t + 0.05);
+      } catch (err) {}
+    }
     const p = k.pitch.value;
     const d = k.decay.value;
     const o = ctx.createOscillator();
@@ -3441,7 +3498,12 @@ const _mkdr1 = function _mkDrum(knob,mkInputPicker){return(
     g.connect(outNode);
     o.start(t);
     o.stop(t + d + 0.05);
-    o.onended = () => g.disconnect();
+    cur = { o, g };
+    o.onended = () => {
+      g.disconnect();
+      if (cur && cur.o === o)
+        cur = null;
+    };
     flash();
   };
   hit.addEventListener('pointerdown', e => {
