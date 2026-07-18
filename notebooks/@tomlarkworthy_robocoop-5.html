@@ -4857,7 +4857,7 @@ const _zqho0j = function _session(client,createAgentSession,toolsView,modelView,
     // single tool call is a fabricated summary — nothing ran (observed on mimo: step-1 task_complete
     // announcing modules it never wrote). A genuinely tool-free reply survives the guard: the model just
     // calls task_complete again and it is accepted.
-    completeGuard: ({toolCallsThisTurn}) => toolCallsThisTurn === 0 ? 'REJECTED: you have made NO tool calls this turn, so nothing has been created, changed, or verified \u2014 ' + 'a completion summary now would be fiction. Do the work first with real tool calls (read_file / ' + 'write_file / edit_file / eval_js / \u2026), verify it, then call task_complete describing what you DID. ' + 'If this request truly requires no tool work, call task_complete again to confirm.' : null,
+    completeGuard: ({toolCallsThisTurn}) => toolCallsThisTurn === 0 ? 'REJECTED: you have made NO tool calls this turn, so nothing has been created, changed, or verified \u2014 ' + 'a completion summary now would be fiction. Do the work first with real tool calls (read_file / ' + 'write_file / edit_file / eval_js / \u2026), verify it, then call task_complete describing what you DID. ' + 'If this request truly requires no tool work \u2014 including when you are ASKING THE USER for information ' + 'or a decision only they can provide \u2014 call task_complete again with your answer or question as the ' + 'summary; asking the user is a legitimate tool-free turn.' : null,
     stallNudgeLimit: 2,
     maxStepsPerTurn: 40,
     // Reasoning models spend completion budget on reasoning; give headroom for reasoning + a full write_file.
@@ -5075,7 +5075,7 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         globToRe
     };
 };
-const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefine, createModule, cellHelpers, summarizeJS, rc5_watchBus, observe, importShim, location, rc5_store) {
+const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefine, createModule, cellHelpers, summarizeJS, rc5_watchBus, observe, importShim, location, rc5_store, descendants) {
     const apply = jbApply({
         currentModules,
         runtime,
@@ -5102,8 +5102,6 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
         };
         if (v._error != null)
             return finish({ error: v._error && v._error.message || String(v._error) });
-        if (v._value !== undefined)
-            return finish({ value: v._value });
         if (v._name)
             Promise.resolve().then(() => mod.value(v._name)).then(value => finish({ value }), error => finish({ error: error && error.message || String(error) }));
         else {
@@ -5113,7 +5111,7 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
             } catch (e) {
             }
         }
-        setTimeout(() => finish({ pending: true }), 4000);
+        setTimeout(() => finish(v._value !== undefined ? { value: v._value } : { pending: true }), 4000);
     });
     const probeAndWatch = async id => {
         const mod = resolveModule(id);
@@ -5154,7 +5152,27 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
         const okCount = probe.length - errored.length;
         if (errored.length)
             return ' \xB7 \u26A0 ' + errored.length + ' cell' + (errored.length === 1 ? '' : 's') + ' ERRORING at runtime \u2014 ' + errored.map(e => e.name + ': ' + e.error).join('; ') + ' \u2014 FIX before task_complete (a compile-clean cell can still error when observed)';
-        return ' \xB7 \u2713 all ' + okCount + ' cell' + (okCount === 1 ? '' : 's') + ' compute with no runtime error (auto-watched; changes stream to you)';
+        const vals = probe.filter(r => r.value !== undefined).slice(0, 8).map(r => r.name + '=' + r.value).join(', ');
+        return ' \xB7 \u2713 all ' + okCount + ' cell' + (okCount === 1 ? '' : 's') + ' compute with no runtime error (auto-watched; changes stream to you)' + (vals ? ' \xB7 values: ' + vals + (probe.length > 8 ? ' \u2026(+' + (probe.length - 8) + ' more)' : '') : '');
+    };
+    const downstreamStatus = async id => {
+        const mod = resolveModule(id);
+        if (!mod)
+            return '';
+        const inSeedModule = new Set(varsOf(mod));
+        const seeds = varsOf(mod).filter(v => v._name && !isStructural(v));
+        if (!seeds.length)
+            return '';
+        const dependents = [...descendants(...seeds)].filter(v => !inSeedModule.has(v) && v._name && !isStructural(v));
+        if (!dependents.length)
+            return '';
+        await new Promise(r => setTimeout(r, 150));
+        const parts = await Promise.all(dependents.slice(0, 12).map(async v => {
+            const label = (v._module && v._module._name ? v._module._name + ':' : '') + v._name;
+            const r = await readVar(v._module, v);
+            return label + '=' + (r.error ? '\u26A0 ' + r.error : r.pending ? '\u23F3 still computing' : summ(r.value));
+        }));
+        return ' \xB7 downstream recomputed: ' + parts.join(', ') + (dependents.length > 12 ? ' \u2026(+' + (dependents.length - 12) + ' more)' : '');
     };
     let cmModPromise = null;
     const getCmMod = () => {
@@ -5269,6 +5287,11 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
                 status = probeStatus(await probeAndWatch(id));
             } catch (e) {
             }
+            let downstream = '';
+            try {
+                downstream = await downstreamStatus(id);
+            } catch (e) {
+            }
             let structure = '';
             try {
                 structure = await structureStatus(id);
@@ -5276,7 +5299,7 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
             }
             return {
                 ok: true,
-                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + status + structure
+                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + status + downstream + structure
             };
         } catch (e) {
             keepDraft();
@@ -6121,7 +6144,7 @@ export default function define(runtime, observer) {
   $def("_76otvk", "cellHelpers", ["currentModules","runtime"], _76otvk);  
   $def("_19x8b93", "rc5_store", [], _19x8b93);  
   $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim"], _o37ix1);  
-  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","importShim","location","rc5_store"], _190yjiu);  
+  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","importShim","location","rc5_store","descendants"], _190yjiu);  
   $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus"], _ual70b);  
   $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS"], _qc0bl);  
@@ -6135,6 +6158,7 @@ export default function define(runtime, observer) {
   main.define("createModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("createModule", _));  
   main.define("observe", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observe", _));  
   main.define("importShim", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("importShim", _));  
+  main.define("descendants", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("descendants", _));  
   main.define("currentModules", ["module @tomlarkworthy/module-map", "@variable"], (_, v) => v.import("currentModules", _));  
   main.define("defineTool", ["module @tomlarkworthy/robocoop-5-core", "@variable"], (_, v) => v.import("defineTool", _));  
   main.define("registerTool", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("registerTool", _));  
@@ -26500,14 +26524,19 @@ const _createAgentSession = function _createAgentSession(truncate){
       type: 'function',
       function: {
         name: completeToolName,
-        description: 'Call this ONLY when the task is fully complete (or you have finished answering) to end ' +
-          'your turn. Put your short summary or final answer in `summary`.',
+        description: 'Call this to END YOUR TURN: when the task is fully complete, when you have finished ' +
+          'answering, or when you are BLOCKED on something only the user can provide (missing information, a ' +
+          'decision, credentials). Put your summary, final answer, or QUESTION TO THE USER in `summary` — the ' +
+          'user cannot see or answer anything until your turn ends, so ending the turn IS how you ask. Never ' +
+          'keep taking tool actions while waiting on the user.',
         parameters: { type: 'object', properties: { summary: { type: 'string', description: 'Short summary / final answer shown to the user.' } }, required: [] },
       },
     } : null;
     const nudge = nudgeMessage ?? ('You ended your turn without calling a tool. If the task is complete, call ' +
-      (completeToolName || 'the completion tool') + ' with a short summary. Otherwise keep going — call a tool ' +
-      'to take the next concrete step; do not just describe what you will do.');
+      (completeToolName || 'the completion tool') + ' with a short summary. If you need information or a ' +
+      'decision from the user, call it with your question as the summary — the user only sees it when your ' +
+      'turn ends. Otherwise keep going — call a tool to take the next concrete step; do not just describe ' +
+      'what you will do.');
 
     const messages = [];
     let currentAbort = null;
@@ -26558,7 +26587,21 @@ const _createAgentSession = function _createAgentSession(truncate){
 
       const sp = getSystemPrompt();
       if (sp != null) {
-        const m = { role: 'system', content: String(sp) };
+        // Loop-owned operating principles: appended to WHATEVER system prompt the provider supplies, so
+        // they hold even when a host swaps in a domain prompt. Trigger-conditioned — each names when it
+        // applies AND when it does not, to avoid over-application on simple tasks.
+        const LOOP_PRINCIPLES = '\n\nOPERATING PRINCIPLES (always active):\n' +
+          '- Target check before hard-to-undo actions (external mutations, purchases, cancellations, sends, ' +
+          'deletions): name the exact target entity first. If MORE THAN ONE entity could plausibly match the ' +
+          'request, or you have not examined all plausible candidates, resolve the ambiguity before acting — ' +
+          'inspect the candidates, or ask the user when only they can disambiguate. Records you have NOT ' +
+          'opened count as unexamined candidates: a match is only unique once you have surveyed every record ' +
+          'that could contain the target. Never resolve ambiguity by taking the first match. When the survey ' +
+          'is complete and exactly one candidate matches, proceed without asking.\n' +
+          '- Multi-part requests: when a request contains several distinct deliverables or changes, enumerate ' +
+          'them explicitly up front, and before finishing check each part off — partial completion otherwise ' +
+          'passes unnoticed. Skip this for single-part requests.';
+        const m = { role: 'system', content: String(sp) + LOOP_PRINCIPLES };
         if (messages[0]?.role === 'system') messages[0] = m;
         else messages.unshift(m);
       }
