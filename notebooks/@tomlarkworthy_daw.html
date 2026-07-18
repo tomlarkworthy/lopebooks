@@ -945,7 +945,8 @@ gridContainer(runtime, {
     'viewof pads1',
     'viewof echo1',
     'viewof verb1',
-    'viewof duck1'
+    'viewof duck1',
+    'viewof slicer1'
   ],
   layout: {
     atoms: {
@@ -1073,10 +1074,14 @@ gridContainer(runtime, {
       'viewof duck1': {
         'x': 760,
         'y': 1310
+      },
+      'viewof slicer1': {
+        'x': 20,
+        'y': 1460
       }
     }
   },
-  height: 1480
+  height: 1650
 })
 )};
 const _hn2uu3 = function _title(md){return(
@@ -1993,8 +1998,9 @@ md`## Extending the studio
 6. **Sidechain**: a duck unit listens for a \`note\` on its ⌁ sources and dips the *ducks* target's gain (\`depth\`, \`rel\`). Default: the kick ducks the reese — classic pump.
 7. **Glide**: any synth's \`glide\` knob > 0 makes it mono — overlapping notes slide 303-style instead of retriggering.
 8. **Pan**: every instrument has a \`pan\` knob. Spread the hats, keep kick and sub centred.
-9. **Arranging**: set the song's ⌁ to the cells that define a section, dial in a sound, **⊕** to capture it as a scene, change things, capture again. Set bar counts, press play — the song walks the scenes in a loop. ▶ auditions a scene, ⟳ re-captures into it. Un-tick *armed* to jam without the song moving values under you.
-10. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\`.`
+9. **Slice a break**: drop a breakbeat on a slicer — it chops into \`slices\` equal parts mapped upward from \`base\` (labels drawn on the waveform). Point seq row chips at those notes to resequence the chop; click a slice to audition.
+10. **Arranging**: set the song's ⌁ to the cells that define a section, dial in a sound, **⊕** to capture it as a scene, change things, capture again. Set bar counts, press play — the song walks the scenes in a loop. ▶ auditions a scene, ⟳ re-captures into it. Un-tick *armed* to jam without the song moving values under you. Tick **morph** for automation: numeric knob values glide toward the next scene across its bars (patterns and note pitches still switch on the boundary).
+11. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\`.`
 )};
 const _dwctrl = function _controls(gridControls){return(
 gridControls()
@@ -2750,11 +2756,17 @@ const _mkarr5 = function _mkArranger(mkInputPicker){return(
   armLab.title = 'armed: apply scenes on bar boundaries (live, not persisted)';
   armLab.style.cssText = 'display:flex; gap:3px; align-items:center; cursor:pointer; margin-left:auto;';
   armLab.append(armed, document.createTextNode('armed'));
+  const morph = document.createElement('input');
+  morph.type = 'checkbox';
+  const morphLab = document.createElement('label');
+  morphLab.title = 'morph: numeric knob values glide toward the next scene across its bars (automation); patterns and notes still switch on the boundary';
+  morphLab.style.cssText = 'display:flex; gap:3px; align-items:center; cursor:pointer;';
+  morphLab.append(morph, document.createTextNode('morph'));
   const capBtn = document.createElement('button');
   capBtn.textContent = '⊕';
   capBtn.title = 'capture current values of ⌁ targets as a new scene';
   capBtn.style.cssText = 'font:9px monospace; cursor:pointer;';
-  head.append(name, picker, armLab, capBtn);
+  head.append(name, picker, armLab, morphLab, capBtn);
   const list = document.createElement('div');
   list.style.cssText = 'display:flex; flex-direction:column; gap:2px;';
   el.append(head, list);
@@ -2787,6 +2799,39 @@ const _mkarr5 = function _mkArranger(mkInputPicker){return(
       b -= sp[i];
     }
     return -1;
+  };
+  const scenePos = bar => {
+    const sp = spans();
+    const total = sp.reduce((a, b) => a + b, 0);
+    if (!total)
+      return null;
+    let b = (bar % total + total) % total;
+    for (let i = 0; i < sp.length; i++) {
+      if (b < sp[i])
+        return { i, barInScene: b, bars: sp[i] };
+      b -= sp[i];
+    }
+    return null;
+  };
+  // morph rule: plain numbers lerp; note pitches, arrays (patterns) and __notes
+  // hold the current scene until the boundary
+  const morphValue = (a, b, f, key) => {
+    if (typeof a === 'number' && typeof b === 'number' && key !== 'note')
+      return a + (b - a) * f;
+    if (a && b && typeof a === 'object' && !Array.isArray(a) && typeof b === 'object' && !Array.isArray(b) && key !== '__notes') {
+      const o = {};
+      for (const k2 of Object.keys(a))
+        o[k2] = k2 in b ? morphValue(a[k2], b[k2], f, k2) : a[k2];
+      return o;
+    }
+    return a;
+  };
+  const hasMorphDiff = (a, b, key) => {
+    if (typeof a === 'number' && typeof b === 'number' && key !== 'note')
+      return a !== b;
+    if (a && b && typeof a === 'object' && !Array.isArray(a) && typeof b === 'object' && !Array.isArray(b) && key !== '__notes')
+      return Object.keys(a).some(k2 => k2 in b && hasMorphDiff(a[k2], b[k2], k2));
+    return false;
   };
   const paintActive = () => {
     [...list.children].forEach((row, i) => {
@@ -2900,6 +2945,28 @@ const _mkarr5 = function _mkArranger(mkInputPicker){return(
       if (next >= 0 && next !== current)
         window.queueMicrotask(() => apply(next));
     }
+    if (morph.checked && current >= 0 && song.scenes.length > 1) {
+      const pos = scenePos(bar);
+      if (pos && pos.i === current) {
+        const a = song.scenes[current].set || {};
+        const nb = song.scenes[(current + 1) % song.scenes.length].set || {};
+        const f = (pos.barInScene * stepsPerBar + stepInBar + 1) / (pos.bars * stepsPerBar);
+        for (const [n, av] of Object.entries(a)) {
+          if (!(n in nb) || !hasMorphDiff(av, nb[n], n))
+            continue;
+          const t = resolve(n);
+          if (!t)
+            continue;
+          try {
+            t.value = JSON.parse(JSON.stringify(morphValue(av, nb[n], f, n)));
+            const ev = new window.Event('input', { bubbles: true });
+            ev.transient = true;
+            t.dispatchEvent(ev);
+          } catch (err) {
+          }
+        }
+      }
+    }
   };
   const onStop = () => {
     current = -1;
@@ -2919,7 +2986,8 @@ const _mkarr5 = function _mkArranger(mkInputPicker){return(
   Object.defineProperty(el, 'value', {
     get: () => JSON.parse(JSON.stringify({
       targets: picker.value,
-      scenes: song.scenes
+      scenes: song.scenes,
+      morph: morph.checked
     })),
     set: v => {
       if (!v)
@@ -2928,6 +2996,7 @@ const _mkarr5 = function _mkArranger(mkInputPicker){return(
         picker.value = v.targets;
       if (Array.isArray(v.scenes))
         song.scenes = JSON.parse(JSON.stringify(v.scenes));
+      morph.checked = !!v.morph;
       render();
     }
   });
@@ -4098,6 +4167,274 @@ sticky(mkDucker(daw_ctx, midiBus, {
 }), {"inputs":[],"target":"","note":36,"depth":0.55,"rel":0.22})
 )};
 const _tdk1g = (G, _) => G.input(_);
+const _mksl1 = function _mkSlicer(knob,mkInputPicker,sampleStore){return(
+(ctx, out, { label = 'slicer', bus = null, inputs = [], invalidation } = {}) => {
+  const NN = n => ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][n % 12] + (Math.floor(n / 12) - 1);
+  const el = document.createElement('div');
+  el.style.cssText = 'display:inline-flex; flex-direction:column; gap:4px; background:#1c2529; border:1px solid #37474f; border-radius:6px; padding:8px 10px; width:max-content;';
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex; gap:8px; align-items:center; font:10px var(--sans-serif, sans-serif); color:#eceff1;';
+  const led = document.createElement('span');
+  led.style.cssText = 'width:7px; height:7px; border-radius:50%; background:#37474f; flex:none;';
+  const name = document.createElement('b');
+  name.textContent = label;
+  const fileLab = document.createElement('span');
+  fileLab.style.cssText = 'color:#90a4ae; font-family:monospace;';
+  fileLab.textContent = '\u2014';
+  let selected = new Set(inputs);
+  const picker = mkInputPicker(bus, {
+    selected: inputs,
+    onChange: v => {
+      selected = new Set(v);
+    }
+  });
+  const file = document.createElement('input');
+  file.type = 'file';
+  file.accept = 'audio/*';
+  file.style.display = 'none';
+  const open = document.createElement('button');
+  open.textContent = '\ud83d\udcc2';
+  open.title = 'load a breakbeat';
+  open.style.cssText = 'font:10px inherit; margin-left:auto; cursor:pointer;';
+  open.onclick = () => file.click();
+  head.append(led, name, fileLab, picker, open, file);
+  const cv = document.createElement('canvas');
+  cv.width = 260;
+  cv.height = 44;
+  cv.style.cssText = 'width:260px; height:44px; border:1px solid #263238; border-radius:3px; cursor:pointer;';
+  cv.title = 'click a slice to audition; drop audio to load';
+  const k = {
+    base: knob({ label: 'base', min: 0, max: 115, value: 60, step: 1, fmt: NN }),
+    slices: knob({ label: 'slices', min: 2, max: 32, value: 8, step: 1 }),
+    rate: knob({ label: 'rate', min: 0.5, max: 2, value: 1, step: 0.01, log: true }),
+    gain: knob({ label: 'gain', min: 0, max: 1.5, value: 1, step: 0.01 }),
+    pan: knob({ label: 'pan', min: -1, max: 1, value: 0, step: 0.01 })
+  };
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex; gap:2px;';
+  row.append(...Object.values(k));
+  el.append(head, cv, row);
+  // slices map upward from base: base=C4, 8 slices -> C4..G#4 trigger chops
+  const outNode = ctx.createGain();
+  const panner = ctx.createStereoPanner();
+  outNode.connect(panner);
+  panner.connect(out);
+  if (bus && bus.registerTap)
+    bus.registerTap(label, outNode);
+  if (bus)
+    bus.register(label);
+  el.addEventListener('input', () => {
+    panner.pan.value = k.pan.value;
+    draw();
+  });
+  let buffer = null;
+  let fileName = null;
+  let loadTok = 0;
+  let cur = null;
+  let flashSlice = -1;
+  const draw = () => {
+    const w = cv.width;
+    const h = cv.height;
+    const g2 = cv.getContext('2d');
+    g2.fillStyle = '#141b1e';
+    g2.fillRect(0, 0, w, h);
+    if (!buffer) {
+      g2.fillStyle = '#546e7a';
+      g2.font = '10px sans-serif';
+      g2.fillText('drop / \ud83d\udcc2 a breakbeat', 8, h / 2 + 3);
+      return;
+    }
+    const d = buffer.getChannelData(0);
+    const step = Math.max(1, Math.floor(d.length / w));
+    g2.strokeStyle = '#3ddc84';
+    g2.beginPath();
+    for (let x = 0; x < w; x++) {
+      let mn = 1;
+      let mx = -1;
+      for (let i = x * step, e = Math.min(d.length, i + step); i < e; i++) {
+        const v = d[i];
+        if (v < mn)
+          mn = v;
+        if (v > mx)
+          mx = v;
+      }
+      g2.moveTo(x + 0.5, h / 2 + mn * (h / 2 - 1));
+      g2.lineTo(x + 0.5, h / 2 + mx * (h / 2 - 1));
+    }
+    g2.stroke();
+    const n = Math.max(2, Math.round(k.slices.value));
+    for (let i = 0; i < n; i++) {
+      const x = i / n * w;
+      if (i) {
+        g2.strokeStyle = 'rgba(236,239,241,0.35)';
+        g2.beginPath();
+        g2.moveTo(x + 0.5, 0);
+        g2.lineTo(x + 0.5, h);
+        g2.stroke();
+      }
+      if (i === flashSlice) {
+        g2.fillStyle = 'rgba(61,220,132,0.25)';
+        g2.fillRect(x, 0, w / n, h);
+      }
+      g2.fillStyle = '#90a4ae';
+      g2.font = '7px monospace';
+      g2.fillText(NN(k.base.value + i), x + 2, 8);
+    }
+  };
+  let fade = null;
+  const flash = i => {
+    flashSlice = i;
+    draw();
+    led.style.background = '#3ddc84';
+    window.clearTimeout(fade);
+    fade = window.setTimeout(() => {
+      flashSlice = -1;
+      led.style.background = '#37474f';
+      draw();
+    }, 120);
+  };
+  const play = (slice, vel = 100, t = null) => {
+    if (!buffer)
+      return;
+    const n = Math.max(2, Math.round(k.slices.value));
+    if (slice < 0 || slice >= n)
+      return;
+    ctx.resume();
+    const tt = t ?? ctx.currentTime + 0.003;
+    // mono choke: each chop cuts the last, like classic hardware slicing
+    if (cur) {
+      cur.g.gain.setTargetAtTime(0.0001, tt, 0.004);
+      try {
+        cur.s.stop(tt + 0.05);
+      } catch (err) {}
+    }
+    const dur = buffer.duration / n;
+    const s = ctx.createBufferSource();
+    s.buffer = buffer;
+    s.playbackRate.value = k.rate.value;
+    const g = ctx.createGain();
+    g.gain.value = k.gain.value * Math.max(0.05, vel / 127);
+    s.connect(g);
+    g.connect(outNode);
+    s.start(tt, slice * dur, dur);
+    cur = { s, g };
+    s.onended = () => {
+      g.disconnect();
+      if (cur && cur.s === s)
+        cur = null;
+    };
+    flash(slice);
+  };
+  const loadFile = async n => {
+    const tok = ++loadTok;
+    try {
+      const buf = await sampleStore.load(n);
+      if (tok !== loadTok)
+        return;
+      buffer = buf;
+      fileName = n;
+      fileLab.textContent = n;
+      draw();
+    } catch (err) {
+      if (tok === loadTok) {
+        fileLab.textContent = n + ' ?';
+        console.warn('daw: slicer load failed', n, err);
+      }
+    }
+  };
+  const upload = async f => {
+    if (!f)
+      return;
+    try {
+      const buf = await sampleStore.register(f);
+      loadTok++;
+      buffer = buf;
+      fileName = f.name;
+      fileLab.textContent = f.name;
+      draw();
+      el.dispatchEvent(new window.Event('input', { bubbles: true }));
+    } catch (err) {
+      console.warn('daw: slicer upload failed', err);
+    }
+  };
+  file.addEventListener('change', e => {
+    e.stopPropagation();
+    upload(file.files[0]);
+    file.value = '';
+  });
+  cv.addEventListener('dragover', e => e.preventDefault());
+  cv.addEventListener('drop', e => {
+    e.preventDefault();
+    upload(e.dataTransfer.files[0]);
+  });
+  cv.addEventListener('pointerdown', e => {
+    if (!buffer)
+      return;
+    const n = Math.max(2, Math.round(k.slices.value));
+    const slice = Math.floor(e.offsetX / cv.getBoundingClientRect().width * n);
+    const t = ctx.currentTime + 0.003;
+    play(slice, 110, t);
+    if (bus) {
+      bus.publish(label, [144, (k.base.value + slice) & 127, 110], t);
+      bus.publish(label, [128, (k.base.value + slice) & 127, 0], t + 0.15);
+    }
+  });
+  const onBus = e => {
+    if (e.detail.source === label || !selected.has(e.detail.source))
+      return;
+    const [st, d1, d2] = e.detail.data;
+    if ((st & 240) !== 144 || d2 === 0)
+      return;
+    play(d1 - k.base.value, d2, e.detail.time ?? null);
+  };
+  if (bus)
+    bus.addEventListener('midi', onBus);
+  if (invalidation)
+    invalidation.then(() => {
+      if (bus)
+        bus.removeEventListener('midi', onBus);
+      outNode.disconnect();
+    });
+  draw();
+  Object.defineProperty(el, 'value', {
+    get: () => ({
+      file: fileName,
+      ...Object.fromEntries(Object.entries(k).map(([n, e]) => [n, e.value])),
+      inputs: picker.value
+    }),
+    set: p => {
+      if (!p)
+        return;
+      for (const [n, e] of Object.entries(k))
+        if (typeof p[n] === 'number')
+          e.value = p[n];
+      panner.pan.value = k.pan.value;
+      if (Array.isArray(p.inputs))
+        picker.value = p.inputs;
+      if (p.file && p.file !== fileName)
+        loadFile(p.file);
+      draw();
+    }
+  });
+  return el;
+}
+)};
+const _sl1v = function _slicer1(sticky,mkSlicer,daw_ctx,drumBus,midiBus,invalidation){return(
+sticky(mkSlicer(daw_ctx, drumBus, {
+  label: 'slicer1',
+  bus: midiBus,
+  invalidation
+}), {"base":60,"slices":8,"rate":1,"gain":1,"pan":0,"inputs":[]})
+)};
+const _sl1g = (G, _) => G.input(_);
+const _tsl1v = function _template_slicer(sticky,mkSlicer,daw_ctx,master,midiBus,invalidation){return(
+sticky(mkSlicer(daw_ctx, master, {
+  label: 'template_slicer',
+  bus: midiBus,
+  invalidation
+}), {"base":60,"slices":8,"rate":1,"gain":1,"pan":0,"inputs":[]})
+)};
+const _tsl1g = (G, _) => G.input(_);
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -4229,6 +4566,11 @@ export default function define(runtime, observer) {
   $def("_tvb1g", "template_verb", ["Generators","viewof template_verb"], _tvb1g);
   $def("_tdk1v", "viewof template_duck", ["sticky","mkDucker","daw_ctx","midiBus","invalidation"], _tdk1v);
   $def("_tdk1g", "template_duck", ["Generators","viewof template_duck"], _tdk1g);
+  $def("_mksl1", "mkSlicer", ["knob","mkInputPicker","sampleStore"], _mksl1);
+  $def("_sl1v", "viewof slicer1", ["sticky","mkSlicer","daw_ctx","drumBus","midiBus","invalidation"], _sl1v);
+  $def("_sl1g", "slicer1", ["Generators","viewof slicer1"], _sl1g);
+  $def("_tsl1v", "viewof template_slicer", ["sticky","mkSlicer","daw_ctx","master","midiBus","invalidation"], _tsl1v);
+  $def("_tsl1g", "template_slicer", ["Generators","viewof template_slicer"], _tsl1g);
   main.define("gridContainer", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridContainer", _));
   main.define("gridControls", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridControls", _));
   main.define("sticky", ["module @tomlarkworthy/sticky", "@variable"], (_, v) => v.import("sticky", _));  
