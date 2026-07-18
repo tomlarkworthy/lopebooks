@@ -1131,7 +1131,7 @@ const _s71xha = function _stepGrid(Event){return(
   wrap.style.gridTemplateColumns = `52px repeat(${ steps }, 18px)`;
   const value = Object.fromEntries(rows.map(r => [
     r,
-    Array(steps).fill(false)
+    Array(steps).fill(0)
   ]));
   const btns = {};
   let ph = -1;
@@ -1141,6 +1141,7 @@ const _s71xha = function _stepGrid(Event){return(
         btns[r][i].style.background = on ? '#e7040f' : i % 4 === 0 ? 'var(--theme-foreground-faint, #ccc)' : 'var(--theme-foreground-faintest, #e5e5e5)';
         btns[r][i].style.outline = i === ph ? '2px solid #3ddc84' : 'none';
         btns[r][i].style.outlineOffset = '-2px';
+        btns[r][i].textContent = on > 1 ? on : '';
       });
   };
   wrap.playhead = i => {
@@ -1157,9 +1158,11 @@ const _s71xha = function _stepGrid(Event){return(
     btns[r] = [];
     for (let i = 0; i < steps; i++) {
       const b = document.createElement('div');
-      b.style.cssText = 'width:18px; height:18px; border-radius:3px; cursor:pointer;';
-      b.addEventListener('pointerdown', () => {
-        value[r][i] = !value[r][i];
+      b.style.cssText = 'width:18px; height:18px; border-radius:3px; cursor:pointer; color:#fff; font:10px/18px var(--sans-serif, sans-serif); text-align:center;';
+      b.addEventListener('pointerdown', e => {
+        const cur = +value[r][i] || 0;
+        // shift-click ratchets: 2-4 sub-hits inside the step (drum rolls)
+        value[r][i] = e.shiftKey ? (cur >= 4 ? 1 : (cur || 1) + 1) : cur ? 0 : 1;
         paint();
         wrap.dispatchEvent(new Event('input', { bubbles: true }));
         wrap.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1175,7 +1178,7 @@ const _s71xha = function _stepGrid(Event){return(
         return;
       for (const r of rows)
         if (Array.isArray(v[r]))
-          value[r] = v[r].slice(0, steps).concat(Array(Math.max(0, steps - v[r].length)).fill(false)).map(Boolean);
+          value[r] = v[r].slice(0, steps).concat(Array(Math.max(0, steps - v[r].length)).fill(0)).map(x => typeof x === 'number' ? Math.max(0, Math.min(4, Math.round(x))) : x ? 1 : 0);
       paint();
     }
   });
@@ -1438,27 +1441,44 @@ const _mkseq3 = function _mkSeq(stepGrid){return(
     bus.register(name);
   const el = document.createElement('div');
   el.style.cssText = 'display:inline-flex; flex-direction:column; gap:2px; width:max-content;';
-  if (label) {
-    const lab = document.createElement('div');
-    lab.textContent = label;
-    lab.style.cssText = 'font:9px var(--sans-serif, sans-serif); color:#90a4ae;';
-    el.appendChild(lab);
-  }
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex; gap:6px; align-items:center; font:9px var(--sans-serif, sans-serif); color:#90a4ae;';
+  const lab = document.createElement('span');
+  lab.textContent = label || name;
+  const muteBtn = document.createElement('button');
+  muteBtn.textContent = 'M';
+  muteBtn.title = 'mute (live, not persisted)';
+  muteBtn.style.cssText = 'font:8px monospace; padding:0 4px; cursor:pointer;';
+  let muted = false;
+  muteBtn.addEventListener('click', () => {
+    muted = !muted;
+    muteBtn.style.background = muted ? '#e7040f' : '';
+    muteBtn.style.color = muted ? '#fff' : '';
+  });
+  head.append(lab, muteBtn);
+  el.appendChild(head);
   el.appendChild(grid);
   const onTick = e => {
     const { t, step, secPerStep } = e.detail;
     const col = step % steps;
     grid.playhead(col);
+    if (muted)
+      return;
     const pat = grid.value;
     for (const r of rows) {
-      if (pat[r.name] && pat[r.name][col]) {
+      const n = pat[r.name] ? +pat[r.name][col] || 0 : 0;
+      if (!n)
+        continue;
+      const hits = Math.min(4, n);
+      for (let h = 0; h < hits; h++) {
+        const ht = t + h * secPerStep / hits;
+        const offT = ht + Math.max(0.02, secPerStep / hits * gate);
         const on = [144, r.note & 127, velocity];
         const off = [128, r.note & 127, 0];
-        const offT = t + Math.max(0.02, secPerStep * gate);
-        el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: on, time: t } }));
+        el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: on, time: ht } }));
         el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: off, time: offT } }));
         if (bus) {
-          bus.publish(name, on, t);
+          bus.publish(name, on, ht);
           bus.publish(name, off, offT);
         }
       }
@@ -1880,8 +1900,9 @@ md`## Extending the studio
 
 1. **＋ cell → ⊕ drum** on the station copies the whole \`template_drum\` group (faceplate, knobs, hit button, voice function) under a fresh name like \`drum1\` — every cross-reference renamed, no code typed. Its knobs are sticky; hit plays it immediately.
 2. To sequence it, pick a MIDI note for it: add a row like \`{ name: 'drum1', note: 45 }\` to the drum seq's \`rows\` (✎ on the pattern atom) and map \`45: drum1_voice\` in the kit's \`voices\` literal.
-3. **＋ cell → ⊕ keys** adds another keyboard; it registers on the \`midiBus\` under its fresh name and appears in every ⌁ input chooser — connect it with a click. Put a \`mkChord\` between a keyboard and a synth and you have a chord keyboard.
-4. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\` / \`template_<name>_<part>\`.`
+3. **＋ cell → ⊕ synth / ⊕ seq / ⊕ keys** add a second synth, another pattern, or another keyboard — each registers on the \`midiBus\` under its fresh name and appears in every ⌁ input chooser. A new seq becomes a **fill**: tick its name in the kit's ⌁ (or a synth's) and it plays alongside; use each seq's \`M\` to mute/unmute live.
+4. **Drum rolls**: shift-click a step to ratchet it — the number (2–4) is how many sub-hits fire inside that step.
+5. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\` / \`template_<name>_<part>\`.`
 )};
 const _dwctrl = function _controls(gridControls){return(
 gridControls()
@@ -2662,6 +2683,29 @@ keys({
 })
 )};
 const _tk1g0 = (G, _) => G.input(_);
+const _tsy1v = function _template_synth(sticky,mkSynth,daw_ctx,master,midiBus,invalidation){return(
+sticky(mkSynth(daw_ctx, master, {
+  label: 'template_synth',
+  bus: midiBus,
+  inputs: [],
+  invalidation
+}), undefined)
+)};
+const _tsy1g = (G, _) => G.input(_);
+const _tsq1v = function _template_seq(sticky,mkSeq,$0,midiBus,invalidation){return(
+sticky(mkSeq($0, {
+  label: 'template_seq',
+  name: 'template_seq',
+  bus: midiBus,
+  rows: [
+    { name: 'kick', note: 36 },
+    { name: 'hat', note: 42 },
+    { name: 'bass', note: 43 }
+  ],
+  invalidation
+}), undefined)
+)};
+const _tsq1g = (G, _) => G.input(_);
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -2745,6 +2789,10 @@ export default function define(runtime, observer) {
   $def("_sy1g2h", "synth1", ["Generators","viewof synth1"], _sy1g2h);
   $def("_tk1v9", "viewof template_keys", ["keys","midiBus"], _tk1v9);
   $def("_tk1g0", "template_keys", ["Generators","viewof template_keys"], _tk1g0);
+  $def("_tsy1v", "viewof template_synth", ["sticky","mkSynth","daw_ctx","master","midiBus","invalidation"], _tsy1v);
+  $def("_tsy1g", "template_synth", ["Generators","viewof template_synth"], _tsy1g);
+  $def("_tsq1v", "viewof template_seq", ["sticky","mkSeq","viewof clock","midiBus","invalidation"], _tsq1v);
+  $def("_tsq1g", "template_seq", ["Generators","viewof template_seq"], _tsq1g);
   main.define("gridContainer", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridContainer", _));
   main.define("gridControls", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridControls", _));
   main.define("sticky", ["module @tomlarkworthy/sticky", "@variable"], (_, v) => v.import("sticky", _));  
