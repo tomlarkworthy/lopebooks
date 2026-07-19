@@ -972,7 +972,9 @@ const _uafule = function _station(gridContainer,runtime,invalidation,dawModule) 
         'viewof duck1',
         'viewof slicer1',
         'viewof tape1',
-        'viewof dub1'
+        'viewof dub1',
+        'viewof drumBus',
+        'viewof roll1'
     ],
     layout: {
         atoms: {
@@ -1106,10 +1108,18 @@ const _uafule = function _station(gridContainer,runtime,invalidation,dawModule) 
             'viewof dub1': {
                 'x': 400,
                 'y': 1610
+            },
+            'viewof drumBus': {
+                'x': 400,
+                'y': 1110
+            },
+            'viewof roll1': {
+                'x': 20,
+                'y': 1780
             }
         }
     },
-    height: 1810
+    height: 2200
 }));};
 const _hn2uu3 = function _title(md){return(
 md`
@@ -1125,7 +1135,7 @@ Built from three orthogonal concepts, none of them audio-specific:
 Audio discipline (no timers anywhere):
 - \`daw_ctx\`/\`master\`/\`analyser\` use the \`this\` idiom — recompute returns the previous instance, so the audio graph is immortal.
 - The **clock** is the only ticking thing, and it runs on the **audio clock**: a silent \`ConstantSourceNode\` ends just before each step boundary and its \`onended\` schedules the next step. No \`setInterval\`, no lookahead polling, and it keeps time in background tabs. It dispatches look-ahead \`tick\` events carrying the exact \`AudioContext\` time of the boundary; everything downstream is a passive subscriber.
-- A **seq** is a pattern grid that listens to the clock and emits *timed* MIDI — a sequencer is a keyboard that plays itself. Instruments can't tell a pattern from a human.
+- A **seq** is a pattern grid that listens to the clock and emits *timed* MIDI — a sequencer is a keyboard that plays itself. Instruments can't tell a pattern from a human. A **roll** is the same subscriber at finer grain: a piano-roll canvas whose notes carry fractional step positions and lengths.
 - Voice functions read knob **elements'** \`.value\` at trigger time, so turning a knob never recomputes the audio path.
 
 Everything speaks **MIDI** over a shared bus. Sources publish named events (\`{source, data, time}\`, raw MIDI bytes, optional scheduled time) onto \`midiBus\`: **keys** (pointer + computer-keyboard piano — the key binding is a plain \`keymap\` literal in its cell), **midiIn** (Web MIDI hardware), and every **seq**. Instruments pick their inputs with the **⌁ chooser** on their faceplate; the selection persists inside the same \`sticky\` patch as the knobs, so rewiring is a click yet the whole patch bay still lives in cell source. **Transformers** are both sink and source: **chord** expands each incoming note into a chord under its own bus name (\`keys1 → chord1 → synth\`) — arpeggiators, transposers and quantizers are the same shape. The bus also carries **audio taps**: \`master\` and every synth register their output node under their name, and a **scope** selects which tap it draws.
@@ -1366,6 +1376,7 @@ const _s71xha = function _stepGrid(Event){return(
         const cur = +value[r][i] || 0;
         // shift-click ratchets: 2-4 sub-hits inside the step (drum rolls)
         value[r][i] = e.shiftKey ? (cur >= 4 ? 1 : (cur || 1) + 1) : cur ? 0 : 1;
+        wrap.lastEdit = { row: r, col: i, on: value[r][i] };
         paint();
         wrap.dispatchEvent(new Event('input', { bubbles: true }));
         wrap.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1403,25 +1414,103 @@ sticky(mkSeq($0, {
 }), {"kick":[1,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0],"snare":[0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0],"ghost":[0,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1],"hat":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"bass":[1,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0]})
 )};
 const _7a7f2w = (G, _) => G.input(_);
-const _dbus1 = function _drumBus(daw_ctx,master,midiBus)
-{
-  // the drum chain: voices sum into a gain, glue compressor, then master.
-  // `this` idiom keeps the graph immortal; tap 'drumBus' lets scopes watch it
-  const b = this ?? (() => {
-    const g = daw_ctx.createGain();
-    g.gain.value = 0.9;
-    const comp = daw_ctx.createDynamicsCompressor();
+const _mkbus1 = function _mkBus(knob,selfName){return(
+(ctx, { out, bus = null, node = null, label = 'bus', gain = 0.9, invalidation } = {}) => {
+  // a submix strip: units sum into .node -> glue compressor -> out.
+  // pass the previous element's node back in to keep the audio graph immortal
+  const g = node ?? (() => {
+    const gg = ctx.createGain();
+    gg.gain.value = gain;
+    const comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -18;
     comp.ratio.value = 4;
     comp.attack.value = 0.003;
     comp.release.value = 0.12;
-    g.connect(comp);
-    comp.connect(master);
-    return g;
+    gg.connect(comp);
+    comp.connect(out);
+    gg.__comp = comp;
+    return gg;
   })();
-  midiBus.registerTap('drumBus', b);
-  return b;
-};
+  const comp = g.__comp;
+  const el = document.createElement('div');
+  el.style.cssText = 'display:inline-flex; gap:8px; align-items:center; font:10px var(--sans-serif, sans-serif); background:#1c2529; color:#eceff1; border:1px solid #37474f; border-radius:6px; padding:6px 10px;';
+  const name = document.createElement('b');
+  name.textContent = label;
+  const k = knob({ label: 'gain', min: 0, max: 1.5, value: g.gain.value, step: 0.01 });
+  k.addEventListener('input', () => {
+    g.gain.value = k.value;
+  });
+  if (!g.__an) {
+    g.__an = ctx.createAnalyser();
+    g.__an.fftSize = 512;
+    (comp ?? g).connect(g.__an);
+  }
+  const mc = document.createElement('canvas');
+  mc.width = 120;
+  mc.height = 28;
+  mc.style.cssText = 'width:60px; height:14px; background:#10181c; border-radius:2px;';
+  const mg = mc.getContext('2d');
+  const red = document.createElement('span');
+  red.style.cssText = 'color:#90a4ae; font-family:monospace; min-width:46px;';
+  red.title = 'glue compressor gain reduction';
+  const buf = new Float32Array(g.__an.fftSize);
+  let raf = 0;
+  const meter = () => {
+    g.__an.getFloatTimeDomainData(buf);
+    let s = 0;
+    for (let i = 0; i < buf.length; i++)
+      s += buf[i] * buf[i];
+    const rms = Math.sqrt(s / buf.length);
+    mg.clearRect(0, 0, 120, 28);
+    mg.fillStyle = rms > 0.5 ? '#e7040f' : '#3ddc84';
+    mg.fillRect(0, 0, Math.min(120, rms * 300), 28);
+    red.textContent = comp && comp.reduction <= -0.5 ? comp.reduction.toFixed(1) + 'dB' : '';
+    raf = window.requestAnimationFrame(meter);
+  };
+  raf = window.requestAnimationFrame(meter);
+  const arrow = document.createElement('span');
+  arrow.style.cssText = 'color:#90a4ae;';
+  arrow.textContent = '\u2192 master';
+  el.append(name, k, mc, red, arrow);
+  selfName(el, n => {
+    if (n) {
+      label = n;
+      name.textContent = n;
+    }
+    if (bus && bus.registerTap)
+      bus.registerTap(label, g);
+    if (invalidation)
+      invalidation.then(() => {
+        if (bus && bus.taps && bus.taps.get(label) === g) {
+          bus.taps.delete(label);
+          bus.dispatchEvent(new window.CustomEvent('taps'));
+        }
+      });
+  });
+  if (invalidation)
+    invalidation.then(() => window.cancelAnimationFrame(raf));
+  el.node = g;
+  Object.defineProperty(el, 'value', {
+    get: () => ({ gain: k.value }),
+    set: v => {
+      if (!v || typeof v.gain !== 'number')
+        return;
+      k.value = v.gain;
+      g.gain.value = v.gain;
+    }
+  });
+  return el;
+}
+)};
+const _dbus1v = function _drumBus_view(sticky,mkBus,daw_ctx,master,midiBus,invalidation){return(
+sticky(mkBus(daw_ctx, {
+  out: master,
+  bus: midiBus,
+  node: this?.node,
+  invalidation
+}), {"gain":0.9})
+)};
+const _dbus1 = ($0) => $0.node;
 const _7zke3z = function _bass_voice($0){return(
 $0.voice
 )};
@@ -1621,10 +1710,10 @@ const _9ywdi1 = (G, _) => G.input(_);
 const _1tgfsqb = function _extending(md){return(
 md`## Extending the studio
 
-1. **＋ cell → ⊕ bass / drum / synth / sampler / pads / seq / keys / scope / echo / verb / duck / tape / dub / slicer** adds a fresh instance of that equipment. Each registers on the \`midiBus\` under its **cell name** — rename the cell and the faceplate, ⌁ entries and audio taps follow — and appears in every ⌁ input chooser.
+1. **＋ cell → ⊕ bass / drum / synth / sampler / pads / seq / roll / keys / scope / echo / verb / duck / tape / dub / slicer** adds a fresh instance of that equipment. Each registers on the \`midiBus\` under its **cell name** — rename the cell and the faceplate, ⌁ entries and audio taps follow — and appears in every ⌁ input chooser.
 2. **Wiring is notes.** Every seq row has a draggable note chip; drums, samplers and the bass have a matching \`note\` knob (pads: a chip per pad). An instrument plays a row when the notes match and the seq's name is ticked in its ⌁. The bass is also the **kit voice**: \`kit1\` maps G2 → \`bass_voice\`, which is just \`viewof bass1.voice\` — a faceplate exposing a function cell.
 3. **Samples**: drop an audio file on a sampler's waveform or a pad (right-click a pad to browse). The bytes become file attachments, so an exported notebook still has them.
-4. **Groove**: the *swing* slider (next to bpm) pushes every off-beat 16th late. **Rolls**: shift-click a step to ratchet it (2–4 sub-hits, rising velocity). **Starting points**: every seq has a ⋯ *groove* select (four-floor, breakbeat, dnb, trap…) — rows are matched by name, so it works on any drum seq — and a 🎲 that rolls a weighted-random pattern: kicks favor downbeats, snares the backbeat, hats run dense. Roll, listen, keep or re-roll. **Solo**: every seq has an **S** — mutes all *other* seqs (additive; live-only, like M). Keys and midiIn are not seqs, so you can solo a pattern and still jam over it.
+4. **Groove**: the *swing* slider (next to bpm) pushes every off-beat 16th late. **Rolls**: shift-click a step to ratchet it (2–4 sub-hits, rising velocity). **Starting points**: every seq has a ⋯ *groove* select (four-floor, breakbeat, dnb, trap…) — rows are matched by name, so it works on any drum seq — and a 🎲 that rolls a weighted-random pattern: kicks favor downbeats, snares the backbeat, hats run dense. Roll, listen, keep or re-roll. **Solo**: every seq has an **S** — mutes all *other* seqs (additive; live-only, like M). Keys and midiIn are not seqs, so you can solo a pattern and still jam over it. Clicking a step **on** auditions it through whatever listens to the seq. **＋** adds a track (hover a row label for × to remove); drag the new chip to pitch it.
 5. **FX are patch cords**: an echo/verb's *from* select taps any instrument's output in parallel (dry path untouched — send/return). \`send\` = how much goes in, \`wet\` = how much comes back. FX register their own tap, so you can scope or duck them by name.
 6. **Sidechain**: a duck unit listens for a \`note\` on its ⌁ sources and dips the *ducks* target's gain (\`depth\`, \`rel\`). Default: the kick ducks the reese — classic pump.
 7. **Tape**: squashes its source through a tanh drive with *wow* (slow pitch wobble + fast flutter). Parallel by design — dry stays put, so it works like New-York-style saturation glue. Default: the drum bus.
@@ -1633,7 +1722,8 @@ md`## Extending the studio
 10. **Pan**: every instrument has a \`pan\` knob. Spread the hats, keep kick and sub centred.
 11. **Slice a break**: a demo break (\`break.wav\`, cut from the bundled kit) loads by default — or drop your own on the waveform. It — it chops into \`slices\` equal parts mapped upward from \`base\` (labels drawn on the waveform). Point seq row chips at those notes to resequence the chop; click a slice to audition.
 12. **Arranging**: set the song's ⌁ to the cells that define a section, dial in a sound, **⊕** to capture it as a scene, change things, capture again. Set bar counts, press play — the song walks the scenes in a loop. ▶ auditions a scene, ⟳ re-captures into it. Un-tick *armed* to jam without the song moving values under you. Tick **morph** for automation: numeric knob values glide toward the next scene across its bars (patterns and note pitches still switch on the boundary).
-13. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\`.`
+13. Any view from anywhere can join: \`viewof myThing = sticky(anyView, undefined)\` remembers itself; **＋ cell** puts it on the rack. Template authors just name cells \`template_<name>\`.
+14. **roll1** is the piano roll — drag to draw notes, drag a note's right edge for length, drag vertically to repitch (auditions as you go), right-click deletes; positions and lengths snap to 1/32. **drumBus** is the drum submix strip the drum units sum into (gain + glue-compressor meter) before master; FX can tap it as \`drumBus\`.`
 )};
 const _dwctrl = function _controls(gridControls){return(
 gridControls()
@@ -2453,6 +2543,7 @@ const _mkseq3 = function _mkSeq(stepGrid,selfName){return(
 (clock, { rows = [], steps = 16, velocity = 100, gate = 0.5, label, bus = null, name = 'seq', invalidation } = {}) => {
   const NN = n => ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][n % 12] + (Math.floor(n / 12) - 1);
   // the wiring is the note: each row's pitch is live UI state (chip), not a source literal
+  rows = rows.map(r => ({ ...r }));
   const notes = Object.fromEntries(rows.map(r => [r.name, r.note & 127]));
   const chips = {};
   const isPitch = rn => /^[A-G]#?\d$/.test(rn);
@@ -2498,12 +2589,59 @@ const _mkseq3 = function _mkSeq(stepGrid,selfName){return(
     };
     chip.addEventListener('pointerup', done);
     chip.addEventListener('pointercancel', done);
-    chip.addEventListener('dblclick', () => bump(r.note & 127));
+    chip.addEventListener('dblclick', () => bump((r && r.note != null ? r.note : notes[rn]) & 127));
     paint();
     box.appendChild(chip);
+    const del = document.createElement('span');
+    del.textContent = '\u00d7';
+    del.title = 'remove track';
+    del.style.cssText = 'color:#90a4ae; cursor:pointer; opacity:0; margin-left:2px;';
+    box.addEventListener('pointerenter', () => {
+      del.style.opacity = 0.8;
+    });
+    box.addEventListener('pointerleave', () => {
+      del.style.opacity = 0;
+    });
+    del.addEventListener('click', () => {
+      const i = rows.findIndex(x => x.name === rn);
+      if (i < 0 || rows.length <= 1)
+        return;
+      rows.splice(i, 1);
+      const pat = { ...grid.value };
+      delete pat[rn];
+      rebuild(pat);
+      commit();
+    });
+    box.appendChild(del);
     return box;
   };
-  const grid = stepGrid(rows.map(r => r.name), { steps, labelWidth: 64, rowLabel });
+  let grid = null;
+  // audition: turning a step on plays it immediately through whatever listens to this seq
+  const onGridEdit = () => {
+    const ed = grid.lastEdit;
+    if (!ed || !ed.on || !bus)
+      return;
+    grid.lastEdit = null;
+    const r = rows.find(x => x.name === ed.row);
+    const note = notes[ed.row];
+    if (note == null)
+      return;
+    bus.publish(name, [144, note, Math.max(1, Math.min(127, (r && r.vel) ?? velocity))]);
+    window.setTimeout(() => bus.publish(name, [128, note, 0]), 250);
+  };
+  const rebuild = pat => {
+    const old = grid;
+    for (const r of rows)
+      if (notes[r.name] == null)
+        notes[r.name] = (r.note ?? 48) & 127;
+    grid = stepGrid(rows.map(r => r.name), { steps, labelWidth: 64, rowLabel });
+    grid.addEventListener('input', onGridEdit);
+    if (pat)
+      grid.value = pat;
+    if (old)
+      old.replaceWith(grid);
+  };
+  rebuild(null);
   const el = document.createElement('div');
   el.style.cssText = 'display:inline-flex; flex-direction:column; gap:2px; width:max-content;';
   const head = document.createElement('div');
@@ -2644,7 +2782,21 @@ const _mkseq3 = function _mkSeq(stepGrid,selfName){return(
     grid.value = pat;
     commit();
   });
-  head.append(lab, preSel, dice, muteBtn, soloBtn);
+  const addBtn = document.createElement('button');
+  addBtn.textContent = '+';
+  addBtn.title = 'add a track; drag its note chip to pitch it, hover its label for \u00d7 to remove';
+  addBtn.style.cssText = 'font:8px monospace; padding:0 4px; cursor:pointer;';
+  addBtn.addEventListener('click', () => {
+    const nm = (window.prompt('track name', 'trk' + (rows.length + 1)) || '').trim();
+    if (!nm || rows.some(r => r.name === nm))
+      return;
+    const pat = { ...grid.value };
+    pat[nm] = Array(steps).fill(0);
+    rows.push({ name: nm, note: 48 });
+    rebuild(pat);
+    commit();
+  });
+  head.append(lab, preSel, dice, addBtn, muteBtn, soloBtn);
   selfName(el, n => {
     if (n) {
       name = n;
@@ -2702,11 +2854,19 @@ const _mkseq3 = function _mkSeq(stepGrid,selfName){return(
   Object.defineProperty(el, 'value', {
     get: () => ({
       ...grid.value,
-      __notes: { ...notes }
+      __notes: { ...notes },
+      __rows: rows.map(r => ({ ...r }))
     }),
     set: v => {
       if (!v)
         return;
+      if (Array.isArray(v.__rows) && v.__rows.length) {
+        const names = v.__rows.map(r => r.name).join('\u0000');
+        const had = rows.map(r => r.name).join('\u0000');
+        rows = v.__rows.map(r => ({ ...r }));
+        if (names !== had)
+          rebuild(null);
+      }
       if (v.__notes)
         for (const [rn, n] of Object.entries(v.__notes))
           if (typeof n === 'number' && notes[rn] != null) {
@@ -2720,6 +2880,270 @@ const _mkseq3 = function _mkSeq(stepGrid,selfName){return(
   return el;
 }
 )};
+const _mkrl1 = function _mkRoll(selfName){return(
+(clock, { bus = null, name = 'roll', steps = 16, div = 2, lo = 36, hi = 84, velocity = 100, gate = 0.9, invalidation } = {}) => {
+  // piano roll: notes are { t, d, n } with t/d in 16th-steps; t and d snap to 1/div steps
+  const NN = m => ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][m % 12] + (Math.floor(m / 12) - 1);
+  const CW = 26;
+  const RH = 7;
+  const GUT = 26;
+  const W = GUT + steps * CW;
+  const H = (hi - lo + 1) * RH;
+  let data = [];
+  let cur = null;
+  let mode = null;
+  let grab = 0;
+  let lastD = 1;
+  let ph = -1;
+  const el = document.createElement('div');
+  el.style.cssText = 'display:inline-flex; flex-direction:column; gap:2px; width:max-content;';
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex; gap:6px; align-items:center; font:9px var(--sans-serif, sans-serif); color:#90a4ae;';
+  const lab = document.createElement('span');
+  lab.textContent = name;
+  const hint = document.createElement('span');
+  hint.textContent = 'drag draws \u00b7 right edge sets length \u00b7 right-click deletes';
+  const muteBtn = document.createElement('button');
+  muteBtn.textContent = 'M';
+  muteBtn.title = 'mute (live, not persisted)';
+  muteBtn.style.cssText = 'font:8px monospace; padding:0 4px; cursor:pointer;';
+  let muted = false;
+  muteBtn.addEventListener('click', () => {
+    muted = !muted;
+    muteBtn.style.background = muted ? '#e7040f' : '';
+    muteBtn.style.color = muted ? '#fff' : '';
+  });
+  const soloBtn = document.createElement('button');
+  soloBtn.textContent = 'S';
+  soloBtn.title = 'solo: mute all other seqs (additive; live, not persisted)';
+  soloBtn.style.cssText = 'font:8px monospace; padding:0 4px; cursor:pointer;';
+  if (bus && !bus.solo)
+    bus.solo = new Set();
+  const soloPaint = () => {
+    const on = bus && bus.solo.has(name);
+    soloBtn.style.background = on ? '#fbc02d' : '';
+    soloBtn.style.color = on ? '#000' : '';
+    lab.style.opacity = bus && bus.solo.size && !on ? 0.35 : 1;
+  };
+  soloBtn.addEventListener('click', () => {
+    if (!bus)
+      return;
+    if (bus.solo.has(name))
+      bus.solo.delete(name);
+    else
+      bus.solo.add(name);
+    bus.dispatchEvent(new window.CustomEvent('solo'));
+  });
+  if (bus) {
+    bus.addEventListener('solo', soloPaint);
+    soloPaint();
+  }
+  const c = document.createElement('canvas');
+  c.width = W * 2;
+  c.height = H * 2;
+  c.style.cssText = `width:${ W }px; height:${ H }px; touch-action:none; cursor:crosshair; border-radius:4px;`;
+  const g = c.getContext('2d');
+  g.scale(2, 2);
+  const BLACK = new Set([1, 3, 6, 8, 10]);
+  const draw = () => {
+    g.clearRect(0, 0, W, H);
+    g.fillStyle = '#10181c';
+    g.fillRect(0, 0, W, H);
+    for (let n = lo; n <= hi; n++) {
+      const y = H - (n - lo + 1) * RH;
+      if (BLACK.has(n % 12)) {
+        g.fillStyle = 'rgba(255,255,255,0.045)';
+        g.fillRect(GUT, y, W - GUT, RH);
+      }
+      if (n % 12 === 0) {
+        g.strokeStyle = 'rgba(255,255,255,0.12)';
+        g.beginPath();
+        g.moveTo(GUT, y + RH);
+        g.lineTo(W, y + RH);
+        g.stroke();
+        g.fillStyle = '#90a4ae';
+        g.font = '7px monospace';
+        g.fillText(NN(n), 2, y + RH - 1);
+      }
+    }
+    for (let s = 0; s <= steps; s++) {
+      const x = GUT + s * CW;
+      g.strokeStyle = s % 4 === 0 ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.06)';
+      g.beginPath();
+      g.moveTo(x, 0);
+      g.lineTo(x, H);
+      g.stroke();
+    }
+    if (ph >= 0) {
+      g.fillStyle = 'rgba(61,220,132,0.12)';
+      g.fillRect(GUT + ph * CW, 0, CW, H);
+    }
+    for (const nt of data) {
+      const x = GUT + nt.t * CW;
+      const y = H - (nt.n - lo + 1) * RH;
+      g.fillStyle = nt === cur ? '#7effb2' : '#3ddc84';
+      g.fillRect(x, y + 0.5, Math.max(3, nt.d * CW - 1), RH - 1);
+    }
+  };
+  const snap = t => Math.round(t * div) / div;
+  const at = e => {
+    const r = c.getBoundingClientRect();
+    return {
+      t: (e.clientX - r.left - GUT) / CW,
+      n: lo + Math.max(0, Math.min(hi - lo, Math.floor((H - (e.clientY - r.top)) / RH)))
+    };
+  };
+  const hitAt = p => data.find(nt => p.n === nt.n && p.t >= nt.t && p.t < nt.t + nt.d);
+  const commit = () => el.dispatchEvent(new window.Event('input', { bubbles: true }));
+  const audition = n => {
+    if (!bus)
+      return;
+    bus.publish(name, [144, n & 127, Math.max(1, Math.min(127, velocity))]);
+    window.setTimeout(() => bus.publish(name, [128, n & 127, 0]), 220);
+  };
+  c.addEventListener('contextmenu', e => e.preventDefault());
+  c.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    try {
+      c.setPointerCapture(e.pointerId);
+    } catch (_) {
+    }
+    const p = at(e);
+    if (p.t < 0)
+      return;
+    const h = hitAt(p);
+    if (e.button === 2 || e.altKey) {
+      if (h) {
+        data = data.filter(x => x !== h);
+        draw();
+        commit();
+      }
+      return;
+    }
+    if (h) {
+      cur = h;
+      mode = p.t > h.t + h.d - Math.min(0.5, h.d / 3) ? 'size' : 'move';
+      grab = p.t - h.t;
+    } else {
+      cur = { t: Math.max(0, Math.min(steps - lastD, snap(p.t))), d: lastD, n: p.n };
+      data.push(cur);
+      mode = 'size';
+      audition(cur.n);
+    }
+    draw();
+  });
+  c.addEventListener('pointermove', e => {
+    if (!cur || !mode)
+      return;
+    const p = at(e);
+    if (mode === 'move') {
+      const t = Math.max(0, Math.min(steps - cur.d, snap(p.t - grab)));
+      if (t !== cur.t || p.n !== cur.n) {
+        if (p.n !== cur.n)
+          audition(p.n);
+        cur.t = t;
+        cur.n = p.n;
+        draw();
+      }
+    } else {
+      const d = snap(p.t) - cur.t;
+      if (d >= 1 / div && d !== cur.d) {
+        cur.d = Math.min(steps - cur.t, d);
+        draw();
+      }
+    }
+  });
+  const up = () => {
+    if (!cur)
+      return;
+    lastD = cur.d;
+    cur = null;
+    mode = null;
+    draw();
+    commit();
+  };
+  c.addEventListener('pointerup', up);
+  c.addEventListener('pointercancel', up);
+  const onTick = e => {
+    const { t, step, secPerStep } = e.detail;
+    const col = step % steps;
+    if (col !== ph) {
+      ph = col;
+      draw();
+    }
+    if (muted)
+      return;
+    if (bus && bus.solo && bus.solo.size && !bus.solo.has(name))
+      return;
+    for (const nt of data) {
+      if (nt.t >= col && nt.t < col + 1) {
+        const note = nt.n & 127;
+        const ht = t + (nt.t - col) * secPerStep;
+        const offT = ht + Math.max(0.03, nt.d * secPerStep * gate);
+        const on = [144, note, Math.max(1, Math.min(127, nt.v ?? velocity))];
+        el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: on, time: ht } }));
+        el.dispatchEvent(new window.CustomEvent('midi', { detail: { data: [128, note, 0], time: offT } }));
+        if (bus) {
+          bus.publish(name, on, ht);
+          bus.publish(name, [128, note, 0], offT);
+        }
+      }
+    }
+  };
+  const onStop = () => {
+    ph = -1;
+    draw();
+  };
+  clock.addEventListener('tick', onTick);
+  clock.addEventListener('stop', onStop);
+  if (invalidation)
+    invalidation.then(() => {
+      clock.removeEventListener('tick', onTick);
+      clock.removeEventListener('stop', onStop);
+      if (bus) {
+        bus.removeEventListener('solo', soloPaint);
+        if (bus.solo && bus.solo.delete(name))
+          bus.dispatchEvent(new window.CustomEvent('solo'));
+      }
+    });
+  selfName(el, n => {
+    if (n) {
+      name = n;
+      lab.textContent = n;
+    }
+    if (bus)
+      bus.register(name);
+  });
+  head.append(lab, hint, muteBtn, soloBtn);
+  el.appendChild(head);
+  el.appendChild(c);
+  Object.defineProperty(el, 'value', {
+    get: () => ({ notes: data.map(x => ({ ...x })) }),
+    set: v => {
+      if (!v || !Array.isArray(v.notes))
+        return;
+      data = v.notes.map(x => ({ ...x }));
+      draw();
+    }
+  });
+  draw();
+  return el;
+}
+)};
+const _rl1v = function _roll1(sticky,mkRoll,$0,midiBus,invalidation){return(
+sticky(mkRoll($0, {
+  bus: midiBus,
+  invalidation
+}), {"notes":[{"t":0,"d":1.5,"n":48},{"t":2,"d":0.5,"n":51},{"t":3,"d":1,"n":55},{"t":5.5,"d":0.5,"n":58},{"t":8,"d":1.5,"n":60},{"t":10,"d":0.5,"n":58},{"t":11,"d":1,"n":55},{"t":13.5,"d":2,"n":51}]})
+)};
+const _rl1g = (G, _) => G.input(_);
+const _trl1v = function _template_roll(sticky,mkRoll,$0,midiBus,invalidation){return(
+sticky(mkRoll($0, {
+  bus: midiBus,
+  invalidation
+}), {"notes":[]})
+)};
+const _trl1g = (G, _) => G.input(_);
 const _mkkit9 = function _mkKit(mkInputPicker,selfName){return(
 (ctx, { voices = {}, sources = [], bus = null, inputs = [], label = 'kit', invalidation } = {}) => {
   const NN = n => ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][n % 12] + (Math.floor(n / 12) - 1);
@@ -5272,7 +5696,9 @@ export default function define(runtime, observer) {
   $def("_s71xha", "stepGrid", ["Event"], _s71xha);  
   $def("_14j1vyd", "viewof drums", ["sticky","mkSeq","viewof clock","midiBus","invalidation"], _14j1vyd);  
   $def("_7a7f2w", "drums", ["Generators","viewof drums"], _7a7f2w);  
-  $def("_dbus1", "drumBus", ["daw_ctx","master","midiBus"], _dbus1);  
+  $def("_mkbus1", "mkBus", ["knob","selfName"], _mkbus1);
+  $def("_dbus1v", "viewof drumBus", ["sticky","mkBus","daw_ctx","master","midiBus","invalidation"], _dbus1v);
+  $def("_dbus1", "drumBus", ["viewof drumBus"], _dbus1);  
   $def("_7zke3z", "bass_voice", ["viewof bass1"], _7zke3z);
   $def("_mkbs1", "mkBass", ["knob","mkInputPicker","selfName"], _mkbs1);
   $def("_bs1v", "viewof bass1", ["sticky","mkBass","daw_ctx","master","midiBus","invalidation"], _bs1v);
@@ -5291,7 +5717,12 @@ export default function define(runtime, observer) {
   $def("_slfn1", "selfName", ["runtime"], _slfn1);  
   $def("_msy5k4", "mkSynth", ["knob","mkInputPicker","selfName"], _msy5k4);  
   $def("_mkclk7", "mkClock", [], _mkclk7);  
-  $def("_mkseq3", "mkSeq", ["stepGrid","selfName"], _mkseq3);  
+  $def("_mkseq3", "mkSeq", ["stepGrid","selfName"], _mkseq3);
+  $def("_mkrl1", "mkRoll", ["selfName"], _mkrl1);
+  $def("_rl1v", "viewof roll1", ["sticky","mkRoll","viewof clock","midiBus","invalidation"], _rl1v);
+  $def("_rl1g", "roll1", ["Generators","viewof roll1"], _rl1g);
+  $def("_trl1v", "viewof template_roll", ["sticky","mkRoll","viewof clock","midiBus","invalidation"], _trl1v);
+  $def("_trl1g", "template_roll", ["Generators","viewof template_roll"], _trl1g);  
   $def("_mkkit9", "mkKit", ["mkInputPicker","selfName"], _mkkit9);  
   $def("_mkchd2", "mkChord", ["mkInputPicker","selfName"], _mkchd2);  
   $def("_ky1v6r", "viewof keys1", ["keys","midiBus"], _ky1v6r);  
