@@ -37558,7 +37558,33 @@ Rendering evaluates the template rather than parsing its text, so an interpolate
 handle over a hole may write to, not how to draw it.
 
 One consequence worth stating: \`applySource\` re-reads \`_definition\` after the \`await\` and abandons the
-put if it changed underneath, because \`editor-5\` may have rewritten the cell mid-gesture.`
+put if it changed underneath, because \`editor-5\` may have rewritten the cell mid-gesture.
+
+### The pieces
+
+\`svgLens\` is wiring and nothing else. The parts it wires:
+
+| Cell | Owns |
+|---|---|
+| \`svgTarget\` | which variable this node is, the parameter name the cell calls \`svgLens\` by, and the document text |
+| \`svgWriter\` | \`applySource\` / \`commit\` / \`runCommand\` — the only code that assigns \`_definition\` |
+| \`svgOverlay\` | the handle layer, and the \`isOwn\` predicate that keeps the renderer off it |
+| \`svgFocus\` | which element is selected and where its handles are drawn |
+| \`svgTools\` | the tool registry: \`toolVertex\`, \`toolMove\`, \`toolStructure\` |
+
+A tool is \`{id, onPointerDown, onPointerMove, onPointerUp, onDblClick}\`. \`onPointerDown\` returns true
+to claim the gesture; registry order is priority. Tools read the document, preview in the live DOM,
+and hand a command or a commit to the writer — they never write the source themselves, and none of
+them knows what a lens is. Adding a tool is adding a cell:
+
+\`\`\`js
+svgTools.push({ id: "rect", onPointerDown(ctx, e) { … } });
+viewof svgTools.dispatchEvent(new Event("input"));
+\`\`\`
+
+The writer stays ignorant of selection: it reports what it did on the \`lens-put\` event, and the
+handles follow — refreshed after an attribute edit, cleared after a structural one, because a
+structural edit shifts every address after it.`
 )};
 
 // Draggable handles for a polygon/polyline's points.
@@ -37674,327 +37700,418 @@ function morph(live, next, skip = () => false) {
 }
 )};
 
-const _sl114 = function _svgLens(runtime,realize,literalSpan,literalLens,cellAttrLens,compose,translateLens,attrVal,invert,applyPoint,ctmMat,parsePoints,parsePath,pointsHandles,pathHandles,handleEdit,morph,pathOfIndex,insertElement,deleteElement,reorderElement,insertPoint,deletePoint,nearestSegment)
-{
-  // Set while re-rendering: the fresh node is a throwaway used to patch the live one, so svgLens
-  // must not attach a second overlay and a second set of listeners to it.
-  let rendering = false;
+// ---- the target: which cell am I, and what does its literal say? --------------------------------
+// Locating the variable by `_value` identity and the parameter name by position is the same trick
+// @tomlarkworthy/sticky uses. Nothing else in the editor knows how a cell is found.
+const _sl116 = function _svgTarget(runtime,literalSpan){return(
+(node, { marker, isOwn = () => false }) => {
+  const NS = "http://www.w3.org/2000/svg";
+  let self = null, alias = "svgLens";
+  const resolve = () => {
+    if (self && self._value === node) return self;
+    self = [...runtime._variables].find((v) => v._value === node) || null;
+    if (!self) return null;
+    const i = self._inputs.findIndex((inp) => inp && inp._value === marker);
+    const params = /^[^(]*\(([^)]*)\)/.exec(self._definition.toString());
+    const names = params ? params[1].split(",").map((s) => s.trim()) : [];
+    alias = (i >= 0 && names[i]) || "svgLens";
+    return self;
+  };
+  const cellSource = () => (resolve() ? self._definition.toString() : null);
+  return {
+    variable: resolve,
+    alias: () => { resolve(); return alias; },
+    cellSource,
+    // The SVG text the source currently holds — null when this node is not (yet) a cell value.
+    doc() {
+      const s = cellSource();
+      if (s === null) return null;
+      const [a, b] = literalSpan(s, alias);
+      return s.slice(a, b);
+    },
+    // Source elements in document order — overlay excluded, so indices match tokenize().
+    elems: () => [node, ...node.querySelectorAll("*")].filter((e) => e.namespaceURI === NS && !isOwn(e))
+  };
+}
+)};
 
-  return function svgLens(node, options = {}) {
-    if (rendering) return node;
-    const NS = "http://www.w3.org/2000/svg";
-    const grid = options.grid === undefined ? 0.5 : options.grid;
-    const snap = (v) => (grid ? Math.round(v / grid) * grid : v);
+// ---- the writer: the one place that touches _definition -----------------------------------------
+// Source is truth; the live node is a projection of it, patched. Rendering evaluates the new
+// definition with the variable's current inputs — it does not parse the SVG text — so an interpolated
+// template renders the same way a static one does. Recomputing the cell instead would mint a new node
+// and break the value's identity.
+const _sl117 = function _svgWriter(runtime,realize,morph,literalLens,cellAttrLens,compose,attrVal,literalSpan){return(
+(node, target, { isOwn, guard }) => {
+  const emit = (record) => {
+    node.lastPut = record;
+    node.dispatchEvent(new CustomEvent("lens-put", { detail: record }));
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    return record;
+  };
 
-    // Handles live in the DOM only. They are never written back: a put only ever splices the byte
-    // span of one attribute of one source element.
-    const overlay = document.createElementNS(NS, "g");
-    overlay.setAttribute("data-svg-lens-overlay", "");
-    node.appendChild(overlay);
-    const style = document.createElementNS(NS, "style");
-    style.textContent = `
+  async function applySource(next, record) {
+    const self = target.variable();
+    const before = self._definition;
+    const [fn] = await realize([next], runtime);
+    if (self._definition !== before) {                 // editor-5 (or another gesture) got there first
+      record.aborted = "definition changed under the gesture";
+      return emit(record);
+    }
+    let fresh;
+    guard.rendering = true;
+    try { fresh = await fn.apply(null, self._inputs.map((i) => i._value)); }
+    finally { guard.rendering = false; }
+    self._definition = fn;                             // silent swap, as in @tomlarkworthy/sticky
+    morph(node, fresh, isOwn);
+    node.style.touchAction = "none";                   // morph syncs attributes, including style
+    return emit(record);
+  }
+
+  // A structural edit: a pure command rewrites the SVG document text, `literalLens` carries it back
+  // into the cell definition, and the writer renders it.
+  async function runCommand(name, fn, { keepFocus = false } = {}) {
+    const s = target.cellSource();
+    if (s === null) return null;
+    const L = literalLens(target.alias());
+    const next = L.put(fn(L.get(s)), s);
+    const record = { target: name, attribute: "(structure)", before: "", after: "", keepFocus,
+                     GetPut: L.put(L.get(next), next) === next, PutGet: true, span: null };
+    if (next === s) { node.lastPut = record; return record; }
+    return applySource(next, record);
+  }
+
+  // One gesture, one put, through the composed lens. `inner` refines the attribute string into the
+  // view the gesture actually manipulates (a translate pair; the string itself otherwise).
+  async function commit(idx, name, value, dflt, inner) {
+    const s = target.cellSource();
+    if (s === null) return null;
+    const alias = target.alias();
+    const base = cellAttrLens(alias, idx, name, dflt);
+    const l = inner ? compose(base, inner) : base;
+    const before = l.get(s);
+    const next = l.put(value, s);
+    const same = (a, b) => (Array.isArray(a) ? Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]) : a === b);
+    const record = {
+      target: target.elems()[idx].localName + "[" + idx + "]", attribute: name,
+      before: String(before), after: String(l.get(next)),
+      // the laws, re-checked on the source this gesture just produced
+      GetPut: l.put(l.get(next), next) === next,
+      PutGet: same(l.get(next), value),
+      span: null
+    };
+    if (next === s) {
+      // skip rule: the view is unchanged, so the source keeps its residue — make the DOM agree
+      const v = attrVal(target.doc(), idx, name);
+      const el = target.elems()[idx];
+      if (v === null) el.removeAttribute(name); else el.setAttribute(name, v);
+      return emit(record);
+    }
+    const [a, b] = literalSpan(next, alias);
+    const tok = attrVal(next.slice(a, b), idx, name);
+    if (tok !== null) {                                // highlight the attribute we just wrote
+      const at = next.indexOf(name + '="' + tok + '"', a);
+      record.span = at === -1 ? null : [at, at + (name + '="' + tok + '"').length];
+    }
+    return applySource(next, record);
+  }
+
+  return { applySource, runCommand, commit };
+}
+)};
+
+// ---- the overlay: handles live in the DOM only, never in the source ------------------------------
+const _sl118 = function _svgOverlay(){return(
+(node) => {
+  const NS = "http://www.w3.org/2000/svg";
+  const el = document.createElementNS(NS, "g");
+  el.setAttribute("data-svg-lens-overlay", "");
+  const style = document.createElementNS(NS, "style");
+  style.textContent = `
       [data-svg-lens-overlay] .anchor{fill:#fff;stroke:#2F6BFF;stroke-width:2;cursor:grab}
       [data-svg-lens-overlay] .ctrl{fill:#EDF1E8;stroke:#8A63D2;stroke-width:1.5;cursor:grab}
       [data-svg-lens-overlay] .hit{fill:transparent;stroke:none;cursor:grab}
       [data-svg-lens-overlay] .link{stroke:#8A63D2;stroke-dasharray:3 3;stroke-width:1;fill:none;opacity:.7}`;
-    overlay.appendChild(style);
-    node.style.touchAction = "none";
+  el.appendChild(style);
+  node.appendChild(el);
+  return {
+    el,
+    isOwn: (n) => n === el || el.contains(n),
+    clear: () => [...el.querySelectorAll("circle,line")].forEach((n) => n.remove()),
+    add(tag, attrs) {
+      const n = document.createElementNS(NS, tag);
+      for (const k in attrs) n.setAttribute(k, attrs[k]);
+      el.appendChild(n);
+      return n;
+    },
+    // Handles are drawn in the focused element's own user space, so no screen-space maths is needed
+    // to place them — the browser applies the same CTM it applies to the shape.
+    alignTo: (target) => el.setAttribute("transform", target ? (target.getAttribute("transform") || "") : "")
+  };
+}
+)};
 
-    // Source elements in document order — the overlay is excluded, so indices match tokenize().
-    const elems = () => [node, ...node.querySelectorAll("*")]
-      .filter((e) => e.namespaceURI === NS && !(e.closest && e.closest("[data-svg-lens-overlay]")));
+// ---- selection: which element is being edited, and its handles -----------------------------------
+const _sl119 = function _svgFocus(pointsHandles,pathHandles){return(
+(overlay, target) => {
+  let idx = null, mode = null;
+  const handles = () => {
+    if (idx === null) return [];
+    const t = target.doc();
+    if (t === null) return [];
+    try { return mode === "points" ? pointsHandles(t, idx) : pathHandles(t, idx); }
+    catch (e) { return []; }                            // outside the lens domain: no handles
+  };
+  const scaleOf = (el) => { const m = el.getScreenCTM(); return m ? Math.hypot(m.a, m.b) : 1; };
+  const draw = () => {
+    overlay.clear();
+    if (idx === null) return;
+    const el = target.elems()[idx];
+    if (!el) return;
+    overlay.alignTo(el);
+    const r = 5 / Math.max(0.2, scaleOf(el));
+    const hs = handles();
+    for (const h of hs) if (h.link) overlay.add("line", { class: "link", x1: h.x, y1: h.y, x2: h.link[0], y2: h.link[1] });
+    for (const h of hs) {
+      overlay.add("circle", { class: h.kind === "anchor" ? "anchor" : "ctrl", r: h.kind === "anchor" ? r : r * 0.8, cx: h.x, cy: h.y });
+      overlay.add("circle", { class: "hit", r: r * 2.6, cx: h.x, cy: h.y }).dataset.key = h.key;
+    }
+  };
+  return {
+    get index() { return idx; },
+    get mode() { return mode; },
+    handles,
+    refresh: draw,
+    set(i, m) { idx = i; mode = m; draw(); },
+    clear() { idx = null; mode = null; draw(); }
+  };
+}
+)};
 
-    let self = null, alias = "svgLens";
-    const resolve = () => {
-      if (self && self._value === node) return self;
-      self = [...runtime._variables].find((v) => v._value === node) || null;
-      if (!self) return null;
-      const i = self._inputs.findIndex((inp) => inp && inp._value === svgLens);
-      const params = /^[^(]*\(([^)]*)\)/.exec(self._definition.toString());
-      const names = params ? params[1].split(",").map((s) => s.trim()) : [];
-      alias = (i >= 0 && names[i]) || "svgLens";
-      return self;
+// ================================================================================================
+// TOOLS — pointer state machines. A tool reads the document, previews in the DOM, and emits a
+// command or a commit; it never writes the source itself. Registered in `svgTools`, so a new tool is
+// a new cell rather than an edit to svgLens.
+//
+//   onPointerDown(ctx, e) -> true to claim the gesture (later moves and the release go to this tool)
+//   onPointerMove(ctx, e)
+//   onPointerUp(ctx, e)
+//   onDblClick(ctx, e)    -> true if handled
+//
+// ctx = { node, options, target, writer, focus, elems(), doc(), localPoint(el, e), snap(v), state }
+// ================================================================================================
+
+// Drag a vertex or control point: the `points` and path `d` lenses.
+const _sl120 = function _toolVertex(handleEdit){return(
+{
+  id: "vertex",
+  onPointerDown(ctx, e) {
+    const key = e.target.dataset && e.target.dataset.key;
+    if (key === undefined || ctx.focus.index === null) return false;
+    e.preventDefault();
+    e.target.setPointerCapture(e.pointerId);
+    ctx.state.drag = { key, idx: ctx.focus.index, mode: ctx.focus.mode, started: false, x0: e.clientX, y0: e.clientY };
+    return true;
+  },
+  onPointerMove(ctx, e) {
+    const d = ctx.state.drag;
+    if (!d) return;
+    if (!d.started && Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < 3) return;
+    d.started = true;
+    const el = ctx.elems()[d.idx];
+    const p = el && ctx.localPoint(el, e);
+    const t = ctx.doc();
+    if (!p || t === null) return;
+    const edit = handleEdit(d.mode, t, d.idx, d.key, p[0], p[1]);
+    if (!edit) return;
+    d.edit = edit;
+    el.setAttribute(edit.name, edit.value);              // live only; the source waits for release
+    ctx.focus.refresh();
+  },
+  async onPointerUp(ctx) {
+    const d = ctx.state.drag;
+    ctx.state.drag = null;
+    if (d && d.started && d.edit) await ctx.writer.commit(d.idx, d.edit.name, d.edit.value, null);
+  }
+}
+)};
+
+// Drag a shape's body: the `transform` lens, focused on the leading translate op. A tap with no
+// movement selects instead, if the shape is in the domain of a handle lens.
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath){return(
+{
+  id: "move",
+  onPointerDown(ctx, e) {
+    const idx = ctx.elems().indexOf(e.target);
+    if (idx <= 0) { ctx.focus.clear(); return false; }   // 0 is the root <svg>
+    const ps = e.target.parentNode.getScreenCTM();
+    const t = ctx.doc();
+    if (!ps || t === null) return false;
+    const text = attrVal(t, idx, "transform") || "";
+    ctx.state.drag = {
+      idx, tag: e.target.localName, text, el: e.target,
+      // screen delta → the element's parent space (linear part only: a drag is a translation)
+      Slin: invert(ctmMat(ps)),
+      T0: translateLens.get(text),
+      x0: e.clientX, y0: e.clientY, started: false,
+      thresh: e.pointerType === "mouse" ? 3 : 10
     };
-    const cellSrc = () => (resolve() ? self._definition.toString() : null);
-    const svgText = () => { const s = cellSrc(); if (s === null) return null; const [a, b] = literalSpan(s, alias); return s.slice(a, b); };
-
-    const isOverlay = (n) => n === overlay;
-
-    // THE WRITER. The one place that touches `_definition`, and the one place the DOM is brought
-    // back in line with the source. Source is truth; the live node is a projection of it, patched.
-    //
-    // Rendering evaluates the new definition with the variable's current inputs — it does not parse
-    // the SVG text — so an interpolated template renders the same way a static one does. Recomputing
-    // the cell instead would mint a new node and break the value's identity.
-    async function applySource(next, record) {
-      const before = self._definition;
-      const [fn] = await realize([next], runtime);
-      if (self._definition !== before) {                 // editor-5 (or another gesture) got there first
-        record.aborted = "definition changed under the gesture";
-        node.dispatchEvent(new CustomEvent("lens-put", { detail: record }));
-        return record;
-      }
-      let fresh;
-      rendering = true;
-      try { fresh = await fn.apply(null, self._inputs.map((i) => i._value)); }
-      finally { rendering = false; }
-      self._definition = fn;                             // silent swap, as in @tomlarkworthy/sticky
-      morph(node, fresh, isOverlay);
-      node.style.touchAction = "none";                   // morph syncs attributes, including style
-      node.lastPut = record;
-      node.dispatchEvent(new CustomEvent("lens-put", { detail: record }));
-      node.dispatchEvent(new Event("input", { bubbles: true }));
-      return record;
-    }
-
-    // A structural edit: a pure command rewrites the SVG document text, `literalLens` carries it back
-    // into the cell definition, and the writer renders it.
-    async function runCommand(name, fn, { keepFocus = false } = {}) {
-      const s = cellSrc();
-      if (s === null) return null;
-      const L = literalLens(alias);
-      const next = L.put(fn(L.get(s)), s);
-      const record = { target: name, attribute: "(structure)", before: "", after: "",
-                       GetPut: L.put(L.get(next), next) === next, PutGet: true, span: null };
-      if (next === s) { node.lastPut = record; return record; }
-      const out = await applySource(next, record);
-      if (keepFocus) buildHandles();                     // same elements, new geometry
-      else clearFocus();                                 // addresses shift under a structural edit
-      return out;
-    }
-
-    // One gesture, one put, through the composed lens. `inner` refines the attribute string into
-    // the view the gesture actually manipulates (a translate pair; the string itself otherwise).
-    async function commit(idx, name, value, dflt, inner) {
-      const s = cellSrc();
-      if (s === null) return null;                       // not (yet) a cell value; nothing to write to
-      const base = cellAttrLens(alias, idx, name, dflt);
-      const l = inner ? compose(base, inner) : base;
-      const before = l.get(s);
-      const next = l.put(value, s);
-      const same = (a, b) => (Array.isArray(a) ? Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]) : a === b);
-      const record = {
-        target: elems()[idx].localName + "[" + idx + "]", attribute: name,
-        before: String(before), after: String(l.get(next)),
-        // the laws, re-checked on the source this gesture just produced
-        GetPut: l.put(l.get(next), next) === next,
-        PutGet: same(l.get(next), value),
-        span: null
-      };
-      if (next === s) {
-        // skip rule: the view is unchanged, so the source keeps its residue — make the DOM agree
-        const v = attrVal(svgText(), idx, name);
-        const el = elems()[idx];
-        if (v === null) el.removeAttribute(name); else el.setAttribute(name, v);
-        node.lastPut = record;
-        node.dispatchEvent(new CustomEvent("lens-put", { detail: record }));
-        node.dispatchEvent(new Event("input", { bubbles: true }));
-        return record;
-      }
-      const [a, b] = literalSpan(next, alias);
-      const tok = attrVal(next.slice(a, b), idx, name);
-      if (tok !== null) {                                // highlight the attribute we just wrote
-        const at = next.indexOf(name + '="' + tok + '"', a);
-        record.span = at === -1 ? null : [at, at + (name + '="' + tok + '"').length];
-      }
-      return applySource(next, record);
-    }
-
-    // ---- handle overlay -------------------------------------------------------------------
-    let focusIdx = null, focusMode = null;
-    const handleEls = new Map();
-    const currentHandles = () => {
-      if (focusIdx === null) return [];
-      const t = svgText();
-      if (t === null) return [];
-      try { return focusMode === "points" ? pointsHandles(t, focusIdx) : pathHandles(t, focusIdx); }
-      catch (e) { return []; }
+    ctx.node.setPointerCapture(e.pointerId);
+    return true;
+  },
+  onPointerMove(ctx, e) {
+    const d = ctx.state.drag;
+    if (!d) return;
+    const dx = e.clientX - d.x0, dy = e.clientY - d.y0;
+    if (!d.started && Math.hypot(dx, dy) < d.thresh) return;
+    d.started = true;
+    const S = d.Slin;
+    d.T = [ctx.snap(d.T0[0] + S[0] * dx + S[2] * dy), ctx.snap(d.T0[1] + S[1] * dx + S[3] * dy)];
+    d.el.setAttribute("transform", translateLens.put(d.T, d.text));
+    if (ctx.focus.index === d.idx) ctx.focus.refresh();
+  },
+  async onPointerUp(ctx, e) {
+    const d = ctx.state.drag;
+    ctx.state.drag = null;
+    if (!d) return;
+    if (d.started) return void await ctx.writer.commit(d.idx, "transform", d.T, "", translateLens);
+    if (e.type !== "pointerup") return;
+    const t = ctx.doc();
+    const tryFocus = (mode, name, parse) => {
+      const v = t === null ? null : attrVal(t, d.idx, name);
+      if (v === null) return false;
+      try { parse(v); } catch (err) { return false; }    // outside the lens domain
+      ctx.focus.set(d.idx, mode);
+      return true;
     };
-    // Handles are drawn in the focused element's own user space, so no screen-space maths is
-    // needed to place them — the browser applies the same CTM it applies to the shape.
-    function buildHandles() {
-      [...overlay.querySelectorAll("circle,line")].forEach((n) => n.remove());
-      handleEls.clear();
-      if (focusIdx === null) return;
-      const el = elems()[focusIdx];
-      if (!el) return;
-      overlay.setAttribute("transform", el.getAttribute("transform") || "");
-      const r = 5 / Math.max(0.2, scaleOf(el));
-      for (const h of currentHandles()) {
-        if (!h.link) continue;
-        const ln = document.createElementNS(NS, "line");
-        ln.setAttribute("class", "link");
-        ln.setAttribute("x1", h.x); ln.setAttribute("y1", h.y);
-        ln.setAttribute("x2", h.link[0]); ln.setAttribute("y2", h.link[1]);
-        overlay.appendChild(ln);
-      }
-      for (const h of currentHandles()) {
-        const c = document.createElementNS(NS, "circle");
-        c.setAttribute("class", h.kind === "anchor" ? "anchor" : "ctrl");
-        c.setAttribute("r", h.kind === "anchor" ? r : r * 0.8);
-        c.setAttribute("cx", h.x); c.setAttribute("cy", h.y);
-        overlay.appendChild(c);
-        const hit = document.createElementNS(NS, "circle");
-        hit.setAttribute("class", "hit");
-        hit.setAttribute("r", r * 2.6);
-        hit.setAttribute("cx", h.x); hit.setAttribute("cy", h.y);
-        hit.dataset.key = h.key;
-        overlay.appendChild(hit);
-        handleEls.set(h.key, [c, hit]);
-      }
+    if ((d.tag === "polygon" || d.tag === "polyline") && tryFocus("points", "points", parsePoints)) return;
+    if (d.tag === "path" && tryFocus("path", "d", parsePath)) return;
+    ctx.focus.clear();
+  }
+}
+)};
+
+// Structural editing by double-click: add a vertex on an edge, remove the one under the pointer, or
+// drop a new shape on empty canvas. Every branch is a pure command.
+const _sl122 = function _toolStructure(pathOfIndex,insertElement,insertPoint,deletePoint,nearestSegment,pointsHandles,parsePoints,attrVal){return(
+{
+  id: "structure",
+  async onDblClick(ctx, e) {
+    const t = ctx.doc();
+    if (t === null) return false;
+    const focus = ctx.focus;
+    const key = e.target.dataset && e.target.dataset.key;
+
+    if (key !== undefined && focus.index !== null && focus.mode === "points") {
+      const h = pointsHandles(t, focus.index).find((x) => x.key === key);
+      if (!h) return false;
+      const idx = focus.index;
+      await ctx.writer.runCommand("deletePoint", (d) => deletePoint(d, pathOfIndex(d, idx), h.i), { keepFocus: true });
+      return true;
     }
-    const scaleOf = (el) => {
-      const m = el.getScreenCTM();
-      return m ? Math.hypot(m.a, m.b) : 1;
-    };
-    const setFocus = (idx, mode) => { focusIdx = idx; focusMode = mode; buildHandles(); };
-    const clearFocus = () => { focusIdx = null; focusMode = null; buildHandles(); };
 
-    // ---- body drag: the transform lens ----------------------------------------------------
-    let drag = null;
-    node.addEventListener("pointerdown", (e) => {
-      const key = e.target.dataset && e.target.dataset.key;
-      if (key !== undefined && focusIdx !== null) {                      // a handle: points / d lens
-        e.preventDefault();
-        e.target.setPointerCapture(e.pointerId);
-        drag = { kind: "handle", key, idx: focusIdx, mode: focusMode, started: false, x0: e.clientX, y0: e.clientY };
-        return;
-      }
-      const target = e.target.closest && e.target.closest("*");
-      const list = elems();
-      const idx = list.indexOf(e.target);
-      if (idx <= 0) { clearFocus(); return; }                            // 0 is the root <svg>
-      const ps = e.target.parentNode.getScreenCTM();
-      if (!ps) return;
-      const t = svgText();
-      if (t === null) return;
-      const text = attrVal(t, idx, "transform") || "";
-      drag = { kind: "body", idx, tag: e.target.localName, text,
-               // screen delta → the element's parent space (linear part only: a drag is a translation)
-               Slin: invert(ctmMat(ps)),
-               T0: translateLens.get(text),
-               x0: e.clientX, y0: e.clientY, started: false, el: e.target,
-               thresh: e.pointerType === "mouse" ? 3 : 10 };
-      node.setPointerCapture(e.pointerId);
-    });
-
-    node.addEventListener("pointermove", (e) => {
-      if (!drag) return;
-      const dx = e.clientX - drag.x0, dy = e.clientY - drag.y0;
-      if (!drag.started && Math.hypot(dx, dy) < (drag.thresh || 3)) return;
-      drag.started = true;
-      if (drag.kind === "body") {
-        const S = drag.Slin;
-        drag.T = [snap(drag.T0[0] + S[0] * dx + S[2] * dy), snap(drag.T0[1] + S[1] * dx + S[3] * dy)];
-        drag.el.setAttribute("transform", translateLens.put(drag.T, drag.text));  // live only; source waits
-        if (focusIdx === drag.idx) buildHandles();
-      } else {
-        const el = elems()[drag.idx];
-        const ctm = el.getScreenCTM();
-        if (!ctm) return;
-        const [px, py] = applyPoint(invert(ctmMat(ctm)), e.clientX, e.clientY);
-        const t = svgText();
-        if (t === null) return;
-        const edit = handleEdit(drag.mode, t, drag.idx, drag.key, snap(px), snap(py));
-        if (!edit) return;
-        drag.edit = edit;
-        el.setAttribute(edit.name, edit.value);
-        buildHandles();
-      }
-    });
-
-    async function end(e) {
-      if (!drag) return;
-      const d = drag;
-      drag = null;
-      if (!d.started && e.type === "pointerup" && d.kind === "body") {   // a tap: focus for editing
-        const t = svgText();
-        const tryFocus = (mode, name, parse) => {
-          const v = t === null ? null : attrVal(t, d.idx, name);
-          if (v === null) return false;
-          try { parse(v); } catch (err) { return false; }                // outside the lens domain
-          setFocus(d.idx, mode);
-          return true;
-        };
-        if ((d.tag === "polygon" || d.tag === "polyline") && tryFocus("points", "points", parsePoints)) return;
-        if (d.tag === "path" && tryFocus("path", "d", parsePath)) return;
-        clearFocus();
-        return;
-      }
-      if (!d.started) return;
-      if (d.kind === "body") await commit(d.idx, "transform", d.T, "", translateLens);
-      else if (d.edit) await commit(d.idx, d.edit.name, d.edit.value, null);
-      buildHandles();
+    const list = ctx.elems();
+    const hit = list.indexOf(e.target);
+    if (focus.index !== null && focus.mode === "points" && (hit === focus.index || key !== undefined)) {
+      const el = list[focus.index];
+      const p = ctx.localPoint(el, e);
+      if (!p) return false;
+      const closed = el.localName !== "polyline";
+      const seg = nearestSegment(parsePoints(attrVal(t, focus.index, "points")), p[0], p[1], closed);
+      const idx = focus.index;
+      await ctx.writer.runCommand("insertPoint", (d) => insertPoint(d, pathOfIndex(d, idx), seg.index, p), { keepFocus: true });
+      return true;
     }
-    node.addEventListener("pointerup", end);
-    node.addEventListener("pointercancel", end);
 
-    // ---- structural gestures ---------------------------------------------------------------
-    // Everything here goes through a pure command; none of it touches the DOM directly.
-    const localPoint = (el, e) => {
-      const ctm = el.getScreenCTM();
-      if (!ctm) return null;
-      const [x, y] = applyPoint(invert(ctmMat(ctm)), e.clientX, e.clientY);
-      return [snap(x), snap(y)];
-    };
-    // Markup for a shape dropped on empty canvas. Overridable — this is UX policy, not geometry.
+    if (hit <= 0) {
+      const p = ctx.localPoint(ctx.node, e);
+      if (!p) return false;
+      await ctx.writer.runCommand("insertElement", (d) => insertElement(d, [0], null, ctx.options.newShape(p[0], p[1])));
+      return true;
+    }
+    return false;
+  }
+}
+)};
+
+// The registry. Order is priority: the first tool to claim a pointerdown owns the gesture. Push a
+// tool from any cell and dispatch an input event to extend the editor without touching it.
+const _sl123 = function _svgTools(Inputs,toolVertex,toolMove,toolStructure){return(
+Inputs.input([toolVertex, toolMove, toolStructure])
+)};
+const _sl123v = (G, _) => G.input(_);
+
+// ---- svgLens: wiring only ------------------------------------------------------------------------
+const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement)
+{
+  // Set while re-rendering: the fresh node is a throwaway used to patch the live one, so svgLens must
+  // not attach a second overlay and a second set of listeners to it.
+  const guard = { rendering: false };
+
+  return function svgLens(node, options = {}) {
+    if (guard.rendering) return node;
+    const grid = options.grid === undefined ? 0.5 : options.grid;
+    const snap = (v) => (grid ? Math.round(v / grid) * grid : v);
+    // Markup for a shape dropped on empty canvas. UX policy, not geometry, so it is overridable.
     const newShape = options.newShape || ((x, y) => {
       const r = options.newShapeSize === undefined ? 24 : options.newShapeSize;
       const pts = [[x - r, y + r], [x, y - r], [x + r, y + r]].map(([a, b]) => `${a},${b}`).join(" ");
       return `<polygon points="${pts}" fill="#5B7A5E"/>`;
     });
 
+    const overlay = svgOverlay(node);
+    const target = svgTarget(node, { marker: svgLens, isOwn: overlay.isOwn });
+    const writer = svgWriter(node, target, { isOwn: overlay.isOwn, guard });
+    const focus = svgFocus(overlay, target);
+    node.style.touchAction = "none";
+
+    const ctx = {
+      node, target, writer, focus, snap, state: {},
+      options: { ...options, newShape },
+      elems: target.elems,
+      doc: target.doc,
+      localPoint: (el, e) => {
+        const ctm = el.getScreenCTM();
+        if (!ctm) return null;
+        const [x, y] = applyPoint(invert(ctmMat(ctm)), e.clientX, e.clientY);
+        return [snap(x), snap(y)];
+      }
+    };
+
+    let active = null;
+    node.addEventListener("pointerdown", (e) => {
+      for (const t of svgTools) if (t.onPointerDown && t.onPointerDown(ctx, e)) { active = t; return; }
+      active = null;
+    });
+    node.addEventListener("pointermove", (e) => { if (active && active.onPointerMove) active.onPointerMove(ctx, e); });
+    const end = async (e) => {
+      const t = active;
+      active = null;
+      if (t && t.onPointerUp) await t.onPointerUp(ctx, e);
+    };
+    node.addEventListener("pointerup", end);
+    node.addEventListener("pointercancel", end);
     node.addEventListener("dblclick", async (e) => {
-      const t = svgText();
-      if (t === null) return;
       e.preventDefault();
+      for (const t of svgTools) if (t.onDblClick && await t.onDblClick(ctx, e)) return;
+    });
 
-      // a vertex: remove it
-      const key = e.target.dataset && e.target.dataset.key;
-      if (key !== undefined && focusIdx !== null && focusMode === "points") {
-        const h = pointsHandles(t, focusIdx).find((x) => x.key === key);
-        const idx = focusIdx;
-        if (h) await runCommand("deletePoint", (d) => deletePoint(d, pathOfIndex(d, idx), h.i), { keepFocus: true });
-        return;
-      }
-
-      // an edge of the focused polygon: add a vertex there
-      const list = elems();
-      const hit = list.indexOf(e.target);
-      if (focusIdx !== null && focusMode === "points" && (hit === focusIdx || key !== undefined)) {
-        const el = list[focusIdx];
-        const p = localPoint(el, e);
-        if (!p) return;
-        const pts = parsePoints(attrVal(t, focusIdx, "points"));
-        const closed = el.localName !== "polyline";
-        const seg = nearestSegment(pts, p[0], p[1], closed);
-        const idx = focusIdx;
-        await runCommand("insertPoint", (d) => insertPoint(d, pathOfIndex(d, idx), seg.index, p), { keepFocus: true });
-        return;
-      }
-
-      // empty canvas: add a shape
-      if (hit <= 0) {
-        const p = localPoint(node, e);
-        if (!p) return;
-        await runCommand("insertElement", (d) => insertElement(d, [0], null, newShape(p[0], p[1])));
-      }
+    // The handles follow every put: same elements after an attribute edit, shifted addresses after a
+    // structural one. The writer knows nothing about selection; it just says what it did.
+    node.addEventListener("lens-put", (e) => {
+      const r = e.detail;
+      if (r.attribute === "(structure)" && !r.keepFocus) focus.clear(); else focus.refresh();
     });
 
     // The cell's value is the SVG text the source currently holds; cellSource() exposes the whole
     // definition so a projection cell can show what a gesture rewrote.
-    Object.defineProperty(node, "value", {
-      configurable: true,
-      get: () => svgText(),
-      set: () => {}
-    });
-    node.cellSource = () => cellSrc() || "";
+    Object.defineProperty(node, "value", { configurable: true, get: target.doc, set: () => {} });
+    node.cellSource = () => target.cellSource() || "";
     // Structural editing, programmatically. Each returns the put record (or null off-cell).
     node.addShape = (markup, at = null, parent = [0]) =>
-      runCommand("insertElement", (d) => insertElement(d, parent, at, markup));
-    node.removeAt = (path) => runCommand("deleteElement", (d) => deleteElement(d, path));
-    node.moveTo = (path, to) => runCommand("reorderElement", (d) => reorderElement(d, path, to));
-    node.edit = (name, fn, opts) => runCommand(name, fn, opts);
+      writer.runCommand("insertElement", (d) => insertElement(d, parent, at, markup));
+    node.removeAt = (path) => writer.runCommand("deleteElement", (d) => deleteElement(d, path));
+    node.moveTo = (path, to) => writer.runCommand("reorderElement", (d) => reorderElement(d, path, to));
+    node.edit = (name, fn, opts) => writer.runCommand(name, fn, opts);
     return node;
   };
 };
@@ -38118,7 +38235,16 @@ export default function define(runtime, observer) {
   $def("sl112", "pathHandles", ["parsePath","attrVal","PATH_ARG_COUNT"], _sl112);
   $def("sl113", "handleEdit", ["pointsHandles","parsePoints","attrVal","printPoints","pathHandles","parsePath","printPath"], _sl113);
   $def("sl115", "morph", [], _sl115);
-  $def("sl114", "svgLens", ["runtime","realize","literalSpan","literalLens","cellAttrLens","compose","translateLens","attrVal","invert","applyPoint","ctmMat","parsePoints","parsePath","pointsHandles","pathHandles","handleEdit","morph","pathOfIndex","insertElement","deleteElement","reorderElement","insertPoint","deletePoint","nearestSegment"], _sl114);
+  $def("sl116", "svgTarget", ["runtime","literalSpan"], _sl116);
+  $def("sl117", "svgWriter", ["runtime","realize","morph","literalLens","cellAttrLens","compose","attrVal","literalSpan"], _sl117);
+  $def("sl118", "svgOverlay", [], _sl118);
+  $def("sl119", "svgFocus", ["pointsHandles","pathHandles"], _sl119);
+  $def("sl120", "toolVertex", ["handleEdit"], _sl120);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath"], _sl121);
+  $def("sl122", "toolStructure", ["pathOfIndex","insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal"], _sl122);
+  $def("sl123", "viewof svgTools", ["Inputs","toolVertex","toolMove","toolStructure"], _sl123);
+  $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
+  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
