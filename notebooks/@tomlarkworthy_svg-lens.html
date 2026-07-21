@@ -36346,6 +36346,45 @@ const _sl02c = function _inspector(htl,invalidation,$0)
   return el;
 };
 
+// ---- the SVG-factory case: a template with holes in it -------------------------------------------
+const _sl06a = function _factoryDoc(md){return(
+md`### Interpolated templates
+
+A drawing built from parameters is a *factory*, not a picture, and dragging one has to decide where
+the change belongs. Each number in an attribute is a **slot**, and each slot has a provenance:
+
+| slot | example | where a drag goes |
+|---|---|---|
+| literal | \`translate(20 **10**)\` | the cell's own source, as usual |
+| whole expression with a view | \`translate(**\${shift}** 0)\` | upstream — the slider moves |
+| any other expression | \`rotate(**\${Math.sin(t) * 30}**)\` | nowhere: the handle is greyed and the put refuses |
+
+Drag the boxes below. The first moves the slider; the second writes its own source in y and reports
+the locked x; the third cannot be moved at all, and says so instead of pretending.`
+)};
+
+const _sl06b = function _shift(Inputs){return(
+Inputs.range([0, 140], { value: 40, step: 1, label: "shift", width: 260 })
+)};
+const _sl06bv = (G, _) => G.input(_);
+
+const _sl06c = function _spin(Inputs){return(
+Inputs.range([0, 90], { value: 20, step: 1, label: "spin", width: 260 })
+)};
+const _sl06cv = (G, _) => G.input(_);
+
+const _sl06 = function _factory(svgLens,svg,shift,spin){return(
+svgLens(svg`<svg viewBox="0 0 240 120" width="100%" style="max-height:220px;background:#EDF1E8">
+  <!-- upstream: the whole x is one expression naming a view, so dragging moves the slider -->
+  <rect x="10" y="14" width="44" height="30" fill="#4C7FD1" transform="translate(${shift} 0)"/>
+  <!-- mixed: y is source and writes; x is an expression and is reported locked -->
+  <rect x="10" y="52" width="44" height="30" fill="#5B7A5E" transform="translate(${shift} 0)"/>
+  <!-- opaque: not an identifier, so there is nothing to write — the handles grey out -->
+  <rect x="10" y="88" width="44" height="24" fill="#B25B3A" transform="rotate(${spin / 2} 32 100)"/>
+</svg>`)
+)};
+const _sl06v = (G, _) => G.input(_);
+
 const _sl04 = function _howToDrive(md){return(
 md`**Drag a shape** to move it — the \`transform\` lens. **Tap a polygon or path**, then drag a handle —
 the \`points\` and path \`d\` lenses. **Tap anything else** for the transform gizmo: rotate and scale from
@@ -36971,14 +37010,108 @@ const _sl71 = function _literalSpan(acorn)
     if (!scope) throw new Error(`no call to ${alias} in the definition`);
     const lit = find(scope.arguments || scope, (n) => n.type === "TemplateLiteral");
     if (!lit) throw new Error("no template literal in the call");
-    if (lit.quasis.length !== 1) throw new Error("template literal has interpolations — outside the domain");
-    return [lit.start + 1, lit.end - 1];
+    // Interpolations are allowed: the body is returned verbatim, holes and all, and the slot model
+    // (`slotsOf`) decides per attribute what a gesture may write. A hole in *element* position —
+    // `${shapes.map(…)}` between tags — is a different matter: it can render any number of elements,
+    // so document-order indices would not line up with the DOM. Refused, loudly.
+    const body = [lit.start + 1, lit.end - 1];
+    for (const e of lit.expressions) {
+      const before = src.slice(body[0], e.start);
+      const open = before.lastIndexOf("<"), close = before.lastIndexOf(">");
+      if (open <= close) throw new Error("interpolation outside an attribute value — element positions would not line up");
+    }
+    return body;
   };
 };
 
-// Text that cannot survive being written back into a template literal.
-const _sl72 = function _literalSafe(){return(
-(t) => !/[`\\]/.test(t) && !t.includes("${")
+// ---- interpolation: an attribute value that is partly source and partly a hole -------------------
+// `transform="translate(${x} 10)"` has two numeric slots: one belongs to the expression `x`, one is
+// literal text. A gesture may write the literal one; the other is not this cell's to change. The
+// model is per *slot*, not per attribute, so a mixed value is still half editable.
+const _sl71b = function _holeSpans(){return(
+(text) => {
+  const out = [];
+  for (let i = 0; (i = text.indexOf("${", i)) !== -1;) {
+    let depth = 1, j = i + 2;
+    for (; j < text.length && depth; j++) {
+      if (text[j] === "{") depth++;
+      else if (text[j] === "}") depth--;
+    }
+    if (depth) break;                                    // unterminated: not a hole, just text
+    out.push({ start: i, end: j, text: text.slice(i, j) });
+    i = j;
+  }
+  return out;
+}
+)};
+
+// The numeric slots of an attribute value, in order: each is either a hole or a literal number.
+// Numbers *inside* a hole are part of the expression, not slots, so hole interiors are skipped.
+const _sl71c = function _slotsOf(holeSpans){return(
+(text) => {
+  const holes = holeSpans(text);
+  const NUM = /[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/g;
+  const out = [];
+  let at = 0;
+  for (const h of holes.concat([{ start: text.length, end: text.length, text: "" }])) {
+    NUM.lastIndex = 0;
+    const seg = text.slice(at, h.start);
+    for (let m; (m = NUM.exec(seg));)
+      out.push({ kind: "num", start: at + m.index, end: at + m.index + m[0].length, text: m[0] });
+    if (h.text) out.push({ kind: "hole", start: h.start, end: h.end, text: h.text });
+    at = h.end;
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+)};
+
+// Write a gesture's result back into an interpolated attribute. The lens works on the *rendered*
+// value (what the DOM shows, all numbers); this maps that result onto the source's slots: literal
+// slots take the new number, hole slots keep their expression — and if the gesture wanted to move a
+// hole, that slot is reported locked rather than silently dropped or silently overwritten.
+const _sl71d = function _mergeInterpolated(slotsOf){return(
+(srcText, rendered, nextRendered) => {
+  const NUM = /[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/g;
+  const nums = (s) => s.match(NUM) || [];
+  const slots = slotsOf(srcText);
+  const was = nums(rendered), now = nums(nextRendered);
+  if (slots.length !== was.length || was.length !== now.length)
+    return { text: srcText, locked: [], reason: "the rendered value has a different shape from the source" };
+  let out = "", at = 0;
+  const locked = [];
+  slots.forEach((slot, i) => {
+    out += srcText.slice(at, slot.start);
+    if (slot.kind === "hole") {
+      out += slot.text;                                  // never rewritten from here
+      if (Number(now[i]) !== Number(was[i])) locked.push(i);
+    } else out += now[i];
+    at = slot.end;
+  });
+  return { text: out + srcText.slice(at), locked, reason: null };
+}
+)};
+
+// Text that cannot survive being written back into a template literal. The rule is relative to the
+// bytes being replaced: an interpolation the author already wrote may come back verbatim (that is
+// how an edit to an interpolated drawing preserves its holes), but no *new* one may appear, and
+// outside the holes there may be no backtick, backslash or `${` at all.
+const _sl72 = function _literalSafe(holeSpans){return(
+(t, was = null) => {
+  const holes = holeSpans(t);
+  if (holes.length) {
+    if (was === null) return false;
+    const had = holeSpans(was).map((h) => h.text);
+    for (const h of holes) {
+      const i = had.indexOf(h.text);
+      if (i === -1) return false;                        // an expression that was not there before
+      had.splice(i, 1);
+    }
+  }
+  let at = 0, rest = "";
+  for (const h of holes) { rest += t.slice(at, h.start); at = h.end; }
+  rest += t.slice(at);
+  return !/[`\\]/.test(rest) && !rest.includes("${");
+}
 )};
 
 // Lens<cell definition source, template literal contents>.
@@ -36988,7 +37121,7 @@ const _sl73 = function _literalLens(lens,literalSpan,literalSafe){return(
   (t, s) => {
     const [a, b] = literalSpan(s, alias);
     if (t === s.slice(a, b)) return s;
-    if (!literalSafe(t)) throw new Error("text would not survive the template literal");
+    if (!literalSafe(t, s.slice(a, b))) throw new Error("text would not survive the template literal");
     return s.slice(0, a) + t + s.slice(b);
   }
 )
@@ -37137,6 +37270,20 @@ const _sl75 = function _attrVal(tokenize){return(
   const el = tokenize(src)[idx];
   if (!el) throw new Error(`no element ${idx}`);
   return el.attrs[name] ? el.attrs[name].value : null;
+}
+)};
+
+// What a gesture can measure. Writing goes to the source, but reading cannot: `translate(${shift} 0)`
+// is not a pair of numbers, and the drawing on screen is. When the source token holds an
+// interpolation the live element's rendered attribute is the honest current value; the writer still
+// decides, slot by slot, which parts of it may be written back.
+const _sl75a = function _effectiveAttr(attrVal,holeSpans){return(
+(elems, src, idx, name) => {
+  const v = attrVal(src, idx, name);
+  if (v === null || !holeSpans(v).length) return v;
+  const el = elems[idx];
+  const r = el && el.getAttribute && el.getAttribute(name);
+  return r === null || r === undefined ? v : r;
 }
 )};
 
@@ -38294,6 +38441,51 @@ const _sl31t = function _test_units_and_style(forAll,arb,mulberry32,NUM_RUNS,len
   return `✅ lengths keep px/%/em, style laws hold, a property is set where it already lives (${NUM_RUNS} runs)`;
 };
 
+// The slot model for interpolated templates: which numbers in an attribute belong to the source and
+// which to an expression, and what a gesture is allowed to do to each. The claim under test is the
+// safety one — a hole's bytes come back verbatim, always — plus the reporting one: a gesture that
+// wanted to move a hole is told so rather than having its change dropped in silence.
+const _sl71t = function _test_interpolation_slots(holeSpans,slotsOf,mergeInterpolated,literalSpan,literalLens)
+{
+  const kinds = (t) => slotsOf(t).map((s) => s.kind).join(",");
+  if (kinds("translate(${x} 10)") !== "hole,num") throw new Error(kinds("translate(${x} 10)"));
+  if (kinds("translate(10 20)") !== "num,num") throw new Error("literal slots misread");
+  if (kinds("${a}") !== "hole") throw new Error("whole-hole misread");
+  // Numbers inside an expression belong to the expression, not to the drawing.
+  if (kinds("${Math.sin(t) * 10}") !== "hole") throw new Error("numbers inside a hole are not slots");
+  if (kinds("${ {a: 1} }") !== "hole") throw new Error("nested braces must not end the hole early");
+  if (holeSpans("a ${unterminated").length !== 0) throw new Error("an unterminated hole is just text");
+
+  // Mixed: the literal moves, the expression does not, and the caller is told which.
+  const mixed = mergeInterpolated("translate(${x} 10)", "translate(37 10)", "translate(45 14)");
+  if (mixed.text !== "translate(${x} 14)") throw new Error(`mixed put wrote ${mixed.text}`);
+  if (mixed.locked.join() !== "0") throw new Error("the moved hole was not reported");
+  // Not moving the hole is not a lock.
+  const clean = mergeInterpolated("translate(${x} 10)", "translate(37 10)", "translate(37 14)");
+  if (clean.locked.length) throw new Error("an untouched hole must not be reported as locked");
+  if (clean.text !== "translate(${x} 14)") throw new Error(clean.text);
+  // Shape mismatch (the expression rendered more or fewer numbers than there are slots): refuse.
+  const odd = mergeInterpolated("translate(${p})", "translate(1 2)", "translate(3 4)");
+  if (odd.text !== "translate(${p})" || !odd.reason) throw new Error("a shape mismatch must refuse");
+  // Whatever happens, the hole's bytes survive byte for byte.
+  for (const src of ["${x}", "translate(${x} 10)", "M ${a} 0 L 10 ${b}", "rotate(${a + 1} 2 3)"]) {
+    const n = (src.match(/\$\{[^}]*\}/g) || []).length;
+    const rendered = src.replace(/\$\{[^}]*\}/g, "7");
+    const out = mergeInterpolated(src, rendered, rendered.replace(/7/g, "9").replace(/(\d+)/g, "$1"));
+    if ((out.text.match(/\$\{[^}]*\}/g) || []).length !== n)
+      throw new Error(`a hole was lost writing ${src}`);
+  }
+
+  // And the cell-level domain: an interpolation inside an attribute is in, one between tags is out.
+  const cell = (body) => `function _d(svgLens, svg, x) {return (svgLens(svg\`${body}\`));}`;
+  const ok = cell('<svg><rect x="${x}"/></svg>');
+  if (literalLens("svgLens").get(ok) !== '<svg><rect x="${x}"/></svg>') throw new Error("attribute hole rejected");
+  let threw = false;
+  try { literalSpan(cell('<svg>${shapes}</svg>'), "svgLens"); } catch (e) { threw = /would not line up/.test(e.message); }
+  if (!threw) throw new Error("an interpolation in element position must be refused");
+  return "✅ slots classified, literals written, expressions preserved byte for byte and reported";
+};
+
 // Following a reference is selection, not editing: the point is to reach the gradient or the symbol
 // that actually paints the shape you clicked.
 const _sl74u = function _test_refs(refsOf,pathOfId)
@@ -38856,7 +39048,7 @@ const _sl116 = function _svgTarget(runtime,literalSpan){return(
 // definition with the variable's current inputs — it does not parse the SVG text — so an interpolated
 // template renders the same way a static one does. Recomputing the cell instead would mint a new node
 // and break the value's identity.
-const _sl117 = function _svgWriter(runtime,realize,morph,literalLens,cellAttrLens,compose,attrVal,literalSpan){return(
+const _sl117 = function _svgWriter(runtime,realize,morph,literalLens,cellAttrLens,compose,attrVal,literalSpan,holeSpans,slotsOf,mergeInterpolated){return(
 (node, target, { isOwn, guard }) => {
   const emit = (record) => {
     node.lastPut = record;
@@ -38901,13 +39093,82 @@ const _sl117 = function _svgWriter(runtime,realize,morph,literalLens,cellAttrLen
     return applySource(next, record);
   }
 
+  // The three sinks a gesture can land in (§4 of the design note). Which one applies is decided by
+  // the *provenance* of the slot being moved, not by the gesture: source text is written here, an
+  // expression's value is written upstream, and anything else is locked and says so.
+  //
+  // Sink 2: the whole attribute is one hole, `${x}`. If `x` is an input of this cell and has a view,
+  // moving the handle moves the view — the runtime then re-renders the drawing for us.
+  function writeUpstream(expr, value) {
+    const self = target.variable();
+    const m = /^\$\{\s*([A-Za-z_$][\w$]*)\s*\}$/.exec(expr);
+    if (!self || !m) return "the expression is not a plain identifier";
+    const input = self._inputs.find((v) => v && v._name === m[1]);
+    if (!input) return `${m[1]} is not an input of this cell`;
+    const view = [...runtime._variables].find(
+      (v) => v._name === "viewof " + m[1] && v._module === input._module);
+    const el = view && view._value;
+    if (!el || typeof el !== "object" || !("value" in el)) return `${m[1]} has no view to write to`;
+    el.value = Number(value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    return null;                                         // written
+  }
+
+  // Sink 1 with holes present: write the literal slots, keep the expressions, report what was locked.
+  async function commitInterpolated(idx, name, value, dflt, inner, srcText, record, was) {
+    const s = target.cellSource();
+    const el = target.elems()[idx];
+    // What the holes rendered to *before* this gesture. A tool that previews by writing the live
+    // element must say so (`was`), or the diff is taken against its own preview and every slot looks
+    // untouched — the drag then commits nothing at all.
+    const rendered = was || (el && el.getAttribute(name)) || dflt || "";
+    const nextRendered = inner ? inner.put(value, rendered) : String(value);
+    const slots = slotsOf(srcText);
+    // The whole value is one expression: nothing here to write, so try the upstream sink.
+    if (slots.length === 1 && slots[0].kind === "hole" && slots[0].text.length === srcText.length) {
+      const why = writeUpstream(srcText, (nextRendered.match(/[+-]?(?:\d+\.?\d*|\.\d+)/) || [])[0]);
+      record.sink = why ? "locked" : "upstream";
+      record.locked = why;
+      if (why && el) el.setAttribute(name, rendered);     // put the preview back: nothing was written
+      return emit(record);
+    }
+    const merged = mergeInterpolated(srcText, rendered, nextRendered);
+    // A moved hole is not automatically a dead end: if it names a view, move the view instead. That
+    // is the same routing decision as the whole-hole case, taken per slot.
+    const nums = nextRendered.match(/[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/g) || [];
+    const stillLocked = [];
+    let wroteUpstream = false;
+    for (const i of merged.locked) {
+      const why = writeUpstream(slots[i].text, nums[i]);
+      if (why) stillLocked.push(`${slots[i].text} (${why})`); else wroteUpstream = true;
+    }
+    record.sink = merged.reason || stillLocked.length ? "mixed (partly locked)"
+                : wroteUpstream ? "upstream + literal" : "literal";
+    record.locked = merged.reason || (stillLocked.length ? stillLocked.join("; ") : null);
+    const next = cellAttrLens(target.alias(), idx, name, dflt).put(merged.text, s);
+    if (next === s) {
+      if (el) el.setAttribute(name, rendered);
+      return emit(record);
+    }
+    record.after = merged.text;
+    return applySource(next, record);
+  }
+
   // One gesture, one put, through the composed lens. `inner` refines the attribute string into the
   // view the gesture actually manipulates (a translate pair; the string itself otherwise).
-  async function commit(idx, name, value, dflt, inner) {
+  async function commit(idx, name, value, dflt, inner, was = null) {
     const s = target.cellSource();
     if (s === null) return null;
     const alias = target.alias();
     const base = cellAttrLens(alias, idx, name, dflt);
+    const srcText = base.get(s);
+    if (srcText !== null && holeSpans(srcText).length) {
+      const el = target.elems()[idx];
+      return commitInterpolated(idx, name, value, dflt, inner, srcText, {
+        target: (el ? el.localName : "?") + "[" + idx + "]", attribute: name,
+        before: srcText, after: srcText, GetPut: true, PutGet: true, span: null
+      }, was);
+    }
     const l = inner ? compose(base, inner) : base;
     const before = l.get(s);
     const next = l.put(value, s);
@@ -38955,7 +39216,8 @@ const _sl118 = function _svgOverlay(){return(
       [data-svg-lens-overlay] .rotate{fill:#2F6BFF;stroke:#fff;stroke-width:1.5;cursor:grab}
       [data-svg-lens-overlay] .box{fill:none;stroke:#2F6BFF;stroke-dasharray:4 3;stroke-width:1;opacity:.6}
       [data-svg-lens-overlay] .link{stroke:#8A63D2;stroke-dasharray:3 3;stroke-width:1;fill:none;opacity:.7}
-      [data-svg-lens-overlay] .guide{stroke:#E4572E;stroke-width:1;opacity:.9}`;
+      [data-svg-lens-overlay] .guide{stroke:#E4572E;stroke-width:1;opacity:.9}
+      [data-svg-lens-overlay] .locked{fill:#cfcfcf;stroke:#9a9a9a;stroke-dasharray:2 2;cursor:not-allowed}`;
   el.appendChild(style);
   node.appendChild(el);
   return {
@@ -39061,7 +39323,7 @@ const _sl119b = function _zTarget(){return(
 // Selection is held as a *path*, not an index: an index into document order is invalidated by any
 // insert or delete before it, a path only by an edit to its own parent chain. `index` stays available
 // because the handle lenses address elements the way tokenize() does.
-const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nodeAt,boxInRoot,topmostPaths){return(
+const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nodeAt,boxInRoot,topmostPaths,attrVal,holeSpans){return(
 (overlay, target, onChange = () => {}) => {
   // A set, ordered by when each element was added. The first is the primary: handles, and everything
   // that only makes sense for one element, follow it. Single selection is the one-element case, so
@@ -39115,9 +39377,21 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
       const b = el.getBBox();
       overlay.add("rect", { class: "box", x: b.x, y: b.y, width: b.width, height: b.height });
     }
+    // A handle over an expression cannot write source. Show that before it is grabbed, rather than
+    // letting the gesture look like it worked; the writer still refuses on release either way.
+    const locked = (() => {
+      const t = target.doc();
+      if (t === null) return false;
+      const name = mode === "points" ? "points" : mode === "path" ? "d" : "transform";
+      try {
+        const v = attrVal(t, idx, name);
+        return !!(v && holeSpans(v).length);
+      } catch (e) { return false; }
+    })();
     for (const h of hs) if (h.link) overlay.add("line", { class: "link", x1: h.x, y1: h.y, x2: h.link[0], y2: h.link[1] });
     for (const h of hs) {
-      const cls = h.kind === "anchor" || h.kind === "scale" || h.kind === "rotate" ? h.kind : "ctrl";
+      const cls = locked ? "locked"
+                : h.kind === "anchor" || h.kind === "scale" || h.kind === "rotate" ? h.kind : "ctrl";
       overlay.add("circle", { class: cls, r: cls === "ctrl" ? r * 0.8 : r, cx: h.x, cy: h.y });
       overlay.add("circle", { class: "hit", r: r * 2.6, cx: h.x, cy: h.y }).dataset.key = h.key;
     }
@@ -39188,7 +39462,7 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,printOp,at
     e.preventDefault();
     grabPointer(ctx.node, e);
     const b = el.getBBox();
-    const text = attrVal(t, idx, "transform") || "";
+    const text = ctx.attr(t, idx, "transform") || "";
     ctx.state.drag = {
       key, idx, el, b, text, base: opsLens.get(text), ops: opsLens.get(text), started: false,
       centre: [b.x + b.width / 2, b.y + b.height / 2],
@@ -39224,7 +39498,7 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,printOp,at
   async onPointerUp(ctx) {
     const d = ctx.state.drag;
     ctx.state.drag = null;
-    if (d && d.started) await ctx.writer.commit(d.idx, "transform", d.ops, "", opsLens);
+    if (d && d.started) await ctx.writer.commit(d.idx, "transform", d.ops, "", opsLens, d.text);
   }
 }
 )};
@@ -39240,7 +39514,11 @@ const _sl120 = function _toolVertex(handleEdit,grabPointer){return(
     if (mode !== "points" && mode !== "path") return false;          // the gizmo owns its own handles
     e.preventDefault();
     grabPointer(ctx.node, e);
-    ctx.state.drag = { key, idx: ctx.focus.index, mode, started: false, x0: e.clientX, y0: e.clientY };
+    const el0 = ctx.elems()[ctx.focus.index];
+    const name = mode === "points" ? "points" : "d";
+    ctx.state.drag = { key, idx: ctx.focus.index, mode, started: false, x0: e.clientX, y0: e.clientY,
+                       // what it rendered before the preview overwrites it (see writer.commit)
+                       was: el0 ? { [name]: el0.getAttribute(name) } : null };
     return true;
   },
   onPointerMove(ctx, e) {
@@ -39261,7 +39539,7 @@ const _sl120 = function _toolVertex(handleEdit,grabPointer){return(
   async onPointerUp(ctx) {
     const d = ctx.state.drag;
     ctx.state.drag = null;
-    if (d && d.started && d.edit) await ctx.writer.commit(d.idx, d.edit.name, d.edit.value, null);
+    if (d && d.started && d.edit) await ctx.writer.commit(d.idx, d.edit.name, d.edit.value, null, null, d.was && d.was[d.edit.name]);
   }
 }
 )};
@@ -39323,7 +39601,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
       const node = list[i];
       const ps = node && node.parentNode.getScreenCTM();
       if (!ps) continue;
-      const text = attrVal(t, i, "transform") || "";
+      const text = ctx.attr(t, i, "transform") || "";
       targets.push({ idx: i, el: node, text,
                      // screen delta → this element's parent space (linear part: a drag is a translation)
                      Slin: invert(ctmMat(ps)), T0: translateLens.get(text) });
@@ -39375,7 +39653,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
     if (!d) return;
     if (d.started) {
       ctx.guides([]);
-      for (const g of d.targets) await ctx.writer.commit(g.idx, "transform", g.T, "", translateLens);
+      for (const g of d.targets) await ctx.writer.commit(g.idx, "transform", g.T, "", translateLens, g.text);
       return;
     }
     if (e.type !== "pointerup") return;
@@ -39391,7 +39669,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
     if (idx <= 0) return;
     const tag = pick.localName;
     const tryFocus = (mode, name, parse) => {
-      const v = attrVal(t, idx, name);
+      const v = ctx.attr(t, idx, name);
       if (v === null) return false;
       try { parse(v); } catch (err) { return false; }    // outside the lens domain
       ctx.focus.set(pathOfIndex(t, idx), mode);
@@ -39478,7 +39756,7 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
     if (key !== undefined && sel && focus.mode === "path") {
       const h = pathHandles(t, focus.index).find((x) => x.key === key);
       if (!h || h.kind !== "anchor") return false;
-      const segs = pathSegments(parsePath(attrVal(t, focus.index, "d")));
+      const segs = pathSegments(parsePath(ctx.attr(t, focus.index, "d")));
       const i = segs.findIndex((s) => s.ci === h.ci && s.o === h.o);
       if (i < 0) return false;
       await ctx.writer.runCommand("deletePathPoint", (d) => deletePathPoint(d, sel, i));
@@ -39494,7 +39772,7 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
       const p = ctx.localPoint(el, e);
       if (!p) return false;
       const closed = el.localName !== "polyline";
-      const seg = nearestSegment(parsePoints(attrVal(t, focus.index, "points")), p[0], p[1], closed);
+      const seg = nearestSegment(parsePoints(ctx.attr(t, focus.index, "points")), p[0], p[1], closed);
       await ctx.writer.runCommand("insertPoint", (d) => insertPoint(d, sel, seg.index, p));
       return true;
     }
@@ -39502,7 +39780,7 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
     if (sel && focus.mode === "path" && hit === focus.index) {
       const p = ctx.localPoint(list[focus.index], e);
       if (!p) return false;
-      const segs = pathSegments(parsePath(attrVal(t, focus.index, "d")));
+      const segs = pathSegments(parsePath(ctx.attr(t, focus.index, "d")));
       const near = nearestPathSegment(segs, p[0], p[1]);
       if (near.index < 0 || segs[near.index].kind === "A") return false;
       await ctx.writer.runCommand("insertPathPoint", (d) => insertPathPoint(d, sel, near.index, near.t));
@@ -39668,7 +39946,7 @@ const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer){return(
     if (t === null) return void ctx.setTool("select");
     let idx;
     try { idx = nodeAt(t, pen.path).index; } catch (err) { return void ctx.setTool("select"); }
-    const d = attrVal(t, idx, "d");
+    const d = ctx.attr(t, idx, "d");
     const r = ctx.options.penCloseRadius === undefined ? 8 : ctx.options.penCloseRadius;
     if (Math.hypot(p[0] - pen.start[0], p[1] - pen.start[1]) <= r) {
       await ctx.writer.commit(idx, "d", penPath.close(d), null);
@@ -39695,7 +39973,7 @@ Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarque
 const _sl123v = (G, _) => G.input(_);
 
 // ---- svgLens: wiring only ------------------------------------------------------------------------
-const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,translateLens,nodeAt,setProperty,refsOf)
+const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf)
 {
   // Set while re-rendering: the fresh node is a throwaway used to patch the live one, so svgLens must
   // not attach a second overlay and a second set of listeners to it.
@@ -39762,6 +40040,8 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
       options: { ...options, newShape },
       elems: target.elems,
       doc: target.doc,
+      // What a tool may measure: the source token, or the rendered one where the source has holes.
+      attr: (t, idx, name) => effectiveAttr(target.elems(), t, idx, name),
       localPoint: (el, e) => {
         const ctm = el.getScreenCTM();
         if (!ctm) return null;
@@ -39887,7 +40167,7 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
       for (const i of focus.indices) {
         const t = target.doc();
         if (t === null) break;
-        const text = attrVal(t, i, "transform") || "";
+        const text = effectiveAttr(target.elems(), t, i, "transform") || "";
         const T = translateLens.get(text);
         const r = (v) => Math.round(v * 1e6) / 1e6;      // nudging must not accumulate float dust
         out.push(await writer.commit(i, "transform", [r(T[0] + dx), r(T[1] + dy)], "", translateLens));
@@ -39948,6 +40228,13 @@ export default function define(runtime, observer) {
   $def("sl02c", "inspector", ["htl","invalidation","viewof drawing"], _sl02c);
   $def("sl02", "viewof drawing", ["svgLens","svg"], _sl02);
   $def("sl03", "drawing", ["Generators","viewof drawing"], _sl03);
+  $def("sl06a", "factoryDoc", ["md"], _sl06a);
+  $def("sl06b", "viewof shift", ["Inputs"], _sl06b);
+  $def("sl06bv", "shift", ["Generators","viewof shift"], _sl06bv);
+  $def("sl06c", "viewof spin", ["Inputs"], _sl06c);
+  $def("sl06cv", "spin", ["Generators","viewof spin"], _sl06cv);
+  $def("sl06", "viewof factory", ["svgLens","svg","shift","spin"], _sl06);
+  $def("sl06v", "factory", ["Generators","viewof factory"], _sl06v);
   $def("sl04", "howToDrive", ["md"], _sl04);
   $def("sl05", "putTable", ["Generators","viewof drawing","Inputs","invalidation"], _sl05);
   $def("sl07", "cellSourceProjection", ["htl","putTable","viewof drawing"], _sl07);
@@ -40006,7 +40293,7 @@ export default function define(runtime, observer) {
 
   $def("sl70", "sourceHeader", ["md"], _sl70);
   $def("sl71", "literalSpan", ["acorn"], _sl71);
-  $def("sl72", "literalSafe", [], _sl72);
+  $def("sl72", "literalSafe", ["holeSpans"], _sl72);
   $def("sl73", "literalLens", ["lens","literalSpan","literalSafe"], _sl73);
   $def("sl74a", "scan", [], _sl74a);
   $def("sl74e", "outsideDomain", ["scan"], _sl74e);
@@ -40015,6 +40302,7 @@ export default function define(runtime, observer) {
   $def("sl74c", "nodeAt", ["parseDoc"], _sl74c);
   $def("sl74d", "pathOfIndex", ["parseDoc"], _sl74d);
   $def("sl75", "attrVal", ["tokenize"], _sl75);
+  $def("sl75a", "effectiveAttr", ["attrVal", "holeSpans"], _sl75a);
   $def("sl76", "spliceAttr", ["tokenize"], _sl76);
   $def("sl77", "attrTextLens", ["lens","attrVal","spliceAttr"], _sl77);
   $def("sl74f", "pathOfId", ["parseDoc"], _sl74f);
@@ -40078,6 +40366,7 @@ export default function define(runtime, observer) {
   $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
   $def("sl74t", "test_domain_boundary", ["outsideDomain","parseDoc","tokenize","childrenLens"], _sl74t);
   $def("sl31t", "test_units_and_style", ["forAll","arb","mulberry32","NUM_RUNS","lengthLens","parseLength","printLength","styleLens","parseStyle","setProperty"], _sl31t);
+  $def("sl71t", "test_interpolation_slots", ["holeSpans","slotsOf","mergeInterpolated","literalSpan","literalLens"], _sl71t);
   $def("sl74u", "test_refs", ["refsOf","pathOfId"], _sl74u);
   $def("sl127t", "test_snapRects", ["forAll","arb","mulberry32","NUM_RUNS","snapRects"], _sl127t);
   $def("sl119u", "test_topmost_selection", ["topmostPaths"], _sl119u);
@@ -40094,12 +40383,15 @@ export default function define(runtime, observer) {
   $def("sl113", "handleEdit", ["pointsHandles","parsePoints","attrVal","printPoints","pathHandles","parsePath","printPath"], _sl113);
   $def("sl115", "morph", [], _sl115);
   $def("sl116", "svgTarget", ["runtime","literalSpan"], _sl116);
-  $def("sl117", "svgWriter", ["runtime","realize","morph","literalLens","cellAttrLens","compose","attrVal","literalSpan"], _sl117);
+  $def("sl71b", "holeSpans", [], _sl71b);
+  $def("sl71c", "slotsOf", ["holeSpans"], _sl71c);
+  $def("sl71d", "mergeInterpolated", ["slotsOf"], _sl71d);
+  $def("sl117", "svgWriter", ["runtime","realize","morph","literalLens","cellAttrLens","compose","attrVal","literalSpan","holeSpans","slotsOf","mergeInterpolated"], _sl117);
   $def("sl118", "svgOverlay", [], _sl118);
   $def("sl119a", "boxInRoot", [], _sl119a);
   $def("sl119c", "topmostPaths", [], _sl119c);
   $def("sl119b", "zTarget", [], _sl119b);
-  $def("sl119", "svgFocus", ["pointsHandles","pathHandles","transformHandles","nodeAt","boxInRoot","topmostPaths"], _sl119);
+  $def("sl119", "svgFocus", ["pointsHandles","pathHandles","transformHandles","nodeAt","boxInRoot","topmostPaths","attrVal","holeSpans"], _sl119);
   $def("sl124c", "grabPointer", [], _sl124c);
   $def("sl120", "toolVertex", ["handleEdit","grabPointer"], _sl120);
   $def("sl121a", "hitTest", [], _sl121a);
@@ -40116,7 +40408,7 @@ export default function define(runtime, observer) {
   $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer"], _sl126);
   $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
-  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","translateLens","nodeAt","setProperty","refsOf"], _sl114);
+  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
