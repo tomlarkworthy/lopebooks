@@ -37563,9 +37563,10 @@ const _hmmFigure = function _hmmFigure(htl, hmmRun, process, renderKit)
 }
 ;
 
-const _s3 = function _s3(md){return(
+const _s3 = function _s3(md, gptKit, trainCfg){return(
 md`## How the Transformer learns
 - literate GPT (cells below: \`gptFactory\`): pre-LN, causal multi-head attention, GELU MLP, hand-written backprop — nobody told it there are hidden states
+- **${gptKit.countParams(trainCfg).toLocaleString("en-US")} learnable parameters** at the current config (${trainCfg.L} layers · ${trainCfg.H} heads · width ${trainCfg.C} · context ${trainCfg.T}) — every one of them drawn in the architecture map below
 - graded on exactly one thing: probability assigned to the next token
 - multi-core: local SGD / federated averaging over Web Workers — K=50 steps per worker between weight averages, one postMessage per worker per round, no SharedArrayBuffer
 - loss floor line = entropy rate of the process (computed from ground truth); watching loss land on the floor is the first small epiphany
@@ -37583,7 +37584,7 @@ Inputs.range([1, 8], {value: Math.min(8, Math.max(1, (window.navigator.hardwareC
 )};
 const _nWorkers = (G, _) => G.input(_);
 
-const _lossFigure = function _lossFigure(htl, trainSnapshot, evalSet, renderKit)
+const _lossFigure = function _lossFigure(htl, trainSnapshot, evalSet, renderKit, gptKit, trainCfg)
 {
   const st = trainSnapshot.st;
   const hist = st.lossHist;
@@ -37592,7 +37593,7 @@ const _lossFigure = function _lossFigure(htl, trainSnapshot, evalSet, renderKit)
     {y: evalSet.iidLoss, color: "#999", label: `iid ${evalSet.iidLoss.toFixed(3)}`}
   ];
   return htl.html`<div class="bsg-fig">
-    <div style="font-size:12px;">step <b>${st.step}</b> ${trainSnapshot.running ? "· training…" : "· idle"} · worker-ema loss ${hist.length ? hist[hist.length - 1][1].toFixed(4) : "—"} nats · checkpoints ${st.ckpts.length}</div>
+    <div style="font-size:12px;">${gptKit.countParams(trainCfg).toLocaleString("en-US")}-param GPT · step <b>${st.step}</b> ${trainSnapshot.running ? "· training…" : "· idle"} · worker-ema loss ${hist.length ? hist[hist.length - 1][1].toFixed(4) : "—"} nats · checkpoints ${st.ckpts.length}</div>
     ${renderKit.lineChart(hist, {width: 560, height: 180, hlines: lines, ymin: evalSet.optimalLoss - 0.02})}
   </div>`;
 }
@@ -38010,7 +38011,7 @@ const _flowFigure = function _flowFigure(htl, process, beliefKit, renderKit, gpt
     holder.replaceChildren(htl.svg`<svg width=${Wd} height=${Hd} viewBox="0 0 ${Wd} ${Hd}" style="max-width:100%;font-family:sans-serif;color:#aaa;">${parts}</svg>`);
     status.textContent = (m._step >= 0 ? "weights from training step " + m._step : "untrained weights — attention is still near-uniform") +
       " · following position " + q + " of " + win.map((k) => process.alphabet[k]).join("") +
-      " · all " + L + " layers × " + H + " heads unrolled, ribbon width = live attention weight" +
+      " · all " + L + " layers × " + H + " heads unrolled (" + m.weightCount().toLocaleString("en-US") + " parameters), ribbon width = live attention weight" +
       (machineState.tokens.length ? "" : " · sample stream — feed the machine above");
   };
   let lastModel = 0;
@@ -38890,7 +38891,7 @@ const _zooSnapshot = async function* _zooSnapshot(zooTraining, nWorkers, trainSt
 }
 ;
 
-const _zooLossFigure = function _zooLossFigure(htl, zooSnapshot, zooEval, renderKit)
+const _zooLossFigure = function _zooLossFigure(htl, zooSnapshot, zooEval, renderKit, gptKit, zooCfg)
 {
   const st = zooSnapshot.st;
   const hist = st.lossHist;
@@ -38899,7 +38900,7 @@ const _zooLossFigure = function _zooLossFigure(htl, zooSnapshot, zooEval, render
     {y: zooEval.iidLoss, color: "#999", label: `iid ${zooEval.iidLoss.toFixed(3)}`}
   ];
   return htl.html`<div class="bsg-fig">
-    <div style="font-size:12px;">zoo model · step <b>${st.step}</b> ${zooSnapshot.running ? "· training…" : "· idle"} · worker-ema loss ${hist.length ? hist[hist.length - 1][1].toFixed(4) : "—"} nats</div>
+    <div style="font-size:12px;">zoo model (${gptKit.countParams(zooCfg).toLocaleString("en-US")} params) · step <b>${st.step}</b> ${zooSnapshot.running ? "· training…" : "· idle"} · worker-ema loss ${hist.length ? hist[hist.length - 1][1].toFixed(4) : "—"} nats</div>
     ${renderKit.lineChart(hist, {width: 560, height: 180, hlines: lines, ymin: zooEval.floorLoss - 0.02})}
   </div>`;
 }
@@ -39724,7 +39725,12 @@ const _gptFactory = function _gptFactory()
         for (const p of this.order) { p.w.set(flat.subarray(off, off + p.w.length)); off += p.w.length; }
       }
     }
-    return { GPT };
+    // total learnable parameters for a config, without building a model
+    const countParams = ({ V, T, C, L, F }) =>
+      V * C + T * C +
+      L * (2 * C + C * 3 * C + 3 * C + C * C + C + 2 * C + C * F + F + F * C + C) +
+      2 * C + C * V + V;
+    return { GPT, countParams };
   }
   return gptFactory;
 }
@@ -40459,12 +40465,12 @@ export default function define(runtime, observer) {
   $def("bsg-v-hmmgo", "viewof hmmGo", ["Inputs"], _v_hmmGo);
   $def("bsg-hmmgo", "hmmGo", ["Generators", "viewof hmmGo"], _hmmGo);
   $def("bsg-hmmfig", "hmmFigure", ["htl", "hmmRun", "process", "renderKit"], _hmmFigure);
-  $def("bsg-s3", null, ["md"], _s3);
+  $def("bsg-s3", null, ["md", "gptKit", "trainCfg"], _s3);
   $def("bsg-v-train", "viewof training", ["Inputs"], _v_training);
   $def("bsg-train", "training", ["Generators", "viewof training"], _training);
   $def("bsg-v-nw", "viewof nWorkers", ["Inputs"], _v_nWorkers);
   $def("bsg-nw", "nWorkers", ["Generators", "viewof nWorkers"], _nWorkers);
-  $def("bsg-lossfig", "lossFigure", ["htl", "trainSnapshot", "evalSet", "renderKit"], _lossFigure);
+  $def("bsg-lossfig", "lossFigure", ["htl", "trainSnapshot", "evalSet", "renderKit", "gptKit", "trainCfg"], _lossFigure);
   $def("bsg-fusion", "fusionFigure", ["htl", "trainState", "process", "trainCfg", "modelBox", "invalidation"], _fusionFigure);
   $def("bsg-s45", null, ["md"], _s45);
   $def("bsg-v-replay", "viewof replay", ["Inputs"], _v_replay);
@@ -40499,7 +40505,7 @@ export default function define(runtime, observer) {
   $def("bsg-v-zootrain", "viewof zooTraining", ["Inputs"], _v_zooTraining);
   $def("bsg-zootrain", "zooTraining", ["Generators", "viewof zooTraining"], _zooTraining);
   $def("bsg-contraction", "contractionFigure", ["htl", "beliefKit", "renderKit", "gptKit", "zooCfg", "zooModelBox", "invalidation"], _contractionFigure);
-  $def("bsg-zooloss", "zooLossFigure", ["htl", "zooSnapshot", "zooEval", "renderKit"], _zooLossFigure);
+  $def("bsg-zooloss", "zooLossFigure", ["htl", "zooSnapshot", "zooEval", "renderKit", "gptKit", "zooCfg"], _zooLossFigure);
   $def("bsg-zooprobereport", "zooProbeReport", ["htl", "zooProbeData", "zooEval"], _zooProbeReport);
   $def("bsg-footer", null, ["md"], _footer);
   // machinery

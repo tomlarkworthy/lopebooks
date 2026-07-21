@@ -36243,11 +36243,47 @@ svgLens(svg`<svg viewBox="0 0 320 220" width="100%" style="max-height:420px;back
 )};
 const _sl03 = (G, _) => G.input(_);
 
+// The toolbar drives `drawing.setTool(id)` and follows the editor's own "lens-tool" event, so the
+// editor stays the source of truth: a tool that finishes (a shape drawn, a path closed) returns to
+// select on its own and the buttons follow.
+const _sl02b = function _toolbar(htl,invalidation,$0)
+{
+  const drawing = $0;                                    // viewof drawing — the editor node
+  const TOOLS = [["select", "Select", "V"], ["rect", "Rect", "R"], ["ellipse", "Ellipse", "E"],
+                 ["line", "Line", "L"], ["pen", "Pen", "P"]];
+  const el = htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap;margin:.5rem 0"></div>`;
+  const buttons = TOOLS.map(([id, label, key]) => {
+    const b = htl.html`<button title="${label} (${key})" style="padding:4px 10px;border-radius:6px;border:1px solid #b9c4b4;cursor:pointer">${label}</button>`;
+    b.onclick = () => drawing.setTool(id);
+    el.appendChild(b);
+    return [id, b];
+  });
+  const paint = (tool) => buttons.forEach(([id, b]) => {
+    b.style.background = id === tool ? "#2F6BFF" : "#fff";
+    b.style.color = id === tool ? "#fff" : "#243";
+  });
+  paint(drawing.tool);
+  drawing.addEventListener("lens-tool", (e) => paint(e.detail.tool));
+  const onKey = (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    const hit = TOOLS.find(([, , k]) => k.toLowerCase() === e.key.toLowerCase());
+    if (hit) drawing.setTool(hit[0]);
+    else if (e.key === "Escape") drawing.setTool("select");
+  };
+  document.addEventListener("keydown", onKey);
+  invalidation.then(() => document.removeEventListener("keydown", onKey));
+  return el;
+};
+
 const _sl04 = function _howToDrive(md){return(
 md`**Drag a shape** to move it — the \`transform\` lens. **Tap a polygon or path**, then drag a handle —
-the \`points\` and path \`d\` lenses. **Double-click** an edge of the tapped polygon to add a vertex, a
-vertex to remove it, or empty canvas to drop in a new shape. Handles are live DOM only; they are
-never written to the source.
+the \`points\` and path \`d\` lenses. **Tap anything else** for the transform gizmo: rotate and scale from
+the box. **Double-click** an edge of the tapped polygon to add a vertex, a vertex to remove it, or
+empty canvas to drop in a new shape. Handles are live DOM only; they are never written to the source.
+
+The toolbar above picks what a gesture *creates*: **R/E/L** drag out a rect, an ellipse or a line;
+**P** places path anchors one click at a time — click the first anchor again to close, double-click to
+finish open, **Esc** or **V** to go back to selecting. A tool that finishes returns to select by itself.
 
 An attribute gesture writes once, on release, through this chain:
 
@@ -37048,7 +37084,10 @@ const _sl79 = function _childrenLens(lens,nodeAt,parseDoc){return(
     // The text before each child (indentation, comments) belongs to that child and travels with it.
     const gaps = n.children.map((c, i) => s.slice(i ? n.children[i - 1].end : n.innerStart, c.start));
     const tail = kn ? s.slice(n.children[kn - 1].end, n.innerEnd) : s.slice(n.innerStart, n.innerEnd);
-    const fresh = gaps[0] || (/^\s*/.exec(tail)[0] || "\n");     // what a newly inserted child gets
+    // What a newly inserted child gets: the *indentation* of an existing gap, never the whole gap —
+    // a gap can hold comments, and copying those would reproduce them once per inserted element.
+    const indent = (g) => /\s*$/.exec(g)[0];
+    const fresh = kn ? indent(gaps[0]) : (indent(tail) || "\n");
     let at = 0, body = "";
     for (const k of kids) {
       const j = cur.indexOf(k, at);
@@ -37883,6 +37922,64 @@ const _sl108f = function _test_transform_gizmo(forAll,arb,mulberry32,NUM_RUNS,ro
   return `✅ rotation about a centre, scaling about a pivot, bounded op list (${NUM_RUNS} runs each)`;
 };
 
+// Creation is geometry, not gesture: whichever corner the drag starts from, the shape it describes is
+// the same, and the markup that reaches the source describes the same shape as the preview. Checked
+// through the real parser — the markup is inserted into a document and read back with the same lenses
+// the editor uses, so a quoting or spelling slip is a failure here.
+const _sl125t = function _test_shape_creation(forAll,arb,mulberry32,NUM_RUNS,dragBox,shapeSpec,shapeMarkup,insertElement,childrenLens,attrVal,nodeAt)
+{
+  const rng = mulberry32(0x5EED001A);
+  const gen = (r) => [arb.pick(r, ["rect", "ellipse", "line"]),
+                      arb.int(r, -99, 99), arb.int(r, -99, 99), arb.int(r, -99, 99), arb.int(r, -99, 99)];
+  const DOC = '<svg viewBox="0 0 10 10">\n  <!-- keep -->\n  <rect x="1"/>\n</svg>';
+
+  forAll(NUM_RUNS, rng, gen, (kind, x0, y0, x1, y1) => {
+    const spec = shapeSpec(kind, x0, y0, x1, y1);
+    const doc = insertElement(DOC, [0], null, shapeMarkup(kind, x0, y0, x1, y1));
+    const kids = childrenLens([0]).get(doc);
+    if (kids.length !== 2) throw new Error("creation did not add exactly one element");
+    const idx = nodeAt(doc, [0, 1]).index;               // the element just appended
+    for (const k in spec.attrs) {
+      const got = attrVal(doc, idx, k);
+      if (Number(got) !== Number(spec.attrs[k]) && got !== String(spec.attrs[k]))
+        throw new Error(`${kind}: ${k} read back as ${got}, preview says ${spec.attrs[k]}`);
+    }
+    if (doc.indexOf("<!-- keep -->") === -1) throw new Error("residue lost");
+    return true;
+  }, "the committed markup is the previewed shape");
+
+  const rng2 = mulberry32(0x5EED001B);
+  forAll(NUM_RUNS, rng2, gen, (kind, x0, y0, x1, y1) => {
+    if (kind === "line") return true;                    // a line is directed: its ends are not a box
+    const a = shapeSpec(kind, x0, y0, x1, y1);
+    const b = shapeSpec(kind, x1, y1, x0, y0);           // the same box, dragged the other way
+    for (const k in a.attrs) if (a.attrs[k] !== b.attrs[k])
+      throw new Error(`${kind}: dragging from the opposite corner changed ${k}`);
+    const box = dragBox(x0, y0, x1, y1, true);
+    if (box.width !== box.height) throw new Error("shift-drag is not square");
+    return true;
+  }, "drag direction does not change the shape");
+  return `✅ preview matches committed markup; drag is corner-symmetric (${NUM_RUNS} runs each)`;
+};
+
+// The pen writes an ordinary `d` attribute, so a half-drawn path is always a real path. Closing is
+// idempotent — a double click on the first anchor must not append two Zs.
+const _sl126t = function _test_pen_path(penPath,parsePath,printPath)
+{
+  const d0 = penPath.start(3, 4);
+  if (printPath(parsePath(d0)) !== "M 3 4") throw new Error(`start is not a moveto: ${d0}`);
+  let d = d0;
+  for (const [x, y] of [[10, 4], [10, 12], [3, 12]]) d = penPath.lineTo(d, x, y);
+  const cmds = parsePath(d);
+  if (cmds.length !== 4) throw new Error(`four anchors, ${cmds.length} commands`);
+  if (cmds.slice(1).some((c) => c.c !== "L")) throw new Error("anchors after the first are not linetos");
+  const closed = penPath.close(d);
+  if (parsePath(closed).slice(-1)[0].c !== "Z") throw new Error("close did not append Z");
+  if (penPath.close(closed) !== closed) throw new Error("close is not idempotent");
+  if (penPath.close("M 1 2 L 3 4 z") !== "M 1 2 L 3 4 z") throw new Error("an already-closed path was reclosed");
+  return "✅ pen builds a parseable path anchor by anchor; close is idempotent";
+};
+
 // Subdivision must be invisible: the curve through the new anchor is the curve that was there. This
 // samples the whole path densely and compares point for point, which also catches the subtle failure
 // — a following S or T reflecting a control point the split moved, bending the *next* segment.
@@ -38360,7 +38457,8 @@ const _sl118 = function _svgOverlay(){return(
   return {
     el,
     isOwn: (n) => n === el || el.contains(n),
-    clear: () => [...el.querySelectorAll("circle,line,rect")].forEach((n) => n.remove()),
+    // Everything except the stylesheet: previews are arbitrary shapes, not just handles.
+    clear: () => [...el.childNodes].forEach((n) => { if (n !== style) n.remove(); }),
     add(tag, attrs) {
       const n = document.createElementNS(NS, tag);
       for (const k in attrs) n.setAttribute(k, attrs[k]);
@@ -38679,10 +38777,173 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
 }
 )};
 
+// ---- creation: pure geometry, so the preview and the committed markup cannot disagree ------------
+// A drag gives two corners in either order; `dragBox` normalises them. `square` is the shift-drag
+// constraint, applied before normalising so the box grows from the corner you started at.
+const _sl125a = function _dragBox(){return(
+(x0, y0, x1, y1, square = false) => {
+  let w = x1 - x0, h = y1 - y0;
+  if (square) {
+    const m = Math.max(Math.abs(w), Math.abs(h));
+    w = (w < 0 ? -1 : 1) * m;
+    h = (h < 0 ? -1 : 1) * m;
+  }
+  return { x: Math.min(x0, x0 + w), y: Math.min(y0, y0 + h),
+           width: Math.abs(w), height: Math.abs(h), x1: x0 + w, y1: y0 + h };
+}
+)};
+
+// One description of a new shape, used twice: as DOM attributes for the drag preview and as markup
+// for the source. Deriving the markup FROM the spec is what keeps the two identical.
+const _sl125b = function _shapeSpec(dragBox){return(
+(kind, x0, y0, x1, y1, opts = {}) => {
+  const b = dragBox(x0, y0, x1, y1, opts.square);
+  const fill = opts.fill === undefined ? "#5B7A5E" : opts.fill;
+  const stroke = opts.stroke === undefined ? "#3E4A3B" : opts.stroke;
+  const width = opts.strokeWidth === undefined ? 3 : opts.strokeWidth;
+  if (kind === "rect")
+    return { tag: "rect", attrs: { x: b.x, y: b.y, width: b.width, height: b.height, fill } };
+  if (kind === "ellipse")
+    return { tag: "ellipse", attrs: { cx: b.x + b.width / 2, cy: b.y + b.height / 2,
+                                      rx: b.width / 2, ry: b.height / 2, fill } };
+  if (kind === "line")
+    return { tag: "line", attrs: { x1: x0, y1: y0, x2: b.x1, y2: b.y1,
+                                   stroke, "stroke-width": width, "stroke-linecap": "round" } };
+  throw new Error(`unknown shape kind: ${kind}`);
+}
+)};
+
+const _sl125c = function _shapeMarkup(shapeSpec){return(
+(kind, x0, y0, x1, y1, opts) => {
+  const { tag, attrs } = shapeSpec(kind, x0, y0, x1, y1, opts);
+  return `<${tag} ${Object.keys(attrs).map((k) => `${k}="${attrs[k]}"`).join(" ")}/>`;
+}
+)};
+
+// The pen builds a `d` attribute one anchor at a time. Text in, text out: each click is an ordinary
+// attribute put, so a half-drawn path is a real path in the source at every step.
+const _sl125d = function _penPath(){return(
+{
+  start: (x, y) => `M ${x} ${y}`,
+  lineTo: (d, x, y) => `${d} L ${x} ${y}`,
+  close: (d) => (/[Zz]\s*$/.test(d) ? d : `${d} Z`)
+}
+)};
+
+// Drag on empty canvas to create a rect, an ellipse or a line. Preview lives in the overlay — the
+// source gets exactly one put, on release, and only if the drag was big enough to mean it.
+const _sl125 = function _toolDraw(shapeSpec,shapeMarkup,dragBox,grabPointer){return(
+{
+  id: "draw",
+  onPointerDown(ctx, e) {
+    const kind = ctx.tool();
+    if (kind !== "rect" && kind !== "ellipse" && kind !== "line") return false;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return false;
+    e.preventDefault();
+    grabPointer(ctx.node, e);
+    ctx.focus.clear();
+    ctx.state.draw = { kind, x0: p[0], y0: p[1], x1: p[0], y1: p[1], square: false, preview: null };
+    return true;
+  },
+  onPointerMove(ctx, e) {
+    const d = ctx.state.draw;
+    if (!d) return;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return;
+    d.x1 = p[0]; d.y1 = p[1]; d.square = e.shiftKey;
+    const spec = shapeSpec(d.kind, d.x0, d.y0, d.x1, d.y1, { square: d.square, ...ctx.options.shapeStyle });
+    ctx.overlay.alignTo(null);                          // the preview is in root user space
+    if (!d.preview || d.preview.localName !== spec.tag) {
+      if (d.preview) d.preview.remove();
+      d.preview = ctx.overlay.add(spec.tag, { ...spec.attrs, opacity: 0.6 });
+    } else for (const k in spec.attrs) d.preview.setAttribute(k, spec.attrs[k]);
+  },
+  async onPointerUp(ctx) {
+    const d = ctx.state.draw;
+    ctx.state.draw = null;
+    if (!d) return;
+    if (d.preview) d.preview.remove();
+    const b = dragBox(d.x0, d.y0, d.x1, d.y1, d.square);
+    const min = ctx.options.minShape === undefined ? 2 : ctx.options.minShape;
+    if (Math.max(b.width, b.height) < min) return void ctx.setTool("select");   // a click, not a drag
+    const at = ctx.childCount([0]);
+    const rec = await ctx.addShape(
+      shapeMarkup(d.kind, d.x0, d.y0, d.x1, d.y1, { square: d.square, ...ctx.options.shapeStyle }));
+    if (rec) ctx.focus.set([0, at], "transform");       // hand the new shape straight to the gizmo
+    ctx.setTool("select");
+  }
+}
+)};
+
+// Click to place anchors; click the first anchor to close, or double-click to finish open. The path
+// exists in the source from the first click, so there is no builder state that can diverge from it —
+// the only state the tool keeps is which path it is extending.
+const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer){return(
+{
+  id: "pen",
+  onPointerDown(ctx, e) {
+    if (ctx.tool() !== "pen") return false;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return false;
+    e.preventDefault();
+    grabPointer(ctx.node, e);
+    ctx.state.penClick = p;
+    return true;
+  },
+  onHover(ctx, e) {                                     // rubber band from the last anchor
+    const pen = ctx.state.pen;
+    if (!pen) return;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return;
+    if (!pen.band || !pen.band.isConnected) {
+      ctx.overlay.alignTo(null);
+      pen.band = ctx.overlay.add("line", { class: "link" });
+    }
+    for (const [k, v] of [["x1", pen.last[0]], ["y1", pen.last[1]], ["x2", p[0]], ["y2", p[1]]])
+      pen.band.setAttribute(k, v);
+  },
+  async onPointerUp(ctx) {
+    const p = ctx.state.penClick;
+    ctx.state.penClick = null;
+    if (!p) return;
+    const pen = ctx.state.pen;
+    if (!pen) {
+      const at = ctx.childCount([0]);
+      const s = ctx.options.penStyle || 'fill="none" stroke="#4C7FD1" stroke-width="3" stroke-linecap="round"';
+      const rec = await ctx.addShape(`<path d="${penPath.start(p[0], p[1])}" ${s}/>`);
+      if (!rec) return;
+      ctx.state.pen = { path: [0, at], start: p, last: p, band: null };
+      ctx.focus.set([0, at], "path");
+      return;
+    }
+    const t = ctx.doc();
+    if (t === null) return void ctx.setTool("select");
+    let idx;
+    try { idx = nodeAt(t, pen.path).index; } catch (err) { return void ctx.setTool("select"); }
+    const d = attrVal(t, idx, "d");
+    const r = ctx.options.penCloseRadius === undefined ? 8 : ctx.options.penCloseRadius;
+    if (Math.hypot(p[0] - pen.start[0], p[1] - pen.start[1]) <= r) {
+      await ctx.writer.commit(idx, "d", penPath.close(d), null);
+      return void ctx.setTool("select");
+    }
+    pen.last = p;
+    await ctx.writer.commit(idx, "d", penPath.lineTo(d, p[0], p[1]), null);
+  },
+  async onDblClick(ctx) {
+    if (!ctx.state.pen) return false;
+    ctx.setTool("select");                              // finish the path where it is
+    return true;
+  }
+}
+)};
+
 // The registry. Order is priority: the first tool to claim a pointerdown owns the gesture. Push a
-// tool from any cell and dispatch an input event to extend the editor without touching it.
-const _sl123 = function _svgTools(Inputs,toolTransform,toolVertex,toolMove,toolStructure){return(
-Inputs.input([toolTransform, toolVertex, toolMove, toolStructure])
+// tool from any cell and dispatch an input event to extend the editor without touching it. The
+// creation tools come first because they gate on the active tool, so they claim nothing in select
+// mode; toolPen precedes toolStructure so its double-click ends the path rather than dropping a shape.
+const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolStructure){return(
+Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolStructure])
 )};
 const _sl123v = (G, _) => G.input(_);
 
@@ -38710,8 +38971,30 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
     const focus = svgFocus(overlay, target);
     node.style.touchAction = "none";
 
+    // The active tool. A gesture means different things in different modes, so the tools that create
+    // gate on it; everything else is unconditional and stays reachable in select mode. Held on the
+    // node rather than in a cell so a toolbar is optional — the editor works without one.
+    let tool = options.tool || "select";
+    const setTool = (id) => {
+      tool = id || "select";
+      ctx.state.pen = null;                              // a half-drawn path ends when the tool changes
+      ctx.state.draw = null;
+      overlay.clear();
+      focus.refresh();
+      node.dispatchEvent(new CustomEvent("lens-tool", { detail: { tool } }));
+    };
+
+    const kidCount = (parent) => {
+      const d = target.doc();
+      if (d === null) return 0;
+      try { return childrenLens(parent).get(d).length; } catch (e) { return 0; }
+    };
+
     const ctx = {
-      node, target, writer, focus, snap, state: {},
+      node, target, writer, focus, snap, overlay, setTool, state: {},
+      tool: () => tool,
+      childCount: kidCount,
+      addShape: (markup, at, parent) => node.addShape(markup, at, parent),
       options: { ...options, newShape },
       elems: target.elems,
       doc: target.doc,
@@ -38728,7 +39011,10 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
       for (const t of svgTools) if (t.onPointerDown && t.onPointerDown(ctx, e)) { active = t; return; }
       active = null;
     });
-    node.addEventListener("pointermove", (e) => { if (active && active.onPointerMove) active.onPointerMove(ctx, e); });
+    node.addEventListener("pointermove", (e) => {
+      if (active) return void (active.onPointerMove && active.onPointerMove(ctx, e));
+      for (const t of svgTools) if (t.onHover) t.onHover(ctx, e);   // between gestures: pen rubber band
+    });
     const end = async (e) => {
       const t = active;
       active = null;
@@ -38759,11 +39045,6 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
     // The index is clamped HERE, once, and the same value goes to the command and to the rebase. The
     // commands clamp out-of-range indices themselves, so passing the raw value to both would let them
     // disagree — and a rebase that disagrees with the edit silently drops the selection.
-    const kidCount = (parent) => {
-      const d = target.doc();
-      if (d === null) return 0;
-      try { return childrenLens(parent).get(d).length; } catch (e) { return 0; }
-    };
     node.addShape = (markup, at = null, parent = [0]) => {
       const n = kidCount(parent);
       const i = at === null ? n : Math.max(0, Math.min(n, at));
@@ -38783,6 +39064,8 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
     };
     node.edit = (name, fn, opts) => writer.runCommand(name, fn, opts);
     node.selection = () => focus.path;
+    node.setTool = setTool;
+    Object.defineProperty(node, "tool", { configurable: true, get: () => tool });
     return node;
   };
 };
@@ -38800,6 +39083,7 @@ export default function define(runtime, observer) {
 
   // Display order (top→bottom): demo → log → tests dashboard → laws → lenses → harness → tests → manipulation.
   $def("sl01", "intro", ["md"], _sl01);
+  $def("sl02b", "toolbar", ["htl","invalidation","viewof drawing"], _sl02b);
   $def("sl02", "viewof drawing", ["svgLens","svg"], _sl02);
   $def("sl03", "drawing", ["Generators","viewof drawing"], _sl03);
   $def("sl04", "howToDrive", ["md"], _sl04);
@@ -38919,6 +39203,8 @@ export default function define(runtime, observer) {
   $def("sl108b", "test_nearestSegment", ["nearestSegment"], _sl108b);
   $def("sl108e", "test_opsLens_laws", ["forAll","lensLaws","opsLens","arb","mulberry32","NUM_RUNS","printOp"], _sl108e);
   $def("sl108f", "test_transform_gizmo", ["forAll","arb","mulberry32","NUM_RUNS","rotateAbout","scaleAbout","printOp","parseTransform","applyPoint"], _sl108f);
+  $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
+  $def("sl126t", "test_pen_path", ["penPath","parsePath","printPath"], _sl126t);
   $def("sl108d", "test_path_subdivision_exact", ["forAll","arb","mulberry32","NUM_RUNS","parsePath","printPath","pathSegments","pointOnSegment","splitPathSegment","deletePathAnchor"], _sl108d);
   $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
   $def("sl109", "test_morph_projection", ["morph"], _sl109);
@@ -38937,7 +39223,13 @@ export default function define(runtime, observer) {
   $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer"], _sl121);
   $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint"], _sl122);
   $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","printOp","attrVal","grabPointer"], _sl124);
-  $def("sl123", "viewof svgTools", ["Inputs","toolTransform","toolVertex","toolMove","toolStructure"], _sl123);
+  $def("sl125a", "dragBox", [], _sl125a);
+  $def("sl125b", "shapeSpec", ["dragBox"], _sl125b);
+  $def("sl125c", "shapeMarkup", ["shapeSpec"], _sl125c);
+  $def("sl125d", "penPath", [], _sl125d);
+  $def("sl125", "toolDraw", ["shapeSpec","shapeMarkup","dragBox","grabPointer"], _sl125);
+  $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer"], _sl126);
+  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolStructure"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens"], _sl114);
 
