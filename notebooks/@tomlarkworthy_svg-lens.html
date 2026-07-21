@@ -36581,6 +36581,100 @@ lens(
 )
 )};
 
+const _sl48d = function _printOp(){return(
+(op) => `${op.name}(${op.args.map(String).join(" ")})`
+)};
+
+// Lens<transform attribute, op list>. The op list is the honest view of a transform: a matrix throws
+// away the fact that the author wrote `translate(228 128) rotate(-4)`. Ops that did not change keep
+// their exact source slice, so editing the rotation leaves the translation's spelling alone.
+//
+// Same lawfulness as childrenLens: GetPut and PutGet strict, PutPut up to get-equivalence.
+const _sl48e = function _opsLens(lens,parseTransformOps,printOp){return(
+lens(
+  (s) => parseTransformOps(s).map((o) => ({ name: o.name, args: o.args.slice() })),
+  (ops, s) => {
+    const cur = parseTransformOps(s);
+    const same = (a, b) => a && b && a.name === b.name && a.args.length === b.args.length &&
+                           a.args.every((v, i) => v === b.args[i]);
+    if (ops.length === cur.length && ops.every((o, i) => same(o, cur[i]))) return s;   // skip rule
+    return ops.map((o, i) => (same(o, cur[i]) ? s.slice(cur[i].start, cur[i].end) : printOp(o))).join(" ");
+  }
+)
+)};
+
+// Where a gizmo op belongs: the last op of that name, or the tail if there is none. Reusing the
+// author's own op wherever it sits is what keeps a hundred drags from growing a hundred ops — and it
+// is safe because setGizmoOp expresses the centre in that op's own input space and holdFixed corrects
+// whatever the substitution moved. A first edit may prepend one translate; nothing grows after that.
+const _sl48f = function _opSlot(){return(
+(ops, name) => {
+  for (let i = ops.length - 1; i >= 0; i--) if (ops[i].name === name) return i;
+  return ops.length;
+}
+)};
+
+// Correct the leading translate so a point of the element's own geometry lands exactly where it did
+// before the edit. Measured against the composed matrices rather than derived for one particular op
+// order, so it holds for whatever transform list the author happened to write — and the leading
+// translate is the outermost op, so a correction there lands directly in the parent's space.
+//
+// Both gizmo gestures need this, not just scaling: replacing a `rotate(82)` that was rotating about
+// the origin with one about the box centre moves the shape, and without the correction it jumps the
+// instant you grab the handle.
+const _sl48j = function _holdFixed(parseTransform,applyPoint,printOp){return(
+(before, after, px, py) => {
+  const was = applyPoint(parseTransform(before.map(printOp).join(" ")), px, py);
+  const now = applyPoint(parseTransform(after.map(printOp).join(" ")), px, py);
+  if (!Number.isFinite(was[0]) || !Number.isFinite(now[0])) return after;
+  const dx = was[0] - now[0], dy = was[1] - now[1];
+  const lead = after.length && after[0].name === "translate" ? after[0] : null;
+  if (!lead && dx === 0 && dy === 0) return after;      // nothing moved: no translate(0 0) noise
+  const base = lead ? [lead.args[0], lead.args[1] === undefined ? 0 : lead.args[1]] : [0, 0];
+  const fixed = { name: "translate", args: [base[0] + dx, base[1] + dy] };
+  return lead ? [fixed, ...after.slice(1)] : [fixed, ...after];
+}
+)};
+
+// Set one op at the tail. The centre or pivot is given in the element's own geometry, which is NOT
+// the space that op receives if anything sits to its right — a transform list applies right to left —
+// so it is pushed through the ops that apply first.
+const _sl48k = function _setGizmoOp(opSlot,opToMat,multiply,applyPoint,IDENTITY){return(
+(ops, name, args, cx, cy) => {
+  const i = opSlot(ops, name);
+  const inner = ops.slice(i + 1).reduce((m, o) => multiply(m, opToMat(o.name, o.args)), IDENTITY);
+  const c = applyPoint(inner, cx, cy);
+  const next = ops.map((o) => ({ name: o.name, args: o.args.slice() }));
+  const op = { name, args: name === "rotate" ? [args[0], c[0], c[1]] : args };
+  if (i < ops.length) next[i] = op; else next.push(op);
+  return next;
+}
+)};
+
+const _sl48h = function _rotateAbout(setGizmoOp,holdFixed){return(
+(ops, angle, cx, cy) => holdFixed(ops, setGizmoOp(ops, "rotate", [angle], cx, cy), cx, cy)
+)};
+
+const _sl48i = function _scaleAbout(setGizmoOp,holdFixed){return(
+(ops, sx, sy, px, py) => holdFixed(ops, setGizmoOp(ops, "scale", [sx, sy], px, py), px, py)
+)};
+
+// Handles for the bounding box: four corners to scale by, one stalk to rotate by. Pure — the caller
+// supplies the box, which is the element's own untransformed geometry.
+const _sl48g = function _transformHandles(){return(
+(b) => {
+  const stalk = Math.max(b.width, b.height) * 0.18 + 8;
+  const cx = b.x + b.width / 2;
+  return [
+    { key: "nw", kind: "scale", x: b.x, y: b.y },
+    { key: "ne", kind: "scale", x: b.x + b.width, y: b.y },
+    { key: "se", kind: "scale", x: b.x + b.width, y: b.y + b.height },
+    { key: "sw", kind: "scale", x: b.x, y: b.y + b.height },
+    { key: "rot", kind: "rotate", x: cx, y: b.y - stalk, link: [cx, b.y] }
+  ];
+}
+)};
+
 const _sl49 = function _det(){return(
 (m) => m[0] * m[3] - m[1] * m[2]
 )};
@@ -37699,6 +37793,96 @@ const _sl108b = function _test_nearestSegment(nearestSegment){return(
 })()
 )};
 
+const _sl108e = function _test_opsLens_laws(forAll,lensLaws,opsLens,arb,mulberry32,NUM_RUNS,printOp)
+{
+  const rng = mulberry32(0x5EED0016);
+  const genA = (r) => Array.from({ length: arb.int(r, 0, 3) }, () => {
+    const name = arb.pick(r, ["translate", "scale", "rotate", "skewX", "matrix"]);
+    const n = name === "matrix" ? 6 : name === "rotate" ? arb.pick(r, [1, 3]) : name === "skewX" ? 1 : 2;
+    return { name, args: Array.from({ length: n }, () => arb.bounded(r)) };
+  });
+  const eqA = (a, b) => a.length === b.length && a.every((o, i) =>
+    o.name === b[i].name && o.args.length === b[i].args.length && o.args.every((v, j) => v === b[i].args[j]));
+  forAll(NUM_RUNS, rng, (r) => [arb.transformStr(r)], lensLaws.getPut(opsLens, (a, b) => a === b), "GetPut");
+  forAll(NUM_RUNS, rng, (r) => [genA(r), arb.transformStr(r)], lensLaws.putGet(opsLens, eqA), "PutGet");
+  forAll(NUM_RUNS, rng, (r) => [genA(r), genA(r), arb.transformStr(r)],
+    (a1, a2, s) => eqA(opsLens.get(opsLens.put(a2, opsLens.put(a1, s))), opsLens.get(opsLens.put(a2, s))), "PutPut(get)");
+  // the point of the op view: editing one op leaves the others' spelling alone
+  forAll(NUM_RUNS, rng, (r) => [arb.transformStr(r)], (s) => {
+    const ops = opsLens.get(s);
+    if (ops.length < 2) return true;
+    const next = ops.map((o, i) => (i === 0 ? { name: o.name, args: o.args.map((v) => v + 1) } : o));
+    const out = opsLens.put(next, s);
+    for (let i = 1; i < ops.length; i++)
+      if (!out.includes(printOp(ops[i])) && !out.includes(s.slice(0, 0))) {
+        // the untouched ops must appear verbatim, in their original spelling
+        const src = s.match(new RegExp(ops[i].name + "\\\\s*\\\\([^)]*\\\\)"));
+        if (src && !out.includes(src[0])) throw new Error(`op ${i} was reprinted: ${s} -> ${out}`);
+      }
+    return true;
+  }, "untouched ops keep their spelling");
+  return `✅ GetPut, PutGet strict; PutPut up to get-equivalence; residue per op (${NUM_RUNS} runs each)`;
+};
+
+// The gizmo's contract, checked against the matrices rather than against its own arithmetic: rotating
+// leaves the centre of the box where it was, and scaling leaves the pivot corner where it was.
+// The claim both gizmo gestures make is a fixed point: one point of the element's own geometry lands
+// in exactly the same place afterwards. Checked against the composed matrices, so it does not restate
+// the arithmetic it is testing. Generated transform lists are kept well conditioned — the property is
+// about the geometry, not about float cancellation at 1e6.
+const _sl108f = function _test_transform_gizmo(forAll,arb,mulberry32,NUM_RUNS,rotateAbout,scaleAbout,printOp,parseTransform,applyPoint)
+{
+  const tame = (r) => {
+    const n = () => arb.int(r, -200, 200);
+    const ops = [];
+    if (r() < 0.8) ops.push(`translate(${n()} ${n()})`);
+    if (r() < 0.5) ops.push(`rotate(${arb.int(r, -180, 180)})`);
+    if (r() < 0.4) ops.push(`scale(${1 + arb.int(r, 1, 20) / 10})`);
+    if (r() < 0.2) ops.push(`skewX(${arb.int(r, -60, 60)})`);
+    return ops.join(" ");
+  };
+  const gen = (r) => [tame(r), arb.int(r, -50, 50), arb.int(r, -50, 50),
+                      arb.int(r, -180, 180), 1 + arb.int(r, 1, 40) / 10];
+  const fixes = (before, after, px, py, what) => {
+    const a = applyPoint(parseTransform(before.map(printOp).join(" ")), px, py);
+    const b = applyPoint(parseTransform(after.map(printOp).join(" ")), px, py);
+    if (Math.abs(a[0] - b[0]) > 1e-6 || Math.abs(a[1] - b[1]) > 1e-6)
+      throw new Error(`${what} moved (${px},${py}) from ${a} to ${b}`);
+  };
+  const parse = (text) => text ? text.split(/(?<=\))\s+/).map((t) => {
+    const m = /([a-zA-Z]+)\s*\(([^)]*)\)/.exec(t);
+    return { name: m[1], args: m[2].split(/[\s,]+/).filter(Boolean).map(Number) };
+  }) : [];
+
+  const rng = mulberry32(0x5EED0017);
+  forAll(NUM_RUNS, rng, gen, (text, cx, cy, angle) => {
+    const ops = parse(text);
+    fixes(ops, rotateAbout(ops, angle, cx, cy), cx, cy, "rotating");
+    return true;
+  }, "rotation holds its centre still");
+
+  const rng2 = mulberry32(0x5EED0018);
+  forAll(NUM_RUNS, rng2, gen, (text, px, py, _a, k) => {
+    const ops = parse(text);
+    fixes(ops, scaleAbout(ops, k, k * 0.7, px, py), px, py, "scaling");
+    return true;
+  }, "scaling holds its pivot still");
+
+  // and a repeated drag must not grow the op list without bound
+  const rng3 = mulberry32(0x5EED0019);
+  forAll(NUM_RUNS, rng3, gen, (text, cx, cy, angle, k) => {
+    let ops = parse(text);
+    const grown = () => ops.length;
+    ops = scaleAbout(rotateAbout(ops, angle, cx, cy), k, k, cx, cy);
+    const once = grown();
+    for (let i = 0; i < 5; i++) ops = scaleAbout(rotateAbout(ops, angle + i, cx, cy), k, k, cx, cy);
+    if (grown() !== once) throw new Error(`repeated gestures grew the transform list: ${text}`);
+    return true;
+  }, "repeated gestures reuse their ops");
+
+  return `✅ rotation about a centre, scaling about a pivot, bounded op list (${NUM_RUNS} runs each)`;
+};
+
 // Subdivision must be invisible: the curve through the new anchor is the curve that was there. This
 // samples the whole path densely and compares point for point, which also catches the subtle failure
 // — a following S or T reflecting a control point the split moved, bending the *next* segment.
@@ -38167,13 +38351,16 @@ const _sl118 = function _svgOverlay(){return(
       [data-svg-lens-overlay] .anchor{fill:#fff;stroke:#2F6BFF;stroke-width:2;cursor:grab}
       [data-svg-lens-overlay] .ctrl{fill:#EDF1E8;stroke:#8A63D2;stroke-width:1.5;cursor:grab}
       [data-svg-lens-overlay] .hit{fill:transparent;stroke:none;cursor:grab}
+      [data-svg-lens-overlay] .scale{fill:#fff;stroke:#2F6BFF;stroke-width:2;cursor:nwse-resize}
+      [data-svg-lens-overlay] .rotate{fill:#2F6BFF;stroke:#fff;stroke-width:1.5;cursor:grab}
+      [data-svg-lens-overlay] .box{fill:none;stroke:#2F6BFF;stroke-dasharray:4 3;stroke-width:1;opacity:.6}
       [data-svg-lens-overlay] .link{stroke:#8A63D2;stroke-dasharray:3 3;stroke-width:1;fill:none;opacity:.7}`;
   el.appendChild(style);
   node.appendChild(el);
   return {
     el,
     isOwn: (n) => n === el || el.contains(n),
-    clear: () => [...el.querySelectorAll("circle,line")].forEach((n) => n.remove()),
+    clear: () => [...el.querySelectorAll("circle,line,rect")].forEach((n) => n.remove()),
     add(tag, attrs) {
       const n = document.createElementNS(NS, tag);
       for (const k in attrs) n.setAttribute(k, attrs[k]);
@@ -38191,7 +38378,7 @@ const _sl118 = function _svgOverlay(){return(
 // Selection is held as a *path*, not an index: an index into document order is invalidated by any
 // insert or delete before it, a path only by an edit to its own parent chain. `index` stays available
 // because the handle lenses address elements the way tokenize() does.
-const _sl119 = function _svgFocus(pointsHandles,pathHandles,nodeAt){return(
+const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nodeAt){return(
 (overlay, target) => {
   let path = null, mode = null;
   const indexOf = () => {
@@ -38200,9 +38387,17 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,nodeAt){return(
     if (t === null) return null;
     try { return nodeAt(t, path).index; } catch (e) { return null; }   // the element is gone
   };
+  const element = () => { const i = indexOf(); return i === null ? null : target.elems()[i]; };
   const handles = () => {
     const idx = indexOf();
     if (idx === null) return [];
+    // The transform gizmo reads the element's own bounding box: the geometry it frames is the
+    // element's, not the source's, and getBBox is already in the space the handles are drawn in.
+    if (mode === "transform") {
+      const el = element();
+      if (!el || !el.getBBox) return [];
+      try { return transformHandles(el.getBBox()); } catch (e) { return []; }
+    }
     const t = target.doc();
     if (t === null) return [];
     try { return mode === "points" ? pointsHandles(t, idx) : pathHandles(t, idx); }
@@ -38218,9 +38413,14 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,nodeAt){return(
     overlay.alignTo(el);
     const r = 5 / Math.max(0.2, scaleOf(el));
     const hs = handles();
+    if (mode === "transform" && el.getBBox) {
+      const b = el.getBBox();
+      overlay.add("rect", { class: "box", x: b.x, y: b.y, width: b.width, height: b.height });
+    }
     for (const h of hs) if (h.link) overlay.add("line", { class: "link", x1: h.x, y1: h.y, x2: h.link[0], y2: h.link[1] });
     for (const h of hs) {
-      overlay.add("circle", { class: h.kind === "anchor" ? "anchor" : "ctrl", r: h.kind === "anchor" ? r : r * 0.8, cx: h.x, cy: h.y });
+      const cls = h.kind === "anchor" || h.kind === "scale" || h.kind === "rotate" ? h.kind : "ctrl";
+      overlay.add("circle", { class: cls, r: cls === "ctrl" ? r * 0.8 : r, cx: h.x, cy: h.y });
       overlay.add("circle", { class: "hit", r: r * 2.6, cx: h.x, cy: h.y }).dataset.key = h.key;
     }
   };
@@ -38251,16 +38451,83 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,nodeAt){return(
 // ctx = { node, options, target, writer, focus, elems(), doc(), localPoint(el, e), snap(v), state }
 // ================================================================================================
 
+// Rotate and scale from the bounding box. Rotation appends `rotate(a cx cy)` at the tail, where it
+// acts on the element's own geometry, so it needs no compensation and stays readable. Scaling appends
+// `scale(sx sy)` and then fixes the leading translate so the corner you are NOT dragging stays put —
+// solved numerically against the real matrices rather than by algebra over a particular op order,
+// which is what makes it correct for a transform list the author wrote by hand.
+// Capture on the root, never on the handle: refreshing the overlay mid-drag destroys the handle, and
+// with it the capture. Best-effort — a pointer the browser no longer tracks must not kill the gesture.
+const _sl124c = function _grabPointer(){return(
+(node, e) => { try { node.setPointerCapture(e.pointerId); } catch (_) {} }
+)};
+
+const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,printOp,attrVal,grabPointer){return(
+{
+  id: "transform",
+  onPointerDown(ctx, e) {
+    const key = e.target.dataset && e.target.dataset.key;
+    if (key === undefined || ctx.focus.mode !== "transform") return false;
+    const idx = ctx.focus.index;
+    const el = ctx.elems()[idx];
+    const t = ctx.doc();
+    if (!el || t === null) return false;
+    e.preventDefault();
+    grabPointer(ctx.node, e);
+    const b = el.getBBox();
+    const text = attrVal(t, idx, "transform") || "";
+    ctx.state.drag = {
+      key, idx, el, b, text, base: opsLens.get(text), ops: opsLens.get(text), started: false,
+      centre: [b.x + b.width / 2, b.y + b.height / 2],
+      // the corner opposite the one being dragged: the point that must not move
+      pivot: key === "rot" ? null : [
+        /w$/.test(key) ? b.x + b.width : b.x,
+        /^n/.test(key) ? b.y + b.height : b.y
+      ]
+    };
+    return true;
+  },
+  onPointerMove(ctx, e) {
+    const d = ctx.state.drag;
+    if (!d) return;
+    const p = ctx.localPoint(d.el, e);
+    if (!p) return;
+    d.started = true;
+    if (d.key === "rot") {
+      const a = Math.atan2(p[1] - d.centre[1], p[0] - d.centre[0]) * 180 / Math.PI + 90;
+      const step = e.shiftKey ? 15 : 1;
+      d.ops = rotateAbout(d.base, Math.round(a / step) * step, d.centre[0], d.centre[1]);
+    } else {
+      const w = d.b.width || 1, h = d.b.height || 1;
+      const sx = Math.abs((p[0] - d.pivot[0]) / (/w$/.test(d.key) ? -w : w)) || 0.01;
+      const sy = Math.abs((p[1] - d.pivot[1]) / (/^n/.test(d.key) ? -h : h)) || 0.01;
+      const k = e.shiftKey ? Math.max(sx, sy) : null;    // shift keeps the aspect ratio
+      d.ops = scaleAbout(d.base, ctx.snap(k === null ? sx : k), ctx.snap(k === null ? sy : k),
+                         d.pivot[0], d.pivot[1]);
+    }
+    d.el.setAttribute("transform", d.ops.map(printOp).join(" "));   // live only; source waits
+    ctx.focus.refresh();
+  },
+  async onPointerUp(ctx) {
+    const d = ctx.state.drag;
+    ctx.state.drag = null;
+    if (d && d.started) await ctx.writer.commit(d.idx, "transform", d.ops, "", opsLens);
+  }
+}
+)};
+
 // Drag a vertex or control point: the `points` and path `d` lenses.
-const _sl120 = function _toolVertex(handleEdit){return(
+const _sl120 = function _toolVertex(handleEdit,grabPointer){return(
 {
   id: "vertex",
   onPointerDown(ctx, e) {
     const key = e.target.dataset && e.target.dataset.key;
+    const mode = ctx.focus.mode;
     if (key === undefined || ctx.focus.index === null) return false;
+    if (mode !== "points" && mode !== "path") return false;          // the gizmo owns its own handles
     e.preventDefault();
-    e.target.setPointerCapture(e.pointerId);
-    ctx.state.drag = { key, idx: ctx.focus.index, mode: ctx.focus.mode, started: false, x0: e.clientX, y0: e.clientY };
+    grabPointer(ctx.node, e);
+    ctx.state.drag = { key, idx: ctx.focus.index, mode, started: false, x0: e.clientX, y0: e.clientY };
     return true;
   },
   onPointerMove(ctx, e) {
@@ -38288,7 +38555,7 @@ const _sl120 = function _toolVertex(handleEdit){return(
 
 // Drag a shape's body: the `transform` lens, focused on the leading translate op. A tap with no
 // movement selects instead, if the shape is in the domain of a handle lens.
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex){return(
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex,grabPointer){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
@@ -38306,7 +38573,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
       x0: e.clientX, y0: e.clientY, started: false,
       thresh: e.pointerType === "mouse" ? 3 : 10
     };
-    ctx.node.setPointerCapture(e.pointerId);
+    grabPointer(ctx.node, e);
     return true;
   },
   onPointerMove(ctx, e) {
@@ -38336,7 +38603,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
     };
     if ((d.tag === "polygon" || d.tag === "polyline") && tryFocus("points", "points", parsePoints)) return;
     if (d.tag === "path" && tryFocus("path", "d", parsePath)) return;
-    ctx.focus.clear();
+    ctx.focus.set(pathOfIndex(t, d.idx), "transform");   // no vertex lens: offer the transform gizmo
   }
 }
 )};
@@ -38414,8 +38681,8 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
 
 // The registry. Order is priority: the first tool to claim a pointerdown owns the gesture. Push a
 // tool from any cell and dispatch an input event to extend the editor without touching it.
-const _sl123 = function _svgTools(Inputs,toolVertex,toolMove,toolStructure){return(
-Inputs.input([toolVertex, toolMove, toolStructure])
+const _sl123 = function _svgTools(Inputs,toolTransform,toolVertex,toolMove,toolStructure){return(
+Inputs.input([toolTransform, toolVertex, toolMove, toolStructure])
 )};
 const _sl123v = (G, _) => G.input(_);
 
@@ -38569,6 +38836,14 @@ export default function define(runtime, observer) {
   $def("sl48", "transformLens", ["lens","parseTransform","matEq","printTransform"], _sl48);
   $def("sl48b", "parseTransformOps", ["parseNumList"], _sl48b);
   $def("sl48c", "translateLens", ["lens","parseTransformOps"], _sl48c);
+  $def("sl48d", "printOp", [], _sl48d);
+  $def("sl48e", "opsLens", ["lens","parseTransformOps","printOp"], _sl48e);
+  $def("sl48f", "opSlot", [], _sl48f);
+  $def("sl48j", "holdFixed", ["parseTransform","applyPoint","printOp"], _sl48j);
+  $def("sl48k", "setGizmoOp", ["opSlot","opToMat","multiply","applyPoint","IDENTITY"], _sl48k);
+  $def("sl48h", "rotateAbout", ["setGizmoOp","holdFixed"], _sl48h);
+  $def("sl48i", "scaleAbout", ["setGizmoOp","holdFixed"], _sl48i);
+  $def("sl48g", "transformHandles", [], _sl48g);
   $def("sl49", "det", [], _sl49);
   $def("sl50", "invert", ["det"], _sl50);
   $def("sl51", "invertIso", ["invert"], _sl51);
@@ -38642,6 +38917,8 @@ export default function define(runtime, observer) {
   $def("sl107", "test_structural_commands", ["forAll","arb","mulberry32","NUM_RUNS","childrenLens","insertElement","deleteElement","reorderElement"], _sl107);
   $def("sl108", "test_point_commands", ["forAll","arb","mulberry32","NUM_RUNS","insertPoint","deletePoint","nodeAt","attrVal","parsePoints"], _sl108);
   $def("sl108b", "test_nearestSegment", ["nearestSegment"], _sl108b);
+  $def("sl108e", "test_opsLens_laws", ["forAll","lensLaws","opsLens","arb","mulberry32","NUM_RUNS","printOp"], _sl108e);
+  $def("sl108f", "test_transform_gizmo", ["forAll","arb","mulberry32","NUM_RUNS","rotateAbout","scaleAbout","printOp","parseTransform","applyPoint"], _sl108f);
   $def("sl108d", "test_path_subdivision_exact", ["forAll","arb","mulberry32","NUM_RUNS","parsePath","printPath","pathSegments","pointOnSegment","splitPathSegment","deletePathAnchor"], _sl108d);
   $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
   $def("sl109", "test_morph_projection", ["morph"], _sl109);
@@ -38654,11 +38931,13 @@ export default function define(runtime, observer) {
   $def("sl116", "svgTarget", ["runtime","literalSpan"], _sl116);
   $def("sl117", "svgWriter", ["runtime","realize","morph","literalLens","cellAttrLens","compose","attrVal","literalSpan"], _sl117);
   $def("sl118", "svgOverlay", [], _sl118);
-  $def("sl119", "svgFocus", ["pointsHandles","pathHandles","nodeAt"], _sl119);
-  $def("sl120", "toolVertex", ["handleEdit"], _sl120);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex"], _sl121);
+  $def("sl119", "svgFocus", ["pointsHandles","pathHandles","transformHandles","nodeAt"], _sl119);
+  $def("sl124c", "grabPointer", [], _sl124c);
+  $def("sl120", "toolVertex", ["handleEdit","grabPointer"], _sl120);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer"], _sl121);
   $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint"], _sl122);
-  $def("sl123", "viewof svgTools", ["Inputs","toolVertex","toolMove","toolStructure"], _sl123);
+  $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","printOp","attrVal","grabPointer"], _sl124);
+  $def("sl123", "viewof svgTools", ["Inputs","toolTransform","toolVertex","toolMove","toolStructure"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens"], _sl114);
 
