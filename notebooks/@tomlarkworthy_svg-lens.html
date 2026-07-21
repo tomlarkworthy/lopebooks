@@ -36431,6 +36431,247 @@ cell source ──literalLens──▶ svg\`…\` text ──childrenLens──�
 Insert, delete and reorder are then just \`splice\` on that list.`
 )};
 
+// ---- how to use it somewhere else ----------------------------------------------------------------
+const _sl08 = function _useIt(md){return(
+md`## Use it in your own notebook
+
+\`\`\`js
+import {svgLens} from "@tomlarkworthy/svg-lens"
+
+viewof picture = svgLens(svg\`<svg viewBox="0 0 100 100">
+  <circle cx="50" cy="50" r="20" fill="tomato"/>
+</svg>\`)
+\`\`\`
+
+Three rules, and they are all consequences of where the writes go:
+
+1. **The SVG must be one template literal in the cell you are calling from.** \`svgLens\` finds its own
+   cell by value identity and edits that literal, so a drawing assembled from string concatenation, or
+   built in a different cell and passed in, has nothing to write to. It still renders; it just will not
+   be editable, and the handles say so.
+2. **Interpolations are allowed inside attribute values, not in element position.** \`viewBox="0 0
+   \${w} 100"\` is fine. \`<svg>\${shapes}</svg>\` is refused, because a hole there can render any number
+   of elements and every address in the document would stop matching the DOM.
+3. **Use \`viewof\`.** The value is the live node; it emits \`input\` on every put, so downstream cells
+   recompute from a drag the same way they would from a slider.
+
+The node is patched in place, never replaced, so anything holding a reference to it — a \`getBBox\`, an
+animation, another view — keeps working across an edit.
+
+| you call | it does |
+|---|---|
+| \`picture.setTool(id)\` | pick what a gesture creates: \`select\`, \`rect\`, \`ellipse\`, \`line\`, \`pen\` |
+| \`picture.select(paths, mode)\`, \`picture.selectionPaths()\` | read or set the selection |
+| \`picture.setAttr(path, name, value)\`, \`picture.setProperty(path, prop, value)\` | typed edits, same put a drag makes |
+| \`picture.addShape(markup, at, parent)\`, \`picture.removeAt\`, \`picture.moveTo\`, \`picture.zOrder\` | structural commands |
+| \`picture.nudge(dx, dy)\`, \`picture.undo()\`, \`picture.redo()\` | keyboard-shaped operations |
+| \`picture.describe(path)\`, \`picture.refs(path)\` | what is at an address, and what it points at |
+| events \`lens-put\`, \`lens-select\`, \`lens-tool\` | every put, every selection change, every tool change |
+
+Every one of those is the same write path: a command, a lens \`put\`, one writer. Nothing in the list is
+a shortcut around the laws.`
+)};
+
+// ================================================================================================
+// PAPER APPARATUS — maths, citations, cross-references
+// ================================================================================================
+// `tex` is not a lopecode builtin: the trimmed standard library has no `require`, and this document
+// is meant to keep working with the network unplugged. So this is a small TeX subset compiled to
+// MathML, which every current browser renders natively — no KaTeX download, no web fonts. It covers
+// what the lens formalism needs (identifiers, numbers, relations, arrows, sub/superscripts,
+// fractions, roman text) and renders anything it does not know as the literal symbol.
+const _sl140 = function _tex(){return(
+(() => {
+  const SYM = {                                          // relations, operators and arrows: <mo>
+    to: "→", rightarrow: "→", longrightarrow: "⟶", mapsto: "↦", leftarrow: "←", uparrow: "↑",
+    Rightarrow: "⇒", Leftrightarrow: "⟺", iff: "⟺", circ: "∘", times: "×", cdot: "⋅", ast: "∗",
+    equiv: "≡", neq: "≠", ne: "≠", le: "≤", leq: "≤", ge: "≥", geq: "≥", approx: "≈", sim: "∼",
+    in: "∈", notin: "∉", subseteq: "⊆", subset: "⊂", cup: "∪", cap: "∩", setminus: "∖",
+    forall: "∀", exists: "∃", neg: "¬", land: "∧", lor: "∨", vdash: "⊢", models: "⊨",
+    langle: "⟨", rangle: "⟩", lbrace: "{", rbrace: "}", colon: ":", mid: "∣", parallel: "∥",
+    emptyset: "∅", bot: "⊥", top: "⊤", ldots: "…", dots: "…", cdots: "⋯", infty: "∞", partial: "∂"
+  };
+  const GREEK = {                                        // letters: <mi>
+    alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", zeta: "ζ", eta: "η", theta: "θ",
+    iota: "ι", kappa: "κ", lambda: "λ", mu: "μ", nu: "ν", xi: "ξ", rho: "ρ", sigma: "σ", tau: "τ",
+    phi: "φ", chi: "χ", psi: "ψ", omega: "ω",
+    Gamma: "Γ", Delta: "Δ", Theta: "Θ", Lambda: "Λ", Xi: "Ξ", Pi: "Π", Sigma: "Σ", Phi: "Φ",
+    Psi: "Ψ", Omega: "Ω"
+  };
+  const SPACE = { ",": "0.17em", ";": "0.28em", ":": "0.22em", " ": "0.25em", quad: "1em", qquad: "2em" };
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const TOKEN = /\\[a-zA-Z]+|\\[,;:! ]|[{}^_]|\d+(?:\.\d+)?|[a-zA-Z]|\s+|[\s\S]/g;
+
+  // Recursive descent over the token list. Returns [markup[], nextIndex]; `stop` ends a group.
+  const parseList = (t, i, stop) => {
+    const out = [];
+    while (i < t.length) {
+      if (stop && t[i] === stop) { i++; break; }
+      let atom;
+      [atom, i] = parseAtom(t, i);
+      if (atom === null) continue;                       // whitespace
+      // A script binds to the atom just parsed, and scripts may stack: x^a_b.
+      let sup = null, sub = null;
+      while (t[i] === "^" || t[i] === "_") {
+        const kind = t[i];
+        let arg;
+        [arg, i] = parseAtom(t, i + 1);
+        if (kind === "^") sup = arg; else sub = arg;
+      }
+      if (sup && sub) atom = `<msubsup>${atom}${sub}${sup}</msubsup>`;
+      else if (sup) atom = `<msup>${atom}${sup}</msup>`;
+      else if (sub) atom = `<msub>${atom}${sub}</msub>`;
+      out.push(atom);
+    }
+    return [out, i];
+  };
+
+  // The raw characters of the next group, for \mathrm and friends, which take text not maths.
+  const rawGroup = (t, i) => {
+    if (t[i] !== "{") return [t[i] === undefined ? "" : t[i], i + 1];
+    let depth = 1, s = "";
+    for (i++; i < t.length && depth; i++) {
+      if (t[i] === "{") depth++;
+      else if (t[i] === "}" && !--depth) break;
+      s += t[i];
+    }
+    return [s, i + 1];
+  };
+
+  const parseAtom = (t, i) => {
+    const tok = t[i];
+    if (tok === undefined) return ["<mi></mi>", i];
+    if (/^\s+$/.test(tok)) return [null, i + 1];
+    if (tok === "{") {
+      const [list, j] = parseList(t, i + 1, "}");
+      return [`<mrow>${list.join("")}</mrow>`, j];
+    }
+    if (tok[0] === "\\") {
+      const name = tok.slice(1);
+      if (name === "frac" || name === "dfrac") {
+        const [a, j] = parseAtom(t, i + 1);
+        const [b, k] = parseAtom(t, j);
+        return [`<mfrac>${a}${b}</mfrac>`, k];
+      }
+      if (name === "sqrt") { const [a, j] = parseAtom(t, i + 1); return [`<msqrt>${a}</msqrt>`, j]; }
+      if (name === "mathrm" || name === "operatorname") {
+        const [s, j] = rawGroup(t, i + 1);
+        return [`<mi mathvariant="normal">${esc(s)}</mi>`, j];
+      }
+      if (name === "text" || name === "textit" || name === "mathit") {
+        const [s, j] = rawGroup(t, i + 1);
+        return [`<mtext>${esc(s)}</mtext>`, j];
+      }
+      if (name === "left" || name === "right") return [null, i + 1];   // sizing: MathML stretches anyway
+      if (SPACE[name]) return [`<mspace width="${SPACE[name]}"></mspace>`, i + 1];
+      if (GREEK[name]) return [`<mi>${GREEK[name]}</mi>`, i + 1];
+      if (SYM[name]) return [`<mo>${esc(SYM[name])}</mo>`, i + 1];
+      return [`<mi mathvariant="normal">${esc(name)}</mi>`, i + 1];     // unknown: show the name
+    }
+    if (/^\d/.test(tok)) return [`<mn>${tok}</mn>`, i + 1];
+    if (/^[a-zA-Z]$/.test(tok)) return [`<mi>${tok}</mi>`, i + 1];
+    return [`<mo>${esc(tok)}</mo>`, i + 1];
+  };
+
+  const render = (src, display) => {
+    const [list] = parseList(String(src).match(TOKEN) || [], 0, null);
+    const div = document.createElement("div");
+    div.innerHTML = `<math display="${display ? "block" : "inline"}"><mrow>${list.join("")}</mrow></math>`;
+    const m = div.firstChild;
+    if (display) m.style.display = "block";
+    m.style.fontSize = display ? "1.15em" : "1.05em";
+    return m;
+  };
+  const tag = (strings, ...vals) =>
+    render(strings.raw ? strings.raw.reduce((a, s, i) => a + vals[i - 1] + s) : strings, false);
+  tag.block = (strings, ...vals) =>
+    render(strings.raw ? strings.raw.reduce((a, s, i) => a + vals[i - 1] + s) : strings, true);
+  tag.markup = (src) => render(src, false).outerHTML;    // for tests: the MathML, as text
+  return tag;
+})()
+)};
+
+const _sl141 = function _test_tex_subset(tex){return(
+(() => {
+  if (typeof document === "undefined") return "⏭ needs a DOM (browser only)";
+  const cases = [
+    ["S \\to A", ["<mi>S</mi>", "<mo>→</mo>", "<mi>A</mi>"]],
+    ["put(a, s)", ["<mi>p</mi>", "<mo>(</mo>", "<mo>,</mo>"]],
+    ["\\mathrm{put}", ['<mi mathvariant="normal">put</mi>']],
+    ["x^2", ["<msup>", "<mn>2</mn>"]],
+    ["a_{i}", ["<msub>", "<mrow>", "<mi>i</mi>"]],
+    ["\\frac{a}{b}", ["<mfrac>", "<mi>a</mi>", "<mi>b</mi>"]],
+    ["l_1 \\circ l_2", ["<mo>∘</mo>", "<msub>"]],
+    ["\\unknowncmd", ['<mi mathvariant="normal">unknowncmd</mi>']]
+  ];
+  for (const [src, wants] of cases) {
+    const got = tex.markup(src);
+    for (const w of wants) if (!got.includes(w)) return `❌ ${src}: expected ${w} in ${got}`;
+  }
+  // The whole point of MathML here: the browser lays it out, with no font to download.
+  const el = tex`x + y`;
+  if (el.namespaceURI !== "http://www.w3.org/1998/Math/MathML") return "❌ not in the MathML namespace";
+  // Angle brackets in the source must not become markup.
+  if (tex.markup("a < b").includes("<mo><")) return "❌ unescaped < reached the markup";
+  return "✅ TeX subset compiles to MathML: symbols, scripts, fractions, roman text, escaping";
+})()
+)};
+
+// ---- source-last: your edits live in the runtime, so take them with you --------------------------
+// A counter over every put in the page. It exists to make the download link *reactive*: the label
+// says how much of your own work the file you are about to download contains.
+const _sl08d = function _edits(Generators,$0,$1,invalidation){return(
+Generators.observe((change) => {
+  let n = 0;
+  change(0);
+  const bump = () => change(++n);
+  for (const node of [$0, $1]) node.addEventListener("lens-put", bump);
+  const off = () => { for (const node of [$0, $1]) node.removeEventListener("lens-put", bump); };
+  invalidation.then(off);
+  return off;
+})
+)};
+
+const _sl08m = function _svgLensModule(thisModule){return(
+thisModule()
+)};
+const _sl08mv = (G, _) => G.input(_);
+
+const _sl08c = async function _keepYourEdits(htl,downloadAnchor,lookupVariable,svgLensModule,edits)
+{
+  // The drawing's definition is the drawing. Read it back out of the runtime to show what a download
+  // would actually capture — not a file on a server, the bytes this page is holding right now.
+  const v = await lookupVariable("viewof drawing", svgLensModule);
+  const bytes = v && v._definition ? v._definition.toString().length : 0;
+  const anchor = downloadAnchor(
+    { style: "font:inherit;font-weight:600" },
+    edits ? `Download this notebook with your ${edits} edit${edits === 1 ? "" : "s"} in it`
+          : "Download this notebook"
+  );
+  return htl.html`<div style="padding:10px 14px;border-left:3px solid #4C7FD1;background:#4C7FD10F;margin:.6rem 0">
+    ${anchor} — ${bytes} bytes of drawing source, read from the live runtime.
+  </div>`;
+};
+
+const _sl08e = function _sourceLastNote(md){return(
+md`### Where your edits actually are
+
+Every drag you make rewrites a JavaScript function that is running in this page. Nothing is sent
+anywhere, and on observablehq.com nothing is written back to the hosted document either — a reader has
+no permission to change someone else's notebook, and this editor does not ask for any. So on the
+hosted copy your work is real but *unpublished*: it lives in the runtime until the tab closes.
+
+That is not a limitation to route around, it is what source-last means. The runtime is canonical, the
+file is a projection of it, and the projection can be taken at any moment: the link above asks
+\`@tomlarkworthy/exporter-3\` to walk this live runtime, recover each cell's source with
+\`toString()\`, and write a single self-contained HTML file — your drawing included, because your
+drawing *is* one of those cells. Download it and you have a copy that boots with your edits, carries
+this editor, and can be edited and re-exported again with no server in the loop.
+
+The label is reactive on purpose: it counts the puts this page has seen, so it tells you how much of
+your own work is in the file before you click.`
+)};
+
 // Every gesture, with the laws re-checked on the source it produced.
 // Cumulative snapshots: the runtime keeps only the latest yield, so re-render the whole log.
 const _sl05 = function _putTable(Generators,$0,Inputs,invalidation){return(
@@ -40221,13 +40462,16 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/editable-md", async () => runtime.module((await import("/@tomlarkworthy/editable-md.js?v=4")).default));
   main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
   main.define("module @tomlarkworthy/acorn-8-11-3", async () => runtime.module((await import("/@tomlarkworthy/acorn-8-11-3.js?v=4")).default));
+  main.define("module @tomlarkworthy/exporter-3", async () => runtime.module((await import("/@tomlarkworthy/exporter-3.js?v=4")).default));
 
   // Display order (top→bottom): demo → log → tests dashboard → laws → lenses → harness → tests → manipulation.
   $def("sl01", "intro", ["md"], _sl01);
   $def("sl02b", "toolbar", ["htl","invalidation","viewof drawing"], _sl02b);
-  $def("sl02c", "inspector", ["htl","invalidation","viewof drawing"], _sl02c);
   $def("sl02", "viewof drawing", ["svgLens","svg"], _sl02);
   $def("sl03", "drawing", ["Generators","viewof drawing"], _sl03);
+  // The inspector's height follows the selection, so it sits *below* the drawing: above it, every
+  // change of selection would shift the picture under the pointer mid-gesture.
+  $def("sl02c", "inspector", ["htl","invalidation","viewof drawing"], _sl02c);
   $def("sl06a", "factoryDoc", ["md"], _sl06a);
   $def("sl06b", "viewof shift", ["Inputs"], _sl06b);
   $def("sl06bv", "shift", ["Generators","viewof shift"], _sl06bv);
@@ -40236,6 +40480,14 @@ export default function define(runtime, observer) {
   $def("sl06", "viewof factory", ["svgLens","svg","shift","spin"], _sl06);
   $def("sl06v", "factory", ["Generators","viewof factory"], _sl06v);
   $def("sl04", "howToDrive", ["md"], _sl04);
+  $def("sl08", "useIt", ["md"], _sl08);
+  $def("sl08e", "sourceLastNote", ["md"], _sl08e);
+  $def("sl140", "tex", [], _sl140);
+  $def("sl141", "test_tex_subset", ["tex"], _sl141);
+  $def("sl08d", "edits", ["Generators","viewof drawing","viewof factory","invalidation"], _sl08d);
+  $def("sl08m", "viewof svgLensModule", ["thisModule"], _sl08m);
+  $def("sl08mv", "svgLensModule", ["Generators","viewof svgLensModule"], _sl08mv);
+  $def("sl08c", "keepYourEdits", ["htl","downloadAnchor","lookupVariable","svgLensModule","edits"], _sl08c);
   $def("sl05", "putTable", ["Generators","viewof drawing","Inputs","invalidation"], _sl05);
   $def("sl07", "cellSourceProjection", ["htl","putTable","viewof drawing"], _sl07);
   $def("sl09", "testsDashboard", ["tests"], _sl09);
@@ -40416,6 +40668,10 @@ export default function define(runtime, observer) {
   main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
   main.define("realize", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("realize", _));
   main.define("acorn", ["module @tomlarkworthy/acorn-8-11-3", "@variable"], (_, v) => v.import("acorn", _));
+  main.define("thisModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("thisModule", _));
+  main.define("lookupVariable", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("lookupVariable", _));
+  // The download link: exporter-3 projects this live runtime back into a file (see `sourceLastNote`).
+  main.define("downloadAnchor", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("downloadAnchor", _));
   return main;
 }
 </script>
