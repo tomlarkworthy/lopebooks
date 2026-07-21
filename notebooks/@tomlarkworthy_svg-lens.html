@@ -37024,6 +37024,178 @@ const _sl79e = function _deletePoint(nodeAt,attrTextLens,parsePoints,printPoints
 }
 )};
 
+// ---- path geometry: segments, subdivision, anchor removal ---------------------------------------
+// The absolute geometry of each drawn segment, and where in the command list it came from. S and T
+// reflections are resolved here, so everything downstream sees plain cubics and quadratics.
+const _sl79h = function _pathSegments(PATH_ARG_COUNT){return(
+(cmds) => {
+  let cx = 0, cy = 0, sx = 0, sy = 0, px = null, py = null;
+  const segs = [];
+  cmds.forEach((cmd, ci) => {
+    const U = cmd.c.toUpperCase(), rel = cmd.c !== U, u = PATH_ARG_COUNT[U];
+    if (U === "Z") {
+      segs.push({ kind: "Z", p0: [cx, cy], p3: [sx, sy], ci, o: 0, rel, letter: cmd.c });
+      cx = sx; cy = sy; px = py = null;
+      return;
+    }
+    for (let o = 0; o < cmd.a.length; o += u) {
+      const A = cmd.a, bx = cx, by = cy;
+      const abs = (i, j) => (rel ? [bx + A[o + i], by + A[o + j]] : [A[o + i], A[o + j]]);
+      const refl = () => [2 * bx - (px === null ? bx : px), 2 * by - (py === null ? by : py)];
+      let seg = null, cpx = null, cpy = null;
+      switch (U) {
+        case "M": {                                     // extra pairs after a moveto are linetos
+          const e = abs(0, 1);
+          if (o === 0) { sx = e[0]; sy = e[1]; } else seg = { kind: "L", p0: [bx, by], p3: e };
+          cx = e[0]; cy = e[1];
+          break;
+        }
+        case "L": { const e = abs(0, 1); seg = { kind: "L", p0: [bx, by], p3: e }; cx = e[0]; cy = e[1]; break; }
+        case "H": { const x = rel ? bx + A[o] : A[o]; seg = { kind: "L", p0: [bx, by], p3: [x, by] }; cx = x; break; }
+        case "V": { const y = rel ? by + A[o] : A[o]; seg = { kind: "L", p0: [bx, by], p3: [bx, y] }; cy = y; break; }
+        case "C": { const c1 = abs(0, 1), c2 = abs(2, 3), e = abs(4, 5);
+                    seg = { kind: "C", p0: [bx, by], p1: c1, p2: c2, p3: e };
+                    cx = e[0]; cy = e[1]; cpx = c2[0]; cpy = c2[1]; break; }
+        case "S": { const c2 = abs(0, 1), e = abs(2, 3);
+                    seg = { kind: "C", p0: [bx, by], p1: refl(), p2: c2, p3: e };
+                    cx = e[0]; cy = e[1]; cpx = c2[0]; cpy = c2[1]; break; }
+        case "Q": { const c = abs(0, 1), e = abs(2, 3);
+                    seg = { kind: "Q", p0: [bx, by], p1: c, p3: e };
+                    cx = e[0]; cy = e[1]; cpx = c[0]; cpy = c[1]; break; }
+        case "T": { const c = refl(), e = abs(0, 1);
+                    seg = { kind: "Q", p0: [bx, by], p1: c, p3: e };
+                    cx = e[0]; cy = e[1]; cpx = c[0]; cpy = c[1]; break; }
+        case "A": { const e = rel ? [bx + A[o + 5], by + A[o + 6]] : [A[o + 5], A[o + 6]];
+                    seg = { kind: "A", p0: [bx, by], p3: e, args: A.slice(o, o + 7) };
+                    cx = e[0]; cy = e[1]; break; }
+      }
+      px = cpx; py = cpy;
+      if (seg) segs.push({ ...seg, ci, o, rel, letter: cmd.c });
+    }
+  });
+  return segs;
+}
+)};
+
+const _sl79i = function _pointOnSegment(){return(
+(seg, t) => {
+  const L = (a, b) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+  if (seg.kind === "C") { const a = L(seg.p0, seg.p1), b = L(seg.p1, seg.p2), c = L(seg.p2, seg.p3);
+                          return L(L(a, b), L(b, c)); }
+  if (seg.kind === "Q") { const a = L(seg.p0, seg.p1), b = L(seg.p1, seg.p3); return L(a, b); }
+  return L(seg.p0, seg.p3);                             // L, Z, and arcs approximated by their chord
+}
+)};
+
+// Replace one argument group with other commands. A group after the replacement keeps its own letter
+// — except inside an M, where the trailing pairs are implicit linetos and must be spelled that way.
+const _sl79j = function _replaceGroup(PATH_ARG_COUNT){return(
+(cmds, ci, o, replacement) => {
+  const cmd = cmds[ci], U = cmd.c.toUpperCase(), u = PATH_ARG_COUNT[U];
+  const before = cmd.a.slice(0, o), after = cmd.a.slice(o + u);
+  const out = [];
+  if (before.length) out.push({ c: cmd.c, a: before });
+  out.push(...replacement);
+  if (after.length) out.push({ c: U === "M" ? (cmd.c === "m" ? "l" : "L") : cmd.c, a: after });
+  return [...cmds.slice(0, ci), ...out, ...cmds.slice(ci + 1)];
+}
+)};
+
+// Rewrite one segment as an absolute command of the same shape. Exact: pathSegments has already
+// resolved relative coordinates and smooth-curve reflections.
+const _sl79k = function _absoluteGroup(replaceGroup){return(
+(cmds, seg) => {
+  const cmd =
+    seg.kind === "C" ? { c: "C", a: [...seg.p1, ...seg.p2, ...seg.p3] } :
+    seg.kind === "Q" ? { c: "Q", a: [...seg.p1, ...seg.p3] } :
+    seg.kind === "A" ? { c: "A", a: [...seg.args.slice(0, 5), ...seg.p3] } :
+    seg.kind === "Z" ? null : { c: "L", a: [...seg.p3] };
+  return cmd === null ? cmds : replaceGroup(cmds, seg.ci, seg.o, [cmd]);
+}
+)};
+
+// Subdivide a segment at parameter t, exactly (de Casteljau). The curve through the new anchor is
+// geometrically identical to the one it replaced — test_path_subdivision_exact holds it to that.
+//
+// The segment after the split has to be rewritten if it is smooth: S and T take their first control
+// point by reflecting the previous one, and the split changes what "previous" means.
+const _sl79l = function _splitPathSegment(pathSegments,replaceGroup,absoluteGroup){return(
+(cmds, segIndex, t) => {
+  const segs = pathSegments(cmds);
+  const seg = segs[segIndex];
+  if (!seg) throw new Error(`no segment ${segIndex}`);
+  if (seg.kind === "A") throw new Error("arc segments cannot be subdivided");
+  const L = (a, b) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+
+  let out = cmds.map((c) => ({ c: c.c, a: c.a.slice() }));
+  const next = segs[segIndex + 1];
+  if (next && /^[STst]$/.test(next.letter)) out = absoluteGroup(out, next);   // higher index first
+
+  if (seg.kind === "Z") {                               // split the closing edge: a lineto, then Z
+    const m = L(seg.p0, seg.p3);
+    return [...out.slice(0, seg.ci), { c: "L", a: m }, ...out.slice(seg.ci)];
+  }
+  let repl;
+  if (seg.kind === "C") {
+    const a = L(seg.p0, seg.p1), b = L(seg.p1, seg.p2), c = L(seg.p2, seg.p3);
+    const d = L(a, b), e = L(b, c), m = L(d, e);
+    repl = [{ c: "C", a: [...a, ...d, ...m] }, { c: "C", a: [...e, ...c, ...seg.p3] }];
+  } else if (seg.kind === "Q") {
+    const a = L(seg.p0, seg.p1), b = L(seg.p1, seg.p3), m = L(a, b);
+    repl = [{ c: "Q", a: [...a, ...m] }, { c: "Q", a: [...b, ...seg.p3] }];
+  } else {
+    repl = [{ c: "L", a: L(seg.p0, seg.p3) }, { c: "L", a: [...seg.p3] }];
+  }
+  return replaceGroup(out, seg.ci, seg.o, repl);
+}
+)};
+
+// Remove the anchor a segment ends at. The following segment is rewritten absolute first: it may be
+// relative (its start moves) or smooth (its reflection base disappears).
+const _sl79m = function _deletePathAnchor(pathSegments,replaceGroup,absoluteGroup){return(
+(cmds, segIndex) => {
+  const segs = pathSegments(cmds);
+  const seg = segs[segIndex];
+  if (!seg) throw new Error(`no segment ${segIndex}`);
+  if (seg.kind === "Z") throw new Error("a close command has no anchor of its own");
+  if (segs.filter((s) => s.kind !== "Z").length < 2) throw new Error("a path needs at least two anchors");
+  let out = cmds.map((c) => ({ c: c.c, a: c.a.slice() }));
+  const next = segs[segIndex + 1];
+  if (next && next.kind !== "Z") out = absoluteGroup(out, next);              // higher index first
+  return replaceGroup(out, seg.ci, seg.o, []);
+}
+)};
+
+// Nearest point on a path, by sampling. Returns which segment and where along it.
+const _sl79n = function _nearestPathSegment(pointOnSegment){return(
+(segs, x, y, samples = 24) => {
+  let best = -1, bestT = 0, bestD = Infinity;
+  segs.forEach((seg, i) => {
+    for (let k = 0; k <= samples; k++) {
+      const t = k / samples;
+      const p = pointOnSegment(seg, t);
+      const d = Math.hypot(x - p[0], y - p[1]);
+      if (d < bestD) { bestD = d; best = i; bestT = t; }
+    }
+  });
+  return { index: best, t: bestT, distance: bestD };
+}
+)};
+
+const _sl79o = function _insertPathPoint(nodeAt,attrTextLens,parsePath,printPath,splitPathSegment){return(
+(src, path, segIndex, t) => {
+  const l = attrTextLens(nodeAt(src, path).index, "d");
+  return l.put(printPath(splitPathSegment(parsePath(l.get(src)), segIndex, t)), src);
+}
+)};
+
+const _sl79p = function _deletePathPoint(nodeAt,attrTextLens,parsePath,printPath,deletePathAnchor){return(
+(src, path, segIndex) => {
+  const l = attrTextLens(nodeAt(src, path).index, "d");
+  return l.put(printPath(deletePathAnchor(parsePath(l.get(src)), segIndex)), src);
+}
+)};
+
 // Carry an address across a structural edit. A path survives everything that happens outside its own
 // parent chain, which is why most edits need no rebase at all: appending a shape, or editing any
 // element's attributes, leaves every existing path valid. Returns null when the addressed element is
@@ -37526,6 +37698,87 @@ const _sl108b = function _test_nearestSegment(nearestSegment){return(
   return "✅ nearest segment on closed and open polygons";
 })()
 )};
+
+// Subdivision must be invisible: the curve through the new anchor is the curve that was there. This
+// samples the whole path densely and compares point for point, which also catches the subtle failure
+// — a following S or T reflecting a control point the split moved, bending the *next* segment.
+const _sl108d = function _test_path_subdivision_exact(forAll,arb,mulberry32,NUM_RUNS,parsePath,printPath,pathSegments,pointOnSegment,splitPathSegment,deletePathAnchor)
+{
+  const rng = mulberry32(0x5EED0014);
+  // Paths of curves and lines, deliberately mixing absolute, relative and smooth spellings, since
+  // those are exactly the cases where a naive split leaks.
+  const gen = (r) => {
+    const n = arb.int(r, 1, 4);
+    const num = () => arb.int(r, -80, 80);
+    let d = `M ${num()} ${num()}`;
+    for (let i = 0; i < n; i++) {
+      switch (arb.int(r, 0, 5)) {
+        case 0: d += ` L ${num()} ${num()}`; break;
+        case 1: d += ` l ${num()} ${num()}`; break;
+        case 2: d += ` C ${num()} ${num()}, ${num()} ${num()}, ${num()} ${num()}`; break;
+        case 3: d += ` c ${num()} ${num()}, ${num()} ${num()}, ${num()} ${num()}`; break;
+        case 4: d += ` S ${num()} ${num()}, ${num()} ${num()}`; break;
+        default: d += ` q ${num()} ${num()}, ${num()} ${num()}`; break;
+      }
+    }
+    if (r() < 0.4) d += " Z";
+    return [d, r(), arb.int(r, 0, 9)];
+  };
+  // Sampling the whole path and comparing point-for-point does NOT work: a split reparameterises the
+  // curve, so the original sample points land at different t. The exact claim is per segment — the
+  // two halves traverse the original at a known change of parameter — plus: every other segment is
+  // untouched. Comparing at equal t is only valid within a segment.
+  const near = (p, q) => Math.abs(p[0] - q[0]) < 1e-9 && Math.abs(p[1] - q[1]) < 1e-9;
+  const sameSeg = (a, b) => Array.from({ length: 9 }, (_, k) => k / 8)
+    .every((u) => near(pointOnSegment(a, u), pointOnSegment(b, u)));
+
+  forAll(NUM_RUNS, rng, gen, (d, t0, which) => {
+    const cmds = parsePath(d);
+    const before = pathSegments(cmds);
+    if (!before.length) return true;
+    const i = which % before.length;
+    if (before[i].kind === "A") return true;
+    const t = 0.05 + t0 * 0.9;
+    // it must survive a print/parse round trip, since that is how it reaches the source
+    const after = pathSegments(parsePath(printPath(splitPathSegment(cmds, i, t))));
+    if (after.length !== before.length + 1)
+      throw new Error(`subdivision changed the segment count for ${d}`);
+    for (let k = 0; k < i; k++)
+      if (!sameSeg(after[k], before[k])) throw new Error(`segment ${k} moved, before the split`);
+    for (let k = i + 1; k < before.length; k++)
+      if (!sameSeg(after[k + 1], before[k])) throw new Error(`segment ${k} moved, after the split`);
+    for (let k = 0; k <= 8; k++) {                      // the halves retrace the original curve
+      const u = k / 8;
+      if (!near(pointOnSegment(after[i], u), pointOnSegment(before[i], u * t)))
+        throw new Error(`first half of ${d} at segment ${i} is not the original curve`);
+      if (!near(pointOnSegment(after[i + 1], u), pointOnSegment(before[i], t + u * (1 - t))))
+        throw new Error(`second half of ${d} at segment ${i} is not the original curve`);
+    }
+    return true;
+  }, "subdivision is exact");
+
+  // Deleting an anchor removes exactly one, and leaves everything before it alone. Restoring the
+  // original geometry only holds for straight segments: dropping an anchor between two curves
+  // genuinely changes the shape, which is what every other editor does too.
+  const rng2 = mulberry32(0x5EED0015);
+  forAll(NUM_RUNS, rng2, gen, (d, t0, which) => {
+    const cmds = parsePath(d);
+    const before = pathSegments(cmds);
+    if (before.filter((s) => s.kind !== "Z").length < 2) return true;
+    const i = which % before.length;
+    if (before[i].kind === "A" || before[i].kind === "Z") return true;
+    const split = parsePath(printPath(splitPathSegment(cmds, i, 0.05 + t0 * 0.9)));
+    const back = pathSegments(parsePath(printPath(deletePathAnchor(split, i))));
+    if (back.length !== before.length) throw new Error("delete did not remove exactly one anchor");
+    for (let k = 0; k < i; k++)
+      if (!sameSeg(back[k], before[k])) throw new Error(`segment ${k} moved when deleting anchor ${i}`);
+    if (before[i].kind === "L" && !sameSeg(back[i], before[i]))
+      throw new Error(`splitting and unsplitting a straight segment changed it: ${d}`);
+    return true;
+  }, "deleting an anchor");
+
+  return `✅ subdivision is exact, deletion removes one anchor (${NUM_RUNS} runs each)`;
+};
 
 // rebasePath is checked against ground truth, not against a restatement of its own rules: take a real
 // document, note the source text at a path, apply the command, and assert the rebased path addresses
@@ -38090,7 +38343,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
 
 // Structural editing by double-click: add a vertex on an edge, remove the one under the pointer, or
 // drop a new shape on empty canvas. Every branch is a pure command.
-const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nearestSegment,pointsHandles,parsePoints,attrVal,childrenLens,rebasePath){return(
+const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nearestSegment,pointsHandles,parsePoints,attrVal,childrenLens,rebasePath,pathHandles,parsePath,pathSegments,nearestPathSegment,insertPathPoint,deletePathPoint){return(
 {
   id: "structure",
   async onDblClick(ctx, e) {
@@ -38108,15 +38361,39 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
       return true;
     }
 
+    // The same two gestures on a path. An anchor handle ends a segment, so deleting "the anchor with
+    // this key" is deleting the segment it terminates.
+    if (key !== undefined && sel && focus.mode === "path") {
+      const h = pathHandles(t, focus.index).find((x) => x.key === key);
+      if (!h || h.kind !== "anchor") return false;
+      const segs = pathSegments(parsePath(attrVal(t, focus.index, "d")));
+      const i = segs.findIndex((s) => s.ci === h.ci && s.o === h.o);
+      if (i < 0) return false;
+      await ctx.writer.runCommand("deletePathPoint", (d) => deletePathPoint(d, sel, i));
+      return true;
+    }
+
     const list = ctx.elems();
     const hit = list.indexOf(e.target);
-    if (sel && focus.mode === "points" && (hit === focus.index || key !== undefined)) {
+    // Inserting means double-clicking the shape itself. A handle under the pointer is a delete
+    // (above) or, for a control point, nothing at all — inserting there would be a guess.
+    if (sel && focus.mode === "points" && hit === focus.index) {
       const el = list[focus.index];
       const p = ctx.localPoint(el, e);
       if (!p) return false;
       const closed = el.localName !== "polyline";
       const seg = nearestSegment(parsePoints(attrVal(t, focus.index, "points")), p[0], p[1], closed);
       await ctx.writer.runCommand("insertPoint", (d) => insertPoint(d, sel, seg.index, p));
+      return true;
+    }
+
+    if (sel && focus.mode === "path" && hit === focus.index) {
+      const p = ctx.localPoint(list[focus.index], e);
+      if (!p) return false;
+      const segs = pathSegments(parsePath(attrVal(t, focus.index, "d")));
+      const near = nearestPathSegment(segs, p[0], p[1]);
+      if (near.index < 0 || segs[near.index].kind === "A") return false;
+      await ctx.writer.runCommand("insertPathPoint", (d) => insertPathPoint(d, sel, near.index, near.t));
       return true;
     }
 
@@ -38327,6 +38604,15 @@ export default function define(runtime, observer) {
   $def("sl79e", "deletePoint", ["nodeAt","attrTextLens","parsePoints","printPoints"], _sl79e);
   $def("sl79f", "nearestSegment", [], _sl79f);
   $def("sl79g", "rebasePath", [], _sl79g);
+  $def("sl79h", "pathSegments", ["PATH_ARG_COUNT"], _sl79h);
+  $def("sl79i", "pointOnSegment", [], _sl79i);
+  $def("sl79j", "replaceGroup", ["PATH_ARG_COUNT"], _sl79j);
+  $def("sl79k", "absoluteGroup", ["replaceGroup"], _sl79k);
+  $def("sl79l", "splitPathSegment", ["pathSegments","replaceGroup","absoluteGroup"], _sl79l);
+  $def("sl79m", "deletePathAnchor", ["pathSegments","replaceGroup","absoluteGroup"], _sl79m);
+  $def("sl79n", "nearestPathSegment", ["pointOnSegment"], _sl79n);
+  $def("sl79o", "insertPathPoint", ["nodeAt","attrTextLens","parsePath","printPath","splitPathSegment"], _sl79o);
+  $def("sl79p", "deletePathPoint", ["nodeAt","attrTextLens","parsePath","printPath","deletePathAnchor"], _sl79p);
 
   $def("sl80", "harnessHeader", ["md"], _sl80);
   $def("sl81", "NUM_RUNS", [], _sl81);
@@ -38356,6 +38642,7 @@ export default function define(runtime, observer) {
   $def("sl107", "test_structural_commands", ["forAll","arb","mulberry32","NUM_RUNS","childrenLens","insertElement","deleteElement","reorderElement"], _sl107);
   $def("sl108", "test_point_commands", ["forAll","arb","mulberry32","NUM_RUNS","insertPoint","deletePoint","nodeAt","attrVal","parsePoints"], _sl108);
   $def("sl108b", "test_nearestSegment", ["nearestSegment"], _sl108b);
+  $def("sl108d", "test_path_subdivision_exact", ["forAll","arb","mulberry32","NUM_RUNS","parsePath","printPath","pathSegments","pointOnSegment","splitPathSegment","deletePathAnchor"], _sl108d);
   $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
   $def("sl109", "test_morph_projection", ["morph"], _sl109);
 
@@ -38370,7 +38657,7 @@ export default function define(runtime, observer) {
   $def("sl119", "svgFocus", ["pointsHandles","pathHandles","nodeAt"], _sl119);
   $def("sl120", "toolVertex", ["handleEdit"], _sl120);
   $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex"], _sl121);
-  $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath"], _sl122);
+  $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint"], _sl122);
   $def("sl123", "viewof svgTools", ["Inputs","toolVertex","toolMove","toolStructure"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens"], _sl114);
