@@ -37024,6 +37024,37 @@ const _sl79e = function _deletePoint(nodeAt,attrTextLens,parsePoints,printPoints
 }
 )};
 
+// Carry an address across a structural edit. A path survives everything that happens outside its own
+// parent chain, which is why most edits need no rebase at all: appending a shape, or editing any
+// element's attributes, leaves every existing path valid. Returns null when the addressed element is
+// the one that was deleted.
+//
+// Structural paths, not injected ids: the drawing is the artifact the user is authoring, and stamping
+// data-lens-id onto every element would pollute exactly the source this project exists to preserve.
+const _sl79g = function _rebasePath(){return(
+(path, op) => {
+  if (!path) return null;
+  const parent = op.kind === "insert" ? op.parent : op.path.slice(0, -1);
+  const at = op.kind === "insert" ? op.at : op.path[op.path.length - 1];
+  if (path.length <= parent.length) return path;                  // an ancestor or a sibling branch
+  for (let i = 0; i < parent.length; i++) if (path[i] !== parent[i]) return path;
+  const out = path.slice();
+  const i = out[parent.length];
+  if (op.kind === "insert") { if (i >= at) out[parent.length] = i + 1; return out; }
+  if (op.kind === "delete") {
+    if (i === at) return null;
+    if (i > at) out[parent.length] = i - 1;
+    return out;
+  }
+  // move: delete then insert, in that order, so `to` is an index in the list without the moved child
+  if (i === at) { out[parent.length] = op.to; return out; }
+  let j = i > at ? i - 1 : i;
+  if (j >= op.to) j += 1;
+  out[parent.length] = j;
+  return out;
+}
+)};
+
 // Nearest segment to a point, for "double-click an edge to add a vertex".
 const _sl79f = function _nearestSegment(){return(
 (pts, x, y, closed = true) => {
@@ -37496,6 +37527,57 @@ const _sl108b = function _test_nearestSegment(nearestSegment){return(
 })()
 )};
 
+// rebasePath is checked against ground truth, not against a restatement of its own rules: take a real
+// document, note the source text at a path, apply the command, and assert the rebased path addresses
+// that same element afterwards. If the two ever disagree the selection lands on the wrong shape.
+const _sl108c = function _test_rebasePath(forAll,arb,mulberry32,NUM_RUNS,rebasePath,nodeAt,childrenLens,insertElement,deleteElement,reorderElement)
+{
+  const rng = mulberry32(0x5EED0013);
+  const MARK = '<circle cx="7" cy="7" r="3"/>';
+  const kidsOf = (d) => childrenLens([0]).get(d);
+  const gen = (r) => {
+    const doc = arb.svgDocStr(r);
+    const n = kidsOf(doc).length;
+    return [doc, arb.int(r, 0, Math.max(0, n - 1)), arb.int(r, 0, n), arb.int(r, 0, Math.max(0, n - 1))];
+  };
+  const follows = (doc, path, next, op) => {
+    const was = (() => { const n = nodeAt(doc, path); return doc.slice(n.start, n.end); })();
+    const to = rebasePath(path, op);
+    if (to === null) return null;                       // caller must treat this as "deleted"
+    const n = nodeAt(next, to);
+    if (next.slice(n.start, n.end) !== was)
+      throw new Error(`rebased ${path.join("/")} -> ${to.join("/")} lands on the wrong element`);
+    return to;
+  };
+  forAll(NUM_RUNS, rng, gen, (doc, i, at, to) => {
+    const kids = kidsOf(doc);
+    if (!kids.length) return true;
+    const every = kids.map((_, j) => [0, j]);           // every sibling, not just the edited one
+
+    const ins = insertElement(doc, [0], at, MARK);
+    for (const p of every)
+      if (follows(doc, p, ins, { kind: "insert", parent: [0], at }) === null)
+        throw new Error("insert never deletes anything");
+
+    const dpath = [0, Math.min(at, kids.length - 1)];
+    const del = deleteElement(doc, dpath);
+    for (const p of every) {
+      const gone = follows(doc, p, del, { kind: "delete", path: dpath }) === null;
+      if (gone !== (p[1] === dpath[1])) throw new Error("delete lost the wrong element");
+    }
+
+    if (kids.length > 1) {                              // a move is a permutation: nobody is lost
+      const t = Math.min(to, kids.length - 1);
+      const mv = reorderElement(doc, [0, i], t);
+      for (const p of every)
+        if (follows(doc, p, mv, { kind: "move", path: [0, i], to: t }) === null)
+          throw new Error("move never deletes anything");
+    }
+    return true;
+  }, "rebasePath follows the element");
+  return `✅ selection follows its element across insert, delete and move (${NUM_RUNS} runs)`;
+};
+
 // The renderer's contract: after a morph the live node IS the projection of the new source, without
 // having been replaced. Browser-only — it needs a real DOM.
 const _sl109 = function _test_morph_projection(morph){return(
@@ -37769,12 +37851,14 @@ const _sl117 = function _svgWriter(runtime,realize,morph,literalLens,cellAttrLen
 
   // A structural edit: a pure command rewrites the SVG document text, `literalLens` carries it back
   // into the cell definition, and the writer renders it.
-  async function runCommand(name, fn, { keepFocus = false } = {}) {
+  // `rebase` maps an address across this edit, for whoever is holding one. The writer never applies
+  // it — it does not know that selection exists — it just reports it on the event.
+  async function runCommand(name, fn, { rebase = null } = {}) {
     const s = target.cellSource();
     if (s === null) return null;
     const L = literalLens(target.alias());
     const next = L.put(fn(L.get(s)), s);
-    const record = { target: name, attribute: "(structure)", before: "", after: "", keepFocus,
+    const record = { target: name, attribute: "(structure)", before: "", after: "", rebase,
                      GetPut: L.put(L.get(next), next) === next, PutGet: true, span: null };
     if (next === s) { node.lastPut = record; return record; }
     return applySource(next, record);
@@ -37851,10 +37935,20 @@ const _sl118 = function _svgOverlay(){return(
 )};
 
 // ---- selection: which element is being edited, and its handles -----------------------------------
-const _sl119 = function _svgFocus(pointsHandles,pathHandles){return(
+// Selection is held as a *path*, not an index: an index into document order is invalidated by any
+// insert or delete before it, a path only by an edit to its own parent chain. `index` stays available
+// because the handle lenses address elements the way tokenize() does.
+const _sl119 = function _svgFocus(pointsHandles,pathHandles,nodeAt){return(
 (overlay, target) => {
-  let idx = null, mode = null;
+  let path = null, mode = null;
+  const indexOf = () => {
+    if (!path) return null;
+    const t = target.doc();
+    if (t === null) return null;
+    try { return nodeAt(t, path).index; } catch (e) { return null; }   // the element is gone
+  };
   const handles = () => {
+    const idx = indexOf();
     if (idx === null) return [];
     const t = target.doc();
     if (t === null) return [];
@@ -37864,7 +37958,8 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles){return(
   const scaleOf = (el) => { const m = el.getScreenCTM(); return m ? Math.hypot(m.a, m.b) : 1; };
   const draw = () => {
     overlay.clear();
-    if (idx === null) return;
+    const idx = indexOf();
+    if (idx === null) { path = null; mode = null; return; }
     const el = target.elems()[idx];
     if (!el) return;
     overlay.alignTo(el);
@@ -37877,12 +37972,15 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles){return(
     }
   };
   return {
-    get index() { return idx; },
+    get path() { return path; },
+    get index() { return indexOf(); },
     get mode() { return mode; },
     handles,
     refresh: draw,
-    set(i, m) { idx = i; mode = m; draw(); },
-    clear() { idx = null; mode = null; draw(); }
+    set(p, m) { path = p; mode = m; draw(); },
+    clear() { path = null; mode = null; draw(); },
+    // Carry the selection across a structural edit; a null result means it was deleted.
+    rebase(fn) { path = path && fn(path); if (!path) mode = null; }
   };
 }
 )};
@@ -37937,7 +38035,7 @@ const _sl120 = function _toolVertex(handleEdit){return(
 
 // Drag a shape's body: the `transform` lens, focused on the leading translate op. A tap with no
 // movement selects instead, if the shape is in the domain of a handle lens.
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath){return(
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
@@ -37980,7 +38078,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
       const v = t === null ? null : attrVal(t, d.idx, name);
       if (v === null) return false;
       try { parse(v); } catch (err) { return false; }    // outside the lens domain
-      ctx.focus.set(d.idx, mode);
+      ctx.focus.set(pathOfIndex(t, d.idx), mode);
       return true;
     };
     if ((d.tag === "polygon" || d.tag === "polyline") && tryFocus("points", "points", parsePoints)) return;
@@ -37992,7 +38090,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
 
 // Structural editing by double-click: add a vertex on an edge, remove the one under the pointer, or
 // drop a new shape on empty canvas. Every branch is a pure command.
-const _sl122 = function _toolStructure(pathOfIndex,insertElement,insertPoint,deletePoint,nearestSegment,pointsHandles,parsePoints,attrVal){return(
+const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nearestSegment,pointsHandles,parsePoints,attrVal,childrenLens,rebasePath){return(
 {
   id: "structure",
   async onDblClick(ctx, e) {
@@ -38000,32 +38098,36 @@ const _sl122 = function _toolStructure(pathOfIndex,insertElement,insertPoint,del
     if (t === null) return false;
     const focus = ctx.focus;
     const key = e.target.dataset && e.target.dataset.key;
+    // A point edit leaves the element tree alone, so every path — including the selection's — holds.
+    const sel = focus.path;
 
-    if (key !== undefined && focus.index !== null && focus.mode === "points") {
+    if (key !== undefined && sel && focus.mode === "points") {
       const h = pointsHandles(t, focus.index).find((x) => x.key === key);
       if (!h) return false;
-      const idx = focus.index;
-      await ctx.writer.runCommand("deletePoint", (d) => deletePoint(d, pathOfIndex(d, idx), h.i), { keepFocus: true });
+      await ctx.writer.runCommand("deletePoint", (d) => deletePoint(d, sel, h.i));
       return true;
     }
 
     const list = ctx.elems();
     const hit = list.indexOf(e.target);
-    if (focus.index !== null && focus.mode === "points" && (hit === focus.index || key !== undefined)) {
+    if (sel && focus.mode === "points" && (hit === focus.index || key !== undefined)) {
       const el = list[focus.index];
       const p = ctx.localPoint(el, e);
       if (!p) return false;
       const closed = el.localName !== "polyline";
       const seg = nearestSegment(parsePoints(attrVal(t, focus.index, "points")), p[0], p[1], closed);
-      const idx = focus.index;
-      await ctx.writer.runCommand("insertPoint", (d) => insertPoint(d, pathOfIndex(d, idx), seg.index, p), { keepFocus: true });
+      await ctx.writer.runCommand("insertPoint", (d) => insertPoint(d, sel, seg.index, p));
       return true;
     }
 
     if (hit <= 0) {
       const p = ctx.localPoint(ctx.node, e);
       if (!p) return false;
-      await ctx.writer.runCommand("insertElement", (d) => insertElement(d, [0], null, ctx.options.newShape(p[0], p[1])));
+      const at = childrenLens([0]).get(t).length;       // appended, so nothing before it moves
+      await ctx.writer.runCommand(
+        "insertElement",
+        (d) => insertElement(d, [0], null, ctx.options.newShape(p[0], p[1])),
+        { rebase: (path) => rebasePath(path, { kind: "insert", parent: [0], at }) });
       return true;
     }
     return false;
@@ -38041,7 +38143,7 @@ Inputs.input([toolVertex, toolMove, toolStructure])
 const _sl123v = (G, _) => G.input(_);
 
 // ---- svgLens: wiring only ------------------------------------------------------------------------
-const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement)
+const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens)
 {
   // Set while re-rendering: the fresh node is a throwaway used to patch the live one, so svgLens must
   // not attach a second overlay and a second set of listeners to it.
@@ -38095,23 +38197,48 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
       for (const t of svgTools) if (t.onDblClick && await t.onDblClick(ctx, e)) return;
     });
 
-    // The handles follow every put: same elements after an attribute edit, shifted addresses after a
-    // structural one. The writer knows nothing about selection; it just says what it did.
+    // The handles follow every put. A structural edit may move the selection's address, so the record
+    // carries a rebase; refresh() drops the selection by itself if the path no longer resolves. The
+    // writer knows nothing about selection — it just says what it did.
     node.addEventListener("lens-put", (e) => {
-      const r = e.detail;
-      if (r.attribute === "(structure)" && !r.keepFocus) focus.clear(); else focus.refresh();
+      if (e.detail.rebase) focus.rebase(e.detail.rebase);
+      focus.refresh();
     });
 
     // The cell's value is the SVG text the source currently holds; cellSource() exposes the whole
     // definition so a projection cell can show what a gesture rewrote.
     Object.defineProperty(node, "value", { configurable: true, get: target.doc, set: () => {} });
     node.cellSource = () => target.cellSource() || "";
-    // Structural editing, programmatically. Each returns the put record (or null off-cell).
-    node.addShape = (markup, at = null, parent = [0]) =>
-      writer.runCommand("insertElement", (d) => insertElement(d, parent, at, markup));
-    node.removeAt = (path) => writer.runCommand("deleteElement", (d) => deleteElement(d, path));
-    node.moveTo = (path, to) => writer.runCommand("reorderElement", (d) => reorderElement(d, path, to));
+    // Structural editing, programmatically. Each returns the put record (or null off-cell) and tells
+    // the writer how to carry an address across the edit, so a selection survives it.
+    //
+    // The index is clamped HERE, once, and the same value goes to the command and to the rebase. The
+    // commands clamp out-of-range indices themselves, so passing the raw value to both would let them
+    // disagree — and a rebase that disagrees with the edit silently drops the selection.
+    const kidCount = (parent) => {
+      const d = target.doc();
+      if (d === null) return 0;
+      try { return childrenLens(parent).get(d).length; } catch (e) { return 0; }
+    };
+    node.addShape = (markup, at = null, parent = [0]) => {
+      const n = kidCount(parent);
+      const i = at === null ? n : Math.max(0, Math.min(n, at));
+      return writer.runCommand("insertElement", (d) => insertElement(d, parent, i, markup), {
+        rebase: (p) => rebasePath(p, { kind: "insert", parent, at: i })
+      });
+    };
+    node.removeAt = (path) =>
+      writer.runCommand("deleteElement", (d) => deleteElement(d, path), {
+        rebase: (p) => rebasePath(p, { kind: "delete", path })
+      });
+    node.moveTo = (path, to) => {
+      const t = Math.max(0, Math.min(kidCount(path.slice(0, -1)) - 1, to));
+      return writer.runCommand("reorderElement", (d) => reorderElement(d, path, t), {
+        rebase: (p) => rebasePath(p, { kind: "move", path, to: t })
+      });
+    };
     node.edit = (name, fn, opts) => writer.runCommand(name, fn, opts);
+    node.selection = () => focus.path;
     return node;
   };
 };
@@ -38199,6 +38326,7 @@ export default function define(runtime, observer) {
   $def("sl79d", "insertPoint", ["nodeAt","attrTextLens","parsePoints","printPoints"], _sl79d);
   $def("sl79e", "deletePoint", ["nodeAt","attrTextLens","parsePoints","printPoints"], _sl79e);
   $def("sl79f", "nearestSegment", [], _sl79f);
+  $def("sl79g", "rebasePath", [], _sl79g);
 
   $def("sl80", "harnessHeader", ["md"], _sl80);
   $def("sl81", "NUM_RUNS", [], _sl81);
@@ -38228,6 +38356,7 @@ export default function define(runtime, observer) {
   $def("sl107", "test_structural_commands", ["forAll","arb","mulberry32","NUM_RUNS","childrenLens","insertElement","deleteElement","reorderElement"], _sl107);
   $def("sl108", "test_point_commands", ["forAll","arb","mulberry32","NUM_RUNS","insertPoint","deletePoint","nodeAt","attrVal","parsePoints"], _sl108);
   $def("sl108b", "test_nearestSegment", ["nearestSegment"], _sl108b);
+  $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
   $def("sl109", "test_morph_projection", ["morph"], _sl109);
 
   $def("sl110", "manipulationHeader", ["md"], _sl110);
@@ -38238,13 +38367,13 @@ export default function define(runtime, observer) {
   $def("sl116", "svgTarget", ["runtime","literalSpan"], _sl116);
   $def("sl117", "svgWriter", ["runtime","realize","morph","literalLens","cellAttrLens","compose","attrVal","literalSpan"], _sl117);
   $def("sl118", "svgOverlay", [], _sl118);
-  $def("sl119", "svgFocus", ["pointsHandles","pathHandles"], _sl119);
+  $def("sl119", "svgFocus", ["pointsHandles","pathHandles","nodeAt"], _sl119);
   $def("sl120", "toolVertex", ["handleEdit"], _sl120);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath"], _sl121);
-  $def("sl122", "toolStructure", ["pathOfIndex","insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal"], _sl122);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex"], _sl121);
+  $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath"], _sl122);
   $def("sl123", "viewof svgTools", ["Inputs","toolVertex","toolMove","toolStructure"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
-  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement"], _sl114);
+  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
