@@ -36264,8 +36264,27 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
   });
   paint(drawing.tool);
   drawing.addEventListener("lens-tool", (e) => paint(e.detail.tool));
+  // Z-order and delete act on the selection, so they belong to whatever is selected, not to a tool.
+  const Z = { "]": "raise", "[": "lower", "}": "front", "{": "back" };
   const onKey = (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    const sel = drawing.selectionPaths();
+    if (Z[e.key] && sel.length) {
+      e.preventDefault();
+      // Each reorder moves the others, so re-read the (rebased) selection between steps rather than
+      // working from a snapshot that the first move already invalidated.
+      (async () => {
+        for (let i = 0; i < sel.length; i++) {
+          const cur = drawing.selectionPaths();
+          if (cur[i]) await drawing.zOrder(cur[i], Z[e.key]);
+        }
+      })();
+      return;
+    }
+    if ((e.key === "Delete" || e.key === "Backspace") && sel.length) {
+      e.preventDefault();
+      return void drawing.removeSelection();
+    }
     const hit = TOOLS.find(([, , k]) => k.toLowerCase() === e.key.toLowerCase());
     if (hit) drawing.setTool(hit[0]);
     else if (e.key === "Escape") drawing.setTool("select");
@@ -36284,6 +36303,11 @@ empty canvas to drop in a new shape. Handles are live DOM only; they are never w
 The toolbar above picks what a gesture *creates*: **R/E/L** drag out a rect, an ellipse or a line;
 **P** places path anchors one click at a time — click the first anchor again to close, double-click to
 finish open, **Esc** or **V** to go back to selecting. A tool that finishes returns to select by itself.
+
+**Selecting**: tap the same spot again to step down through stacked shapes, **shift-tap** to add to
+the selection, or rubber-band on empty canvas. Dragging one of several selected shapes moves them all
+— one \`put\` each. **[** and **]** lower and raise, **{** and **}** send to back and front, and
+**Delete** removes the whole selection.
 
 An attribute gesture writes once, on release, through this chain:
 
@@ -37962,6 +37986,52 @@ const _sl125t = function _test_shape_creation(forAll,arb,mulberry32,NUM_RUNS,dra
   return `✅ preview matches committed markup; drag is corner-symmetric (${NUM_RUNS} runs each)`;
 };
 
+// Z-order is stated against the paint model: SVG paints in document order, so "front" is last, and
+// raising the frontmost element is a no-op rather than an error. Checked by actually reordering the
+// children and reading back where the element landed relative to its siblings.
+const _sl119t = function _test_z_order(forAll,arb,mulberry32,NUM_RUNS,zTarget,reorderElement,childrenLens)
+{
+  const rng = mulberry32(0x5EED001C);
+  const gen = (r) => {
+    const n = arb.int(r, 2, 6);
+    const kids = Array.from({ length: n }, (_, i) => `<rect id="r${i}"/>`);
+    return [`<svg>\n  ${kids.join("\n  ")}\n</svg>`, arb.int(r, 0, n - 1),
+            arb.pick(r, ["front", "back", "raise", "lower"])];
+  };
+  forAll(NUM_RUNS, rng, gen, (doc, from, kind) => {
+    const kids = childrenLens([0]).get(doc);
+    const me = kids[from];
+    const to = zTarget(kind, from, kids.length);
+    const after = childrenLens([0]).get(reorderElement(doc, [0, from], to));
+    const now = after.indexOf(me);
+    if (kind === "front" && now !== after.length - 1) throw new Error("front is not last");
+    if (kind === "back" && now !== 0) throw new Error("back is not first");
+    if (kind === "raise" && now !== Math.min(kids.length - 1, from + 1)) throw new Error("raise moved by more than one");
+    if (kind === "lower" && now !== Math.max(0, from - 1)) throw new Error("lower moved by more than one");
+    if (after.length !== kids.length) throw new Error("z-order changed the child count");
+    return true;
+  }, "z-order");
+  return `✅ front/back/raise/lower against document paint order, clamped at the ends (${NUM_RUNS} runs)`;
+};
+
+// A selection must never contain both a group and something inside it, or a drag translates the
+// inner element twice — once with its group, once on its own. Found by rubber-banding the demo.
+const _sl119u = function _test_topmost_selection(topmostPaths)
+{
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const t = (input, want, why) => {
+    const got = topmostPaths(input);
+    if (!eq(got, want)) throw new Error(`${why}: ${JSON.stringify(got)} ≠ ${JSON.stringify(want)}`);
+  };
+  t([[0, 3], [0, 3, 0], [0, 3, 1]], [[0, 3]], "children of a selected group must drop out");
+  t([[0, 3, 0], [0, 3]], [[0, 3]], "order must not matter");
+  t([[0, 1], [0, 2]], [[0, 1], [0, 2]], "siblings are all topmost");
+  t([[0, 3, 0], [0, 4]], [[0, 3, 0], [0, 4]], "an unselected group does not absorb its child");
+  t([[0, 1], [0, 1]], [[0, 1], [0, 1]], "an exact duplicate is not a nesting");
+  t([[0, 12], [0, 1, 0]], [[0, 12], [0, 1, 0]], "prefixes are per component, not per character");
+  return "✅ a selection never holds a group and its own descendant";
+};
+
 // The pen writes an ordinary `d` attribute, so a half-drawn path is always a real path. Closing is
 // idempotent — a double click on the first anchor must not append two Zs.
 const _sl126t = function _test_pen_path(penPath,parsePath,printPath)
@@ -38465,6 +38535,7 @@ const _sl118 = function _svgOverlay(){return(
       el.appendChild(n);
       return n;
     },
+    root: node,
     // Handles are drawn in the focused element's own user space, so no screen-space maths is needed
     // to place them — the browser applies the same CTM it applies to the shape.
     alignTo: (target) => el.setAttribute("transform", target ? (target.getAttribute("transform") || "") : "")
@@ -38472,19 +38543,68 @@ const _sl118 = function _svgOverlay(){return(
 }
 )};
 
+// An element's bounding box in the root's user space, so boxes for several elements — each with its
+// own transform — can be drawn in one coordinate system. The corners are mapped and re-bounded; the
+// box of a rotated element is the box of its rotated corners, not its rotated box.
+const _sl119a = function _boxInRoot(){return(
+(el, root) => {
+  if (!el.getBBox || !el.getScreenCTM || !root.getScreenCTM) return null;
+  const rm = root.getScreenCTM(), em = el.getScreenCTM();
+  if (!rm || !em) return null;
+  const M = rm.inverse().multiply(em);
+  const b = el.getBBox();
+  const xs = [], ys = [];
+  for (const [x, y] of [[b.x, b.y], [b.x + b.width, b.y], [b.x + b.width, b.y + b.height], [b.x, b.y + b.height]]) {
+    xs.push(M.a * x + M.c * y + M.e);
+    ys.push(M.b * x + M.d * y + M.f);
+  }
+  const x0 = Math.min(...xs), y0 = Math.min(...ys);
+  return { x: x0, y: y0, width: Math.max(...xs) - x0, height: Math.max(...ys) - y0 };
+}
+)};
+
+// Drop any address that lies inside another one in the set. Selecting a group *and* its children
+// would move the children twice — once with the group, once on their own.
+const _sl119c = function _topmostPaths(){return(
+(paths) => {
+  const key = (p) => p.join("/") + "/";
+  const keys = paths.map(key);
+  return paths.filter((p, i) => !keys.some((k, j) => j !== i && key(p).startsWith(k) && k.length < keys[i].length));
+}
+)};
+
+// Where does a z-order gesture put an element? Pure, so the semantics are testable without a DOM:
+// "front" is last in document order because SVG paints in document order.
+const _sl119b = function _zTarget(){return(
+(kind, from, count) => {
+  const last = Math.max(0, count - 1);
+  const clamp = (i) => Math.max(0, Math.min(last, i));
+  if (kind === "front") return last;
+  if (kind === "back") return 0;
+  if (kind === "raise") return clamp(from + 1);
+  if (kind === "lower") return clamp(from - 1);
+  throw new Error(`unknown z-order: ${kind}`);
+}
+)};
+
 // ---- selection: which element is being edited, and its handles -----------------------------------
 // Selection is held as a *path*, not an index: an index into document order is invalidated by any
 // insert or delete before it, a path only by an edit to its own parent chain. `index` stays available
 // because the handle lenses address elements the way tokenize() does.
-const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nodeAt){return(
+const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nodeAt,boxInRoot,topmostPaths){return(
 (overlay, target) => {
-  let path = null, mode = null;
-  const indexOf = () => {
-    if (!path) return null;
+  // A set, ordered by when each element was added. The first is the primary: handles, and everything
+  // that only makes sense for one element, follow it. Single selection is the one-element case, so
+  // the tools that predate multi-select need no changes.
+  let paths = [], mode = null;
+  const key = (p) => p.join("/");
+  const indexOfPath = (p) => {
+    if (!p) return null;
     const t = target.doc();
     if (t === null) return null;
-    try { return nodeAt(t, path).index; } catch (e) { return null; }   // the element is gone
+    try { return nodeAt(t, p).index; } catch (e) { return null; }      // the element is gone
   };
+  const indexOf = () => indexOfPath(paths.length ? paths[0] : null);
   const element = () => { const i = indexOf(); return i === null ? null : target.elems()[i]; };
   const handles = () => {
     const idx = indexOf();
@@ -38504,8 +38624,18 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
   const scaleOf = (el) => { const m = el.getScreenCTM(); return m ? Math.hypot(m.a, m.b) : 1; };
   const draw = () => {
     overlay.clear();
+    paths = paths.filter((p) => indexOfPath(p) !== null);               // drop what no longer resolves
+    if (paths.length > 1) {                                            // a set: boxes only, no handles
+      overlay.alignTo(null);
+      for (const p of paths) {
+        const el = target.elems()[indexOfPath(p)];
+        const b = el && boxInRoot(el, overlay.root);
+        if (b) overlay.add("rect", { class: "box", x: b.x, y: b.y, width: b.width, height: b.height });
+      }
+      return;
+    }
     const idx = indexOf();
-    if (idx === null) { path = null; mode = null; return; }
+    if (idx === null) { paths = []; mode = null; return; }
     const el = target.elems()[idx];
     if (!el) return;
     overlay.alignTo(el);
@@ -38523,15 +38653,28 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
     }
   };
   return {
-    get path() { return path; },
+    get path() { return paths.length ? paths[0] : null; },             // the primary
+    get paths() { return paths.slice(); },
+    get indices() { return paths.map(indexOfPath).filter((i) => i !== null); },
     get index() { return indexOf(); },
     get mode() { return mode; },
     handles,
     refresh: draw,
-    set(p, m) { path = p; mode = m; draw(); },
-    clear() { path = null; mode = null; draw(); },
-    // Carry the selection across a structural edit; a null result means it was deleted.
-    rebase(fn) { path = path && fn(path); if (!path) mode = null; }
+    set(p, m) { paths = p ? [p] : []; mode = p ? m : null; draw(); },
+    setAll(ps, m = null) { paths = topmostPaths(ps); mode = paths.length === 1 ? m : null; draw(); },
+    // Shift-click: in or out of the set, primary unchanged unless it was the one removed.
+    toggle(p) {
+      const i = paths.findIndex((q) => key(q) === key(p));
+      if (i >= 0) paths.splice(i, 1); else paths = topmostPaths(paths.concat([p]));
+      if (paths.length !== 1) mode = null;
+      draw();
+    },
+    clear() { paths = []; mode = null; draw(); },
+    // Carry the selection across a structural edit; a dropped path means that element was deleted.
+    rebase(fn) {
+      paths = paths.map(fn).filter(Boolean);
+      if (paths.length !== 1) mode = null;
+    }
   };
 }
 )};
@@ -38651,23 +38794,71 @@ const _sl120 = function _toolVertex(handleEdit,grabPointer){return(
 }
 )};
 
-// Drag a shape's body: the `transform` lens, focused on the leading translate op. A tap with no
-// movement selects instead, if the shape is in the domain of a handle lens.
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex,grabPointer){return(
+// What is under the pointer, front to back. `elementsFromPoint` answers for painted geometry, which
+// already gives click-through to occluded shapes for free. When it finds nothing — a thin unfilled
+// stroke the pointer merely came close to — fall back to distance along the geometry, so hairlines
+// are still reachable. The browser is the authority on hit shape either way; no geometry is restated.
+const _sl121a = function _hitTest(){return(
+(ctx, e, opts = {}) => {
+  const list = ctx.elems();
+  const own = new Set(list.slice(1));                    // 0 is the root <svg>: never a hit
+  const painted = (document.elementsFromPoint ? document.elementsFromPoint(e.clientX, e.clientY) : [])
+    .filter((n) => own.has(n));
+  if (painted.length) return painted;
+  const tol = opts.tolerance === undefined ? 6 : opts.tolerance;       // CSS px
+  const near = [];
+  for (let i = 1; i < list.length; i++) {
+    const el = list[i];
+    if (!el.getTotalLength || !el.getPointAtLength) continue;
+    let len, m;
+    try { len = el.getTotalLength(); m = el.getScreenCTM(); } catch (err) { continue; }
+    if (!m || !(len >= 0)) continue;
+    const steps = Math.max(8, Math.min(128, Math.round(len / 4)));
+    let best = Infinity;
+    for (let s = 0; s <= steps; s++) {
+      const p = el.getPointAtLength((len * s) / steps);
+      best = Math.min(best, Math.hypot(m.a * p.x + m.c * p.y + m.e - e.clientX,
+                                       m.b * p.x + m.d * p.y + m.f - e.clientY));
+    }
+    if (best <= tol) near.push([best, el]);
+  }
+  return near.sort((a, b) => a[0] - b[0]).map((x) => x[1]);
+}
+)};
+
+// Drag a shape's body: the `transform` lens, focused on the leading translate op. Dragging one of
+// several selected shapes moves them all — one commit each, since each writes its own attribute.
+// A tap with no movement selects instead: shift adds to the set, and tapping the shape that is
+// already primary cycles to the next shape underneath, which is how an occluded shape is reached.
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex,grabPointer,hitTest){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
-    const idx = ctx.elems().indexOf(e.target);
-    if (idx <= 0) { ctx.focus.clear(); return false; }   // 0 is the root <svg>
-    const ps = e.target.parentNode.getScreenCTM();
+    if (ctx.tool() !== "select") return false;
+    const hits = hitTest(ctx, e, { tolerance: ctx.options.hitTolerance });
+    if (!hits.length) return false;                      // empty canvas: the marquee may want it
+    const list = ctx.elems();
     const t = ctx.doc();
-    if (!ps || t === null) return false;
-    const text = attrVal(t, idx, "transform") || "";
+    if (t === null) return false;
+    const sel = ctx.focus.indices;
+    // Grabbing a selected shape grabs the whole selection; grabbing anything else grabs just it.
+    const primary = sel.length ? list[sel[0]] : null;
+    const el = hits.indexOf(primary) >= 0 ? primary : hits[0];
+    const idx = list.indexOf(el);
+    if (idx <= 0) return false;
+    const targets = [];
+    for (const i of sel.indexOf(idx) >= 0 ? sel : [idx]) {
+      const node = list[i];
+      const ps = node && node.parentNode.getScreenCTM();
+      if (!ps) continue;
+      const text = attrVal(t, i, "transform") || "";
+      targets.push({ idx: i, el: node, text,
+                     // screen delta → this element's parent space (linear part: a drag is a translation)
+                     Slin: invert(ctmMat(ps)), T0: translateLens.get(text) });
+    }
+    if (!targets.length) return false;
     ctx.state.drag = {
-      idx, tag: e.target.localName, text, el: e.target,
-      // screen delta → the element's parent space (linear part only: a drag is a translation)
-      Slin: invert(ctmMat(ps)),
-      T0: translateLens.get(text),
+      idx, hits, tag: el.localName, targets,
       x0: e.clientX, y0: e.clientY, started: false,
       thresh: e.pointerType === "mouse" ? 3 : 10
     };
@@ -38680,28 +38871,92 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
     const dx = e.clientX - d.x0, dy = e.clientY - d.y0;
     if (!d.started && Math.hypot(dx, dy) < d.thresh) return;
     d.started = true;
-    const S = d.Slin;
-    d.T = [ctx.snap(d.T0[0] + S[0] * dx + S[2] * dy), ctx.snap(d.T0[1] + S[1] * dx + S[3] * dy)];
-    d.el.setAttribute("transform", translateLens.put(d.T, d.text));
-    if (ctx.focus.index === d.idx) ctx.focus.refresh();
+    for (const g of d.targets) {
+      const S = g.Slin;
+      g.T = [ctx.snap(g.T0[0] + S[0] * dx + S[2] * dy), ctx.snap(g.T0[1] + S[1] * dx + S[3] * dy)];
+      g.el.setAttribute("transform", translateLens.put(g.T, g.text));
+    }
+    ctx.focus.refresh();
   },
   async onPointerUp(ctx, e) {
     const d = ctx.state.drag;
     ctx.state.drag = null;
     if (!d) return;
-    if (d.started) return void await ctx.writer.commit(d.idx, "transform", d.T, "", translateLens);
+    if (d.started) {
+      for (const g of d.targets) await ctx.writer.commit(g.idx, "transform", g.T, "", translateLens);
+      return;
+    }
     if (e.type !== "pointerup") return;
     const t = ctx.doc();
+    if (t === null) return;
+    if (e.shiftKey) return void ctx.focus.toggle(pathOfIndex(t, d.idx));
+    // Tapping the primary again steps down the stack; tapping anything else selects the top hit.
+    const list = ctx.elems();
+    const single = ctx.focus.paths.length === 1;
+    const at = d.hits.indexOf(list[d.idx]);
+    const pick = single && at >= 0 ? d.hits[(at + 1) % d.hits.length] : d.hits[0];
+    const idx = list.indexOf(pick);
+    if (idx <= 0) return;
+    const tag = pick.localName;
     const tryFocus = (mode, name, parse) => {
-      const v = t === null ? null : attrVal(t, d.idx, name);
+      const v = attrVal(t, idx, name);
       if (v === null) return false;
       try { parse(v); } catch (err) { return false; }    // outside the lens domain
-      ctx.focus.set(pathOfIndex(t, d.idx), mode);
+      ctx.focus.set(pathOfIndex(t, idx), mode);
       return true;
     };
-    if ((d.tag === "polygon" || d.tag === "polyline") && tryFocus("points", "points", parsePoints)) return;
-    if (d.tag === "path" && tryFocus("path", "d", parsePath)) return;
-    ctx.focus.set(pathOfIndex(t, d.idx), "transform");   // no vertex lens: offer the transform gizmo
+    if ((tag === "polygon" || tag === "polyline") && tryFocus("points", "points", parsePoints)) return;
+    if (tag === "path" && tryFocus("path", "d", parsePath)) return;
+    ctx.focus.set(pathOfIndex(t, idx), "transform");     // no vertex lens: offer the transform gizmo
+  }
+}
+)};
+
+// Drag on empty canvas to rubber-band a selection. Intersection is tested in the root's user space,
+// where the marquee is drawn, so a rotated element is compared as the box it actually occupies.
+const _sl121b = function _toolMarquee(boxInRoot,pathOfIndex,grabPointer,dragBox){return(
+{
+  id: "marquee",
+  onPointerDown(ctx, e) {
+    if (ctx.tool() !== "select") return false;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return false;
+    grabPointer(ctx.node, e);
+    if (!e.shiftKey) ctx.focus.clear();
+    ctx.state.band = { x0: p[0], y0: p[1], x1: p[0], y1: p[1], add: e.shiftKey, box: null, moved: false };
+    return true;
+  },
+  onPointerMove(ctx, e) {
+    const b = ctx.state.band;
+    if (!b) return;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return;
+    b.x1 = p[0]; b.y1 = p[1]; b.moved = true;
+    const r = dragBox(b.x0, b.y0, b.x1, b.y1);
+    if (!b.box || !b.box.isConnected) {
+      ctx.overlay.alignTo(null);
+      b.box = ctx.overlay.add("rect", { class: "box" });
+    }
+    for (const k of ["x", "y", "width", "height"]) b.box.setAttribute(k, r[k]);
+  },
+  onPointerUp(ctx) {
+    const b = ctx.state.band;
+    ctx.state.band = null;
+    if (!b) return;
+    if (b.box) b.box.remove();
+    if (!b.moved) return void ctx.focus.clear();
+    const r = dragBox(b.x0, b.y0, b.x1, b.y1);
+    const t = ctx.doc();
+    if (t === null) return;
+    const list = ctx.elems();
+    const hits = [];
+    for (let i = 1; i < list.length; i++) {
+      const box = boxInRoot(list[i], ctx.node);
+      if (!box) continue;
+      if (box.x <= r.x + r.width && box.x + box.width >= r.x &&
+          box.y <= r.y + r.height && box.y + box.height >= r.y) hits.push(pathOfIndex(t, i));
+    }
+    ctx.focus.setAll(b.add ? ctx.focus.paths.concat(hits) : hits);
   }
 }
 )};
@@ -38942,13 +39197,13 @@ const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer){return(
 // tool from any cell and dispatch an input event to extend the editor without touching it. The
 // creation tools come first because they gate on the active tool, so they claim nothing in select
 // mode; toolPen precedes toolStructure so its double-click ends the path rather than dropping a shape.
-const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolStructure){return(
-Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolStructure])
+const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure){return(
+Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure])
 )};
 const _sl123v = (G, _) => G.input(_);
 
 // ---- svgLens: wiring only ------------------------------------------------------------------------
-const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens)
+const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget)
 {
   // Set while re-rendering: the fresh node is a throwaway used to patch the live one, so svgLens must
   // not attach a second overlay and a second set of listeners to it.
@@ -39063,7 +39318,26 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
       });
     };
     node.edit = (name, fn, opts) => writer.runCommand(name, fn, opts);
+    // Z-order over the same reorder command. SVG paints in document order, so "front" is last.
+    node.zOrder = (path, kind) =>
+      node.moveTo(path, zTarget(kind, path[path.length - 1], kidCount(path.slice(0, -1))));
+    // Delete a whole selection: deepest and last first, so an address is never invalidated by an
+    // earlier deletion in the same batch.
+    node.removeSelection = async () => {
+      const order = focus.paths.slice().sort((a, b) => {
+        for (let i = 0; i < Math.max(a.length, b.length); i++) {
+          const d = (b[i] === undefined ? -1 : b[i]) - (a[i] === undefined ? -1 : a[i]);
+          if (d) return d;
+        }
+        return 0;
+      });
+      const out = [];
+      for (const p of order) out.push(await node.removeAt(p));
+      return out;
+    };
     node.selection = () => focus.path;
+    node.selectionPaths = () => focus.paths;
+    node.select = (paths, mode) => focus.setAll(paths, mode);
     node.setTool = setTool;
     Object.defineProperty(node, "tool", { configurable: true, get: () => tool });
     return node;
@@ -39204,6 +39478,8 @@ export default function define(runtime, observer) {
   $def("sl108e", "test_opsLens_laws", ["forAll","lensLaws","opsLens","arb","mulberry32","NUM_RUNS","printOp"], _sl108e);
   $def("sl108f", "test_transform_gizmo", ["forAll","arb","mulberry32","NUM_RUNS","rotateAbout","scaleAbout","printOp","parseTransform","applyPoint"], _sl108f);
   $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
+  $def("sl119u", "test_topmost_selection", ["topmostPaths"], _sl119u);
+  $def("sl119t", "test_z_order", ["forAll","arb","mulberry32","NUM_RUNS","zTarget","reorderElement","childrenLens"], _sl119t);
   $def("sl126t", "test_pen_path", ["penPath","parsePath","printPath"], _sl126t);
   $def("sl108d", "test_path_subdivision_exact", ["forAll","arb","mulberry32","NUM_RUNS","parsePath","printPath","pathSegments","pointOnSegment","splitPathSegment","deletePathAnchor"], _sl108d);
   $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
@@ -39217,10 +39493,15 @@ export default function define(runtime, observer) {
   $def("sl116", "svgTarget", ["runtime","literalSpan"], _sl116);
   $def("sl117", "svgWriter", ["runtime","realize","morph","literalLens","cellAttrLens","compose","attrVal","literalSpan"], _sl117);
   $def("sl118", "svgOverlay", [], _sl118);
-  $def("sl119", "svgFocus", ["pointsHandles","pathHandles","transformHandles","nodeAt"], _sl119);
+  $def("sl119a", "boxInRoot", [], _sl119a);
+  $def("sl119c", "topmostPaths", [], _sl119c);
+  $def("sl119b", "zTarget", [], _sl119b);
+  $def("sl119", "svgFocus", ["pointsHandles","pathHandles","transformHandles","nodeAt","boxInRoot","topmostPaths"], _sl119);
   $def("sl124c", "grabPointer", [], _sl124c);
   $def("sl120", "toolVertex", ["handleEdit","grabPointer"], _sl120);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer"], _sl121);
+  $def("sl121a", "hitTest", [], _sl121a);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer","hitTest"], _sl121);
+  $def("sl121b", "toolMarquee", ["boxInRoot","pathOfIndex","grabPointer","dragBox"], _sl121b);
   $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint"], _sl122);
   $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","printOp","attrVal","grabPointer"], _sl124);
   $def("sl125a", "dragBox", [], _sl125a);
@@ -39229,9 +39510,9 @@ export default function define(runtime, observer) {
   $def("sl125d", "penPath", [], _sl125d);
   $def("sl125", "toolDraw", ["shapeSpec","shapeMarkup","dragBox","grabPointer"], _sl125);
   $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer"], _sl126);
-  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolStructure"], _sl123);
+  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
-  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens"], _sl114);
+  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
