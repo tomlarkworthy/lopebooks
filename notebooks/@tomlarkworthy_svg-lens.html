@@ -36267,7 +36267,12 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
   // Z-order and delete act on the selection, so they belong to whatever is selected, not to a tool.
   const Z = { "]": "raise", "[": "lower", "}": "front", "{": "back" };
   const onKey = (e) => {
-    if (e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    const typing = /^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.target.isContentEditable;
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !typing) {
+      e.preventDefault();                                // editor-5 owns undo while you are in a cell
+      return void (e.shiftKey ? drawing.redo() : drawing.undo());
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey || typing) return;
     const sel = drawing.selectionPaths();
     if (Z[e.key] && sel.length) {
       e.preventDefault();
@@ -36307,7 +36312,8 @@ finish open, **Esc** or **V** to go back to selecting. A tool that finishes retu
 **Selecting**: tap the same spot again to step down through stacked shapes, **shift-tap** to add to
 the selection, or rubber-band on empty canvas. Dragging one of several selected shapes moves them all
 — one \`put\` each. **[** and **]** lower and raise, **{** and **}** send to back and front, and
-**Delete** removes the whole selection.
+**Delete** removes the whole selection. **⌘Z / ⇧⌘Z** undo and redo, restoring the previous cell source
+byte for byte; an undo declines if something else has written to the cell since.
 
 An attribute gesture writes once, on release, through this chain:
 
@@ -38438,6 +38444,9 @@ const _sl117 = function _svgWriter(runtime,realize,morph,literalLens,cellAttrLen
   async function applySource(next, record) {
     const self = target.variable();
     const before = self._definition;
+    // The whole prior definition, so a history layer can restore the exact bytes. The swap is
+    // silent — `onCodeChange` only samples when the variable *set* changes — so nothing else sees it.
+    record.source = { before: target.cellSource(), after: next };
     const [fn] = await realize([next], runtime);
     if (self._definition !== before) {                 // editor-5 (or another gesture) got there first
       record.aborted = "definition changed under the gesture";
@@ -39335,6 +39344,38 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
       for (const p of order) out.push(await node.removeAt(p));
       return out;
     };
+    // ---- history ---------------------------------------------------------------------------------
+    // Undo here is just "put the previous source back", which the writer already knows how to do; the
+    // entries are whole definitions, so a structural undo restores the exact prior bytes rather than
+    // trying to invert a command. Refuses when the current source is not what this entry produced —
+    // someone else (editor-5, another gesture) has written since, and clobbering that is worse than
+    // declining. Bounded, because a drag is one entry but a session is many.
+    const undoStack = [], redoStack = [];
+    const limit = options.historyLimit === undefined ? 200 : options.historyLimit;
+    let replaying = false;
+    node.addEventListener("lens-put", (e) => {
+      const s = e.detail.source;
+      if (!s || replaying || e.detail.aborted) return;
+      undoStack.push(s);
+      if (undoStack.length > limit) undoStack.shift();
+      redoStack.length = 0;                              // a new edit forks the future
+    });
+    const step = async (from, to, want, name) => {
+      const entry = from[from.length - 1];
+      if (!entry) return null;
+      if (target.cellSource() !== entry[want]) return null;   // written since: refuse
+      from.pop();
+      to.push(entry);
+      replaying = true;
+      try {
+        return await writer.applySource(want === "after" ? entry.before : entry.after,
+          { target: name, attribute: "(history)", before: "", after: "", GetPut: true, PutGet: true, span: null });
+      } finally { replaying = false; }
+    };
+    node.undo = () => step(undoStack, redoStack, "after", "undo");
+    node.redo = () => step(redoStack, undoStack, "before", "redo");
+    node.historyDepth = () => ({ undo: undoStack.length, redo: redoStack.length });
+
     node.selection = () => focus.path;
     node.selectionPaths = () => focus.paths;
     node.select = (paths, mode) => focus.setAll(paths, mode);
