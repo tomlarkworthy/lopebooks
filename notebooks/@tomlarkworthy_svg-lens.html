@@ -36989,15 +36989,46 @@ const _sl74a = function _scan(){return(
 )};
 
 // Elements in document order — the flat addressing `attrTextLens` uses.
-const _sl74 = function _tokenize(scan){return(
-(src) => scan(src).filter((t) => t.kind === "open")
+const _sl74 = function _tokenize(scan,outsideDomain){return(
+(src) => {
+  const bad = outsideDomain(src);
+  if (bad) throw new Error(`outside the svg-lens domain — ${bad}`);
+  return scan(src).filter((t) => t.kind === "open");
+}
 )};
 
 // The same tokens nested into a tree with spans. `innerStart`/`innerEnd` bound the children region,
 // which is what a structural edit splices; `index` is the flat document-order index, so a path and
 // an index address the same element.
-const _sl74b = function _parseDoc(scan){return(
+// `scan` is a tokenizer, not an XML parser, and a wrong span splices the wrong bytes — a silent,
+// destructive failure. So state the domain and fail loudly at its edge instead of guessing.
+// Outside it: CDATA and raw-text elements (their contents may hold `<`, `>` or a stray `</`), and
+// DOCTYPEs with an internal subset (`>` inside `[…]`). Inside it, and deliberately so: entity
+// references, which are left as the bytes the author wrote — this editor rewrites source, and
+// decoding `&amp;` on the way in would mean re-encoding it on the way out.
+const _sl74e = function _outsideDomain(scan){return(
 (src) => {
+  const RAW = { script: 1, style: 1, foreignobject: 1 };
+  const why = (what, at) =>
+    `${what} at offset ${at}: its contents are not element markup, so byte spans would be wrong`;
+  // Over tokens, not over the raw text: a script tag written inside a comment is a comment, and
+  // saying otherwise would refuse documents this editor handles perfectly well.
+  for (const t of scan(src)) {
+    if (t.kind === "open" && RAW[t.tag.toLowerCase()]) return why(`a <${t.tag}> element`, t.start);
+    if (t.kind === "other") {
+      const s = src.slice(t.start, t.end);
+      if (s.startsWith("<![CDATA[")) return why("a CDATA section", t.start);
+      if (/^<!DOCTYPE/i.test(s) && s.includes("[")) return why("a DOCTYPE with an internal subset", t.start);
+    }
+  }
+  return null;
+}
+)};
+
+const _sl74b = function _parseDoc(scan,outsideDomain){return(
+(src) => {
+  const bad = outsideDomain(src);
+  if (bad) throw new Error(`outside the svg-lens domain — ${bad}`);
   const root = { tag: null, attrs: {}, start: 0, end: src.length, innerStart: 0, innerEnd: src.length, index: -1, path: [], children: [] };
   const stack = [root];
   let index = 0;
@@ -38020,6 +38051,44 @@ const _sl119t = function _test_z_order(forAll,arb,mulberry32,NUM_RUNS,zTarget,re
   return `✅ front/back/raise/lower against document paint order, clamped at the ends (${NUM_RUNS} runs)`;
 };
 
+// The domain boundary itself, without a DOM: what is refused, what is not, and that refusal reaches
+// every entry point rather than only the one that happened to be checked.
+const _sl74t = function _test_domain_boundary(outsideDomain,parseDoc,tokenize,childrenLens)
+{
+  const NS = 'xmlns="http://www.w3.org/2000/svg"';
+  // Built, never written literally: this module lives inside a <scr…ipt type="text/plain"> block, and
+  // an HTML parser that sees `<!--` followed by a script tag stops looking for the block's end.
+  const SC = "scr" + "ipt", ST = "st" + "yle";
+  const inside = [
+    `<svg ${NS}><rect x="1" data-gt="a>b"/></svg>`,
+    `<svg ${NS}><!-- a <${SC}> written in a comment is just text --><rect/></svg>`,
+    `<svg ${NS}><text>&amp; &lt; &#65;</text></svg>`,
+    `<svg ${NS}><rect data-q='say "hi"'/></svg>`
+  ];
+  const outside = [
+    `<svg ${NS}><![CDATA[ <rect/> ]]></svg>`,
+    `<svg ${NS}><${ST}>a{}</${ST}></svg>`,
+    `<svg ${NS}><${SC}>a &lt; b</${SC}></svg>`,
+    `<svg ${NS}><foreignObject><div>hi</div></foreignObject></svg>`,
+    `<!DOCTYPE svg [<!ENTITY x "y">]><svg ${NS}/>`
+  ];
+  for (const s of inside) {
+    if (outsideDomain(s)) throw new Error(`refused a document it can handle: ${s}`);
+    parseDoc(s);                                       // must not throw
+  }
+  for (const s of outside) {
+    if (!outsideDomain(s)) throw new Error(`accepted a document it cannot handle: ${s}`);
+    for (const [name, f] of [["parseDoc", parseDoc], ["tokenize", tokenize],
+                             ["childrenLens", (d) => childrenLens([0]).get(d)]]) {
+      let msg = null;
+      try { f(s); } catch (e) { msg = e.message; }
+      if (!msg || !/outside the svg-lens domain/.test(msg))
+        throw new Error(`${name} did not refuse loudly: ${msg}`);
+    }
+  }
+  return `✅ ${inside.length} accepted, ${outside.length} refused at every entry point`;
+};
+
 // A selection must never contain both a group and something inside it, or a drag translates the
 // inner element twice — once with its group, once on its own. Found by rubber-banding the demo.
 const _sl119u = function _test_topmost_selection(topmostPaths)
@@ -38220,6 +38289,91 @@ const _sl109 = function _test_morph_projection(morph){return(
   return "✅ node identity kept, overlay preserved, insert/delete applied, idempotent";
 })()
 )};
+
+// The scanner's own claim, checked against the browser rather than against more generated documents
+// that stay inside the domain by construction: for a corpus of real and adversarial markup, the tree
+// `parseDoc` builds must agree with `DOMParser` on shape, tags and attribute values, and every span
+// it reports must slice out exactly the element the browser saw. A span that is merely *plausible*
+// is the dangerous case — it splices the wrong bytes silently — so this compares slices, not counts.
+const _sl109b = function _test_parse_vs_DOMParser(parseDoc,outsideDomain,attrVal,tokenize)
+{
+  if (typeof DOMParser === "undefined") return "⏭ needs a DOM (browser only)";
+  const NS = "http://www.w3.org/2000/svg";
+  const SC = "scr" + "ipt", ST = "st" + "yle";        // never written literally: see test_domain_boundary
+  const parse = (t) => {
+    const d = new DOMParser().parseFromString(t, "image/svg+xml");
+    if (d.querySelector("parsererror")) throw new Error("the browser refused this document");
+    return d.documentElement;
+  };
+  // Real markup, plus the cases a regex tokenizer is most likely to get wrong.
+  const CORPUS = [
+    `<svg xmlns="${NS}" viewBox="0 0 10 10"><rect x="1"/></svg>`,
+    `<svg xmlns="${NS}">\n  <!-- a comment with <angle> brackets and a /> in it -->\n  <g transform="rotate(4)"><circle r="2"/></g>\n</svg>`,
+    `<svg xmlns="${NS}"><text font-family="a &gt; b">&amp;&lt;</text></svg>`,          // entities
+    `<svg xmlns="${NS}"><rect data-note="it's fine" data-other='say "hi"'/></svg>`,     // mixed quotes
+    `<svg xmlns="${NS}"><path d="M0,0 L1,1"/><rect x="1" y="2"   width="3"/></svg>`,    // odd spacing
+    `<svg xmlns="${NS}"><g><g><g><rect x="1"/></g></g></g></svg>`,                      // deep nesting
+    `<svg xmlns="${NS}"><rect x="1" data-gt="a>b"/></svg>`,                             // > inside a value
+    `<svg xmlns="${NS}"><rect/><rect></rect></svg>`                                     // both closings
+  ];
+
+  const shapeOf = (el) => `${el.localName}[${[...el.children].map(shapeOf).join(",")}]`;
+  const shapeOfNode = (n) => `${n.tag}[${n.children.map(shapeOfNode).join(",")}]`;
+
+  for (const src of CORPUS) {
+    if (outsideDomain(src)) throw new Error(`the corpus must be inside the domain: ${src}`);
+    const dom = parse(src);
+    const mine = parseDoc(src).children[0];
+    if (shapeOfNode(mine) !== shapeOf(dom))
+      throw new Error(`tree shape differs\n  mine: ${shapeOfNode(mine)}\n  DOM:  ${shapeOf(dom)}`);
+    // Attribute values, element by element, in document order.
+    const domEls = [dom, ...dom.querySelectorAll("*")];
+    const mineEls = tokenize(src);
+    if (domEls.length !== mineEls.length) throw new Error(`element count ${mineEls.length} ≠ ${domEls.length}`);
+    domEls.forEach((el, i) => {
+      for (const a of el.attributes) {
+        if (a.name === "xmlns") continue;
+        const got = attrVal(src, i, a.name);
+        // The DOM decodes entities; this editor deliberately does not, so compare decoded forms.
+        const decoded = got === null ? null : new DOMParser()
+          .parseFromString(`<x a="${got.replace(/"/g, "&quot;")}"/>`, "text/xml").documentElement.getAttribute("a");
+        if (decoded !== a.value)
+          throw new Error(`element ${i} ${el.localName}@${a.name}: ${JSON.stringify(decoded)} ≠ ${JSON.stringify(a.value)}`);
+      }
+    });
+    // Spans: the slice at each node must be that element and nothing else.
+    const walk = (n) => {
+      if (n.tag) {
+        const slice = src.slice(n.start, n.end);
+        const re = parse(slice.startsWith("<svg") ? slice : `<svg xmlns="${NS}">${slice}</svg>`);
+        const el = slice.startsWith("<svg") ? re : re.firstElementChild;
+        if (el.localName !== n.tag) throw new Error(`span at ${n.start} slices a <${el.localName}>, not <${n.tag}>`);
+        // The inner span is what a structural edit splices, so it must sit strictly inside the
+        // element and stop exactly where its close tag begins.
+        if (!(n.innerStart >= n.openEnd && n.innerEnd <= n.end && n.innerEnd >= n.innerStart))
+          throw new Error(`<${n.tag}>: inner span [${n.innerStart},${n.innerEnd}] escapes [${n.openEnd},${n.end}]`);
+        const closing = src.slice(n.innerEnd, n.end);
+        if (!(n.selfClosing ? closing === "" : new RegExp(`^</\\s*${n.tag}\\s*>$`).test(closing)))
+          throw new Error(`<${n.tag}>: the bytes after the inner span are ${JSON.stringify(closing)}, not its close tag`);
+      }
+      n.children.forEach(walk);
+    };
+    walk(parseDoc(src));
+  }
+
+  // And the edge of the domain is refused, loudly, rather than mis-parsed.
+  for (const bad of [
+    `<svg xmlns="${NS}"><![CDATA[ <rect x="1"/> ]]></svg>`,
+    `<svg xmlns="${NS}"><${ST}>rect { fill: red }</${ST}><rect x="1"/></svg>`,
+    `<svg xmlns="${NS}"><${SC}>if (a &lt; b) {}</${SC}></svg>`
+  ]) {
+    if (!outsideDomain(bad)) throw new Error(`should be refused: ${bad}`);
+    let threw = false;
+    try { parseDoc(bad); } catch (e) { threw = /outside the svg-lens domain/.test(e.message); }
+    if (!threw) throw new Error(`parseDoc must refuse: ${bad}`);
+  }
+  return `✅ agrees with DOMParser on ${CORPUS.length} documents (shape, attributes, spans); refuses CDATA and raw-text elements`;
+};
 
 // ================================================================================================
 // DIRECT MANIPULATION — the drawing edits its own cell
@@ -39462,8 +39616,9 @@ export default function define(runtime, observer) {
   $def("sl72", "literalSafe", [], _sl72);
   $def("sl73", "literalLens", ["lens","literalSpan","literalSafe"], _sl73);
   $def("sl74a", "scan", [], _sl74a);
-  $def("sl74", "tokenize", ["scan"], _sl74);
-  $def("sl74b", "parseDoc", ["scan"], _sl74b);
+  $def("sl74e", "outsideDomain", ["scan"], _sl74e);
+  $def("sl74", "tokenize", ["scan","outsideDomain"], _sl74);
+  $def("sl74b", "parseDoc", ["scan","outsideDomain"], _sl74b);
   $def("sl74c", "nodeAt", ["parseDoc"], _sl74c);
   $def("sl74d", "pathOfIndex", ["parseDoc"], _sl74d);
   $def("sl75", "attrVal", ["tokenize"], _sl75);
@@ -39519,11 +39674,13 @@ export default function define(runtime, observer) {
   $def("sl108e", "test_opsLens_laws", ["forAll","lensLaws","opsLens","arb","mulberry32","NUM_RUNS","printOp"], _sl108e);
   $def("sl108f", "test_transform_gizmo", ["forAll","arb","mulberry32","NUM_RUNS","rotateAbout","scaleAbout","printOp","parseTransform","applyPoint"], _sl108f);
   $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
+  $def("sl74t", "test_domain_boundary", ["outsideDomain","parseDoc","tokenize","childrenLens"], _sl74t);
   $def("sl119u", "test_topmost_selection", ["topmostPaths"], _sl119u);
   $def("sl119t", "test_z_order", ["forAll","arb","mulberry32","NUM_RUNS","zTarget","reorderElement","childrenLens"], _sl119t);
   $def("sl126t", "test_pen_path", ["penPath","parsePath","printPath"], _sl126t);
   $def("sl108d", "test_path_subdivision_exact", ["forAll","arb","mulberry32","NUM_RUNS","parsePath","printPath","pathSegments","pointOnSegment","splitPathSegment","deletePathAnchor"], _sl108d);
   $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
+  $def("sl109b", "test_parse_vs_DOMParser", ["parseDoc","outsideDomain","attrVal","tokenize"], _sl109b);
   $def("sl109", "test_morph_projection", ["morph"], _sl109);
 
   $def("sl110", "manipulationHeader", ["md"], _sl110);
