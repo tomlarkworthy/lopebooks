@@ -36286,6 +36286,12 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
       })();
       return;
     }
+    const ARROW = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    if (ARROW[e.key] && sel.length) {
+      e.preventDefault();
+      const k = e.shiftKey ? 10 : 1;
+      return void drawing.nudge(ARROW[e.key][0] * k, ARROW[e.key][1] * k);
+    }
     if ((e.key === "Delete" || e.key === "Backspace") && sel.length) {
       e.preventDefault();
       return void drawing.removeSelection();
@@ -36296,6 +36302,41 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
   };
   document.addEventListener("keydown", onKey);
   invalidation.then(() => document.removeEventListener("keydown", onKey));
+  return el;
+};
+
+// Type an exact value. The inspector reads the selected element's attributes out of the source and
+// writes them back through `setAttr` — the same commit a drag performs — so nothing here is a second
+// write path. It re-renders on `lens-select`, which the focus emits whenever it repaints.
+const _sl02c = function _inspector(htl,invalidation,$0)
+{
+  const drawing = $0;
+  const el = htl.html`<div style="font:12px/1.5 ui-monospace,monospace;margin:.5rem 0;min-height:2.2em"></div>`;
+  const render = () => {
+    const path = drawing.selection();
+    el.textContent = "";
+    if (!path) { el.append(htl.html`<span style="opacity:.6">nothing selected</span>`); return; }
+    const info = drawing.describe(path);
+    if (!info) return;
+    const row = htl.html`<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"></div>`;
+    row.append(htl.html`<b>&lt;${info.tag}&gt;</b>`);
+    for (const [name, value] of info.attrs) {
+      const input = htl.html`<input value="${value}" size="${Math.min(28, Math.max(6, value.length))}"
+        style="font:inherit;padding:2px 4px;border:1px solid #b9c4b4;border-radius:4px">`;
+      // `change`, not `input`: one commit per finished edit, like one commit per finished drag.
+      input.onchange = () => drawing.setAttr(path, name, input.value);
+      row.append(htl.html`<label style="opacity:.75">${name}</label>`, input);
+    }
+    el.append(row);
+  };
+  render();
+  const on = () => render();
+  drawing.addEventListener("lens-select", on);
+  drawing.addEventListener("lens-put", on);
+  invalidation.then(() => {
+    drawing.removeEventListener("lens-select", on);
+    drawing.removeEventListener("lens-put", on);
+  });
   return el;
 };
 
@@ -36314,6 +36355,11 @@ the selection, or rubber-band on empty canvas. Dragging one of several selected 
 — one \`put\` each. **[** and **]** lower and raise, **{** and **}** send to back and front, and
 **Delete** removes the whole selection. **⌘Z / ⇧⌘Z** undo and redo, restoring the previous cell source
 byte for byte; an undo declines if something else has written to the cell since.
+
+Dragging **snaps** to a sibling's edges and centres, with a guide drawn where the alignment is; hold
+**alt** to ignore it. **Arrow keys** nudge the selection by one unit, **shift** by ten. The inspector
+above types exact values into the selected element's attributes — through the same \`put\` a drag makes,
+so a typed \`transform\` keeps its readable spelling.
 
 An attribute gesture writes once, on release, through this chain:
 
@@ -38089,6 +38135,43 @@ const _sl74t = function _test_domain_boundary(outsideDomain,parseDoc,tokenize,ch
   return `✅ ${inside.length} accepted, ${outside.length} refused at every entry point`;
 };
 
+// Snapping's claim: after applying the returned delta, some edge or centre of the moving box lies
+// exactly on one of the target box's, and it is the nearest such line within tolerance. Checked by
+// re-measuring the moved box, not by re-deriving the arithmetic.
+const _sl127t = function _test_snapRects(forAll,arb,mulberry32,NUM_RUNS,snapRects)
+{
+  const rng = mulberry32(0x5EED001D);
+  const box = (r) => ({ x: arb.int(r, -100, 100), y: arb.int(r, -100, 100),
+                        width: arb.int(r, 1, 60), height: arb.int(r, 1, 60) });
+  const linesOf = (b) => [b.x, b.x + b.width / 2, b.x + b.width];
+  const rowsOf = (b) => [b.y, b.y + b.height / 2, b.y + b.height];
+  const TOL = 6;
+
+  forAll(NUM_RUNS, rng, (r) => [box(r), box(r), box(r)], (m, a, b) => {
+    const s = snapRects(m, [a, b], TOL);
+    if (Math.abs(s.dx) > TOL || Math.abs(s.dy) > TOL) throw new Error("moved further than the tolerance");
+    const moved = { ...m, x: m.x + s.dx, y: m.y + s.dy };
+    const near = (mine, theirs) => mine.some((p) => theirs.some((q) => Math.abs(p - q) < 1e-9));
+    const others = [a, b];
+    if (s.snapped.x && !near(linesOf(moved), others.flatMap(linesOf)))
+      throw new Error("claimed an x snap but nothing lines up");
+    if (s.snapped.y && !near(rowsOf(moved), others.flatMap(rowsOf)))
+      throw new Error("claimed a y snap but nothing lines up");
+    // And it must not miss one: if some line was within tolerance, it must have snapped.
+    const couldX = linesOf(m).some((p) => others.flatMap(linesOf).some((q) => Math.abs(q - p) <= TOL));
+    if (couldX && !s.snapped.x) throw new Error("missed an x alignment inside the tolerance");
+    if (s.guides.length !== (s.snapped.x ? 1 : 0) + (s.snapped.y ? 1 : 0))
+      throw new Error("one guide per snapped axis");
+    return true;
+  }, "snapping");
+
+  const nothing = snapRects({ x: 0, y: 0, width: 10, height: 10 }, [{ x: 500, y: 500, width: 1, height: 1 }], TOL);
+  if (nothing.dx || nothing.dy || nothing.guides.length) throw new Error("snapped to something far away");
+  const already = snapRects({ x: 0, y: 0, width: 10, height: 10 }, [{ x: 0, y: 0, width: 10, height: 10 }], TOL);
+  if (already.dx !== 0 || !already.snapped.x) throw new Error("an already-aligned box must report a snap of 0");
+  return `✅ snaps to the nearest line within tolerance, never misses one, one guide per axis (${NUM_RUNS} runs)`;
+};
+
 // A selection must never contain both a group and something inside it, or a drag translates the
 // inner element twice — once with its group, once on its own. Found by rubber-banding the demo.
 const _sl119u = function _test_topmost_selection(topmostPaths)
@@ -38684,7 +38767,8 @@ const _sl118 = function _svgOverlay(){return(
       [data-svg-lens-overlay] .scale{fill:#fff;stroke:#2F6BFF;stroke-width:2;cursor:nwse-resize}
       [data-svg-lens-overlay] .rotate{fill:#2F6BFF;stroke:#fff;stroke-width:1.5;cursor:grab}
       [data-svg-lens-overlay] .box{fill:none;stroke:#2F6BFF;stroke-dasharray:4 3;stroke-width:1;opacity:.6}
-      [data-svg-lens-overlay] .link{stroke:#8A63D2;stroke-dasharray:3 3;stroke-width:1;fill:none;opacity:.7}`;
+      [data-svg-lens-overlay] .link{stroke:#8A63D2;stroke-dasharray:3 3;stroke-width:1;fill:none;opacity:.7}
+      [data-svg-lens-overlay] .guide{stroke:#E4572E;stroke-width:1;opacity:.9}`;
   el.appendChild(style);
   node.appendChild(el);
   return {
@@ -38726,6 +38810,42 @@ const _sl119a = function _boxInRoot(){return(
 }
 )};
 
+// Alignment snapping, as pure rectangle arithmetic: given the box being dragged and the boxes it
+// could align to, return the nudge that lands it on the nearest edge or centre within `tol`, and the
+// guides to draw for it. Coordinate-system agnostic — the caller passes boxes in one space and gets
+// a delta in that space. Each axis snaps independently, and ties go to the smaller correction.
+const _sl127 = function _snapRects(){return(
+(moving, others, tol = 6) => {
+  const lines = (b) => ({ x: [b.x, b.x + b.width / 2, b.x + b.width],
+                          y: [b.y, b.y + b.height / 2, b.y + b.height] });
+  const mine = lines(moving);
+  const best = { x: null, y: null };
+  for (const o of others) {
+    const theirs = lines(o);
+    for (const axis of ["x", "y"]) {
+      for (const a of mine[axis]) for (const b of theirs[axis]) {
+        const d = b - a;
+        if (Math.abs(d) > tol) continue;
+        if (!best[axis] || Math.abs(d) < Math.abs(best[axis].d)) best[axis] = { d, at: b, other: o };
+      }
+    }
+  }
+  const guides = [];
+  const span = (axis, at, o) => {
+    // The guide runs across both boxes on the other axis, so it reads as "these two line up".
+    const lo = axis === "x" ? Math.min(moving.y, o.y) : Math.min(moving.x, o.x);
+    const hi = axis === "x" ? Math.max(moving.y + moving.height, o.y + o.height)
+                            : Math.max(moving.x + moving.width, o.x + o.width);
+    return axis === "x" ? { x1: at, y1: lo, x2: at, y2: hi } : { x1: lo, y1: at, x2: hi, y2: at };
+  };
+  const dx = best.x ? best.x.d : 0, dy = best.y ? best.y.d : 0;
+  if (best.x) guides.push(span("x", best.x.at, best.x.other));
+  if (best.y) guides.push(span("y", best.y.at, best.y.other));
+  // `snapped` distinguishes "already aligned" (d === 0 with a match) from "nothing to align to".
+  return { dx, dy, guides, snapped: { x: !!best.x, y: !!best.y } };
+}
+)};
+
 // Drop any address that lies inside another one in the set. Selecting a group *and* its children
 // would move the children twice — once with the group, once on their own.
 const _sl119c = function _topmostPaths(){return(
@@ -38755,7 +38875,7 @@ const _sl119b = function _zTarget(){return(
 // insert or delete before it, a path only by an edit to its own parent chain. `index` stays available
 // because the handle lenses address elements the way tokenize() does.
 const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nodeAt,boxInRoot,topmostPaths){return(
-(overlay, target) => {
+(overlay, target, onChange = () => {}) => {
   // A set, ordered by when each element was added. The first is the primary: handles, and everything
   // that only makes sense for one element, follow it. Single selection is the one-element case, so
   // the tools that predate multi-select need no changes.
@@ -38785,7 +38905,7 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
     catch (e) { return []; }                            // outside the lens domain: no handles
   };
   const scaleOf = (el) => { const m = el.getScreenCTM(); return m ? Math.hypot(m.a, m.b) : 1; };
-  const draw = () => {
+  const paint = () => {
     overlay.clear();
     paths = paths.filter((p) => indexOfPath(p) !== null);               // drop what no longer resolves
     if (paths.length > 1) {                                            // a set: boxes only, no handles
@@ -38815,6 +38935,8 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
       overlay.add("circle", { class: "hit", r: r * 2.6, cx: h.x, cy: h.y }).dataset.key = h.key;
     }
   };
+  // One place announces that the selection may have changed: whatever redrew it.
+  const draw = () => { paint(); onChange(); };
   return {
     get path() { return paths.length ? paths[0] : null; },             // the primary
     get paths() { return paths.slice(); },
@@ -38993,7 +39115,7 @@ const _sl121a = function _hitTest(){return(
 // several selected shapes moves them all — one commit each, since each writes its own attribute.
 // A tap with no movement selects instead: shift adds to the set, and tapping the shape that is
 // already primary cycles to the next shape underneath, which is how an occluded shape is reached.
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex,grabPointer,hitTest){return(
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex,grabPointer,hitTest,snapRects){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
@@ -39020,10 +39142,17 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
                      Slin: invert(ctmMat(ps)), T0: translateLens.get(text) });
     }
     if (!targets.length) return false;
+    // Snapping is measured in screen space, where every box is axis-aligned whatever transforms
+    // its element carries, and the drag delta already lives. One dragged element only: aligning a
+    // set to a sibling means choosing which member aligns, which is a UX question, not this one.
+    const snapping = targets.length === 1 && ctx.options.snap !== false;
     ctx.state.drag = {
       idx, hits, tag: el.localName, targets,
       x0: e.clientX, y0: e.clientY, started: false,
-      thresh: e.pointerType === "mouse" ? 3 : 10
+      thresh: e.pointerType === "mouse" ? 3 : 10,
+      box: snapping ? el.getBoundingClientRect() : null,
+      others: snapping ? list.slice(1).filter((n) => n !== el && !n.contains(el) && !el.contains(n))
+                              .map((n) => n.getBoundingClientRect()) : null
     };
     grabPointer(ctx.node, e);
     return true;
@@ -39031,21 +39160,34 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
   onPointerMove(ctx, e) {
     const d = ctx.state.drag;
     if (!d) return;
-    const dx = e.clientX - d.x0, dy = e.clientY - d.y0;
+    let dx = e.clientX - d.x0, dy = e.clientY - d.y0;
     if (!d.started && Math.hypot(dx, dy) < d.thresh) return;
     d.started = true;
+    let guides = [], aligned = { x: false, y: false };
+    if (d.box && !e.altKey) {                            // alt is the usual "ignore snapping" modifier
+      const moved = { x: d.box.x + dx, y: d.box.y + dy, width: d.box.width, height: d.box.height };
+      const snap = snapRects(moved, d.others, ctx.options.snapTolerance);
+      dx += snap.dx; dy += snap.dy;
+      guides = snap.guides;
+      aligned = snap.snapped;                            // an alignment beats the grid: it is exact
+    }
     for (const g of d.targets) {
       const S = g.Slin;
-      g.T = [ctx.snap(g.T0[0] + S[0] * dx + S[2] * dy), ctx.snap(g.T0[1] + S[1] * dx + S[3] * dy)];
+      // Per axis: an aligned axis keeps its exact value (rounded only to kill float noise, or the
+      // source fills up with 10.476190476190474), an unaligned one still lands on the grid.
+      const q = (v, on) => (on ? Math.round(v * 1e6) / 1e6 : ctx.snap(v));
+      g.T = [q(g.T0[0] + S[0] * dx + S[2] * dy, aligned.x), q(g.T0[1] + S[1] * dx + S[3] * dy, aligned.y)];
       g.el.setAttribute("transform", translateLens.put(g.T, g.text));
     }
-    ctx.focus.refresh();
+    ctx.focus.refresh();                                 // clears the overlay, so guides come after
+    ctx.guides(guides);
   },
   async onPointerUp(ctx, e) {
     const d = ctx.state.drag;
     ctx.state.drag = null;
     if (!d) return;
     if (d.started) {
+      ctx.guides([]);
       for (const g of d.targets) await ctx.writer.commit(g.idx, "transform", g.T, "", translateLens);
       return;
     }
@@ -39366,7 +39508,7 @@ Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarque
 const _sl123v = (G, _) => G.input(_);
 
 // ---- svgLens: wiring only ------------------------------------------------------------------------
-const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget)
+const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,translateLens,nodeAt)
 {
   // Set while re-rendering: the fresh node is a throwaway used to patch the live one, so svgLens must
   // not attach a second overlay and a second set of listeners to it.
@@ -39386,7 +39528,8 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
     const overlay = svgOverlay(node);
     const target = svgTarget(node, { marker: svgLens, isOwn: overlay.isOwn });
     const writer = svgWriter(node, target, { isOwn: overlay.isOwn, guard });
-    const focus = svgFocus(overlay, target);
+    const focus = svgFocus(overlay, target,
+      () => node.dispatchEvent(new CustomEvent("lens-select", { detail: { paths: focus.paths, mode: focus.mode } })));
     node.style.touchAction = "none";
 
     // The active tool. A gesture means different things in different modes, so the tools that create
@@ -39408,8 +39551,24 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
       try { return childrenLens(parent).get(d).length; } catch (e) { return 0; }
     };
 
+    // Alignment guides, handed in screen coordinates and drawn in the root's user space — the tools
+    // measure where the pointer is, the overlay draws where the drawing is.
+    const guides = (lines) => {
+      for (const n of [...overlay.el.querySelectorAll("line.guide")]) n.remove();
+      if (!lines || !lines.length) return;
+      const m = node.getScreenCTM();
+      if (!m) return;
+      const inv = m.inverse();
+      const at = (x, y) => [inv.a * x + inv.c * y + inv.e, inv.b * x + inv.d * y + inv.f];
+      overlay.alignTo(null);
+      for (const g of lines) {
+        const [x1, y1] = at(g.x1, g.y1), [x2, y2] = at(g.x2, g.y2);
+        overlay.add("line", { class: "guide", x1, y1, x2, y2 });
+      }
+    };
+
     const ctx = {
-      node, target, writer, focus, snap, overlay, setTool, state: {},
+      node, target, writer, focus, snap, overlay, setTool, guides, state: {},
       tool: () => tool,
       childCount: kidCount,
       addShape: (markup, at, parent) => node.addShape(markup, at, parent),
@@ -39533,6 +39692,38 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
     node.selection = () => focus.path;
     node.selectionPaths = () => focus.paths;
     node.select = (paths, mode) => focus.setAll(paths, mode);
+
+    // Keyboard nudge and typed values go through the very same lens a drag does — no second write
+    // path, so the laws and the residue rules cover them without restating anything.
+    node.nudge = async (dx, dy) => {
+      const out = [];
+      for (const i of focus.indices) {
+        const t = target.doc();
+        if (t === null) break;
+        const text = attrVal(t, i, "transform") || "";
+        const T = translateLens.get(text);
+        const r = (v) => Math.round(v * 1e6) / 1e6;      // nudging must not accumulate float dust
+        out.push(await writer.commit(i, "transform", [r(T[0] + dx), r(T[1] + dy)], "", translateLens));
+      }
+      focus.refresh();
+      return out;
+    };
+    // What is at this address: tag and attributes, read from the source rather than the DOM, so an
+    // inspector shows the bytes the author has (readable `rotate(45)`, not a flattened matrix).
+    node.describe = (path) => {
+      const t = target.doc();
+      if (t === null) return null;
+      try {
+        const n = nodeAt(t, path);
+        return { tag: n.tag, index: n.index,
+                 attrs: Object.keys(n.attrs).map((k) => [k, n.attrs[k].value]) };
+      } catch (e) { return null; }
+    };
+    node.setAttr = (path, name, value) => {
+      const t = target.doc();
+      if (t === null) return null;
+      return writer.commit(nodeAt(t, path).index, name, value, null);
+    };
     node.setTool = setTool;
     Object.defineProperty(node, "tool", { configurable: true, get: () => tool });
     return node;
@@ -39553,6 +39744,7 @@ export default function define(runtime, observer) {
   // Display order (top→bottom): demo → log → tests dashboard → laws → lenses → harness → tests → manipulation.
   $def("sl01", "intro", ["md"], _sl01);
   $def("sl02b", "toolbar", ["htl","invalidation","viewof drawing"], _sl02b);
+  $def("sl02c", "inspector", ["htl","invalidation","viewof drawing"], _sl02c);
   $def("sl02", "viewof drawing", ["svgLens","svg"], _sl02);
   $def("sl03", "drawing", ["Generators","viewof drawing"], _sl03);
   $def("sl04", "howToDrive", ["md"], _sl04);
@@ -39675,6 +39867,7 @@ export default function define(runtime, observer) {
   $def("sl108f", "test_transform_gizmo", ["forAll","arb","mulberry32","NUM_RUNS","rotateAbout","scaleAbout","printOp","parseTransform","applyPoint"], _sl108f);
   $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
   $def("sl74t", "test_domain_boundary", ["outsideDomain","parseDoc","tokenize","childrenLens"], _sl74t);
+  $def("sl127t", "test_snapRects", ["forAll","arb","mulberry32","NUM_RUNS","snapRects"], _sl127t);
   $def("sl119u", "test_topmost_selection", ["topmostPaths"], _sl119u);
   $def("sl119t", "test_z_order", ["forAll","arb","mulberry32","NUM_RUNS","zTarget","reorderElement","childrenLens"], _sl119t);
   $def("sl126t", "test_pen_path", ["penPath","parsePath","printPath"], _sl126t);
@@ -39698,7 +39891,8 @@ export default function define(runtime, observer) {
   $def("sl124c", "grabPointer", [], _sl124c);
   $def("sl120", "toolVertex", ["handleEdit","grabPointer"], _sl120);
   $def("sl121a", "hitTest", [], _sl121a);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer","hitTest"], _sl121);
+  $def("sl127", "snapRects", [], _sl127);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer","hitTest","snapRects"], _sl121);
   $def("sl121b", "toolMarquee", ["boxInRoot","pathOfIndex","grabPointer","dragBox"], _sl121b);
   $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint"], _sl122);
   $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","printOp","attrVal","grabPointer"], _sl124);
@@ -39710,7 +39904,7 @@ export default function define(runtime, observer) {
   $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer"], _sl126);
   $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
-  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget"], _sl114);
+  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","translateLens","nodeAt"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
