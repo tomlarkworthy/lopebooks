@@ -36327,6 +36327,12 @@ const _sl02c = function _inspector(htl,invalidation,$0)
       input.onchange = () => drawing.setAttr(path, name, input.value);
       row.append(htl.html`<label style="opacity:.75">${name}</label>`, input);
     }
+    for (const ref of drawing.refs(path)) {
+      const b = htl.html`<button style="font:inherit;padding:2px 8px;border-radius:6px;border:1px solid #b9c4b4;cursor:pointer">→ ${ref.attribute} #${ref.id}</button>`;
+      if (ref.path) b.onclick = () => drawing.select([ref.path], "transform");
+      else { b.disabled = true; b.title = "nothing in this document has that id"; }
+      row.append(b);
+    }
     el.append(row);
   };
   render();
@@ -36359,7 +36365,12 @@ byte for byte; an undo declines if something else has written to the cell since.
 Dragging **snaps** to a sibling's edges and centres, with a guide drawn where the alignment is; hold
 **alt** to ignore it. **Arrow keys** nudge the selection by one unit, **shift** by ten. The inspector
 above types exact values into the selected element's attributes — through the same \`put\` a drag makes,
-so a typed \`transform\` keeps its readable spelling.
+so a typed \`transform\` keeps its readable spelling. A reference — \`fill="url(#g)"\`, \`href="#tile"\` —
+shows as a button that selects what it points at.
+
+Units are residue too: \`lengthLens\` views the number in \`50%\` or \`12px\` and puts it back wearing the
+unit it found, and \`setProperty\` writes a paint property into the \`style=""\` declaration when one is
+already there, rather than adding an attribute the declaration would silently override.
 
 An attribute gesture writes once, on release, through this chain:
 
@@ -37158,6 +37169,100 @@ const _sl77 = function _attrTextLens(lens,attrVal,spliceAttr){return(
 )};
 
 // Lens<cell definition source, attribute string>: the whole way out.
+// ---- references: url(#id), href="#id" ------------------------------------------------------------
+// A gradient, marker, clipPath or <use> points somewhere else in the document. Editing the *referrer*
+// is usually not what you meant — you want the thing it names — so give selection a way to follow it.
+// Only same-document references: an external one is not this cell's source, so it is out of scope.
+const _sl74f = function _pathOfId(parseDoc){return(
+(src, id) => {
+  let found = null;
+  const walk = (n) => {
+    if (found) return;
+    if (n.attrs && n.attrs.id && n.attrs.id.value === id) { found = n.path; return; }
+    n.children.forEach(walk);
+  };
+  walk(parseDoc(src));
+  return found;
+}
+)};
+
+const _sl74g = function _refsOf(parseDoc,nodeAt,pathOfId){return(
+(src, path) => {
+  const n = nodeAt(src, path);
+  const out = [];
+  for (const name of Object.keys(n.attrs)) {
+    const v = n.attrs[name].value;
+    const m = /^\s*url\(\s*#([^)\s]+)\s*\)\s*$/.exec(v) || /^\s*#([^\s]+)\s*$/.exec(v);
+    if (!m) continue;
+    out.push({ attribute: name, id: m[1], path: pathOfId(src, m[1]) });
+  }
+  return out;
+}
+)};
+
+// ---- lengths: numbers that carry a unit ----------------------------------------------------------
+// `x="12px"` and `width="50%"` are ordinary SVG. A gesture wants to move a *number*, so the unit is
+// residue: `lengthLens` views the number and puts it back wearing whatever unit was already there.
+// That keeps a percentage a percentage instead of quietly turning it into user units.
+const _sl31b = function _parseLength(){return(
+(s) => {
+  const m = /^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(px|pt|pc|cm|mm|in|em|ex|ch|rem|vw|vh|%)?\s*$/.exec(s);
+  if (!m) throw new Error(`not a length: ${JSON.stringify(s)}`);
+  return { n: Number(m[1]), unit: m[2] || "" };
+}
+)};
+
+const _sl31c = function _printLength(){return(
+({ n, unit }) => `${n}${unit || ""}`
+)};
+
+const _sl31d = function _lengthLens(lens,parseLength,printLength){return(
+lens(
+  (s) => parseLength(s).n,
+  (n, s) => {
+    const { n: was, unit } = parseLength(s);
+    return n === was ? s : printLength({ n, unit });     // skip rule: keep the author's spelling
+  }
+)
+)};
+
+// ---- style="": the other place an SVG property can live ------------------------------------------
+// The view is the declaration list, in order, as [property, value] pairs — source substrings would
+// buy nothing here since values have no interesting inner structure to preserve. Unknown text
+// (comments, empty declarations) is dropped by `get`, so PutPut holds only up to get-equivalence,
+// exactly as for `childrenLens`; the skip rule keeps the original text whenever nothing changed.
+const _sl31e = function _parseStyle(){return(
+(s) => s.split(";").map((d) => d.trim()).filter(Boolean).map((d) => {
+  const at = d.indexOf(":");
+  if (at === -1) throw new Error(`not a declaration: ${JSON.stringify(d)}`);
+  return [d.slice(0, at).trim(), d.slice(at + 1).trim()];
+})
+)};
+
+const _sl31f = function _printStyle(){return(
+(decls) => decls.map(([k, v]) => `${k}: ${v}`).join("; ")
+)};
+
+const _sl31g = function _styleLens(lens,parseStyle,printStyle){return(
+lens(parseStyle, (decls, s) => {
+  const was = parseStyle(s);
+  const same = was.length === decls.length && was.every(([k, v], i) => k === decls[i][0] && v === decls[i][1]);
+  return same ? s : printStyle(decls);
+})
+)};
+
+// Set one property where it already lives. A shape styled through `style="fill: red"` must not end
+// up with a `fill` attribute as well — the attribute would lose to the declaration and the drawing
+// would not change, which is the worst kind of edit: it looks like it worked.
+const _sl31h = function _setProperty(attrVal,styleLens){return(
+(doc, idx, prop, value) => {
+  const style = attrVal(doc, idx, "style");
+  if (style !== null && styleLens.get(style).some(([k]) => k === prop))
+    return { name: "style", value: styleLens.put(styleLens.get(style).map(([k, v]) => (k === prop ? [k, value] : [k, v])), style) };
+  return { name: prop, value };                          // no declaration to update: the attribute it is
+}
+)};
+
 const _sl78 = function _cellAttrLens(compose,literalLens,attrTextLens){return(
 (alias, idx, name, dflt = null) => compose(literalLens(alias), attrTextLens(idx, name, dflt))
 )};
@@ -38133,6 +38238,88 @@ const _sl74t = function _test_domain_boundary(outsideDomain,parseDoc,tokenize,ch
     }
   }
   return `✅ ${inside.length} accepted, ${outside.length} refused at every entry point`;
+};
+
+// Units are residue: moving a number must not change what the number *means*. `50%` edited to 60
+// stays a percentage; `12px` stays px. Plus the laws on both new lenses, and the precedence rule that
+// setting a property already in `style=""` edits the declaration instead of adding a losing attribute.
+const _sl31t = function _test_units_and_style(forAll,arb,mulberry32,NUM_RUNS,lengthLens,parseLength,printLength,styleLens,parseStyle,setProperty)
+{
+  const UNITS = ["", "px", "pt", "cm", "mm", "in", "em", "ex", "ch", "rem", "vw", "vh", "%"];
+  const rng = mulberry32(0x5EED001E);
+  const gen = (r) => [arb.int(r, -999, 999) / (arb.pick(r, [1, 2, 10, 100])),
+                      arb.pick(r, UNITS), arb.pick(r, ["", " ", "  "]), arb.int(r, -50, 50)];
+
+  forAll(NUM_RUNS, rng, gen, (n, unit, pad, next) => {
+    const s = `${pad}${n}${unit}${pad}`;
+    if (lengthLens.get(s) !== n) throw new Error(`get ${JSON.stringify(s)} ≠ ${n}`);
+    if (lengthLens.put(n, s) !== s) throw new Error("GetPut: an unchanged number must keep its spelling");
+    const out = lengthLens.put(next, s);
+    if (lengthLens.get(out) !== next) throw new Error("PutGet");
+    if (parseLength(out).unit !== unit) throw new Error(`unit lost: ${JSON.stringify(out)}`);
+    if (lengthLens.put(next, lengthLens.put(n + 1, s)) !== lengthLens.put(next, s)) throw new Error("PutPut");
+    if (printLength(parseLength(out)) !== out.trim()) throw new Error("print/parse not exact");
+    return true;
+  }, "lengths keep their unit");
+
+  for (const bad of ["", "abc", "12 34", "12pxx", "%", "12%%"]) {
+    let threw = false;
+    try { parseLength(bad); } catch (e) { threw = true; }
+    if (!threw) throw new Error(`parseLength accepted ${JSON.stringify(bad)}`);
+  }
+
+  const rng2 = mulberry32(0x5EED001F);
+  const decls = (r) => Array.from({ length: arb.int(r, 0, 4) }, (_, i) =>
+    [arb.pick(r, ["fill", "stroke", "opacity", "stroke-width"]) + (i ? `-${i}` : ""), String(arb.int(r, 0, 99))]);
+  forAll(NUM_RUNS, rng2, (r) => [decls(r), decls(r)], (a, b) => {
+    const s = a.map(([k, v]) => `${k}: ${v}`).join("; ");
+    if (styleLens.put(styleLens.get(s), s) !== s) throw new Error("GetPut");
+    const got = styleLens.get(styleLens.put(b, s));
+    if (JSON.stringify(got) !== JSON.stringify(b)) throw new Error("PutGet");
+    if (styleLens.put(b, styleLens.put(a, s)) !== styleLens.put(b, s)) throw new Error("PutPut");
+    return true;
+  }, "style declarations");
+
+  // Precedence: a declaration wins over an attribute, so the setter must edit the declaration.
+  const styled = '<svg><rect style="fill: red; opacity: .5"/></svg>';
+  const w1 = setProperty(styled, 1, "fill", "blue");
+  if (w1.name !== "style") throw new Error("wrote a fill attribute that the style would override");
+  if (parseStyle(w1.value).map(([k, v]) => k + "=" + v).join(",") !== "fill=blue,opacity=.5")
+    throw new Error(`declaration not edited in place: ${w1.value}`);
+  const plain = '<svg><rect fill="red"/></svg>';
+  if (setProperty(plain, 1, "fill", "blue").name !== "fill") throw new Error("should write the attribute");
+  const neither = '<svg><rect style="opacity: 1"/></svg>';
+  if (setProperty(neither, 1, "fill", "blue").name !== "fill")
+    throw new Error("an unrelated declaration must not capture the write");
+  return `✅ lengths keep px/%/em, style laws hold, a property is set where it already lives (${NUM_RUNS} runs)`;
+};
+
+// Following a reference is selection, not editing: the point is to reach the gradient or the symbol
+// that actually paints the shape you clicked.
+const _sl74u = function _test_refs(refsOf,pathOfId)
+{
+  const doc = [
+    '<svg>',
+    '  <defs>',
+    '    <linearGradient id="g1"><stop offset="0"/></linearGradient>',
+    '    <rect id="tile" width="4" height="4"/>',
+    '  </defs>',
+    '  <rect fill="url(#g1)" clip-path="url( #missing )"/>',
+    '  <use href="#tile"/>',
+    '</svg>'
+  ].join("\n");
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!eq(pathOfId(doc, "g1"), [0, 0, 0])) throw new Error(`gradient at ${JSON.stringify(pathOfId(doc, "g1"))}`);
+  if (pathOfId(doc, "nope") !== null) throw new Error("an absent id must resolve to null");
+  const refs = refsOf(doc, [0, 1]);
+  const fill = refs.find((r) => r.attribute === "fill");
+  if (!fill || fill.id !== "g1" || !eq(fill.path, [0, 0, 0])) throw new Error("url(#id) not followed");
+  const missing = refs.find((r) => r.attribute === "clip-path");
+  if (!missing || missing.path !== null) throw new Error("a dangling reference must report a null target");
+  const use = refsOf(doc, [0, 2]).find((r) => r.attribute === "href");
+  if (!use || !eq(use.path, [0, 0, 1])) throw new Error("href=\"#id\" not followed");
+  if (refsOf(doc, [0, 0, 1]).length !== 0) throw new Error("an id attribute is not a reference");
+  return "✅ url(#id) and href=#id resolve to a path; dangling references say so";
 };
 
 // Snapping's claim: after applying the returned delta, some edge or centre of the moving box lies
@@ -39508,7 +39695,7 @@ Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarque
 const _sl123v = (G, _) => G.input(_);
 
 // ---- svgLens: wiring only ------------------------------------------------------------------------
-const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,translateLens,nodeAt)
+const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,translateLens,nodeAt,setProperty,refsOf)
 {
   // Set while re-rendering: the fresh node is a throwaway used to patch the live one, so svgLens must
   // not attach a second overlay and a second set of listeners to it.
@@ -39724,6 +39911,20 @@ const _sl114 = function _svgLens(svgTarget,svgWriter,svgOverlay,svgFocus,svgTool
       if (t === null) return null;
       return writer.commit(nodeAt(t, path).index, name, value, null);
     };
+    // Set a paint property where it already lives: a `style="fill: …"` declaration wins over a `fill`
+    // attribute, so writing the attribute would look like an edit and change nothing.
+    node.setProperty = (path, prop, value) => {
+      const t = target.doc();
+      if (t === null) return null;
+      const idx = nodeAt(t, path).index;
+      const w = setProperty(t, idx, prop, value);
+      return writer.commit(idx, w.name, w.value, null);
+    };
+    node.refs = (path) => {
+      const t = target.doc();
+      if (t === null) return [];
+      try { return refsOf(t, path); } catch (e) { return []; }
+    };
     node.setTool = setTool;
     Object.defineProperty(node, "tool", { configurable: true, get: () => tool });
     return node;
@@ -39816,6 +40017,15 @@ export default function define(runtime, observer) {
   $def("sl75", "attrVal", ["tokenize"], _sl75);
   $def("sl76", "spliceAttr", ["tokenize"], _sl76);
   $def("sl77", "attrTextLens", ["lens","attrVal","spliceAttr"], _sl77);
+  $def("sl74f", "pathOfId", ["parseDoc"], _sl74f);
+  $def("sl74g", "refsOf", ["parseDoc","nodeAt","pathOfId"], _sl74g);
+  $def("sl31b", "parseLength", [], _sl31b);
+  $def("sl31c", "printLength", [], _sl31c);
+  $def("sl31d", "lengthLens", ["lens","parseLength","printLength"], _sl31d);
+  $def("sl31e", "parseStyle", [], _sl31e);
+  $def("sl31f", "printStyle", [], _sl31f);
+  $def("sl31g", "styleLens", ["lens","parseStyle","printStyle"], _sl31g);
+  $def("sl31h", "setProperty", ["attrVal","styleLens"], _sl31h);
   $def("sl78", "cellAttrLens", ["compose","literalLens","attrTextLens"], _sl78);
   $def("sl79", "childrenLens", ["lens","nodeAt","parseDoc"], _sl79);
   $def("sl79a", "insertElement", ["childrenLens"], _sl79a);
@@ -39867,6 +40077,8 @@ export default function define(runtime, observer) {
   $def("sl108f", "test_transform_gizmo", ["forAll","arb","mulberry32","NUM_RUNS","rotateAbout","scaleAbout","printOp","parseTransform","applyPoint"], _sl108f);
   $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
   $def("sl74t", "test_domain_boundary", ["outsideDomain","parseDoc","tokenize","childrenLens"], _sl74t);
+  $def("sl31t", "test_units_and_style", ["forAll","arb","mulberry32","NUM_RUNS","lengthLens","parseLength","printLength","styleLens","parseStyle","setProperty"], _sl31t);
+  $def("sl74u", "test_refs", ["refsOf","pathOfId"], _sl74u);
   $def("sl127t", "test_snapRects", ["forAll","arb","mulberry32","NUM_RUNS","snapRects"], _sl127t);
   $def("sl119u", "test_topmost_selection", ["topmostPaths"], _sl119u);
   $def("sl119t", "test_z_order", ["forAll","arb","mulberry32","NUM_RUNS","zTarget","reorderElement","childrenLens"], _sl119t);
@@ -39904,7 +40116,7 @@ export default function define(runtime, observer) {
   $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer"], _sl126);
   $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
-  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","translateLens","nodeAt"], _sl114);
+  $def("sl114", "svgLens", ["svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","translateLens","nodeAt","setProperty","refsOf"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
