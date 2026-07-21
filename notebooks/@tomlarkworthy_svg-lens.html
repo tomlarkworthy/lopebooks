@@ -36245,9 +36245,11 @@ const _sl03 = (G, _) => G.input(_);
 
 const _sl04 = function _howToDrive(md){return(
 md`**Drag a shape** to move it — the \`transform\` lens. **Tap a polygon or path**, then drag a handle —
-the \`points\` and path \`d\` lenses. Handles are live DOM only; they are never written to the source.
+the \`points\` and path \`d\` lenses. **Double-click** an edge of the tapped polygon to add a vertex, a
+vertex to remove it, or empty canvas to drop in a new shape. Handles are live DOM only; they are
+never written to the source.
 
-A gesture writes once, on release, through this chain:
+An attribute gesture writes once, on release, through this chain:
 
 \`\`\`
 cell source ──literalLens──▶ svg\`…\` text ──attrTextLens──▶ attribute string ──transformLens──▶ [a b c d e f]
@@ -36255,7 +36257,16 @@ cell source ──literalLens──▶ svg\`…\` text ──attrTextLens──�
 
 Every level is a lens, so the composite is a lens, and the laws below hold of the whole chain. Drag a
 shape and return it to where it started: the source snaps back to \`translate(228 128) rotate(-4)\`,
-because GetPut says an unchanged view must leave the source untouched.`
+because GetPut says an unchanged view must leave the source untouched.
+
+A structural gesture takes the same route, but stops one level earlier — at \`childrenLens\`, whose view
+is the list of child element source strings:
+
+\`\`\`
+cell source ──literalLens──▶ svg\`…\` text ──childrenLens──▶ ["<circle …/>", "<polygon …/>", …]
+\`\`\`
+
+Insert, delete and reorder are then just \`splice\` on that list.`
 )};
 
 // Every gesture, with the laws re-checked on the source it produced.
@@ -36767,13 +36778,28 @@ const _sl73 = function _literalLens(lens,literalSpan,literalSafe){return(
 )};
 
 // Elements with attribute byte spans, in document order (comments/closers/prolog skipped).
-const _sl74 = function _tokenize(){return(
+// Token stream over SVG source text: open/close tags, comments, text. Every token carries its byte
+// span, so everything above this line can splice rather than reprint. Not an XML parser — no CDATA,
+// no entity handling, and attribute values may not contain their own quote character.
+const _sl74a = function _scan(){return(
 (src) => {
-  const els = [];
-  let i = 0;
+  const out = [];
+  let i = 0, at = 0;
+  const text = (to) => { if (to > at) out.push({ kind: "text", start: at, end: to }); };
   while ((i = src.indexOf("<", i)) !== -1) {
-    if (src.startsWith("<!--", i)) { const e = src.indexOf("-->", i); i = e === -1 ? src.length : e + 3; continue; }
-    if (src[i + 1] === "/" || src[i + 1] === "?" || src[i + 1] === "!") { const e = src.indexOf(">", i); i = e === -1 ? src.length : e + 1; continue; }
+    if (src.startsWith("<!--", i)) {
+      const e = src.indexOf("-->", i), end = e === -1 ? src.length : e + 3;
+      text(i); out.push({ kind: "comment", start: i, end }); at = i = end; continue;
+    }
+    if (src[i + 1] === "/") {
+      const e = src.indexOf(">", i), end = e === -1 ? src.length : e + 1;
+      const m = /^<\/\s*([a-zA-Z][\w:-]*)/.exec(src.slice(i));
+      text(i); out.push({ kind: "close", tag: m ? m[1] : "", start: i, end }); at = i = end; continue;
+    }
+    if (src[i + 1] === "?" || src[i + 1] === "!") {
+      const e = src.indexOf(">", i), end = e === -1 ? src.length : e + 1;
+      text(i); out.push({ kind: "other", start: i, end }); at = i = end; continue;
+    }
     const m = /^<([a-zA-Z][\w:-]*)/.exec(src.slice(i));
     if (!m) { i++; continue; }
     let j = i + m[0].length;
@@ -36791,10 +36817,70 @@ const _sl74 = function _tokenize(){return(
         j += bm ? bm[0].length : 1;
       }
     }
-    els.push({ tag: m[1], attrs, insertPos: j });
-    i = j + (src[j] === "/" ? 2 : 1);
+    const selfClosing = src[j] === "/";
+    const end = j + (selfClosing ? 2 : 1);
+    text(i);
+    out.push({ kind: "open", tag: m[1], attrs, insertPos: j, start: i, end, selfClosing });
+    at = i = end;
   }
-  return els;
+  text(src.length);
+  return out;
+}
+)};
+
+// Elements in document order — the flat addressing `attrTextLens` uses.
+const _sl74 = function _tokenize(scan){return(
+(src) => scan(src).filter((t) => t.kind === "open")
+)};
+
+// The same tokens nested into a tree with spans. `innerStart`/`innerEnd` bound the children region,
+// which is what a structural edit splices; `index` is the flat document-order index, so a path and
+// an index address the same element.
+const _sl74b = function _parseDoc(scan){return(
+(src) => {
+  const root = { tag: null, attrs: {}, start: 0, end: src.length, innerStart: 0, innerEnd: src.length, index: -1, path: [], children: [] };
+  const stack = [root];
+  let index = 0;
+  for (const t of scan(src)) {
+    if (t.kind === "open") {
+      const top = stack[stack.length - 1];
+      const n = { tag: t.tag, attrs: t.attrs, start: t.start, openEnd: t.end, innerStart: t.end,
+                  innerEnd: null, end: null, selfClosing: t.selfClosing, index: index++,
+                  path: [...top.path, top.children.length], children: [] };
+      top.children.push(n);
+      if (t.selfClosing) { n.innerEnd = t.end; n.end = t.end; } else stack.push(n);
+    } else if (t.kind === "close") {
+      for (let k = stack.length - 1; k > 0; k--) {
+        if (stack[k].tag === t.tag) { stack[k].innerEnd = t.start; stack[k].end = t.end; stack.length = k; break; }
+      }
+    }
+  }
+  while (stack.length > 1) { const n = stack.pop(); n.innerEnd = src.length; n.end = src.length; }
+  return root;
+}
+)};
+
+// Address an element by path (`[]` is the synthetic document root, `[0]` the outermost <svg>).
+const _sl74c = function _nodeAt(parseDoc){return(
+(src, path) => {
+  let n = parseDoc(src);
+  for (const k of path) { n = n.children[k]; if (!n) throw new Error(`no element at path ${path.join("/")}`); }
+  return n;
+}
+)};
+
+// Flat index -> path. Positional addressing is not stable across structural edits (see
+// knowledge/svg-editor-architecture.md §2.2); converting early keeps a gesture on one element.
+const _sl74d = function _pathOfIndex(parseDoc){return(
+(src, idx) => {
+  const walk = (n) => {
+    if (n.index === idx) return n.path;
+    for (const c of n.children) { const p = walk(c); if (p) return p; }
+    return null;
+  };
+  const p = walk(parseDoc(src));
+  if (!p) throw new Error(`no element ${idx}`);
+  return p;
 }
 )};
 
@@ -36837,6 +36923,121 @@ const _sl77 = function _attrTextLens(lens,attrVal,spliceAttr){return(
 // Lens<cell definition source, attribute string>: the whole way out.
 const _sl78 = function _cellAttrLens(compose,literalLens,attrTextLens){return(
 (alias, idx, name, dflt = null) => compose(literalLens(alias), attrTextLens(idx, name, dflt))
+)};
+
+// Lens<SVG document text, child element source strings>. The view is exact source slices, so every
+// child keeps its own residue; only the children that actually changed are reprinted. This is the
+// lens structural editing needs — insert, delete, reorder and group are all puts on this list.
+//
+// Domain: each supplied string must be exactly one element (no leading or trailing text), otherwise
+// PutGet could not hold — get always returns a bare element slice.
+//
+// Lawfulness: GetPut and PutGet hold strictly. PutPut holds only **up to get-equivalence** — the two
+// routes agree on the children but may differ in the whitespace and comments between them. That is
+// not fixable while preserving residue: the gap belonging to a child is destroyed when an
+// intermediate put removes that child, so deleting and re-adding cannot restore it. Reprinting every
+// gap canonically would make PutPut strict and throw the residue away instead. See
+// test_childrenLens_laws and knowledge/svg-editor-architecture.md.
+const _sl79 = function _childrenLens(lens,nodeAt,parseDoc){return(
+(path) => lens(
+  (s) => { const n = nodeAt(s, path); return n.children.map((c) => s.slice(c.start, c.end)); },
+  (kids, s) => {
+    const n = nodeAt(s, path);
+    const kn = n.children.length;
+    const cur = n.children.map((c) => s.slice(c.start, c.end));
+    if (kids.length === cur.length && kids.every((k, i) => k === cur[i])) return s;   // skip rule
+    for (const k of kids) {
+      const d = parseDoc(k);
+      if (d.children.length !== 1 || d.children[0].start !== 0 || d.children[0].end !== k.length)
+        throw new Error("a child must be exactly one element");
+    }
+    // The text before each child (indentation, comments) belongs to that child and travels with it.
+    const gaps = n.children.map((c, i) => s.slice(i ? n.children[i - 1].end : n.innerStart, c.start));
+    const tail = kn ? s.slice(n.children[kn - 1].end, n.innerEnd) : s.slice(n.innerStart, n.innerEnd);
+    const fresh = gaps[0] || (/^\s*/.exec(tail)[0] || "\n");     // what a newly inserted child gets
+    let at = 0, body = "";
+    for (const k of kids) {
+      const j = cur.indexOf(k, at);
+      if (j === -1) body += fresh + k;
+      else { body += gaps[j] + k; at = j + 1; }
+    }
+    return s.slice(0, n.innerStart) + body + tail + s.slice(n.innerEnd);
+  }
+)
+)};
+
+// ---- commands: pure (document text, address, …) -> document text --------------------------------
+// Each one is a put, so the laws still cover it. Nothing here knows about the DOM or the pointer.
+
+const _sl79a = function _insertElement(childrenLens){return(
+(src, parentPath, at, markup) => {
+  const l = childrenLens(parentPath);
+  const kids = l.get(src).slice();
+  const i = at === null || at === undefined ? kids.length : Math.max(0, Math.min(kids.length, at));
+  kids.splice(i, 0, markup);
+  return l.put(kids, src);
+}
+)};
+
+const _sl79b = function _deleteElement(childrenLens){return(
+(src, path) => {
+  if (!path.length) throw new Error("cannot delete the document root");
+  const l = childrenLens(path.slice(0, -1));
+  const kids = l.get(src).slice();
+  const i = path[path.length - 1];
+  if (i < 0 || i >= kids.length) throw new Error(`no element at path ${path.join("/")}`);
+  kids.splice(i, 1);
+  return l.put(kids, src);
+}
+)};
+
+const _sl79c = function _reorderElement(childrenLens){return(
+(src, path, to) => {
+  const l = childrenLens(path.slice(0, -1));
+  const kids = l.get(src).slice();
+  const from = path[path.length - 1];
+  if (from < 0 || from >= kids.length) throw new Error(`no element at path ${path.join("/")}`);
+  const [k] = kids.splice(from, 1);
+  kids.splice(Math.max(0, Math.min(kids.length, to)), 0, k);
+  return l.put(kids, src);
+}
+)};
+
+// Adding and removing points needs no new lens: pointsLens already exposes a lawful list view.
+const _sl79d = function _insertPoint(nodeAt,attrTextLens,parsePoints,printPoints){return(
+(src, path, after, p) => {
+  const l = attrTextLens(nodeAt(src, path).index, "points");
+  const pts = parsePoints(l.get(src));
+  pts.splice(Math.max(0, Math.min(pts.length, after + 1)), 0, p);
+  return l.put(printPoints(pts), src);
+}
+)};
+
+const _sl79e = function _deletePoint(nodeAt,attrTextLens,parsePoints,printPoints){return(
+(src, path, i) => {
+  const l = attrTextLens(nodeAt(src, path).index, "points");
+  const pts = parsePoints(l.get(src));
+  if (i < 0 || i >= pts.length) throw new Error(`no point ${i}`);
+  if (pts.length <= 2) throw new Error("a polygon needs at least two points");
+  pts.splice(i, 1);
+  return l.put(printPoints(pts), src);
+}
+)};
+
+// Nearest segment to a point, for "double-click an edge to add a vertex".
+const _sl79f = function _nearestSegment(){return(
+(pts, x, y, closed = true) => {
+  let best = -1, bestD = Infinity;
+  const n = pts.length;
+  for (let i = 0; i < (closed ? n : n - 1); i++) {
+    const [ax, ay] = pts[i], [bx, by] = pts[(i + 1) % n];
+    const dx = bx - ax, dy = by - ay, len = dx * dx + dy * dy;
+    const t = len ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / len)) : 0;
+    const d = Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return { index: best, distance: bestD };
+}
 )};
 
 // ================================================================================================
@@ -37214,6 +37415,120 @@ const _sl105 = function _test_source_residue_preserved(forAll,arb,mulberry32,NUM
   return `✅ puts leave every byte outside the literal untouched (${NUM_RUNS} runs)`;
 };
 
+const _sl106 = function _test_childrenLens_laws(forAll,lensLaws,childrenLens,arb,mulberry32,NUM_RUNS)
+{
+  const rng = mulberry32(0x5EED0010);
+  const POOL = ['<rect x="1" y="2" width="3" height="4"/>', '<circle cx="0" cy="0" r="5"/>',
+                '<g><rect x="0"/></g>', '<polygon points="0,0 1,1 2,0"/>'];
+  const l = childrenLens([0]);                                 // children of the outermost <svg>
+  const genS = (r) => arb.svgDocStr(r);
+  const genA = (r) => Array.from({ length: arb.int(r, 0, 4) }, () => arb.pick(r, POOL));
+  const eqA = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+  forAll(NUM_RUNS, rng, (r) => [genS(r)], lensLaws.getPut(l, (a, b) => a === b), "GetPut");
+  forAll(NUM_RUNS, rng, (r) => [genA(r), genS(r)], lensLaws.putGet(l, eqA), "PutGet");
+  // PutPut only up to get-equivalence: a child's leading gap dies with the child, so delete-then-
+  // re-add cannot restore it. Strict PutPut would mean reprinting every gap and losing the residue.
+  forAll(NUM_RUNS, rng, (r) => [genA(r), genA(r), genS(r)],
+    (a1, a2, s) => eqA(l.get(l.put(a2, l.put(a1, s))), l.get(l.put(a2, s))), "PutPut(get)");
+  return `✅ GetPut, PutGet strict; PutPut up to get-equivalence (${NUM_RUNS} runs each)`;
+};
+
+const _sl107 = function _test_structural_commands(forAll,arb,mulberry32,NUM_RUNS,childrenLens,insertElement,deleteElement,reorderElement)
+{
+  const rng = mulberry32(0x5EED0011);
+  const MARK = '<circle cx="7" cy="7" r="3"/>';
+  const kidsOf = (d) => childrenLens([0]).get(d);
+  forAll(NUM_RUNS, rng, (r) => [arb.svgDocStr(r), arb.int(r, 0, 5)], (doc, at) => {
+    const kids = kidsOf(doc);
+    const i = Math.min(at, kids.length);
+    const after = kidsOf(insertElement(doc, [0], i, MARK));
+    if (after.length !== kids.length + 1) throw new Error("insert did not add exactly one child");
+    if (after[i] !== MARK) throw new Error("inserted at the wrong index");
+    const back = kidsOf(deleteElement(insertElement(doc, [0], i, MARK), [0, i]));
+    if (!(back.length === kids.length && back.every((k, j) => k === kids[j])))
+      throw new Error("delete did not undo insert");
+    if (kids.length > 1) {
+      const moved = kidsOf(reorderElement(doc, [0, 0], kids.length - 1));
+      if (moved[kids.length - 1] !== kids[0]) throw new Error("reorder moved it to the wrong place");
+      if ([...moved].sort().join("|") !== [...kids].sort().join("|"))
+        throw new Error("reorder is not a permutation");
+    }
+    return true;
+  }, "structural commands");
+  return `✅ insert/delete inverse, reorder is a permutation (${NUM_RUNS} runs)`;
+};
+
+const _sl108 = function _test_point_commands(forAll,arb,mulberry32,NUM_RUNS,insertPoint,deletePoint,nodeAt,attrVal,parsePoints)
+{
+  const rng = mulberry32(0x5EED0012);
+  const gen = (r) => {
+    const pts = Array.from({ length: arb.int(r, 3, 6) }, () => [arb.int(r, -99, 99), arb.int(r, -99, 99)]);
+    return [`<svg viewBox="0 0 10 10">\n  <polygon points="${pts.map((p) => p.join(",")).join(" ")}"/>\n</svg>`,
+            arb.int(r, 0, pts.length - 1), [arb.int(r, -9, 9), arb.int(r, -9, 9)]];
+  };
+  forAll(NUM_RUNS, rng, gen, (doc, i, p) => {
+    const idx = nodeAt(doc, [0, 0]).index;
+    const pts = (d) => parsePoints(attrVal(d, idx, "points"));
+    const before = pts(doc);
+    const ins = insertPoint(doc, [0, 0], i, p);
+    const mid = pts(ins);
+    if (mid.length !== before.length + 1) throw new Error("insertPoint did not add one point");
+    if (mid[i + 1][0] !== p[0] || mid[i + 1][1] !== p[1]) throw new Error("point landed in the wrong slot");
+    const end = pts(deletePoint(ins, [0, 0], i + 1));
+    if (!(end.length === before.length && end.every((q, j) => q[0] === before[j][0] && q[1] === before[j][1])))
+      throw new Error("deletePoint did not undo insertPoint");
+    return true;
+  }, "point commands");
+  return `✅ insertPoint/deletePoint inverse on polygons (${NUM_RUNS} runs)`;
+};
+
+const _sl108b = function _test_nearestSegment(nearestSegment){return(
+(() => {
+  const sq = [[0, 0], [10, 0], [10, 10], [0, 10]];
+  const at = (x, y, closed = true) => nearestSegment(sq, x, y, closed).index;
+  if (at(5, 0) !== 0) throw new Error("midpoint of the first edge");
+  if (at(10, 5) !== 1) throw new Error("midpoint of the second edge");
+  if (at(5, 10) !== 2) throw new Error("midpoint of the third edge");
+  if (at(0, 5) !== 3) throw new Error("the closing edge must be a candidate when closed");
+  if (at(0, 5, false) === 3) throw new Error("an open polyline has no closing edge");
+  if (nearestSegment(sq, 5, 1).distance !== 1) throw new Error("distance to the nearest edge");
+  return "✅ nearest segment on closed and open polygons";
+})()
+)};
+
+// The renderer's contract: after a morph the live node IS the projection of the new source, without
+// having been replaced. Browser-only — it needs a real DOM.
+const _sl109 = function _test_morph_projection(morph){return(
+(() => {
+  if (typeof document === "undefined" || typeof DOMParser === "undefined") return "⏭ needs a DOM (browser only)";
+  const NS = "http://www.w3.org/2000/svg";
+  const parse = (t) => new DOMParser().parseFromString(t, "image/svg+xml").documentElement;
+  const A = `<svg xmlns="${NS}" viewBox="0 0 10 10"><rect x="1"/><!-- keep --><circle r="2"/></svg>`;
+  const B = `<svg xmlns="${NS}" viewBox="0 0 20 20"><rect x="1"/><!-- keep --><polygon points="0,0 1,1"/><circle r="2"/></svg>`;
+  const live = parse(A), root = live;
+  const overlay = document.createElementNS(NS, "g");
+  overlay.setAttribute("data-svg-lens-overlay", "");
+  live.appendChild(overlay);
+  const rect = live.querySelector("rect");
+  const skip = (n) => n === overlay;
+
+  morph(live, parse(B), skip);
+  if (live !== root) throw new Error("morph replaced the root node");
+  if (live.querySelector("rect") !== rect) throw new Error("morph replaced an unchanged child");
+  if (live.getAttribute("viewBox") !== "0 0 20 20") throw new Error("attributes not synced");
+  if (live.lastElementChild !== overlay) throw new Error("the overlay must stay last");
+  const shape = [...live.children].filter((n) => n !== overlay).map((n) => n.localName).join(",");
+  if (shape !== "rect,polygon,circle") throw new Error("children not aligned: " + shape);
+  if (![...live.childNodes].some((n) => n.nodeType === 8)) throw new Error("comment residue lost");
+
+  morph(live, parse(B), skip);                       // idempotent
+  if ([...live.children].filter((n) => n !== overlay).length !== 3) throw new Error("second morph changed the tree");
+  morph(live, parse(A), skip);                       // and reversible
+  if ([...live.children].filter((n) => n !== overlay).length !== 2) throw new Error("delete not applied");
+  return "✅ node identity kept, overlay preserved, insert/delete applied, idempotent";
+})()
+)};
+
 // ================================================================================================
 // DIRECT MANIPULATION — the drawing edits its own cell
 // ================================================================================================
@@ -37227,9 +37542,23 @@ the source's exact bytes: if you drag a shape back to where it started, the read
 \`translate(228 128) rotate(-4)\` is still there, because GetPut says so.
 
 The new definition is installed the way \`@tomlarkworthy/sticky\` installs its: build the function with
-\`realize\` (which routes through \`importShim\` on lopecode) and assign \`_definition\` **silently**. The
-live DOM already embodies the value, so recomputing would only rebuild identical nodes and cancel the
-drag. Export and \`editor-5\` both read \`_definition\`, so they see the change immediately.`
+\`realize\` (which routes through \`importShim\` on lopecode) and assign \`_definition\` **silently**.
+Export and \`editor-5\` both read \`_definition\`, so they see the change immediately.
+
+### Source is truth; the drawing is a projection of it
+
+Reconciling the DOM with a \`setAttribute\` is enough to move a shape and nothing else — it cannot add
+or remove one. So the writer instead **renders**: it calls the new definition with the variable's
+current inputs to get a fresh node, and \`morph\` patches the live node toward it. Recomputing the cell
+would mint a *new* node and break the value's identity, the observer holding it, and the gesture in
+flight; morphing keeps the node the cell already handed out.
+
+Rendering evaluates the template rather than parsing its text, so an interpolated
+\`svg\\\`<circle r="\${r}"/>\\\`\` would render the same way — the remaining work there is deciding what a
+handle over a hole may write to, not how to draw it.
+
+One consequence worth stating: \`applySource\` re-reads \`_definition\` after the \`await\` and abandons the
+put if it changed underneath, because \`editor-5\` may have rewritten the cell mid-gesture.`
 )};
 
 // Draggable handles for a polygon/polyline's points.
@@ -37309,9 +37638,50 @@ const _sl113 = function _handleEdit(pointsHandles,parsePoints,attrVal,printPoint
 }
 )};
 
-const _sl114 = function _svgLens(runtime,realize,literalSpan,cellAttrLens,compose,translateLens,attrVal,invert,applyPoint,ctmMat,parsePoints,parsePath,pointsHandles,pathHandles,handleEdit)
+// Patch `live` into the shape of `next`, in place. The cell's value is the live node, so it must
+// survive the edit: replacing it would break node identity, the observer holding it, and the gesture
+// in flight. `skip` marks nodes the renderer does not own (the handle overlay), which stay put and
+// are never counted when aligning children.
+//
+// Alignment is by index within the owned children, with a tag check. An insert in the middle
+// therefore rebuilds the nodes after it; the output is right either way, and only the elements the
+// user is not holding lose identity.
+const _sl115 = function _morph(){return(
+function morph(live, next, skip = () => false) {
+  if (live.nodeType !== 1) {
+    if (live.nodeValue !== next.nodeValue) live.nodeValue = next.nodeValue;
+    return live;
+  }
+  for (let i = live.attributes.length - 1; i >= 0; i--) {
+    const a = live.attributes[i];
+    if (!next.hasAttribute(a.name)) live.removeAttribute(a.name);
+  }
+  for (const a of next.attributes) if (live.getAttribute(a.name) !== a.value) live.setAttribute(a.name, a.value);
+
+  const all = [...live.childNodes];
+  const kept = all.filter((n) => !skip(n));
+  const anchor = all.find(skip) || null;      // new children go before the overlay, not after it
+  const want = [...next.childNodes];
+  for (let i = 0; i < want.length; i++) {
+    const b = want[i], a = kept[i];
+    if (!a) live.insertBefore(b.cloneNode(true), anchor);
+    else if (a.nodeType !== b.nodeType || (a.nodeType === 1 && a.localName !== b.localName))
+      live.replaceChild(b.cloneNode(true), a);
+    else morph(a, b, skip);
+  }
+  for (let i = want.length; i < kept.length; i++) kept[i].remove();
+  return live;
+}
+)};
+
+const _sl114 = function _svgLens(runtime,realize,literalSpan,literalLens,cellAttrLens,compose,translateLens,attrVal,invert,applyPoint,ctmMat,parsePoints,parsePath,pointsHandles,pathHandles,handleEdit,morph,pathOfIndex,insertElement,deleteElement,reorderElement,insertPoint,deletePoint,nearestSegment)
 {
+  // Set while re-rendering: the fresh node is a throwaway used to patch the live one, so svgLens
+  // must not attach a second overlay and a second set of listeners to it.
+  let rendering = false;
+
   return function svgLens(node, options = {}) {
+    if (rendering) return node;
     const NS = "http://www.w3.org/2000/svg";
     const grid = options.grid === undefined ? 0.5 : options.grid;
     const snap = (v) => (grid ? Math.round(v / grid) * grid : v);
@@ -37348,6 +37718,51 @@ const _sl114 = function _svgLens(runtime,realize,literalSpan,cellAttrLens,compos
     const cellSrc = () => (resolve() ? self._definition.toString() : null);
     const svgText = () => { const s = cellSrc(); if (s === null) return null; const [a, b] = literalSpan(s, alias); return s.slice(a, b); };
 
+    const isOverlay = (n) => n === overlay;
+
+    // THE WRITER. The one place that touches `_definition`, and the one place the DOM is brought
+    // back in line with the source. Source is truth; the live node is a projection of it, patched.
+    //
+    // Rendering evaluates the new definition with the variable's current inputs — it does not parse
+    // the SVG text — so an interpolated template renders the same way a static one does. Recomputing
+    // the cell instead would mint a new node and break the value's identity.
+    async function applySource(next, record) {
+      const before = self._definition;
+      const [fn] = await realize([next], runtime);
+      if (self._definition !== before) {                 // editor-5 (or another gesture) got there first
+        record.aborted = "definition changed under the gesture";
+        node.dispatchEvent(new CustomEvent("lens-put", { detail: record }));
+        return record;
+      }
+      let fresh;
+      rendering = true;
+      try { fresh = await fn.apply(null, self._inputs.map((i) => i._value)); }
+      finally { rendering = false; }
+      self._definition = fn;                             // silent swap, as in @tomlarkworthy/sticky
+      morph(node, fresh, isOverlay);
+      node.style.touchAction = "none";                   // morph syncs attributes, including style
+      node.lastPut = record;
+      node.dispatchEvent(new CustomEvent("lens-put", { detail: record }));
+      node.dispatchEvent(new Event("input", { bubbles: true }));
+      return record;
+    }
+
+    // A structural edit: a pure command rewrites the SVG document text, `literalLens` carries it back
+    // into the cell definition, and the writer renders it.
+    async function runCommand(name, fn, { keepFocus = false } = {}) {
+      const s = cellSrc();
+      if (s === null) return null;
+      const L = literalLens(alias);
+      const next = L.put(fn(L.get(s)), s);
+      const record = { target: name, attribute: "(structure)", before: "", after: "",
+                       GetPut: L.put(L.get(next), next) === next, PutGet: true, span: null };
+      if (next === s) { node.lastPut = record; return record; }
+      const out = await applySource(next, record);
+      if (keepFocus) buildHandles();                     // same elements, new geometry
+      else clearFocus();                                 // addresses shift under a structural edit
+      return out;
+    }
+
     // One gesture, one put, through the composed lens. `inner` refines the attribute string into
     // the view the gesture actually manipulates (a translate pair; the string itself otherwise).
     async function commit(idx, name, value, dflt, inner) {
@@ -37366,32 +37781,23 @@ const _sl114 = function _svgLens(runtime,realize,literalSpan,cellAttrLens,compos
         PutGet: same(l.get(next), value),
         span: null
       };
-      if (next !== s) {
-        const [a] = literalSpan(next, alias);
-        const el = elems()[idx];
-        const [fn] = await realize([next], runtime);
-        self._definition = fn;                           // silent swap, as in @tomlarkworthy/sticky
-        const t = svgText();
-        const v = attrVal(t, idx, name);
-        if (v === null) el.removeAttribute(name); else el.setAttribute(name, v);  // DOM adopts the source bytes
-        const sp = /* highlight the attribute we just wrote */ (() => {
-          const tok = attrVal(t, idx, name);
-          if (tok === null) return null;
-          const at = next.indexOf(name + '="' + tok + '"', a);
-          return at === -1 ? null : [at, at + (name + '="' + tok + '"').length];
-        })();
-        record.span = sp;
-      } else {
+      if (next === s) {
         // skip rule: the view is unchanged, so the source keeps its residue — make the DOM agree
-        const t = svgText();
-        const v = attrVal(t, idx, name);
+        const v = attrVal(svgText(), idx, name);
         const el = elems()[idx];
         if (v === null) el.removeAttribute(name); else el.setAttribute(name, v);
+        node.lastPut = record;
+        node.dispatchEvent(new CustomEvent("lens-put", { detail: record }));
+        node.dispatchEvent(new Event("input", { bubbles: true }));
+        return record;
       }
-      node.lastPut = record;
-      node.dispatchEvent(new CustomEvent("lens-put", { detail: record }));
-      node.dispatchEvent(new Event("input", { bubbles: true }));
-      return record;
+      const [a, b] = literalSpan(next, alias);
+      const tok = attrVal(next.slice(a, b), idx, name);
+      if (tok !== null) {                                // highlight the attribute we just wrote
+        const at = next.indexOf(name + '="' + tok + '"', a);
+        record.span = at === -1 ? null : [at, at + (name + '="' + tok + '"').length];
+      }
+      return applySource(next, record);
     }
 
     // ---- handle overlay -------------------------------------------------------------------
@@ -37523,6 +37929,58 @@ const _sl114 = function _svgLens(runtime,realize,literalSpan,cellAttrLens,compos
     node.addEventListener("pointerup", end);
     node.addEventListener("pointercancel", end);
 
+    // ---- structural gestures ---------------------------------------------------------------
+    // Everything here goes through a pure command; none of it touches the DOM directly.
+    const localPoint = (el, e) => {
+      const ctm = el.getScreenCTM();
+      if (!ctm) return null;
+      const [x, y] = applyPoint(invert(ctmMat(ctm)), e.clientX, e.clientY);
+      return [snap(x), snap(y)];
+    };
+    // Markup for a shape dropped on empty canvas. Overridable — this is UX policy, not geometry.
+    const newShape = options.newShape || ((x, y) => {
+      const r = options.newShapeSize === undefined ? 24 : options.newShapeSize;
+      const pts = [[x - r, y + r], [x, y - r], [x + r, y + r]].map(([a, b]) => `${a},${b}`).join(" ");
+      return `<polygon points="${pts}" fill="#5B7A5E"/>`;
+    });
+
+    node.addEventListener("dblclick", async (e) => {
+      const t = svgText();
+      if (t === null) return;
+      e.preventDefault();
+
+      // a vertex: remove it
+      const key = e.target.dataset && e.target.dataset.key;
+      if (key !== undefined && focusIdx !== null && focusMode === "points") {
+        const h = pointsHandles(t, focusIdx).find((x) => x.key === key);
+        const idx = focusIdx;
+        if (h) await runCommand("deletePoint", (d) => deletePoint(d, pathOfIndex(d, idx), h.i), { keepFocus: true });
+        return;
+      }
+
+      // an edge of the focused polygon: add a vertex there
+      const list = elems();
+      const hit = list.indexOf(e.target);
+      if (focusIdx !== null && focusMode === "points" && (hit === focusIdx || key !== undefined)) {
+        const el = list[focusIdx];
+        const p = localPoint(el, e);
+        if (!p) return;
+        const pts = parsePoints(attrVal(t, focusIdx, "points"));
+        const closed = el.localName !== "polyline";
+        const seg = nearestSegment(pts, p[0], p[1], closed);
+        const idx = focusIdx;
+        await runCommand("insertPoint", (d) => insertPoint(d, pathOfIndex(d, idx), seg.index, p), { keepFocus: true });
+        return;
+      }
+
+      // empty canvas: add a shape
+      if (hit <= 0) {
+        const p = localPoint(node, e);
+        if (!p) return;
+        await runCommand("insertElement", (d) => insertElement(d, [0], null, newShape(p[0], p[1])));
+      }
+    });
+
     // The cell's value is the SVG text the source currently holds; cellSource() exposes the whole
     // definition so a projection cell can show what a gesture rewrote.
     Object.defineProperty(node, "value", {
@@ -37531,6 +37989,12 @@ const _sl114 = function _svgLens(runtime,realize,literalSpan,cellAttrLens,compos
       set: () => {}
     });
     node.cellSource = () => cellSrc() || "";
+    // Structural editing, programmatically. Each returns the put record (or null off-cell).
+    node.addShape = (markup, at = null, parent = [0]) =>
+      runCommand("insertElement", (d) => insertElement(d, parent, at, markup));
+    node.removeAt = (path) => runCommand("deleteElement", (d) => deleteElement(d, path));
+    node.moveTo = (path, to) => runCommand("reorderElement", (d) => reorderElement(d, path, to));
+    node.edit = (name, fn, opts) => runCommand(name, fn, opts);
     return node;
   };
 };
@@ -37602,11 +38066,22 @@ export default function define(runtime, observer) {
   $def("sl71", "literalSpan", ["acorn"], _sl71);
   $def("sl72", "literalSafe", [], _sl72);
   $def("sl73", "literalLens", ["lens","literalSpan","literalSafe"], _sl73);
-  $def("sl74", "tokenize", [], _sl74);
+  $def("sl74a", "scan", [], _sl74a);
+  $def("sl74", "tokenize", ["scan"], _sl74);
+  $def("sl74b", "parseDoc", ["scan"], _sl74b);
+  $def("sl74c", "nodeAt", ["parseDoc"], _sl74c);
+  $def("sl74d", "pathOfIndex", ["parseDoc"], _sl74d);
   $def("sl75", "attrVal", ["tokenize"], _sl75);
   $def("sl76", "spliceAttr", ["tokenize"], _sl76);
   $def("sl77", "attrTextLens", ["lens","attrVal","spliceAttr"], _sl77);
   $def("sl78", "cellAttrLens", ["compose","literalLens","attrTextLens"], _sl78);
+  $def("sl79", "childrenLens", ["lens","nodeAt","parseDoc"], _sl79);
+  $def("sl79a", "insertElement", ["childrenLens"], _sl79a);
+  $def("sl79b", "deleteElement", ["childrenLens"], _sl79b);
+  $def("sl79c", "reorderElement", ["childrenLens"], _sl79c);
+  $def("sl79d", "insertPoint", ["nodeAt","attrTextLens","parsePoints","printPoints"], _sl79d);
+  $def("sl79e", "deletePoint", ["nodeAt","attrTextLens","parsePoints","printPoints"], _sl79e);
+  $def("sl79f", "nearestSegment", [], _sl79f);
 
   $def("sl80", "harnessHeader", ["md"], _sl80);
   $def("sl81", "NUM_RUNS", [], _sl81);
@@ -37632,12 +38107,18 @@ export default function define(runtime, observer) {
   $def("sl103", "test_attrTextLens_laws", ["checkLens","attrTextLens","arb","mulberry32","NUM_RUNS"], _sl103);
   $def("sl104", "test_cellSourceLens_laws", ["checkLens","compose","cellAttrLens","transformLens","arb","mulberry32","NUM_RUNS","matEq"], _sl104);
   $def("sl105", "test_source_residue_preserved", ["forAll","arb","mulberry32","NUM_RUNS","literalLens","cellAttrLens","literalSpan"], _sl105);
+  $def("sl106", "test_childrenLens_laws", ["forAll","lensLaws","childrenLens","arb","mulberry32","NUM_RUNS"], _sl106);
+  $def("sl107", "test_structural_commands", ["forAll","arb","mulberry32","NUM_RUNS","childrenLens","insertElement","deleteElement","reorderElement"], _sl107);
+  $def("sl108", "test_point_commands", ["forAll","arb","mulberry32","NUM_RUNS","insertPoint","deletePoint","nodeAt","attrVal","parsePoints"], _sl108);
+  $def("sl108b", "test_nearestSegment", ["nearestSegment"], _sl108b);
+  $def("sl109", "test_morph_projection", ["morph"], _sl109);
 
   $def("sl110", "manipulationHeader", ["md"], _sl110);
   $def("sl111", "pointsHandles", ["parsePoints","attrVal"], _sl111);
   $def("sl112", "pathHandles", ["parsePath","attrVal","PATH_ARG_COUNT"], _sl112);
   $def("sl113", "handleEdit", ["pointsHandles","parsePoints","attrVal","printPoints","pathHandles","parsePath","printPath"], _sl113);
-  $def("sl114", "svgLens", ["runtime","realize","literalSpan","cellAttrLens","compose","translateLens","attrVal","invert","applyPoint","ctmMat","parsePoints","parsePath","pointsHandles","pathHandles","handleEdit"], _sl114);
+  $def("sl115", "morph", [], _sl115);
+  $def("sl114", "svgLens", ["runtime","realize","literalSpan","literalLens","cellAttrLens","compose","translateLens","attrVal","invert","applyPoint","ctmMat","parsePoints","parsePath","pointsHandles","pathHandles","handleEdit","morph","pathOfIndex","insertElement","deleteElement","reorderElement","insertPoint","deletePoint","nearestSegment"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
