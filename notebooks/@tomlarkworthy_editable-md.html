@@ -5405,6 +5405,13 @@ import {md} from "@tomlarkworthy/editable-md"
 
 Template interpolation works! You can bring other notebook values into the text with \`\${<expr>}\`. For example, the value of the slider is: ${control}
 
+GFM tables are editable too — click a cell, TAB moves to the next one:
+
+| feature | editable | notes |
+| :--- | :---: | ---: |
+| paragraphs | yes | since v1 |
+| tables | yes | alignment survives |
+
 After an update (keyboard shortcut SHIFT + ENTER), the markdown is parsed back into the tagged template representation and pushed back into the runtime. Runtime serializers like [exporter](https://observablehq.com/@tomlarkworthy/exporter-3) and [Lopecode](https://github.com/tomlarkworthy/lopecode) will pick up the changes next export.`
 )};
 const _1drzw1m = function _control(Inputs){return(
@@ -5426,7 +5433,7 @@ md`## Known Issues
 
 - escaped tagged template literal lose their escaping if they are not in a code block. This is due to \`prosemirror.defaultMarkdownParser.parse(markdown)\` removing redundant escapes. We should probably make template placeholders a 1st class concept but as there is an easy work around of putting them in a code fence it is enough for now. (see [\`test_defaultMarkdownParser_preserves_escapes\`](#test_defaultMarkdownParser_preserves_escapes))`
 )};
-const _1z4iyw = function _md(editor_theme_css,prosemirror,Element,randstr,originalMd,markdownToMdTagged,compile,runtime,decompile,mdCellSourceToMarkdown,linkifyPastedUrl,invalidation)
+const _1z4iyw = function _md(editor_theme_css,prosemirror,editableSchema,Element,randstr,originalMd,editableMarkdownSerializer,markdownToMdTagged,compile,runtime,decompile,mdCellSourceToMarkdown,editableMarkdownParser,linkifyPastedUrl,invalidation)
 {
   // Force the theme override stylesheet to be evaluated and inserted.
   editor_theme_css;
@@ -5436,7 +5443,7 @@ const _1z4iyw = function _md(editor_theme_css,prosemirror,Element,randstr,origin
   //       for a URL/data URL which isn't reachable from inside a lopecode
   //       notebook; a working version would attach the picked image as a
   //       file-attachment and emit an `${FileAttachment(...)}` placeholder.
-  const menuItems = prosemirror.buildMenuItems(prosemirror.schema);
+  const menuItems = prosemirror.buildMenuItems(editableSchema);
   const insertMenu = new prosemirror.Dropdown([menuItems.insertHorizontalRule].filter(Boolean), { label: 'Insert' });
   const menuContent = menuItems.inlineMenu.concat([[
       insertMenu,
@@ -5470,8 +5477,13 @@ const _1z4iyw = function _md(editor_theme_css,prosemirror,Element,randstr,origin
     return prosemirror.inputRules({ rules });
   };
   const editorPlugins = [
-    buildEditorInputRules(prosemirror.schema),
-    prosemirror.keymap(prosemirror.buildKeymap(prosemirror.schema)),
+    // Table cell navigation must beat baseKeymap, so it goes first.
+    prosemirror.keymap({
+      Tab: prosemirror.goToNextCell(1),
+      'Shift-Tab': prosemirror.goToNextCell(-1)
+    }),
+    buildEditorInputRules(editableSchema),
+    prosemirror.keymap(prosemirror.buildKeymap(editableSchema)),
     prosemirror.keymap(prosemirror.baseKeymap),
     prosemirror.dropCursor(),
     prosemirror.gapCursor(),
@@ -5480,6 +5492,7 @@ const _1z4iyw = function _md(editor_theme_css,prosemirror,Element,randstr,origin
       content: menuContent
     }),
     prosemirror.history(),
+    prosemirror.tableEditing(),
     new prosemirror.Plugin({ props: { attributes: { class: 'ProseMirror-example-setup-style' } } })
   ];
   const isInteractiveTarget = (event, root) => {
@@ -5520,7 +5533,7 @@ const _1z4iyw = function _md(editor_theme_css,prosemirror,Element,randstr,origin
     let view;
     let self;
     function saveAndRender() {
-      const markdown = prosemirror.defaultMarkdownSerializer.serialize(view.state.doc);
+      const markdown = editableMarkdownSerializer.serialize(view.state.doc);
       const template = markdownToMdTagged(markdown);
       const variables = compile(template);
       self._inputs = variables[0]._inputs.map(n => self._module._resolve(n));
@@ -5545,10 +5558,10 @@ const _1z4iyw = function _md(editor_theme_css,prosemirror,Element,randstr,origin
           dom.addEventListener('focusout', lostFocus);
           const ojs_source = await decompile([self]);
           const markdown = mdCellSourceToMarkdown(ojs_source);
-          const doc = prosemirror.defaultMarkdownParser.parse(markdown);
+          const doc = editableMarkdownParser.parse(markdown);
           const state = prosemirror.EditorState.create({
             doc,
-            schema: prosemirror.schema,
+            schema: editableSchema,
             plugins: editorPlugins
           });
           dom.innerHTML = '';
@@ -5594,6 +5607,99 @@ const _1z4iyw = function _md(editor_theme_css,prosemirror,Element,randstr,origin
     Object.defineProperty(dom, 'markdown', { get: () => selfPromise.then(self => decompile([self])).then(ojs_source => mdCellSourceToMarkdown(ojs_source)) });
     return dom;
   };
+};
+const _1t782yk = function _editableSchema(prosemirror){return(
+new prosemirror.Schema({
+  nodes: prosemirror.schema.spec.nodes.append(
+    prosemirror.tableNodes({
+      tableGroup: "block",
+      cellContent: "inline*",
+      cellAttributes: {
+        align: {
+          default: null,
+          getFromDOM: (dom) => dom.style.textAlign || null,
+          setDOMAttr: (value, attrs) => {
+            if (value) attrs.style = "text-align:" + value;
+          }
+        }
+      }
+    })
+  ),
+  marks: prosemirror.schema.spec.marks
+})
+)};
+const _ug01ne = function _editableMarkdownParser(prosemirror,editableSchema)
+{
+  // The default parser runs markdown-it's commonmark preset, which has no table
+  // rule, so a GFM pipe table collapses into one paragraph of softbreaks.
+  const MarkdownIt = prosemirror.defaultMarkdownParser.tokenizer.constructor;
+  const tokenizer = new MarkdownIt("commonmark", { html: false }).enable("table");
+  const alignOf = (tok) => {
+    const style = tok.attrGet && tok.attrGet("style");
+    const m = style && /text-align\s*:\s*(left|center|right)/.exec(style);
+    return m ? m[1] : null;
+  };
+  const tokens = Object.assign({}, prosemirror.defaultMarkdownParser.tokens, {
+    table: { block: "table" },
+    thead: { ignore: true },
+    tbody: { ignore: true },
+    tr: { block: "table_row" },
+    th: { block: "table_header", getAttrs: (tok) => ({ align: alignOf(tok) }) },
+    td: { block: "table_cell", getAttrs: (tok) => ({ align: alignOf(tok) }) }
+  });
+  return new prosemirror.MarkdownParser(editableSchema, tokenizer, tokens);
+};
+const _o4sxix = function _editableMarkdownSerializer(prosemirror)
+{
+  // Render a cell's inline content to a string by borrowing the live state's
+  // output buffer, then rewinding it. delim is suppressed so a table nested in a
+  // blockquote/list does not pick up the "> " prefix mid-cell.
+  const cellText = (state, cell) => {
+    const delim = state.delim;
+    state.delim = "";
+    const start = state.out.length;
+    state.renderInline(cell);
+    const text = state.out.slice(start);
+    state.out = state.out.slice(0, start);
+    state.delim = delim;
+    return text.replace(/\n/g, " ").replace(/\|/g, "\\|").trim();
+  };
+  const nodes = Object.assign({}, prosemirror.defaultMarkdownSerializer.nodes, {
+    table(state, node) {
+      // Flush the pending block separator before measuring cells, otherwise it
+      // lands inside the first cell's text and is rewound away.
+      state.flushClose();
+      const rows = [];
+      node.forEach((row) => {
+        const cells = [];
+        row.forEach((cell) =>
+          cells.push({ text: cellText(state, cell), align: cell.attrs.align })
+        );
+        rows.push(cells);
+      });
+      if (!rows.length) return;
+      const width = Math.max(...rows.map((r) => r.length));
+      const line = (cells) =>
+        "| " +
+        Array.from({ length: width }, (_, i) => (cells[i] && cells[i].text) || " ").join(" | ") +
+        " |";
+      const rule = Array.from({ length: width }, (_, i) => {
+        const a = rows[0][i] && rows[0][i].align;
+        return a === "center" ? ":---:" : a === "right" ? "---:" : a === "left" ? ":---" : "---";
+      });
+      const lines = [line(rows[0]), "| " + rule.join(" | ") + " |"].concat(
+        rows.slice(1).map(line)
+      );
+      // Write line by line so a nested table picks up the block delimiter on
+      // each row; no trailing newline, closeBlock owns the block separation.
+      lines.forEach((l, i) => state.write(i < lines.length - 1 ? l + "\n" : l));
+      state.closeBlock(node);
+    },
+    table_row() {},
+    table_cell() {},
+    table_header() {}
+  });
+  return new prosemirror.MarkdownSerializer(nodes, prosemirror.defaultMarkdownSerializer.marks);
 };
 const _etlb83 = function _irToEditableText(){return(
 function irToEditableText(ir) {
@@ -5772,11 +5878,12 @@ function isPasteableUrl(text) {
   return /^(https?:\/\/|mailto:)\S+$/i.test(s);
 }
 )};
-const _2mqz8v = function _linkifyPastedUrl(prosemirror,isPasteableUrl){return(
+const _2mqz8v = function _linkifyPastedUrl(isPasteableUrl){return(
 function linkifyPastedUrl(view, event) {
   // Pasting a URL over a selection links the selection instead of replacing it.
   // Returns true when handled, so prosemirror skips its default paste.
-  const linkType = prosemirror.schema.marks.link;
+  // Mark types are per-schema, so take it from the view's own schema.
+  const linkType = view.state.schema.marks.link;
   if (!linkType) return false;
   const text = event.clipboardData && event.clipboardData.getData("text/plain");
   if (!isPasteableUrl(text)) return false;
@@ -5794,7 +5901,8 @@ const _3kmqp1 = function _escapeMarkdownInline(){return(
 function escapeMarkdownInline(text) {
   // Mirrors the character set prosemirror's defaultMarkdownSerializer escapes inline,
   // so escape/unescape are exact inverses across a parse+serialize round trip.
-  return text.replace(/[\\`*~\[\]_]/g, (c) => "\\" + c);
+  // `|` is included so a placeholder inside a table cell is not split at a pipe.
+  return text.replace(/[\\`*~\[\]_|]/g, (c) => "\\" + c);
 }
 )};
 const _9wq3vz = function _unescapeMarkdownInline(){return(
@@ -5896,6 +6004,31 @@ const _9lnk2b = function _test_link_survives_round_trip(expect,mdCellSourceToMar
   expect(template).toBe("md`see [the docs](https://example.com/a_b) here`");
   expect(compile(template)[0]._inputs).toContain("md");
 };
+const _1g67rxt = function _test_table_round_trip(mdCellSourceToMarkdown,editableMarkdownParser,expect,editableMarkdownSerializer,markdownToMdTagged)
+{
+  // The reported bug: a GFM table came back as a single paragraph of pipes
+  // because the default parser has no table rule, destroying the table.
+  const CELL = "t = md`Before\n\n| a | b |\n| :-- | --: |\n| 1 | *x* |\n\nAfter`";
+  const markdown = mdCellSourceToMarkdown(CELL);
+  const doc = editableMarkdownParser.parse(markdown);
+  expect(doc.content.content.map((n) => n.type.name)).toEqual(["paragraph", "table", "paragraph"]);
+  const serialized = editableMarkdownSerializer.serialize(doc);
+  expect(serialized).toBe("Before\n\n| a | b |\n| :--- | ---: |\n| 1 | *x* |\n\nAfter");
+  // Stable under a second round trip, so repeated edits do not drift.
+  expect(editableMarkdownSerializer.serialize(editableMarkdownParser.parse(serialized))).toBe(serialized);
+  expect(markdownToMdTagged(serialized)).toBe("md`" + serialized + "`");
+};
+const _5f1lir = function _test_table_placeholder_round_trip(mdCellSourceToMarkdown,editableMarkdownSerializer,editableMarkdownParser,markdownToMdTagged,expect,compile)
+{
+  // A `${...}` placeholder inside a table cell must survive, pipes and all.
+  const CELL = "t = md`| v | expr |\n| --- | --- |\n| ${a || b} | ${f(x, [y])} |`";
+  const markdown = mdCellSourceToMarkdown(CELL);
+  const serialized = editableMarkdownSerializer.serialize(editableMarkdownParser.parse(markdown));
+  const template = markdownToMdTagged(serialized);
+  expect(template).toBe("md`| v | expr |\n| --- | --- |\n| ${a || b} | ${f(x, [y])} |`");
+  expect(compile(template)[0]._inputs).toContain("a");
+  expect(compile(template)[0]._inputs).toContain("f");
+};
 const _2dh7y5 = function _test_defaultMarkdownParser_preserves_escapes(prosemirror,expect)
 {
   const result = prosemirror.defaultMarkdownParser.parse("\\${}");
@@ -5971,8 +6104,11 @@ export default function define(runtime, observer) {
   $def("_t5sezz", null, ["md"], _t5sezz);  
   $def("_1lfncpk", null, ["title"], _1lfncpk);  
   $def("_u4o7gp", null, ["md"], _u4o7gp);  
-  $def("_1z4iyw", "md", ["editor_theme_css","prosemirror","Element","randstr","originalMd","markdownToMdTagged","compile","runtime","decompile","mdCellSourceToMarkdown","linkifyPastedUrl","invalidation"], _1z4iyw);
-  $def("_etlb83", "irToEditableText", [], _etlb83);  
+  $def("_1z4iyw", "md", ["editor_theme_css","prosemirror","editableSchema","Element","randstr","originalMd","editableMarkdownSerializer","markdownToMdTagged","compile","runtime","decompile","mdCellSourceToMarkdown","editableMarkdownParser","linkifyPastedUrl","invalidation"], _1z4iyw);
+  $def("_1t782yk", "editableSchema", ["prosemirror"], _1t782yk);
+  $def("_ug01ne", "editableMarkdownParser", ["prosemirror","editableSchema"], _ug01ne);
+  $def("_o4sxix", "editableMarkdownSerializer", ["prosemirror"], _o4sxix);
+  $def("_etlb83", "irToEditableText", [], _etlb83);
   $def("_bpew19", "replaceArgPlaceholders", [], _bpew19);  
   main.define("exporter", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("exporter", _));  
   $def("_n2jvwt", null, ["md"], _n2jvwt);  
@@ -5983,7 +6119,7 @@ export default function define(runtime, observer) {
   $def("_1060b9b", "tokenizeMarkdownTemplate", ["unescapeMarkdownInline"], _1060b9b);
   $def("_8wivof", "escapeTemplateChunk", [], _8wivof);
   $def("_7pk3xw", "isPasteableUrl", [], _7pk3xw);
-  $def("_2mqz8v", "linkifyPastedUrl", ["prosemirror","isPasteableUrl"], _2mqz8v);
+  $def("_2mqz8v", "linkifyPastedUrl", ["isPasteableUrl"], _2mqz8v);
   $def("_3kmqp1", "escapeMarkdownInline", [], _3kmqp1);
   $def("_9wq3vz", "unescapeMarkdownInline", [], _9wq3vz);
   $def("_150iump", "randstr", [], _150iump);
@@ -5998,6 +6134,8 @@ export default function define(runtime, observer) {
   $def("_5vqw7d", "test_escapeMarkdownInline_inverse", ["expect","escapeMarkdownInline","unescapeMarkdownInline"], _5vqw7d);
   $def("_9lnk1a", "test_isPasteableUrl", ["expect","isPasteableUrl"], _9lnk1a);
   $def("_9lnk2b", "test_link_survives_round_trip", ["expect","mdCellSourceToMarkdown","prosemirror","markdownToMdTagged","compile"], _9lnk2b);
+  $def("_1g67rxt", "test_table_round_trip", ["mdCellSourceToMarkdown","editableMarkdownParser","expect","editableMarkdownSerializer","markdownToMdTagged"], _1g67rxt);
+  $def("_5f1lir", "test_table_placeholder_round_trip", ["mdCellSourceToMarkdown","editableMarkdownSerializer","editableMarkdownParser","markdownToMdTagged","expect","compile"], _5f1lir);
   $def("_2dh7y5", "test_defaultMarkdownParser_preserves_escapes", ["prosemirror","expect"], _2dh7y5);
   main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));  
   main.define("originalMd", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("md", "originalMd", _));  
