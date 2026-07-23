@@ -12313,7 +12313,8 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
     }
     const hit = TOOLS.find(([, , k]) => k.toLowerCase() === e.key.toLowerCase());
     if (hit) drawing.setTool(hit[0]);
-    else if (e.key === "Escape") drawing.setTool("select");
+    // Escape means "undo what I am doing now", and only failing that "leave this mode".
+    else if (e.key === "Escape") { if (!drawing.cancelGesture()) drawing.setTool("select"); }
   };
   document.addEventListener("keydown", onKey);
   invalidation.then(() => document.removeEventListener("keydown", onKey));
@@ -16104,6 +16105,7 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
 //   onPointerMove(ctx, e)
 //   onPointerUp(ctx, e)
 //   onDblClick(ctx, e)    -> true if handled
+//   onCancel(ctx)         -> true if it had something to abandon (Escape; see node.cancelGesture)
 //
 // ctx = { node, options, target, writer, focus, elems(), doc(), localPoint(el, e), snap(v), state }
 // ================================================================================================
@@ -16157,6 +16159,25 @@ const _sl128a = function _previewDelta(gestureDelta){return(
 }
 )};
 
+// The third sink, and the reason `attr` carries `was`: put back what the preview overwrote. A
+// gesture that is abandoned must leave the drawing showing what the source says, and the source is
+// unchanged — nothing was committed — so the correct view is simply the one from before the preview.
+// An empty `was` means the attribute was not there: restoring it as `transform=""` would render the
+// same and still make the live DOM disagree with a re-render of the source, which T5 would catch.
+const _sl128c = function _revertDelta(){return(
+(ctx, ds) => {
+  for (const d of [].concat(ds)) {
+    if (!d || d.kind !== "attr") continue;
+    const el = ctx.elems()[d.idx];
+    if (!el) continue;
+    if (d.was === null || d.was === undefined || d.was === "") el.removeAttribute(d.name);
+    else el.setAttribute(d.name, d.was);
+  }
+  ctx.overlay.clear();
+  ctx.focus.refresh();
+}
+)};
+
 const _sl128b = function _commitDelta(){return(
 async (ctx, ds) => {
   const out = [];
@@ -16177,7 +16198,7 @@ async (ctx, ds) => {
 }
 )};
 
-const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointer,gestureDelta,previewDelta,commitDelta){return(
+const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta){return(
 {
   id: "transform",
   onPointerDown(ctx, e) {
@@ -16193,6 +16214,7 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
     if (!b) return false;
     const text = ctx.attr(t, idx, "transform") || "";
     ctx.state.drag = {
+      tool: "transform",                                 // see the note on `onCancel` below
       key, idx, el, b, text, base: opsLens.get(text), ops: opsLens.get(text), started: false,
       centre: [b.x + b.width / 2, b.y + b.height / 2],
       // the corner opposite the one being dragged: the point that must not move
@@ -16233,12 +16255,23 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
     const d = ctx.state.drag;
     ctx.state.drag = null;
     if (d && d.started && d.delta) await commitDelta(ctx, d.delta);
+  },
+  // `state.drag` is one key shared by this tool, the vertex tool and the move tool — safe during a
+  // gesture, because only one of them is ever active, but `cancelGesture` offers the cancel to every
+  // tool, and without the stamp the first one asked would swallow another's scratch and revert
+  // nothing. Found by T1 the first time cancel existed.
+  onCancel(ctx) {
+    const d = ctx.state.drag;
+    if (!d || d.tool !== "transform") return false;
+    ctx.state.drag = null;
+    revertDelta(ctx, d.delta || []);
+    return true;
   }
 }
 )};
 
 // Drag a vertex or control point: the `points` and path `d` lenses.
-const _sl120 = function _toolVertex(handleEdit,grabPointer,gestureDelta,previewDelta,commitDelta){return(
+const _sl120 = function _toolVertex(handleEdit,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta){return(
 {
   id: "vertex",
   onPointerDown(ctx, e) {
@@ -16250,7 +16283,7 @@ const _sl120 = function _toolVertex(handleEdit,grabPointer,gestureDelta,previewD
     grabPointer(ctx.node, e);
     const el0 = ctx.elems()[ctx.focus.index];
     const name = mode === "points" ? "points" : "d";
-    ctx.state.drag = { key, idx: ctx.focus.index, mode, started: false, x0: e.clientX, y0: e.clientY,
+    ctx.state.drag = { tool: "vertex", key, idx: ctx.focus.index, mode, started: false, x0: e.clientX, y0: e.clientY,
                        // what it rendered before the preview overwrites it (see writer.commit)
                        was: el0 ? { [name]: el0.getAttribute(name) } : null };
     return true;
@@ -16276,6 +16309,13 @@ const _sl120 = function _toolVertex(handleEdit,grabPointer,gestureDelta,previewD
     const d = ctx.state.drag;
     ctx.state.drag = null;
     if (d && d.started && d.delta) await commitDelta(ctx, d.delta);
+  },
+  onCancel(ctx) {
+    const d = ctx.state.drag;
+    if (!d || d.tool !== "vertex") return false;
+    ctx.state.drag = null;
+    revertDelta(ctx, d.delta || []);
+    return true;
   }
 }
 )};
@@ -16316,7 +16356,7 @@ const _sl121a = function _hitTest(){return(
 // several selected shapes moves them all — one commit each, since each writes its own attribute.
 // A tap with no movement selects instead: shift adds to the set, and tapping the shape that is
 // already primary cycles to the next shape underneath, which is how an occluded shape is reached.
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta){return(
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
@@ -16348,6 +16388,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
     // set to a sibling means choosing which member aligns, which is a UX question, not this one.
     const snapping = targets.length === 1 && ctx.options.snap !== false;
     ctx.state.drag = {
+      tool: "move",
       idx, hits, tag: el.localName, targets,
       x0: e.clientX, y0: e.clientY, started: false,
       thresh: e.pointerType === "mouse" ? 3 : 10,
@@ -16364,6 +16405,12 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
     let dx = e.clientX - d.x0, dy = e.clientY - d.y0;
     if (!d.started && Math.hypot(dx, dy) < d.thresh) return;
     d.started = true;
+    // Shift locks the drag to whichever axis it has travelled furthest along, measured from the
+    // origin rather than the last frame, so the lock is a function of where the pointer *is* and T2
+    // still holds. Shift on a tap already means toggle-select; the disambiguation is drag-vs-tap,
+    // which `started` has decided by the time we get here.
+    const frozen = !e.shiftKey ? null : Math.abs(dx) >= Math.abs(dy) ? "y" : "x";
+    if (frozen === "y") dy = 0; else if (frozen === "x") dx = 0;
     let guides = [], aligned = { x: false, y: false };
     if (d.box && !e.altKey) {                            // alt is the usual "ignore snapping" modifier
       const moved = { x: d.box.x + dx, y: d.box.y + dy, width: d.box.width, height: d.box.height };
@@ -16371,6 +16418,10 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
       dx += snap.dx; dy += snap.dy;
       guides = snap.guides;
       aligned = snap.snapped;                            // an alignment beats the grid: it is exact
+      // ...but not the lock. Snapping may pull the frozen axis; put it back, or shift-drag drifts
+      // sideways whenever a neighbour happens to line up.
+      if (frozen === "y") { dy = 0; aligned.y = false; }
+      else if (frozen === "x") { dx = 0; aligned.x = false; }
     }
     // One delta per element the gesture claimed — which is what makes T4's "one commit per claimed
     // element" literal rather than inferred.
@@ -16423,6 +16474,14 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
       return "transform";
     })();
     await commitDelta(ctx, gestureDelta.select([pathOfIndex(t, idx)], mode));
+  },
+  onCancel(ctx) {
+    const d = ctx.state.drag;
+    if (!d || d.tool !== "move") return false;
+    ctx.state.drag = null;
+    ctx.guides([]);
+    revertDelta(ctx, d.deltas || []);
+    return true;
   }
 }
 )};
@@ -16471,6 +16530,14 @@ const _sl121b = function _toolMarquee(pathOfIndex,grabPointer,dragBox,gestureDel
           box.y <= r.y + r.height && box.y + box.height >= r.y) hits.push(pathOfIndex(t, i));
     }
     return commitDelta(ctx, gestureDelta.select(b.add ? ctx.focus.paths.concat(hits) : hits));
+  },
+  // Nothing to put back — the band lives in the overlay and the selection is not an edit (T9).
+  onCancel(ctx) {
+    const b = ctx.state.band;
+    ctx.state.band = null;
+    if (!b) return false;
+    if (b.box) b.box.remove();
+    return true;
   }
 }
 )};
@@ -16641,6 +16708,15 @@ const _sl125 = function _toolDraw(shapeSpec,shapeMarkup,dragBox,grabPointer,gest
     // hand the new shape straight to the gizmo
     if (rec) await commitDelta(ctx, gestureDelta.select([[0, at]], "transform"));
     ctx.setTool("select");
+  },
+  // The shape does not exist in the source until release, so abandoning is dropping the ghost. The
+  // tool stays armed: Esc cancels the shape you are drawing, not the mode you are in.
+  onCancel(ctx) {
+    const d = ctx.state.draw;
+    ctx.state.draw = null;
+    if (!d) return false;
+    if (d.preview) d.preview.remove();
+    return true;
   }
 }
 )};
@@ -16699,6 +16775,17 @@ const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta
   async onDblClick(ctx) {
     if (!ctx.state.pen) return false;
     ctx.setTool("select");                              // finish the path where it is
+    return true;
+  },
+  // Every anchor is already committed, so there is nothing to revert: Esc ends the path where it is,
+  // which is the same thing the double-click means. Undo removes anchors one at a time.
+  onCancel(ctx) {
+    const pen = ctx.state.pen;
+    ctx.state.penClick = null;
+    if (!pen) return false;
+    if (pen.band) pen.band.remove();
+    ctx.state.pen = null;
+    ctx.setTool("select");
     return true;
   }
 }
@@ -16850,6 +16937,10 @@ const _sl131 = function _playGesture(){return(
   play.drag = (pts, o = {}) => () => [["down", pts[0][0], pts[0][1], o],
     ...pts.slice(1).map(([x, y]) => ["move", x, y, o]),
     ["up", pts[pts.length - 1][0], pts[pts.length - 1][1], o]];
+  // A drag left in flight, for the gestures that end some other way than a release: Esc, or a tool
+  // change. The pointer is still down when this returns.
+  play.hold = (pts, o = {}) => () => [["down", pts[0][0], pts[0][1], o],
+    ...pts.slice(1).map(([x, y]) => ["move", x, y, o])];
   play.dblclick = (x, y) => () => [["dbl", x, y, {}]];
   play.press = (key, o = {}) => () => [["key", key, 0, o]];
   return play;
@@ -16920,7 +17011,7 @@ const _sl133 = function _withFixture(gestureFixture){return(
 // L1 · T1 identity — `p(1, c) = (1, c)`. A gesture that moves nothing writes nothing, and hands the
 // complement back untouched. Selection is exempt: a click legitimately selects, and selection is not
 // in `M_X`. The left half of this law is where gap 0 lives — a missed hit that becomes a *creation*.
-const _sl134 = function _test_gesture_identity(withFixture,gestureCorpus,playGesture)
+const _sl134 = function _test_gesture_identity(withFixture,gestureCorpus,playGesture,domShape)
 {
   if (typeof document === "undefined") return () => "⏭ needs a browser";
   return () => withFixture(gestureCorpus.basic, {}, async (f) => {
@@ -16934,7 +17025,24 @@ const _sl134 = function _test_gesture_identity(withFixture,gestureCorpus,playGes
       await playGesture(f, playGesture.tap(x, y));
       if (f.doc() !== doc0) throw new Error(`a second null tap on ${where} wrote to the source`);
     }
-    return `✅ T1: a null gesture is a null edit at ${Object.keys(gestureCorpus.at).length} points`;
+    // The other way a gesture can be null: it moved, and then was abandoned. Esc must put back what
+    // the preview overwrote, so the drawing is a rendering of its own (unchanged) source again —
+    // otherwise the cancel leaves a shape sitting somewhere the source never said.
+    let cancels = 0;
+    for (const [where, from, to] of [["the polygon", [60, 80], [78, 92]],
+                                     ["the rect", [35, 18], [52, 34]],
+                                     ["empty canvas (marquee)", [105, 15], [150, 40]]]) {
+      const doc0 = f.doc(), h0 = f.historyDepth();
+      await playGesture(f, playGesture.hold([from, [(from[0] + to[0]) / 2, (from[1] + to[1]) / 2], to]));
+      if (!f.node.cancelGesture()) throw new Error(`no tool claimed the drag on ${where}, so cancelling is untested`);
+      cancels++;
+      if (f.doc() !== doc0) throw new Error(`a cancelled drag on ${where} wrote to the source`);
+      if (f.historyDepth() !== h0) throw new Error(`a cancelled drag on ${where} pushed an undo entry`);
+      if (domShape.live(f.node) !== domShape.fromSource(f.doc()))
+        throw new Error(`a cancelled drag on ${where} left the preview on screen`);
+    }
+    return `✅ T1: a null gesture is a null edit at ${Object.keys(gestureCorpus.at).length} points, `
+         + `and ${cancels} abandoned drags leave neither a byte nor a pixel behind`;
   });
 };
 
@@ -16948,16 +17056,22 @@ const _sl135 = function _test_gesture_path_independence(withFixture,gestureCorpu
   const straight = [A, [(A[0] + B[0]) / 2, (A[1] + B[1]) / 2], B];
   const wander = [A, [A[0] + 40, A[1] - 3], [A[0] - 12, A[1] + 25], [B[0] + 18, B[1] - 14],
                   [A[0] + 2, A[1] + 2], B];
-  const run = (path) => withFixture(gestureCorpus.basic, {}, async (f) => {
+  const run = (path, o = {}) => withFixture(gestureCorpus.basic, {}, async (f) => {
     await playGesture(f, playGesture.tap(...A));
-    await playGesture(f, playGesture.drag(path));
+    await playGesture(f, playGesture.drag(path, o));
     return f.doc();
   });
-  return async () => Promise.all([run(straight), run(wander)]).then(([a, b]) => {
-    if (a !== b) throw new Error(`the route changed the commit:\n  straight: ${a.match(/transform="[^"]*"/)}\n  wander:   ${b.match(/transform="[^"]*"/)}`);
-    if (!/translate/.test(a)) throw new Error("the drag committed nothing, so the law is vacuous here");
-    return "✅ T2: a 5-leg wander and a straight drag to the same point commit the same bytes";
-  });
+  return async () => Promise.all([run(straight), run(wander),
+                                  run(straight, { shiftKey: true }), run(wander, { shiftKey: true })])
+    .then(([a, b, la, lb]) => {
+      if (a !== b) throw new Error(`the route changed the commit:\n  straight: ${a.match(/transform="[^"]*"/)}\n  wander:   ${b.match(/transform="[^"]*"/)}`);
+      if (!/translate/.test(a)) throw new Error("the drag committed nothing, so the law is vacuous here");
+      // The axis lock is a function of the endpoint, not of the route, so it has to survive the same
+      // test — a lock computed per frame would drift and this is what would catch it.
+      if (la !== lb) throw new Error(`with the axis locked, the route changed the commit:\n  straight: ${la.match(/transform="[^"]*"/)}\n  wander:   ${lb.match(/transform="[^"]*"/)}`);
+      if (la === a) throw new Error("shift changed nothing, so the axis lock is untested");
+      return "✅ T2: a 5-leg wander and a straight drag to the same point commit the same bytes, locked or free";
+    });
 };
 
 // L4 · T4 origin — d-PutInc, `dom P(X, α) = X`. A gesture commits against the state it started from.
@@ -17035,12 +17149,12 @@ const _sl138 = function _test_gesture_selection_is_not_an_edit(withFixture,gestu
 // different value (or none), and the drawing keeps showing the preview until something unrelated
 // forces a re-render. Mid-gesture is exempt, deliberately: a preview is allowed to be ahead of the
 // source, it is just not allowed to survive.
-const _sl140 = function _test_gesture_render_consistency(withFixture,gestureCorpus,playGesture)
-{
-  if (typeof document === "undefined") return () => "⏭ needs a browser";
-  // The tree, minus what neither side can be expected to agree on: the overlay (not in the source by
-  // construction), whitespace-only text (formatting), and the root's `style`, which svgLens sets to
-  // `touch-action:none` on the node it projects.
+// "The drawing is a rendering of its own source", as a comparable value. Ignores what neither side
+// can be expected to agree on: the overlay (not in the source by construction), whitespace-only text
+// (formatting), and the root's `style`, which svgLens sets to `touch-action:none` on the node it
+// projects. Used by T5 after a commit and by T1 after a cancel — the same claim, two occasions.
+const _sl140a = function _domShape(){return(
+(() => {
   const shape = (el, root) => {
     const attrs = {};
     for (const a of el.attributes) if (!(el === root && a.name === "style")) attrs[a.name] = a.value;
@@ -17053,12 +17167,21 @@ const _sl140 = function _test_gesture_render_consistency(withFixture,gestureCorp
     }
     return { tag: el.localName, attrs, kids };
   };
-  const live = (node) => JSON.stringify(shape(node, node));
-  const fromSource = (text) => {
-    const d = new DOMParser().parseFromString(text, "image/svg+xml");
-    if (d.querySelector("parsererror")) throw new Error("the committed source no longer parses as SVG");
-    return JSON.stringify(shape(d.documentElement, d.documentElement));
+  return {
+    live: (node) => JSON.stringify(shape(node, node)),
+    fromSource: (text) => {
+      const d = new DOMParser().parseFromString(text, "image/svg+xml");
+      if (d.querySelector("parsererror")) throw new Error("the source no longer parses as SVG");
+      return JSON.stringify(shape(d.documentElement, d.documentElement));
+    }
   };
+})()
+)};
+
+const _sl140 = function _test_gesture_render_consistency(withFixture,gestureCorpus,playGesture,domShape)
+{
+  if (typeof document === "undefined") return () => "⏭ needs a browser";
+  const { live, fromSource } = domShape;
   return () => withFixture(gestureCorpus.basic, {}, async (f) => {
     // move, gizmo and vertex: one gesture through each of the three tools that write an attribute.
     const script = [
@@ -17432,6 +17555,19 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     };
     node.addEventListener("pointerup", end);
     node.addEventListener("pointercancel", end);
+    // Abandon whatever is in flight. Offered to every tool, not just the active one, because a tool
+    // can hold gesture state between gestures — the pen's half-drawn path is not an active drag.
+    // Each `onCancel` reports whether it had anything to abandon, so a callsite can tell a cancelled
+    // gesture from a plain Escape and do something else with the latter. Keyboard belongs to the
+    // callsite (arrows, delete and z-order already live there), so this is a method, not a listener:
+    // a commit remounts this node, and a document listener added here would leak one per commit.
+    node.cancelGesture = () => {
+      const was = active;
+      active = null;
+      let claimed = false;
+      for (const t of tools) if (t.onCancel && t.onCancel(liveCtx)) claimed = true;
+      return claimed || !!was;
+    };
     node.addEventListener("dblclick", async (e) => {
       e.preventDefault();
       for (const t of tools) if (t.onDblClick && await t.onDblClick(liveCtx, e)) return;
@@ -17838,13 +17974,14 @@ export default function define(runtime, observer) {
   $def("sl128", "gestureDelta", [], _sl128);
   $def("sl128a", "previewDelta", ["gestureDelta"], _sl128a);
   $def("sl128b", "commitDelta", [], _sl128b);
-  $def("sl120", "toolVertex", ["handleEdit","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl120);
+  $def("sl128c", "revertDelta", [], _sl128c);
+  $def("sl120", "toolVertex", ["handleEdit","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl120);
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta"], _sl121);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl121);
   $def("sl121b", "toolMarquee", ["pathOfIndex","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
   $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint","gestureDelta","commitDelta"], _sl122);
-  $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl124);
+  $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl124);
   $def("sl125a", "dragBox", [], _sl125a);
   $def("sl125b", "shapeSpec", ["dragBox"], _sl125b);
   $def("sl125c", "shapeMarkup", ["shapeSpec"], _sl125c);
@@ -17855,14 +17992,15 @@ export default function define(runtime, observer) {
   $def("sl131", "playGesture", [], _sl131);
   $def("sl132", "gestureCorpus", [], _sl132);
   $def("sl133", "withFixture", ["gestureFixture"], _sl133);
-  $def("sl134", "test_gesture_identity", ["withFixture","gestureCorpus","playGesture"], _sl134);
+  $def("sl134", "test_gesture_identity", ["withFixture","gestureCorpus","playGesture","domShape"], _sl134);
   $def("sl135", "test_gesture_path_independence", ["withFixture","gestureCorpus","playGesture"], _sl135);
   $def("sl136", "test_gesture_commits_against_its_origin", ["withFixture","gestureCorpus","playGesture"], _sl136);
   $def("sl137", "test_gesture_confinement", ["withFixture","gestureCorpus","playGesture","svgTools"], _sl137);
   $def("sl138", "test_gesture_selection_is_not_an_edit", ["withFixture","gestureCorpus","playGesture","toolMarquee"], _sl138);
   $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl144);
   $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl143);
-  $def("sl140", "test_gesture_render_consistency", ["withFixture","gestureCorpus","playGesture"], _sl140);
+  $def("sl140a", "domShape", [], _sl140a);
+  $def("sl140", "test_gesture_render_consistency", ["withFixture","gestureCorpus","playGesture","domShape"], _sl140);
   $def("sl141", "test_gesture_rebase_agreement", ["withFixture","gestureCorpus","nodeAt","childrenLens","insertPoint"], _sl141);
   $def("sl142", "test_gesture_partiality", ["withFixture","gestureCorpus","playGesture"], _sl142);
   $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit"], _sl139);
