@@ -15379,17 +15379,32 @@ const sl118 = function _svgOverlay(){return(
       [data-svg-lens-overlay] .locked{fill:#cfcfcf;stroke:#9a9a9a;stroke-dasharray:2 2;cursor:not-allowed}`;
   el.appendChild(style);
   node.appendChild(el);
+  // Two layers, because the overlay draws in two coordinate systems. `el` carries the focused
+  // element's transform, so handles need no screen-space maths. Anything measured in the root's
+  // space — alignment guides, a marquee, a shape preview — goes in `rootEl`, which is never
+  // transformed. One shared layer meant drawing a guide had to clear the alignment first, which
+  // left the handles and the selection box at the element's *untransformed* position for the rest
+  // of the gesture: after one move, every later drag ghosted the shape's original position.
+  const rootEl = document.createElementNS(NS, "g");
+  rootEl.setAttribute("data-svg-lens-overlay", "");
+  node.appendChild(rootEl);
+  const make = (parent) => (tag, attrs) => {
+    const n = document.createElementNS(NS, tag);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    parent.appendChild(n);
+    return n;
+  };
   return {
     el,
-    isOwn: (n) => n === el || el.contains(n),
+    rootEl,
+    isOwn: (n) => n === el || el.contains(n) || n === rootEl || rootEl.contains(n),
     // Everything except the stylesheet: previews are arbitrary shapes, not just handles.
-    clear: () => [...el.childNodes].forEach((n) => { if (n !== style) n.remove(); }),
-    add(tag, attrs) {
-      const n = document.createElementNS(NS, tag);
-      for (const k in attrs) n.setAttribute(k, attrs[k]);
-      el.appendChild(n);
-      return n;
+    clear: () => {
+      [...el.childNodes].forEach((n) => { if (n !== style) n.remove(); });
+      [...rootEl.childNodes].forEach((n) => n.remove());
     },
+    add: make(el),
+    addRoot: make(rootEl),
     root: node,
     // Handles are drawn in the focused element's own user space, so no screen-space maths is needed
     // to place them — the browser applies the same CTM it applies to the shape.
@@ -15466,11 +15481,10 @@ const sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,node
     overlay.clear();
     paths = paths.filter((p) => indexOfPath(p) !== null);               // drop what no longer resolves
     if (paths.length > 1) {                                            // a set: boxes only, no handles
-      overlay.alignTo(null);
       for (const p of paths) {
         const el = target.elems()[indexOfPath(p)];
         const b = el && boxInRoot(el, overlay.root);
-        if (b) overlay.add("rect", { class: "box", x: b.x, y: b.y, width: b.width, height: b.height });
+        if (b) overlay.addRoot("rect", { class: "box", x: b.x, y: b.y, width: b.width, height: b.height });
       }
       return;
     }
@@ -15752,10 +15766,7 @@ const sl121b = function _toolMarquee(boxInRoot,pathOfIndex,grabPointer,dragBox){
     if (!p) return;
     b.x1 = p[0]; b.y1 = p[1]; b.moved = true;
     const r = dragBox(b.x0, b.y0, b.x1, b.y1);
-    if (!b.box || !b.box.isConnected) {
-      ctx.overlay.alignTo(null);
-      b.box = ctx.overlay.add("rect", { class: "box" });
-    }
+    if (!b.box || !b.box.isConnected) b.box = ctx.overlay.addRoot("rect", { class: "box" });
     for (const k of ["x", "y", "width", "height"]) b.box.setAttribute(k, r[k]);
   },
   onPointerUp(ctx) {
@@ -15963,10 +15974,9 @@ const sl125 = function _toolDraw(shapeSpec,shapeMarkup,dragBox,grabPointer){retu
     if (!p) return;
     d.x1 = p[0]; d.y1 = p[1]; d.square = e.shiftKey;
     const spec = shapeSpec(d.kind, d.x0, d.y0, d.x1, d.y1, { square: d.square, ...ctx.options.shapeStyle });
-    ctx.overlay.alignTo(null);                          // the preview is in root user space
-    if (!d.preview || d.preview.localName !== spec.tag) {
+    if (!d.preview || !d.preview.isConnected || d.preview.localName !== spec.tag) {
       if (d.preview) d.preview.remove();
-      d.preview = ctx.overlay.add(spec.tag, { ...spec.attrs, opacity: 0.6 });
+      d.preview = ctx.overlay.addRoot(spec.tag, { ...spec.attrs, opacity: 0.6 });   // root user space
     } else for (const k in spec.attrs) d.preview.setAttribute(k, spec.attrs[k]);
   },
   async onPointerUp(ctx) {
@@ -16002,10 +16012,7 @@ const sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer){return(
     if (!pen) return;
     const p = ctx.localPoint(ctx.node, e);
     if (!p) return;
-    if (!pen.band || !pen.band.isConnected) {
-      ctx.overlay.alignTo(null);
-      pen.band = ctx.overlay.add("line", { class: "link" });
-    }
+    if (!pen.band || !pen.band.isConnected) pen.band = ctx.overlay.addRoot("line", { class: "link" });
     for (const [k, v] of [["x1", pen.last[0]], ["y1", pen.last[1]], ["x2", p[0]], ["y2", p[1]]])
       pen.band.setAttribute(k, v);
   },
@@ -16105,16 +16112,15 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
     // Alignment guides, handed in screen coordinates and drawn in the root's user space — the tools
     // measure where the pointer is, the overlay draws where the drawing is.
     const guides = (lines) => {
-      for (const n of [...overlay.el.querySelectorAll("line.guide")]) n.remove();
+      for (const n of [...overlay.rootEl.querySelectorAll("line.guide")]) n.remove();
       if (!lines || !lines.length) return;
       const m = node.getScreenCTM();
       if (!m) return;
       const inv = m.inverse();
       const at = (x, y) => [inv.a * x + inv.c * y + inv.e, inv.b * x + inv.d * y + inv.f];
-      overlay.alignTo(null);
       for (const g of lines) {
         const [x1, y1] = at(g.x1, g.y1), [x2, y2] = at(g.x2, g.y2);
-        overlay.add("line", { class: "guide", x1, y1, x2, y2 });
+        overlay.addRoot("line", { class: "guide", x1, y1, x2, y2 });
       }
     };
 
