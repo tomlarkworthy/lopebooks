@@ -17145,6 +17145,7 @@ const _sl118 = function _svgOverlay(){return(
       [data-svg-lens-overlay] .hit{fill:transparent;stroke:none;cursor:grab}
       [data-svg-lens-overlay] .scale{fill:#fff;stroke:#2F6BFF;stroke-width:2;cursor:nwse-resize}
       [data-svg-lens-overlay] .rotate{fill:#2F6BFF;stroke:#fff;stroke-width:1.5;cursor:grab}
+      [data-svg-lens-overlay] .pivot{fill:#E4572E;stroke:#fff;stroke-width:2;cursor:move}
       [data-svg-lens-overlay] .box{fill:none;stroke:#2F6BFF;stroke-dasharray:4 3;stroke-width:1;opacity:.6}
       [data-svg-lens-overlay] .link{stroke:#8A63D2;stroke-dasharray:3 3;stroke-width:1;fill:none;opacity:.7}
       [data-svg-lens-overlay] .guide{stroke:#E4572E;stroke-width:1;opacity:.9}
@@ -17297,6 +17298,10 @@ const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateH
   // S9. What to draw *on* the selection once its box is known — set by svgLens, which alone has the
   // affordance registry and `canCommand`. `paint` computes the box (single or union) and hands it over.
   let decorate = null;
+  // G12. The rotation pivot, in the primary element's *local* user space (where its bbox and every
+  // transform handle live), or null for "the bounding-box centre". Moving it writes nothing — it is a
+  // property of how you are about to rotate, not of the drawing — so it lives here beside the selection.
+  let pivot = null;
   const key = (p) => p.join("/");
   const indexOfPath = (p) => {
     if (!p) return null;
@@ -17314,7 +17319,13 @@ const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateH
     if (mode === "transform") {
       const el = element();
       if (!el || !el.getBBox) return [];
-      try { return transformHandles(el.getBBox()); } catch (e) { return []; }
+      try {
+        const b = el.getBBox();
+        const hs = transformHandles(b);
+        const c = pivot || [b.x + b.width / 2, b.y + b.height / 2];   // G12: the movable rotation pivot
+        hs.push({ key: "pivot", kind: "pivot", x: c[0], y: c[1] });
+        return hs;
+      } catch (e) { return []; }
     }
     const t = target.doc();
     if (t === null) return [];
@@ -17387,7 +17398,7 @@ const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateH
     }
     for (const h of hs) {
       const cls = locked ? "locked"
-                : h.kind === "anchor" || h.kind === "scale" || h.kind === "rotate" ? h.kind : "ctrl";
+                : h.kind === "anchor" || h.kind === "scale" || h.kind === "rotate" || h.kind === "pivot" ? h.kind : "ctrl";
       const on = chosen.has(h.key);
       overlay.add("circle", { class: cls + (on ? " sel" : ""),
                               r: (cls === "ctrl" ? r * 0.8 : r) * (on ? 1.35 : 1), cx: h.x, cy: h.y });
@@ -17407,9 +17418,12 @@ const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateH
     get mode() { return mode; },
     handles,
     setDecorate(fn) { decorate = fn; },
+    // G12. Read/set the rotation pivot; a fresh selection resets it to the box centre (null).
+    get pivot() { return pivot ? pivot.slice() : null; },
+    setPivot(p) { pivot = p ? p.slice() : null; draw(); },
     refresh: draw,
-    set(p, m) { paths = p ? [p] : []; mode = p ? m : null; draw(); },
-    setAll(ps, m = null) { paths = topmostPaths(ps); mode = paths.length === 1 ? m : null; draw(); },
+    set(p, m) { paths = p ? [p] : []; mode = p ? m : null; pivot = null; draw(); },
+    setAll(ps, m = null) { paths = topmostPaths(ps); mode = paths.length === 1 ? m : null; pivot = null; draw(); },
     // Shift-click: in or out of the set, primary unchanged unless it was the one removed.
     toggle(p) {
       const i = paths.findIndex((q) => key(q) === key(p));
@@ -17417,7 +17431,7 @@ const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateH
       if (paths.length !== 1) mode = null;
       draw();
     },
-    clear() { paths = []; verts = []; mode = null; draw(); },
+    clear() { paths = []; verts = []; mode = null; pivot = null; draw(); },
     // ---- the vertex selection (P7) ---------------------------------------------------------------
     get vertices() { return verts.slice(); },
     setVertices(list) { verts = (list || []).slice(); draw(); },
@@ -17609,11 +17623,16 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
     grabPointer(ctx.node, e);
     const b = ctx.bbox(el);
     if (!b) return false;
+    // G12. Grabbing the pivot mark moves it — a view change, not an edit: it writes nothing, so it
+    // needs no `text`/`ops`, and a rotate afterwards reads `focus.pivot` as its centre.
+    if (key === "pivot") { ctx.state.drag = { tool: "transform", key, idx, el, pivotMove: true, started: false }; return true; }
     const text = ctx.attr(t, idx, "transform") || "";
+    const centre = ctx.focus.pivot || [b.x + b.width / 2, b.y + b.height / 2];
     ctx.state.drag = {
       tool: "transform",                                 // see the note on `onCancel` below
       key, idx, el, b, text, base: opsLens.get(text), ops: opsLens.get(text), started: false,
-      centre: [b.x + b.width / 2, b.y + b.height / 2],
+      centre: [b.x + b.width / 2, b.y + b.height / 2],   // the box centre: what alt-scale scales about
+      rotCentre: centre,                                  // G12: the (possibly moved) rotation pivot
       // the corner opposite the one being dragged: the point that must not move
       pivot: key === "rot" ? null : [
         /w$/.test(key) ? b.x + b.width : b.x,
@@ -17628,11 +17647,18 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
     const p = ctx.localPoint(d.el, e);
     if (!p) return;
     d.started = true;
+    // G12. Dragging the pivot just repositions it; the rotate gesture that follows reads it.
+    if (d.pivotMove) {
+      ctx.focus.setPivot(p);
+      const at = ctx.localPoint(ctx.node, e);
+      if (at) previewDelta(ctx, gestureDelta.readout(`pivot ${p[0].toFixed(1)}, ${p[1].toFixed(1)}`, at, ctx.readoutFont()));
+      return;
+    }
     if (d.key === "rot") {
-      const a = Math.atan2(p[1] - d.centre[1], p[0] - d.centre[0]) * 180 / Math.PI + 90;
+      const a = Math.atan2(p[1] - d.rotCentre[1], p[0] - d.rotCentre[0]) * 180 / Math.PI + 90;
       const step = e.shiftKey ? 15 : 1;
       const ang = Math.round(a / step) * step;
-      d.ops = rotateAbout(d.base, ang, d.centre[0], d.centre[1]);
+      d.ops = rotateAbout(d.base, ang, d.rotCentre[0], d.rotCentre[1]);
       d.read = `${((ang % 360) + 360) % 360}°`;
     } else {
       // G11: alt scales about the centre, so both sides move symmetrically — the pivot becomes the
@@ -17662,6 +17688,8 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
   async onPointerUp(ctx) {
     const d = ctx.state.drag;
     ctx.state.drag = null;
+    // A pivot move writes nothing, so no commit clears the overlay for it — clear its readout by hand.
+    if (d && d.pivotMove) return void previewDelta(ctx, gestureDelta.view([], { key: "readout" }));
     if (d && d.started && d.delta) await commitDelta(ctx, d.delta);
   },
   // `state.drag` is one key shared by this tool, the vertex tool and the move tool — safe during a
