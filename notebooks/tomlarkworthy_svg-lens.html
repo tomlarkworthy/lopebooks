@@ -14405,6 +14405,31 @@ const _sl79c = function _reorderElement(childrenLens){return(
 }
 )};
 
+// ---- defs: minting an id and writing into <defs> (S10) -------------------------------------------
+// A gradient, marker or pattern is a *reference target*: the thing you point at is not the thing that
+// gets written (`refsOf` reports which attribute points where). Two primitives are all S10 needs on
+// top of the lenses that already carry `defs` through an edit untouched — an id that does not collide
+// with any the document already holds (`idsIn` is the same authority `freshenIds` uses on paste, so
+// two minted gradients cannot share an id, S10's first falsifier), and a write into `<defs>` that
+// creates it when absent. `defs` is appended as the *last* child of the svg, so no existing element's
+// address moves — the referring shape keeps its path and the command needs no rebase.
+const _sl275 = function _mintId(idsIn){return(
+(src, prefix = "id") => {
+  const taken = idsIn(src);
+  let i = 1; while (taken.has(prefix + i)) i++;
+  return prefix + i;
+}
+)};
+
+const _sl276 = function _defsInsert(nodeAt,insertElement){return(
+(src, markup) => {
+  const svg = nodeAt(src, [0]);
+  const defs = svg.children.find((c) => c.tag === "defs");
+  if (defs) return insertElement(src, defs.path, null, markup);
+  return insertElement(src, [0], null, `<defs>${markup}</defs>`);
+}
+)};
+
 // ---- structural commands, part 2: group, ungroup, and the copy/paste codec (S4, P8) -------------
 // Same shape as the three above — pure (document text, addresses) -> document text — so every law
 // that covers a put covers these too. Nothing here knows about the DOM, the pointer or the clipboard.
@@ -20246,7 +20271,62 @@ const _sl264 = function _cmdSelect(gestureDelta,nodeAt){return(
 })
 )};
 
-const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth,cmdSelect,cmdConvertSegment){return(
+// S10/G35. Mint a linearGradient into <defs> and point the selected shape's fill at it. The shape's
+// current fill becomes the first stop (its notation preserved), white the second — a starting point
+// you then edit by selecting a <stop> like any other element, which is the whole point of defs living
+// in the same tree. One shape, because "point *this* fill at a new gradient" names one referrer; a
+// pasted copy of the shape carries the url and `freshenIds` renames the gradient with it, so the copy
+// gets its own — S10's paste-collision falsifier holds through the existing codec, not a special case.
+const _sl277 = function _cmdAddGradient(gestureDelta,nodeAt,attrVal,setProperty,attrTextLens,mintId,defsInsert){return(
+{
+  id: "add-gradient", label: "Add gradient", key: null,
+  plan(env) {
+    if (env.paths.length !== 1) return null;
+    const path = env.paths[0];
+    let n; try { n = nodeAt(env.src, path); } catch (e) { return null; }
+    const paintable = ["rect", "circle", "ellipse", "polygon", "path", "line", "polyline", "text"];
+    if (!paintable.includes(n.tag)) return null;
+    const cur = attrVal(env.src, n.index, "fill");
+    return gestureDelta.command("add-gradient", (src) => {
+      const idx = nodeAt(src, path).index;
+      const id = mintId(src, "grad");
+      const base = cur && !/^\s*url\(/.test(cur) && cur !== "none" ? cur : "#888888";
+      const grad = `<linearGradient id="${id}" x1="0" y1="0" x2="1" y2="0">`
+                 + `<stop offset="0" stop-color="${base}"/><stop offset="1" stop-color="#ffffff"/></linearGradient>`;
+      const w = setProperty(src, idx, "fill", `url(#${id})`);
+      return defsInsert(attrTextLens(idx, w.name).put(w.value, src), grad);
+    }, { rebase: null, select: () => [path] });
+  }
+}
+)};
+
+// S10/G36. The same move for a marker: mint an arrowhead into <defs> and point `marker-end` at it,
+// coloured by the shape's stroke. Markers attach to the stroked path tags. Everything else — the
+// non-colliding id, the untouched addresses, the paste rename — is shared with the gradient command.
+const _sl278 = function _cmdAddMarker(gestureDelta,nodeAt,attrVal,setProperty,attrTextLens,mintId,defsInsert){return(
+{
+  id: "add-marker", label: "Add arrowhead", key: null,
+  plan(env) {
+    if (env.paths.length !== 1) return null;
+    const path = env.paths[0];
+    let n; try { n = nodeAt(env.src, path); } catch (e) { return null; }
+    const strokable = ["path", "line", "polyline", "polygon"];
+    if (!strokable.includes(n.tag)) return null;
+    const cur = attrVal(env.src, n.index, "stroke");
+    return gestureDelta.command("add-marker", (src) => {
+      const idx = nodeAt(src, path).index;
+      const id = mintId(src, "arrow");
+      const color = cur && !/^\s*url\(/.test(cur) && cur !== "none" ? cur : "#333333";
+      const mk = `<marker id="${id}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">`
+               + `<path d="M0,0 L10,5 L0,10 z" fill="${color}"/></marker>`;
+      const w = setProperty(src, idx, "marker-end", `url(#${id})`);
+      return defsInsert(attrTextLens(idx, w.name).put(w.value, src), mk);
+    }, { rebase: null, select: () => [path] });
+  }
+}
+)};
+
+const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth,cmdSelect,cmdConvertSegment,cmdAddGradient,cmdAddMarker){return(
 // A plain array, not an `Inputs.input`, for the same reason `svgShapes` is: pure code plans a command
 // and the laws exercise that headless, where there is no DOM to hold a view.
 [cmdGroup, cmdUngroup, cmdDuplicate, cmdCopy, cmdCut, cmdPaste(false), cmdPaste(true)]
@@ -20255,6 +20335,7 @@ const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cm
            cmdDeleteVertex, cmdClosePath(true), cmdClosePath(false), cmdToggleSmooth])
   .concat(["all", "none", "same-fill", "same-tag"].map(cmdSelect))
   .concat(["L", "C", "Q"].map(cmdConvertSegment))
+  .concat([cmdAddGradient, cmdAddMarker])
 )};
 
 // Look one up, and answer "what does this keystroke mean" in one place. The binding is a
@@ -20354,7 +20435,18 @@ const _sl272 = function _svgAffordances(gestureDelta,previewDelta,setProperty,no
     { id: "open-path", command: "open-path", cursor: "pointer", applies: isPath,
       glyph: () => ({ symbol: "◠", fill: "#fff" }), title: "Open path" },
     { id: "toggle-smooth", command: "toggle-smooth", cursor: "pointer", applies: isPath,
-      glyph: () => ({ symbol: "∿", fill: "#fff" }), title: "Smooth / corner" }
+      glyph: () => ({ symbol: "∿", fill: "#fff" }), title: "Smooth / corner" },
+
+    // S10/G35-G36: mint a defs target and point at it. Command-backed, so each declines exactly when
+    // its command's plan does (`a.canDo`) — the gradient chip greys unless one paintable shape is
+    // selected, the arrowhead chip unless one stroked path is. Applies gates cheaply on the tag so the
+    // chip is only *considered* for the right shapes; canDo makes the final call (G41 = T8).
+    { id: "add-gradient", command: "add-gradient", cursor: "pointer",
+      applies: (a) => a.paths.length === 1,
+      glyph: () => ({ symbol: "◑", fill: "#fff" }), title: "Add gradient" },
+    { id: "add-marker", command: "add-marker", cursor: "pointer",
+      applies: (a) => a.paths.length === 1,
+      glyph: () => ({ symbol: "➤", fill: "#fff" }), title: "Add arrowhead" }
   ];
 })()
 )};
@@ -21362,6 +21454,8 @@ export default function define(runtime, observer) {
   $def("sl79a", "insertElement", ["childrenLens"], _sl79a);
   $def("sl79b", "deleteElement", ["childrenLens"], _sl79b);
   $def("sl79c", "reorderElement", ["childrenLens"], _sl79c);
+  $def("sl275", "mintId", ["idsIn"], _sl275);
+  $def("sl276", "defsInsert", ["nodeAt","insertElement"], _sl276);
   $def("sl79xa", "groupPlan", [], _sl79xa);
   $def("sl79xb", "groupElements", ["childrenLens","groupPlan","nodeAt"], _sl79xb);
   $def("sl79xc", "ungroupBlockers", ["nodeAt"], _sl79xc);
@@ -21478,7 +21572,9 @@ export default function define(runtime, observer) {
   $def("sl264", "cmdSelect", ["gestureDelta","nodeAt"], _sl264);
   $def("sl265", "pathConvert", ["pathSegments","replaceGroup","absoluteGroup"], _sl265);
   $def("sl266", "cmdConvertSegment", ["gestureDelta","attrVal","parsePath","printPath","pathSegments","pathHandles","attrTextLens","nodeAt","pathConvert"], _sl266);
-  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth","cmdSelect","cmdConvertSegment"], _sl250);
+  $def("sl277", "cmdAddGradient", ["gestureDelta","nodeAt","attrVal","setProperty","attrTextLens","mintId","defsInsert"], _sl277);
+  $def("sl278", "cmdAddMarker", ["gestureDelta","nodeAt","attrVal","setProperty","attrTextLens","mintId","defsInsert"], _sl278);
+  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth","cmdSelect","cmdConvertSegment","cmdAddGradient","cmdAddMarker"], _sl250);
   $def("sl272", "svgAffordances", ["gestureDelta","previewDelta","setProperty","nodeAt"], _sl272);
   $def("sl249", "commandLookup", [], _sl249);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
