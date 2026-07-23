@@ -12313,8 +12313,11 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
     }
     const hit = TOOLS.find(([, , k]) => k.toLowerCase() === e.key.toLowerCase());
     if (hit) drawing.setTool(hit[0]);
-    // Escape means "undo what I am doing now", and only failing that "leave this mode".
-    else if (e.key === "Escape") { if (!drawing.cancelGesture()) drawing.setTool("select"); }
+    // Escape means "undo what I am doing now", then "step out of this group", and only failing
+    // both "leave this mode". Keyboard stays with the callsite; the drawing only offers the verbs.
+    else if (e.key === "Escape") {
+      if (!drawing.cancelGesture() && !drawing.ascendScope()) drawing.setTool("select");
+    }
   };
   document.addEventListener("keydown", onKey);
   invalidation.then(() => document.removeEventListener("keydown", onKey));
@@ -15018,6 +15021,47 @@ const _sl108g = function _test_commands_commute(forAll,arb,mulberry32,NUM_RUNS,t
 // place, or "direct geometry" would quietly mean "a different editor for rects".
 // The other two are the registry's own contract: a handle put where it already is writes nothing
 // (T1 at the level of one entry), and moving a handle puts it where you asked (PutGet for handles).
+// The group policy, headless (S1). T10 checks it through a browser; this checks the function it is
+// made of, which is where an off-by-one in "one level deeper" would actually live.
+const _sl119e = function _test_scoped_path(forAll,arb,mulberry32,NUM_RUNS,scopedPath)
+{
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const TABLE = [
+    // [leaf,        scope,     selects]
+    [[0, 3, 0],      [0],       [0, 3]],      // at the root a grouped shape is its group
+    [[0, 3, 0],      [0, 3],    [0, 3, 0]],   // inside that group it is itself
+    [[0, 2],         [0],       [0, 2]],      // a top-level shape is always itself
+    [[0, 2],         [0, 3],    [0, 2]],      // ...even with an unrelated group entered
+    [[0, 1, 2, 3],   [0, 1],    [0, 1, 2]],   // one level at a time
+    [[0, 1, 2, 3],   [0, 1, 2], [0, 1, 2, 3]],
+    [[0],            [0],       [0]]          // the root is never a selection
+  ];
+  for (const [leaf, scope, want] of TABLE)
+    if (!eq(scopedPath(leaf, scope), want))
+      throw new Error(`scopedPath(${JSON.stringify(leaf)}, ${JSON.stringify(scope)}) = `
+                    + `${JSON.stringify(scopedPath(leaf, scope))}, expected ${JSON.stringify(want)}`);
+
+  const rng = mulberry32(0x5EED0041);
+  forAll(NUM_RUNS, rng,
+    (r) => [Array.from({ length: 1 + arb.int(r, 1, 5) }, (_, i) => (i ? arb.int(r, 0, 4) : 0)),
+            arb.int(r, 0, 5)],
+    (leaf, depth) => {
+      const scope = leaf.slice(0, Math.max(1, Math.min(depth, leaf.length)));
+      const sel = scopedPath(leaf, scope);
+      // never past the leaf, never above the scope, and exactly one step when there is room
+      if (sel.length > leaf.length) throw new Error(`selected deeper than the leaf: ${sel}`);
+      if (!scope.every((v, i) => sel[i] === v)) throw new Error(`selected outside the scope: ${sel}`);
+      if (leaf.length > scope.length && sel.length !== scope.length + 1)
+        throw new Error(`did not descend exactly one level: ${sel} for scope ${scope}`);
+      // and it is a fixpoint once the scope has reached the leaf's parent
+      if (!eq(scopedPath(leaf, sel), sel.length < leaf.length ? sel.concat(leaf[sel.length]) : sel))
+        throw new Error(`re-scoping is not one more step: ${sel}`);
+      return true;
+    }, "scopedPath descends exactly one level and never leaves its scope");
+  return `✅ the group policy: ${TABLE.length} table rows and ${NUM_RUNS} random paths descend one `
+       + `level at a time and never escape the scope`;
+};
+
 const _sl113t = function _test_shape_registry(forAll,arb,mulberry32,NUM_RUNS,scaleAbout,printOp,parseTransform,applyPoint,svgShapes,shapeLookup,attrTextLens)
 {
   const doc = (el) => `<svg xmlns="http://www.w3.org/2000/svg">${el}</svg>`;
@@ -16703,6 +16747,20 @@ const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDe
 }
 )};
 
+// Group-vs-leaf, as one pure function (design note S1). A click means "the outermost thing that is
+// not already opened": at the root scope a leaf inside a `<g>` stands for the `<g>`, and entering
+// that group makes the same leaf stand for itself. A path that is not under the scope answers as if
+// the scope were the root, so a stale scope can never make a click select something surprising.
+const _sl119d = function _scopedPath(){return(
+(path, scope = [0]) => {
+  if (!path || path.length < 2) return path;             // the root itself is never a selection
+  // `<=`, not `<`: a scope that has reached the element itself means the element, not a fall back to
+  // the root. Only a scope this path is not under starts again from the top.
+  const inside = scope.length <= path.length && scope.every((v, i) => path[i] === v);
+  return path.slice(0, Math.min((inside ? scope.length : 1) + 1, path.length));
+}
+)};
+
 // What is under the pointer, front to back. `elementsFromPoint` answers for painted geometry, which
 // already gives click-through to occluded shapes for free. When it finds nothing — a thin unfilled
 // stroke the pointer merely came close to — fall back to distance along the geometry, so hairlines
@@ -16735,6 +16793,35 @@ const _sl121a = function _hitTest(){return(
 }
 )};
 
+// Enter a group (G6). Double-click descends one level and selects what is under the pointer at the
+// new depth; `node.ascendScope()` (Escape, at the callsite) comes back out. It sits before
+// `toolStructure` in the registry so a double-click on a group enters it rather than falling through
+// to "insert a point" or "drop a shape" — and it declines the moment there is nothing left to enter,
+// which is exactly when those gestures are the ones you meant.
+const _sl122b = function _toolScope(pathOfIndex,scopedPath,shapeLookup,gestureDelta,commitDelta){return(
+{
+  id: "scope",
+  async onDblClick(ctx, e) {
+    if (ctx.tool() !== "select") return false;
+    const t = ctx.doc();
+    if (t === null) return false;
+    const list = ctx.elems();
+    const leafEl = ctx.hit(e)[0];
+    const li = leafEl ? list.indexOf(leafEl) : -1;
+    if (li <= 0) return false;
+    const leaf = pathOfIndex(t, li);
+    const here = scopedPath(leaf, ctx.scope());
+    if (here.length >= leaf.length) return false;        // already at the leaf: nothing to enter
+    ctx.setScope(here);
+    const p = ctx.pick(e)[0];                            // now answers one level deeper
+    if (!p) return false;
+    const entry = shapeLookup.forTag(ctx.shapes, p.el.localName, t, p.index);
+    await commitDelta(ctx, gestureDelta.select([p.path], entry ? entry.mode : "transform"));
+    return true;
+  }
+}
+)};
+
 // Drag a shape's body: the `transform` lens, focused on the leading translate op. Dragging one of
 // several selected shapes moves them all — one commit each, since each writes its own attribute.
 // A tap with no movement selects instead: shift adds to the set, and tapping the shape that is
@@ -16744,17 +16831,19 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
   id: "move",
   onPointerDown(ctx, e) {
     if (ctx.tool() !== "select") return false;
-    const hits = ctx.hit(e);
+    // `pick`, not `hit`: inside a group a leaf stands for its group, and this is the same call the
+    // hover outline makes, so what lights up is what a press claims (S1).
+    const hits = ctx.pick(e);
     if (!hits.length) return false;                      // empty canvas: the marquee may want it
     const list = ctx.elems();
     const t = ctx.doc();
     if (t === null) return false;
     const sel = ctx.focus.indices;
     // Grabbing a selected shape grabs the whole selection; grabbing anything else grabs just it.
-    const primary = sel.length ? list[sel[0]] : null;
-    const el = hits.indexOf(primary) >= 0 ? primary : hits[0];
-    const idx = list.indexOf(el);
-    if (idx <= 0) return false;
+    const at0 = sel.length ? hits.findIndex((h) => h.index === sel[0]) : -1;
+    const idx = at0 >= 0 ? sel[0] : hits[0].index;
+    const el = list[idx];
+    if (idx <= 0 || !el) return false;
     const targets = [];
     for (const i of sel.indexOf(idx) >= 0 ? sel : [idx]) {
       const node = list[i];
@@ -16772,7 +16861,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     const snapping = targets.length === 1 && ctx.options.snap !== false;
     ctx.state.drag = {
       tool: "move",
-      idx, hits, tag: el.localName, targets,
+      idx, hits, tag: el.localName, targets,      // `hits` are picks, not raw elements
       x0: e.clientX, y0: e.clientY, started: false,
       thresh: e.pointerType === "mouse" ? 3 : 10,
       box: snapping ? ctx.screenBox(el) : null,
@@ -16836,19 +16925,22 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     if (e.shiftKey)
       return void await commitDelta(ctx, gestureDelta.select([pathOfIndex(t, d.idx)], null, { toggle: true }));
     // Tapping the primary again steps down the stack; tapping anything else selects the top hit.
-    const list = ctx.elems();
     const single = ctx.focus.paths.length === 1;
-    const at = d.hits.indexOf(list[d.idx]);
+    const at = d.hits.findIndex((h) => h.index === d.idx);
     const pick = single && at >= 0 ? d.hits[(at + 1) % d.hits.length] : d.hits[0];
-    const idx = list.indexOf(pick);
+    const idx = pick.index;
     if (idx <= 0) return;
-    const tag = pick.localName;
+    const tag = pick.el.localName;
     // Which mode a tap offers is the registry's decision, and it turns on whether the lens can
     // actually *read* this element rather than on its tag: a polygon with an unparseable points list
     // falls through to the gizmo rather than to broken handles. That is the partiality law (T8) as
     // one lookup, and adding a tag to the registry is now the whole of teaching this the new shape.
     const entry = shapeLookup.forTag(ctx.shapes, tag, t, idx);
-    await commitDelta(ctx, gestureDelta.select([pathOfIndex(t, idx)], entry ? entry.mode : "transform"));
+    // Selecting something the current group does not contain is how you leave it — otherwise the
+    // scope outlives its usefulness and a later click inside another group behaves oddly.
+    const sc = ctx.scope();
+    if (!(sc.length < pick.path.length && sc.every((v, i) => pick.path[i] === v))) ctx.setScope([0]);
+    await commitDelta(ctx, gestureDelta.select([pick.path], entry ? entry.mode : "transform"));
   },
   onCancel(ctx) {
     const d = ctx.state.drag;
@@ -16863,7 +16955,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
 
 // Drag on empty canvas to rubber-band a selection. Intersection is tested in the root's user space,
 // where the marquee is drawn, so a rotated element is compared as the box it actually occupies.
-const _sl121b = function _toolMarquee(pathOfIndex,grabPointer,dragBox,gestureDelta,commitDelta){return(
+const _sl121b = function _toolMarquee(pathOfIndex,scopedPath,grabPointer,dragBox,gestureDelta,commitDelta){return(
 {
   id: "marquee",
   onPointerDown(ctx, e) {
@@ -16902,9 +16994,14 @@ const _sl121b = function _toolMarquee(pathOfIndex,grabPointer,dragBox,gestureDel
       const box = ctx.rootBox(list[i]);
       if (!box) continue;
       if (box.x <= r.x + r.width && box.x + box.width >= r.x &&
-          box.y <= r.y + r.height && box.y + box.height >= r.y) hits.push(pathOfIndex(t, i));
+          box.y <= r.y + r.height && box.y + box.height >= r.y)
+        hits.push(scopedPath(pathOfIndex(t, i), ctx.scope()));
     }
-    return commitDelta(ctx, gestureDelta.select(b.add ? ctx.focus.paths.concat(hits) : hits));
+    // A band over two leaves of one group is that group, once — the same policy a click uses.
+    const seen = new Set();
+    const uniq = hits.filter((p) => { const k = p.join("/"); return !seen.has(k) && seen.add(k); });
+    if (!uniq.length) ctx.setScope([0]);                 // a band over nothing leaves the group
+    return commitDelta(ctx, gestureDelta.select(b.add ? ctx.focus.paths.concat(uniq) : uniq));
   },
   // Nothing to put back — the band lives in the overlay and the selection is not an edit (T9).
   onCancel(ctx) {
@@ -16949,8 +17046,10 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
       return true;
     }
 
+    // The same hit contract selection uses, rather than whatever DOM node the event landed on:
+    // `e.target` was the last place in the editor where "what did I click" had a second answer.
+    const hit = key === undefined ? ((ctx.pick(e)[0] || {}).index ?? -1) : -1;
     const list = ctx.elems();
-    const hit = list.indexOf(e.target);
     // Inserting means double-clicking the shape itself. A handle under the pointer is a delete
     // (above) or, for a control point, nothing at all — inserting there would be a guess.
     if (sel && focus.mode === "points" && hit === focus.index) {
@@ -16973,7 +17072,7 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
       return true;
     }
 
-    if (hit <= 0) {
+    if (hit < 0) {
       const p = ctx.localPoint(ctx.node, e);
       if (!p) return false;
       const at = childrenLens([0]).get(t).length;       // appended, so nothing before it moves
@@ -17688,9 +17787,9 @@ const _sl142 = function _test_gesture_partiality(withFixture,gestureCorpus,playG
 // the point: this is a claim about how the tools are *written*, and it fails the moment one is
 // written differently. The tools are listed rather than read from `svgTools`, which is an
 // `Inputs.input` and so needs a DOM this law does not.
-const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure,toolHover)
+const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolStructure,toolHover)
 {
-  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure, toolHover];
+  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolStructure, toolHover];
   const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave"];
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
   const bad = [];
@@ -17723,9 +17822,9 @@ const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,too
 // facade to `getBBox`/`getScreenCTM`/`elementsFromPoint` has a hidden input, and hidden inputs are
 // exactly what the laws cannot see. `hitTest` still asks the browser; the point is that it is the
 // one place that does, reachable as `ctx.hit`.
-const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure,toolHover)
+const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolStructure,toolHover)
 {
-  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure, toolHover];
+  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolStructure, toolHover];
   const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave"];
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
   const BANNED = /\b(getBBox|getScreenCTM|getBoundingClientRect|elementsFromPoint|getTotalLength|getPointAtLength)\s*\(/g;
@@ -17747,7 +17846,67 @@ const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolTra
 // events and commit through `Variable.define` — seconds of work and a burst of change-history
 // traffic — so running them on every reader's load would be wrong. Each law above is a function;
 // this runs them all and reports. CI calls `gestureLaws.run()`.
-const _sl139 = function _gestureLaws(test_gesture_identity,test_gesture_path_independence,test_gesture_commits_against_its_origin,test_gesture_render_consistency,test_gesture_confinement,test_gesture_rebase_agreement,test_gesture_partiality,test_gesture_selection_is_not_an_edit){return(
+// T10 — the hit contract (S1/G6). Ours, not from either paper, and it is the law gap 0 needed: what
+// the hover outlines, what a press claims and what a double-click enters are three readings of one
+// answer, so they cannot drift apart. It also pins the group policy — click takes the group,
+// double-click descends, Escape ascends — and the case that made gap 0 visible, a double-click on a
+// stroke-only shape, which used to miss with `e.target` and append a shape onto the canvas.
+const _sl145 = function _test_gesture_hit_agreement(withFixture,gestureCorpus,playGesture,boxInRoot)
+{
+  if (typeof document === "undefined") return () => "⏭ needs a browser";
+  const near = (a, b) => a && b && Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y),
+                                            Math.abs(a.width - b.width), Math.abs(a.height - b.height)) < 1.5;
+  return () => withFixture(gestureCorpus.basic, {}, async (f) => {
+    const hoverBox = () => {
+      const r = f.node.querySelector("[data-svg-lens-overlay] rect.hover");
+      return r && { x: +r.getAttribute("x"), y: +r.getAttribute("y"),
+                    width: +r.getAttribute("width"), height: +r.getAttribute("height") };
+    };
+    const selBox = () => {
+      const sel = f.node.selectionPaths();
+      if (sel.length !== 1) return null;
+      const el = f.elems()[f.node.describe(sel[0]).index];
+      return el && boxInRoot(el, f.node);
+    };
+    let checked = 0;
+    for (const [where, [x, y]] of Object.entries(gestureCorpus.at)) {
+      if (where === "empty") continue;
+      await playGesture(f, playGesture.tap(-40, -40));              // clear the selection first
+      await playGesture(f, () => [["move", x, y]]);                 // hover, no press
+      const hb = hoverBox();
+      if (!hb) throw new Error(`nothing was outlined over ${where}`);
+      await playGesture(f, playGesture.tap(x, y));
+      if (!near(hb, selBox()))
+        throw new Error(`over ${where} the outline and the selection disagree: `
+                      + `${JSON.stringify(hb)} vs ${JSON.stringify(selBox())}`);
+      checked++;
+    }
+    // A group is one thing until you enter it.
+    await playGesture(f, playGesture.tap(...gestureCorpus.at.group));
+    const outer = f.node.selectionPaths()[0];
+    if (!outer || outer.length !== 2)
+      throw new Error(`clicking a grouped shape selected ${JSON.stringify(outer)}, not the group`);
+    const n0 = f.elemCount();
+    await playGesture(f, playGesture.dblclick(...gestureCorpus.at.group));
+    const inner = f.node.selectionPaths()[0];
+    if (!inner || inner.length !== 3)
+      throw new Error(`double-click did not descend: ${JSON.stringify(inner)}`);
+    if (f.elemCount() !== n0) throw new Error("descending into a group changed the element count");
+    if (!f.node.ascendScope()) throw new Error("Escape could not step back out of the group");
+    if (JSON.stringify(f.node.selectionPaths()[0]) !== JSON.stringify(outer))
+      throw new Error("stepping out of a group did not select the group");
+    // Gap 0: a stroke-only shape is hittable, so double-clicking it is not "empty canvas".
+    await playGesture(f, playGesture.tap(-40, -40));
+    const n1 = f.elemCount();
+    await playGesture(f, playGesture.dblclick(...gestureCorpus.at.stroke));
+    if (f.elemCount() !== n1)
+      throw new Error("double-clicking a stroke-only shape appended an element");
+    return `✅ T10: outline and selection agree at ${checked} points, a group is one thing until `
+         + `entered, and a stroke-only shape is not empty canvas`;
+  });
+};
+
+const _sl139 = function _gestureLaws(test_gesture_identity,test_gesture_path_independence,test_gesture_commits_against_its_origin,test_gesture_render_consistency,test_gesture_confinement,test_gesture_rebase_agreement,test_gesture_partiality,test_gesture_selection_is_not_an_edit,test_gesture_hit_agreement){return(
 {
   laws: {
     "T1 identity": test_gesture_identity,
@@ -17757,7 +17916,8 @@ const _sl139 = function _gestureLaws(test_gesture_identity,test_gesture_path_ind
     "T6 confinement": test_gesture_confinement,
     "T7 rebase agreement": test_gesture_rebase_agreement,
     "T8 partiality": test_gesture_partiality,
-    "T9 selection is not an edit": test_gesture_selection_is_not_an_edit
+    "T9 selection is not an edit": test_gesture_selection_is_not_an_edit,
+    "T10 hit agreement": test_gesture_hit_agreement
   },
   async run() {
     const out = {};
@@ -17780,9 +17940,10 @@ const _sl127h = function _toolHover(gestureDelta,previewDelta){return(
 {
   id: "hover",
   onHover(ctx, e) {
-    const hit = ctx.hit(e)[0] || null;
+    const p = ctx.pick(e)[0] || null;                    // the same call selection makes (S1)
+    const hit = p && p.el;
     // The selection already has a box round it; outlining it again just makes the box thicker.
-    const selected = hit && ctx.focus.indices.includes(ctx.elems().indexOf(hit));
+    const selected = p && ctx.focus.indices.includes(p.index);
     const b = hit && !selected ? ctx.rootBox(hit) : null;
     previewDelta(ctx, gestureDelta.view(
       b ? [{ tag: "rect", attrs: { class: "hover", x: b.x, y: b.y, width: b.width, height: b.height } }] : [],
@@ -17795,8 +17956,8 @@ const _sl127h = function _toolHover(gestureDelta,previewDelta){return(
 }
 )};
 
-const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure,toolHover){return(
-Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure, toolHover])
+const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolStructure,toolHover){return(
+Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolStructure, toolHover])
 )};
 const _sl123v = (G, _) => G.input(_);
 
@@ -17810,7 +17971,7 @@ const _sl113s = function _lensState(){return(
 new Map()
 )};
 
-const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest)
+const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex)
 {
   // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
   // node that is the cell's value now, rather than the one its gesture started on.
@@ -17851,7 +18012,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       myVar = v;
       let s = lensState.get(v);
       if (!s) lensState.set(v, s = { undo: [], redo: [], paths: null, mode: "replace", tool: null,
-                                     gesture: {} });
+                                     gesture: {}, scope: null });
       return (shared = s);
     };
     const focus = svgFocus(overlay, target, () => {
@@ -17860,6 +18021,35 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       node.dispatchEvent(new CustomEvent("lens-select", { detail: { paths: focus.paths, mode: focus.mode } }));
     }, shapes);
     node.style.touchAction = "none";
+
+    // Which container the pointer is working inside. `[0]` is the drawing itself; entering a group
+    // pushes its path. It lives in the shared state for the same reason the tool does — a commit
+    // mints a new node, and being inside a group must survive that.
+    let localScope = [0];
+    const setScope = (p) => {
+      localScope = p;
+      const st = stateOf();
+      if (st) st.scope = p;
+      return p;
+    };
+    const scopeNow = () => {
+      const st = stateOf();
+      const sc = (st && st.scope) || localScope;
+      if (!sc || !sc.length) return setScope([0]);
+      const d = target.doc();
+      if (d === null) return sc;
+      try { nodeAt(d, sc); } catch (err) { return setScope([0]); }   // its group is gone
+      return sc;
+    };
+    // Leaving a group. Offered before "leave this mode" at the callsite, after cancelling a gesture.
+    node.ascendScope = () => {
+      const sc = scopeNow();
+      if (sc.length <= 1) return false;
+      const left = sc;
+      setScope(sc.slice(0, -1));
+      focus.set(left, "transform");                      // select the group just stepped out of
+      return true;
+    };
 
     // The active tool, and the scratch a half-finished gesture keeps. A gesture means different
     // things in different modes, so the tools that create gate on it; everything else is
@@ -17933,7 +18123,33 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       rootBox: (el) => boxInRoot(el, node),
       // What is under the pointer, front to back. Painted geometry first, then near-misses.
       hit: (e, opts = {}) =>
-        hitTest(ctx, e, { tolerance: options.hitTolerance, ...opts })
+        hitTest(ctx, e, { tolerance: options.hitTolerance, ...opts }),
+      // ---- the one hit contract (S1) ----------------------------------------------------------
+      // `hit` answers with painted leaves; `pick` answers what a *click* means, which is a different
+      // question — at the current scope a leaf inside a group stands for the group. Front to back,
+      // deduped, so tapping again steps down the stack. Selection, the hover highlight and the
+      // descent gesture all read this, which is why the outline cannot disagree with the click.
+      pick: (e, opts = {}) => {
+        const d = target.doc();
+        if (d === null) return [];
+        const list = target.elems();
+        const sc = scopeNow();
+        const out = [], seen = new Set();
+        for (const h of hitTest(ctx, e, { tolerance: options.hitTolerance, ...opts })) {
+          const li = list.indexOf(h);
+          if (li <= 0) continue;
+          let path, i;
+          try { path = scopedPath(pathOfIndex(d, li), sc); i = nodeAt(d, path).index; }
+          catch (err) { continue; }
+          const k = path.join("/");
+          if (seen.has(k) || !list[i]) continue;
+          seen.add(k);
+          out.push({ index: i, path, el: list[i] });
+        }
+        return out;
+      },
+      scope: scopeNow,
+      setScope
     };
 
     ctxByNode.set(node, ctx);
@@ -18272,6 +18488,7 @@ export default function define(runtime, observer) {
   $def("sl108e", "test_opsLens_laws", ["forAll","lensLaws","opsLens","arb","mulberry32","NUM_RUNS","printOp"], _sl108e);
   $def("sl108f", "test_transform_gizmo", ["forAll","arb","mulberry32","NUM_RUNS","rotateAbout","scaleAbout","printOp","parseTransform","applyPoint"], _sl108f);
   $def("sl108g", "test_commands_commute", ["forAll","arb","mulberry32","NUM_RUNS","tokenize","attrTextLens"], _sl108g);
+  $def("sl119e", "test_scoped_path", ["forAll","arb","mulberry32","NUM_RUNS","scopedPath"], _sl119e);
   $def("sl113t", "test_shape_registry", ["forAll","arb","mulberry32","NUM_RUNS","scaleAbout","printOp","parseTransform","applyPoint","svgShapes","shapeLookup","attrTextLens"], _sl113t);
   $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
   $def("sl74t", "test_domain_boundary", ["outsideDomain","parseDoc","tokenize","childrenLens"], _sl74t);
@@ -18408,10 +18625,12 @@ export default function define(runtime, observer) {
   $def("sl128b", "commitDelta", [], _sl128b);
   $def("sl128c", "revertDelta", [], _sl128c);
   $def("sl120", "toolVertex", ["handleEdit","shapeLookup","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl120);
+  $def("sl119d", "scopedPath", [], _sl119d);
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
   $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl121);
-  $def("sl121b", "toolMarquee", ["pathOfIndex","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
+  $def("sl122b", "toolScope", ["pathOfIndex","scopedPath","shapeLookup","gestureDelta","commitDelta"], _sl122b);
+  $def("sl121b", "toolMarquee", ["pathOfIndex","scopedPath","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
   $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint","gestureDelta","commitDelta"], _sl122);
   $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl124);
   $def("sl125a", "dragBox", [], _sl125a);
@@ -18429,18 +18648,19 @@ export default function define(runtime, observer) {
   $def("sl136", "test_gesture_commits_against_its_origin", ["withFixture","gestureCorpus","playGesture"], _sl136);
   $def("sl137", "test_gesture_confinement", ["withFixture","gestureCorpus","playGesture","svgTools"], _sl137);
   $def("sl138", "test_gesture_selection_is_not_an_edit", ["withFixture","gestureCorpus","playGesture","toolMarquee"], _sl138);
-  $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure","toolHover"], _sl144);
-  $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure","toolHover"], _sl143);
+  $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolStructure","toolHover"], _sl144);
+  $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolStructure","toolHover"], _sl143);
   $def("sl140a", "domShape", [], _sl140a);
   $def("sl140", "test_gesture_render_consistency", ["withFixture","gestureCorpus","playGesture","domShape"], _sl140);
   $def("sl141", "test_gesture_rebase_agreement", ["withFixture","gestureCorpus","nodeAt","childrenLens","insertPoint"], _sl141);
   $def("sl142", "test_gesture_partiality", ["withFixture","gestureCorpus","playGesture"], _sl142);
-  $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit"], _sl139);
+  $def("sl145", "test_gesture_hit_agreement", ["withFixture","gestureCorpus","playGesture","boxInRoot"], _sl145);
+  $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit","test_gesture_hit_agreement"], _sl139);
   $def("sl127h", "toolHover", ["gestureDelta","previewDelta"], _sl127h);
-  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure","toolHover"], _sl123);
+  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolStructure","toolHover"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest"], _sl114);
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
