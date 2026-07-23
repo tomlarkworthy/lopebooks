@@ -16059,6 +16059,9 @@ new Map()
 )};
 const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf)
 {
+  // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
+  // node that is the cell's value now, rather than the one its gesture started on.
+  const ctxByNode = new WeakMap();
   return function svgLens(node, options = {}) {
     const grid = options.grid === undefined ? 0.5 : options.grid;
     const snap = (v) => (grid ? Math.round(v / grid) * grid : v);
@@ -16073,13 +16076,21 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
     const target = svgTarget(node, { marker: svgLens, isOwn: overlay.isOwn });
     const writer = svgWriter(node, target);
     // Lazily, because `target.variable()` matches on `_value === node` and the runtime has not
-    // assigned this cell's value yet — we are still inside the definition that produces it.
+    // assigned this cell's value yet — we are still inside the definition that produces it. Both are
+    // cached once found: after a commit this node is no longer the variable's value, so `variable()`
+    // stops resolving, but a gesture that started here still has to reach the document's shared
+    // state — and `define` mutates the Variable in place, so the cached one keeps pointing at
+    // whichever node is current.
+    let shared = null, myVar = null;
     const stateOf = () => {
+      if (shared) return shared;
       const v = target.variable();
       if (!v) return null;
+      myVar = v;
       let s = lensState.get(v);
-      if (!s) lensState.set(v, s = { undo: [], redo: [], paths: null, mode: "replace", tool: null });
-      return s;
+      if (!s) lensState.set(v, s = { undo: [], redo: [], paths: null, mode: "replace", tool: null,
+                                     gesture: {} });
+      return (shared = s);
     };
     const focus = svgFocus(overlay, target, () => {
       const s = stateOf();
@@ -16088,19 +16099,26 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
     });
     node.style.touchAction = "none";
 
-    // The active tool. A gesture means different things in different modes, so the tools that create
-    // gate on it; everything else is unconditional and stays reachable in select mode. Held on the
-    // node rather than in a cell so a toolbar is optional — the editor works without one.
-    let tool = options.tool || "select";
+    // The active tool, and the scratch a half-finished gesture keeps. A gesture means different
+    // things in different modes, so the tools that create gate on it; everything else is
+    // unconditional and stays reachable in select mode. Both live in the shared state rather than
+    // this closure, because a tool can outlive the node it started on: the pen commits a path on its
+    // first anchor and extends it on the next click, by which time this node has been replaced.
+    // The locals are the fallback for a node that is not (yet) a cell value.
+    let localTool = options.tool || "select";
+    const localGesture = {};
+    const gesture = () => { const s = stateOf(); return s ? (s.gesture || (s.gesture = {})) : localGesture; };
+    const toolNow = () => { const s = stateOf(); return (s && s.tool) || localTool; };
     const setTool = (id) => {
-      tool = id || "select";
+      localTool = id || "select";
       const s = stateOf();
-      if (s) s.tool = tool;
-      ctx.state.pen = null;                              // a half-drawn path ends when the tool changes
-      ctx.state.draw = null;
+      if (s) s.tool = localTool;
+      const g = gesture();
+      g.pen = null;                                      // a half-drawn path ends when the tool changes
+      g.draw = null;
       overlay.clear();
       focus.refresh();
-      node.dispatchEvent(new CustomEvent("lens-tool", { detail: { tool } }));
+      node.dispatchEvent(new CustomEvent("lens-tool", { detail: { tool: localTool } }));
     };
 
     const kidCount = (parent) => {
@@ -16125,8 +16143,9 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
     };
 
     const ctx = {
-      node, target, writer, focus, snap, overlay, setTool, guides, state: {},
-      tool: () => tool,
+      node, target, writer, focus, snap, overlay, setTool, guides,
+      get state() { return gesture(); },
+      tool: () => toolNow(),
       childCount: kidCount,
       addShape: (markup, at, parent) => node.addShape(markup, at, parent),
       options: { ...options, newShape },
@@ -16142,25 +16161,43 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
       }
     };
 
+    ctxByNode.set(node, ctx);
+    // Tools are handed a facade, not this closure's ctx. A commit mints a new node, so an operation
+    // that spans one leaves the instance it started on dead: the old target no longer resolves, its
+    // overlay is detached, and its writer would silently refuse (`cellSource()` is null). The facade
+    // forwards every field to whichever instance is the cell's value *right now* — read from the
+    // Variable rather than from an instance announcing itself, because an announcement scheduled on
+    // a timer loses the race against the next `await` in a multi-element commit loop. So the pen
+    // extends one path across the commits its own anchors cause, moving a selection writes every
+    // element rather than the first two, and the `setTool("select")` that ends a draw reaches the
+    // node the user is looking at.
+    const liveCtx = {};
+    for (const k of Object.keys(ctx))
+      Object.defineProperty(liveCtx, k, { enumerable: true, get: () => {
+        stateOf();                                       // resolves `myVar` the first time it can
+        const cur = myVar && myVar._value;
+        return ((cur && ctxByNode.get(cur)) || ctx)[k];
+      } });
+
     let active = null;
     node.addEventListener("pointerdown", (e) => {
-      for (const t of svgTools) if (t.onPointerDown && t.onPointerDown(ctx, e)) { active = t; return; }
+      for (const t of svgTools) if (t.onPointerDown && t.onPointerDown(liveCtx, e)) { active = t; return; }
       active = null;
     });
     node.addEventListener("pointermove", (e) => {
-      if (active) return void (active.onPointerMove && active.onPointerMove(ctx, e));
-      for (const t of svgTools) if (t.onHover) t.onHover(ctx, e);   // between gestures: pen rubber band
+      if (active) return void (active.onPointerMove && active.onPointerMove(liveCtx, e));
+      for (const t of svgTools) if (t.onHover) t.onHover(liveCtx, e);   // between gestures: pen rubber band
     });
     const end = async (e) => {
       const t = active;
       active = null;
-      if (t && t.onPointerUp) await t.onPointerUp(ctx, e);
+      if (t && t.onPointerUp) await t.onPointerUp(liveCtx, e);
     };
     node.addEventListener("pointerup", end);
     node.addEventListener("pointercancel", end);
     node.addEventListener("dblclick", async (e) => {
       e.preventDefault();
-      for (const t of svgTools) if (t.onDblClick && await t.onDblClick(ctx, e)) return;
+      for (const t of svgTools) if (t.onDblClick && await t.onDblClick(liveCtx, e)) return;
     });
 
     // The handles follow every put. A structural edit may move the selection's address, so the record
@@ -16307,15 +16344,17 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
       try { return refsOf(t, path); } catch (e) { return []; }
     };
     node.setTool = setTool;
-    Object.defineProperty(node, "tool", { configurable: true, get: () => tool });
+    Object.defineProperty(node, "tool", { configurable: true, get: () => toolNow() });
     // A commit remounts this cell, so this run may be the continuation of an editing session rather
     // than the start of one. The variable is not bound to the node until the runtime has taken this
     // return value, hence the tick. Selection is restored by *path*, which is why it is addressed
     // that way: an index would not survive the structural edit that caused the remount.
+    // Only the selection needs restoring. The tool is read from the shared state, and re-running
+    // setTool here would clear the very gesture that caused the remount — which is how the pen used
+    // to lose its path after its first anchor.
     setTimeout(() => {
       const s = stateOf();
       if (!s) return;
-      if (s.tool && s.tool !== tool) setTool(s.tool);
       if (s.paths && s.paths.length) focus.setAll(s.paths, s.mode);
     }, 0);
     return node;
