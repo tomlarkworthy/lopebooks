@@ -15874,7 +15874,8 @@ const _sl118 = function _svgOverlay(){return(
       [data-svg-lens-overlay] .box{fill:none;stroke:#2F6BFF;stroke-dasharray:4 3;stroke-width:1;opacity:.6}
       [data-svg-lens-overlay] .link{stroke:#8A63D2;stroke-dasharray:3 3;stroke-width:1;fill:none;opacity:.7}
       [data-svg-lens-overlay] .guide{stroke:#E4572E;stroke-width:1;opacity:.9}
-      [data-svg-lens-overlay] .locked{fill:#cfcfcf;stroke:#9a9a9a;stroke-dasharray:2 2;cursor:not-allowed}`;
+      [data-svg-lens-overlay] .locked{fill:#cfcfcf;stroke:#9a9a9a;stroke-dasharray:2 2;cursor:not-allowed}
+      [data-svg-lens-overlay] .hover{fill:none;stroke:#2F6BFF;stroke-width:1.5;opacity:.5;pointer-events:none}`;
   el.appendChild(style);
   node.appendChild(el);
   // Two layers, because the overlay draws in two coordinate systems. `el` carries the focused
@@ -16106,6 +16107,8 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
 //   onPointerUp(ctx, e)
 //   onDblClick(ctx, e)    -> true if handled
 //   onCancel(ctx)         -> true if it had something to abandon (Escape; see node.cancelGesture)
+//   onHover(ctx, e)       -> between gestures only; decoration, never an edit
+//   onPointerLeave(ctx, e)
 //
 // ctx = { node, options, target, writer, focus, elems(), doc(), localPoint(el, e), snap(v), state }
 // ================================================================================================
@@ -16140,6 +16143,11 @@ const _sl128 = function _gestureDelta(){return(
   command: (name, apply, { rebase = null } = {}) => ({ kind: "command", name, apply, rebase }),
   // `toggle` is shift-click: in or out of the set. An empty `paths` clears.
   select: (paths, mode = null, { toggle = false } = {}) => ({ kind: "select", paths, mode, toggle }),
+  // Something to *show* that the source cannot express: a hover outline, a rubber band, a readout.
+  // `marks` are overlay primitives `{tag, attrs, layer}` and `key` names the group they replace, so
+  // emitting the same key each frame is idempotent rather than cumulative. Without this a gesture
+  // that only decorates would have to reach into the DOM itself, which L3 forbids.
+  view: (marks, { key = "view", cursor = null } = {}) => ({ kind: "view", marks, key, cursor }),
   // The attribute text this delta stands for. One expression, read by both sinks.
   text: (d) => (d.lens ? d.lens.put(d.value, d.base) : String(d.value))
 }
@@ -16149,7 +16157,22 @@ const _sl128a = function _previewDelta(gestureDelta){return(
 (ctx, ds) => {
   const out = [];
   for (const d of [].concat(ds)) {
-    if (!d || d.kind !== "attr") continue;          // commands and selections have no attribute preview
+    if (!d) continue;
+    if (d.kind === "view") {
+      // Replace this key's marks rather than adding to them. `focus.refresh()` clears both overlay
+      // layers wholesale, so a stale mark cannot outlive a repaint either way — this is about the
+      // frames between repaints, which is most of them during a hover.
+      for (const layer of [ctx.overlay.el, ctx.overlay.rootEl])
+        for (const n of [...layer.querySelectorAll(`[data-view-key="${d.key}"]`)]) n.remove();
+      for (const m of d.marks || []) {
+        const n = (m.layer === "el" ? ctx.overlay.add : ctx.overlay.addRoot)(m.tag, m.attrs);
+        n.dataset.viewKey = d.key;
+        out.push(n);
+      }
+      if (d.cursor !== null) ctx.node.style.cursor = d.cursor;
+      continue;
+    }
+    if (d.kind !== "attr") continue;                // commands and selections have no attribute preview
     const el = ctx.elems()[d.idx];
     if (!el) continue;
     el.setAttribute(d.name, gestureDelta.text(d));
@@ -16192,7 +16215,8 @@ async (ctx, ds) => {
       else if (d.paths.length === 1 && d.mode) ctx.focus.set(d.paths[0], d.mode);
       else ctx.focus.setAll(d.paths);
       out.push(null);                               // selection is not a source edit
-    } else throw new Error(`unknown delta kind: ${d.kind}`);
+    } else if (d.kind === "view") out.push(null);     // decoration: never a source edit (T9's cousin)
+    else throw new Error(`unknown delta kind: ${d.kind}`);
   }
   return out;
 }
@@ -17301,10 +17325,10 @@ const _sl142 = function _test_gesture_partiality(withFixture,gestureCorpus,playG
 // the point: this is a claim about how the tools are *written*, and it fails the moment one is
 // written differently. The tools are listed rather than read from `svgTools`, which is an
 // `Inputs.input` and so needs a DOM this law does not.
-const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure)
+const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure,toolHover)
 {
-  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure];
-  const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover"];
+  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure, toolHover];
+  const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave"];
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
   const bad = [];
   let previews = 0;
@@ -17336,10 +17360,10 @@ const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,too
 // facade to `getBBox`/`getScreenCTM`/`elementsFromPoint` has a hidden input, and hidden inputs are
 // exactly what the laws cannot see. `hitTest` still asks the browser; the point is that it is the
 // one place that does, reachable as `ctx.hit`.
-const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure)
+const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure,toolHover)
 {
-  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure];
-  const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover"];
+  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure, toolHover];
+  const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave"];
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
   const BANNED = /\b(getBBox|getScreenCTM|getBoundingClientRect|elementsFromPoint|getTotalLength|getPointAtLength)\s*\(/g;
   const bad = [];
@@ -17383,8 +17407,33 @@ const _sl139 = function _gestureLaws(test_gesture_identity,test_gesture_path_ind
 )};
 
 
-const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure){return(
-Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure])
+// Outline whatever a click would claim. Hit-testing is deliberately tolerant — it falls back to
+// distance along the geometry, so a hairline is grabbable from several pixels away — and that
+// tolerance is invisible without this: you cannot tell a shape you are about to select from one you
+// are about to miss. It reads through `ctx.hit`, the same call `toolMove` makes, so the highlight
+// cannot disagree with what the click then does. Draws only, and only into the overlay: a `view`
+// delta, so T9's argument covers it too.
+const _sl127h = function _toolHover(gestureDelta,previewDelta){return(
+{
+  id: "hover",
+  onHover(ctx, e) {
+    const hit = ctx.hit(e)[0] || null;
+    // The selection already has a box round it; outlining it again just makes the box thicker.
+    const selected = hit && ctx.focus.indices.includes(ctx.elems().indexOf(hit));
+    const b = hit && !selected ? ctx.rootBox(hit) : null;
+    previewDelta(ctx, gestureDelta.view(
+      b ? [{ tag: "rect", attrs: { class: "hover", x: b.x, y: b.y, width: b.width, height: b.height } }] : [],
+      { key: "hover", cursor: hit ? "move" : "default" }));
+  },
+  // The pointer can leave without a last move over empty space, which would strand the outline.
+  onPointerLeave(ctx) {
+    previewDelta(ctx, gestureDelta.view([], { key: "hover", cursor: "default" }));
+  }
+}
+)};
+
+const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolStructure,toolHover){return(
+Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolStructure, toolHover])
 )};
 const _sl123v = (G, _) => G.input(_);
 
@@ -17568,6 +17617,9 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       for (const t of tools) if (t.onCancel && t.onCancel(liveCtx)) claimed = true;
       return claimed || !!was;
     };
+    node.addEventListener("pointerleave", (e) => {
+      for (const t of tools) if (t.onPointerLeave) t.onPointerLeave(liveCtx, e);
+    });
     node.addEventListener("dblclick", async (e) => {
       e.preventDefault();
       for (const t of tools) if (t.onDblClick && await t.onDblClick(liveCtx, e)) return;
@@ -17997,14 +18049,15 @@ export default function define(runtime, observer) {
   $def("sl136", "test_gesture_commits_against_its_origin", ["withFixture","gestureCorpus","playGesture"], _sl136);
   $def("sl137", "test_gesture_confinement", ["withFixture","gestureCorpus","playGesture","svgTools"], _sl137);
   $def("sl138", "test_gesture_selection_is_not_an_edit", ["withFixture","gestureCorpus","playGesture","toolMarquee"], _sl138);
-  $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl144);
-  $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl143);
+  $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure","toolHover"], _sl144);
+  $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure","toolHover"], _sl143);
   $def("sl140a", "domShape", [], _sl140a);
   $def("sl140", "test_gesture_render_consistency", ["withFixture","gestureCorpus","playGesture","domShape"], _sl140);
   $def("sl141", "test_gesture_rebase_agreement", ["withFixture","gestureCorpus","nodeAt","childrenLens","insertPoint"], _sl141);
   $def("sl142", "test_gesture_partiality", ["withFixture","gestureCorpus","playGesture"], _sl142);
   $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit"], _sl139);
-  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure"], _sl123);
+  $def("sl127h", "toolHover", ["gestureDelta","previewDelta"], _sl127h);
+  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure","toolHover"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
   $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest"], _sl114);
