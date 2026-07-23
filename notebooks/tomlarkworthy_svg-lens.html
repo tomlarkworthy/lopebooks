@@ -16213,6 +16213,74 @@ const _sl254 = function _test_align_commands(cmdAlign,cmdDistribute,alignSpecs,g
 // `parseDoc` builds must agree with `DOMParser` on shape, tags and attribute values, and every span
 // it reports must slice out exactly the element the browser saw. A span that is merely *plausible*
 // is the dangerous case — it splices the wrong bytes silently — so this compares slices, not counts.
+const _sl262 = function _test_path_smooth(forAll,arb,mulberry32,NUM_RUNS,pathSmooth,pathHandles,parsePath,pathSegments,attrVal)
+{
+  const rng = mulberry32(0x5EED0041);
+  const IDX = 1;
+  const doc = (d) => `<svg><path d="${d}"/></svg>`;
+  const dOf = (t) => attrVal(t, IDX, "d");
+  const at = [0, 0];
+
+  // A polyline with a genuine corner in the middle. Toggling that corner must make it smooth, and
+  // toggling it back must give the author's own bytes — not a curve that merely looks straight.
+  const gen = (r) => {
+    const P = () => [arb.int(r, -80, 80), arb.int(r, -80, 80)];
+    const n = arb.int(r, 3, 6);
+    const pts = Array.from({ length: n }, P);
+    return [doc(`M ${pts[0].join(" ")} ` + pts.slice(1).map((q) => `L ${q.join(" ")}`).join(" ")),
+            arb.int(r, 1, n - 2)];
+  };
+  forAll(NUM_RUNS, rng, gen, (src, k) => {
+    const on = pathSmooth.toggle(src, at, k);
+    if (on === null) return true;                       // degenerate geometry: declining is allowed
+    if (!pathSmooth.smooth(pathHandles(on, IDX), k))
+      throw new Error(`anchor ${k} is not smooth after the toggle: ${dOf(on)}`);
+    // Every *other* anchor is left exactly as it was — a toggle is not a resmoothing of the path.
+    const h0 = pathHandles(src, IDX).filter((h) => h.kind === "anchor");
+    const h1 = pathHandles(on, IDX).filter((h) => h.kind === "anchor");
+    if (h0.length !== h1.length) throw new Error("the toggle changed how many anchors there are");
+    h0.forEach((h, i) => {
+      if (Math.hypot(h.x - h1[i].x, h.y - h1[i].y) > 1e-9)
+        throw new Error(`anchor ${i} moved when anchor ${k} was smoothed`);
+    });
+    const off = pathSmooth.toggle(on, at, k);
+    if (off === null) throw new Error("a smooth anchor must be able to become a corner again");
+    if (off !== src) throw new Error(`round trip is not byte-identical:\n  ${dOf(src)}\n  ${dOf(off)}`);
+    return true;
+  });
+
+  // Dragging one handle of a smooth anchor keeps it smooth, and keeps the partner's length.
+  const gen2 = (r) => {
+    const P = () => [arb.int(r, -80, 80), arb.int(r, -80, 80)];
+    const [a, b, c] = [P(), P(), P()];
+    return [doc(`M ${a.join(" ")} L ${b.join(" ")} L ${c.join(" ")}`), P()];
+  };
+  forAll(NUM_RUNS, rng, gen2, (src, to) => {
+    const on = pathSmooth.toggle(src, at, 1);
+    if (on === null) return true;
+    const before = pathSmooth.around(pathHandles(on, IDX), 1);
+    const len = Math.hypot(before.outH.x - before.anchor.x, before.outH.y - before.anchor.y);
+    const next = pathSmooth.couple(on, IDX, before.inH.key, to[0], to[1]);
+    if (next === null) return true;                     // dragging onto the anchor has no direction
+    const after = pathSmooth.around(pathHandles(doc(next), IDX), 1);
+    if (Math.hypot(after.inH.x - to[0], after.inH.y - to[1]) > 1e-6)
+      throw new Error("the dragged handle did not go where the pointer is");
+    const len2 = Math.hypot(after.outH.x - after.anchor.x, after.outH.y - after.anchor.y);
+    if (Math.abs(len - len2) > 1e-6) throw new Error(`the partner changed length: ${len} -> ${len2}`);
+    if (!pathSmooth.smooth(pathHandles(doc(next), IDX), 1))
+      throw new Error("coupling a smooth anchor left it not smooth");
+    return true;
+  });
+
+  // What it declines. An arc is not ours to rewrite, and an endpoint has nothing on one side.
+  if (pathSmooth.toggle(doc("M 0 0 A 5 5 0 0 1 10 10 L 20 0"), at, 1) !== null)
+    throw new Error("an arc must be declined, not approximated");
+  const line = doc("M 0 0 L 10 10 L 20 0");
+  if (pathSmooth.toggle(line, at, 0) !== null) throw new Error("the M anchor has no incoming segment");
+  if (pathSmooth.toggle(line, at, 2) !== null) throw new Error("the last anchor has no outgoing segment");
+  return `✅ smooth/corner round-trips to the original bytes and couples the partner handle (${NUM_RUNS} runs)`;
+};
+
 const _sl109b = function _test_parse_vs_DOMParser(parseDoc,outsideDomain,attrVal,tokenize)
 {
   if (typeof DOMParser === "undefined") return "⏭ needs a DOM (browser only)";
@@ -17031,6 +17099,12 @@ const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateH
   const scaleOf = (el) => { const m = el.getScreenCTM(); return m ? Math.hypot(m.a, m.b) : 1; };
   const paint = () => {
     overlay.clear();
+    // A detached node cannot read its own document, and "I cannot see it" is not "it is gone": drop
+    // nothing and draw nothing. Without this the *old* node's last repaint after a commit filtered
+    // every path away — every address resolves against a document it no longer projects — and wrote
+    // that emptiness over the shared selection the new node had just restored. Invisible until the
+    // next thing that reads the shared state, which is undo.
+    if (target.doc() === null) return;
     paths = paths.filter((p) => indexOfPath(p) !== null);               // drop what no longer resolves
     if (paths.length > 1) {                                            // a set: boxes only, no handles
       for (const p of paths) {
@@ -17335,7 +17409,7 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
 )};
 
 // Drag a vertex or control point: the `points` and path `d` lenses.
-const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta,vertexAddress){return(
+const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta,vertexAddress,pathSmooth){return(
 {
   id: "vertex",
   onPointerDown(ctx, e) {
@@ -17371,7 +17445,14 @@ const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDe
     const p = el && ctx.localPoint(el, e);
     const t = ctx.doc();
     if (!p || t === null) return;
-    const edits = handleEdit(d.mode, t, d.idx, d.key, p[0], p[1], ctx.shapes);
+    // G21. A smooth anchor moves both of its handles; alt breaks the pair for this drag, which is
+    // how you make a corner without saying so — the geometry stops being collinear and that *is* the
+    // corner. Reading `altKey` off the live event, not off the press, so the decision is revocable
+    // mid-drag like every other modifier here.
+    const paired = d.mode === "path" && !e.altKey
+      ? pathSmooth.couple(t, d.idx, d.key, p[0], p[1]) : null;
+    const edits = paired !== null ? [{ name: "d", value: paired }]
+                                  : handleEdit(d.mode, t, d.idx, d.key, p[0], p[1], ctx.shapes);
     if (!edits.length) return;
     // `handleEdit` already reprints the whole attribute, so there is no lens here: the delta's value
     // *is* the text. One delta per attribute the handle moves — a rect corner moves four — and an
@@ -19084,13 +19165,182 @@ const _sl259 = function _cmdClosePath(gestureDelta,attrVal,attrTextLens,nodeAt){
 })
 )};
 
-const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath){return(
+// ---- G21: smooth and corner anchors --------------------------------------------------------------
+// Smoothness is *geometry*, not a stored flag: an anchor is smooth when its two control handles are
+// collinear with it and point opposite ways. There is nowhere to keep a "corner that happens to look
+// smooth" bit that would not be hidden state, and hidden state is the thing this editor does not
+// have — so the drawing is asked, never a side table.
+//
+// The neighbourhood is read off the *handle order* rather than off the segment list, because that is
+// what survives subpaths: pathHandles emits `c1 c2 anchor` per cubic, so the handle just before an
+// anchor is its incoming one, and a handle followed by another handle is the next segment's
+// outgoing one. An `M` anchor has no handle before it, which is exactly the right answer.
+const _sl260 = function _pathSmooth(parsePath,printPath,pathHandles,pathSegments,attrVal,attrTextLens,nodeAt,replaceGroup){return(
+(() => {
+  const isC = (h) => h && h.kind === "ctrl";
+  const ordAt = (hs, i) => hs.slice(0, i).filter((h) => h.kind === "anchor").length;
+  const anchorIndex = (hs, n) => {
+    let c = -1;
+    for (let i = 0; i < hs.length; i++) if (hs[i].kind === "anchor" && ++c === n) return i;
+    return -1;
+  };
+  const set = (cmds, h, x, y) => {
+    const A = cmds[h.ci].a;
+    if (h.ix >= 0) A[h.o + h.ix] = h.rel ? x - h.base[0] : x;
+    if (h.iy >= 0) A[h.o + h.iy] = h.rel ? y - h.base[1] : y;
+  };
+  const around = (hs, n) => {
+    const j = anchorIndex(hs, n);
+    if (j < 0) return null;
+    return { j, anchor: hs[j],
+             inH: isC(hs[j - 1]) ? hs[j - 1] : null,
+             outH: isC(hs[j + 1]) && isC(hs[j + 2]) ? hs[j + 1] : null,
+             prev: hs.slice(0, j).filter((h) => h.kind === "anchor").pop() || null,
+             next: hs.slice(j + 1).find((h) => h.kind === "anchor") || null };
+  };
+  const TOL = 0.02;
+  const smooth = (hs, n) => {
+    const a = around(hs, n);
+    if (!a || !a.inH || !a.outH) return false;
+    const v = [a.anchor.x - a.inH.x, a.anchor.y - a.inH.y];
+    const w = [a.outH.x - a.anchor.x, a.outH.y - a.anchor.y];
+    const mv = Math.hypot(v[0], v[1]), mw = Math.hypot(w[0], w[1]);
+    if (mv < 1e-6 || mw < 1e-6) return false;            // a retracted handle is a corner
+    return Math.abs(v[0] * w[1] - v[1] * w[0]) / (mv * mw) <= TOL && v[0] * w[0] + v[1] * w[1] > 0;
+  };
+  return {
+    around, smooth,
+    // Which anchor a dragged control belongs to, and on which side of it.
+    roleOf(hs, key) {
+      const i = hs.findIndex((h) => h.key === key);
+      if (i < 0 || hs[i].kind !== "ctrl" || !hs[i + 1]) return null;
+      if (hs[i + 1].kind === "anchor") return { n: ordAt(hs, i + 1), side: "in" };
+      return hs[i - 1] && hs[i - 1].kind === "anchor" ? { n: ordAt(hs, i - 1), side: "out" } : null;
+    },
+    // Drag one handle of a smooth anchor and the other follows, mirrored, keeping its own length —
+    // which is what makes the curve stay smooth while you shape it. Returns null when it does not
+    // apply, and the caller falls back to moving the one handle it was told about.
+    couple(src, idx, key, x, y) {
+      let hs;
+      try { hs = pathHandles(src, idx); } catch (e) { return null; }
+      const r = this.roleOf(hs, key);
+      if (!r || !smooth(hs, r.n)) return null;
+      const a = around(hs, r.n);
+      const moved = r.side === "in" ? a.inH : a.outH, other = r.side === "in" ? a.outH : a.inH;
+      const len = Math.hypot(other.x - a.anchor.x, other.y - a.anchor.y);
+      const v = [x - a.anchor.x, y - a.anchor.y], m = Math.hypot(v[0], v[1]);
+      if (m < 1e-6) return null;                         // no direction to mirror
+      const cmds = parsePath(attrVal(src, idx, "d"));
+      set(cmds, moved, x, y);
+      set(cmds, other, a.anchor.x - (v[0] / m) * len, a.anchor.y - (v[1] / m) * len);
+      return printPath(cmds);
+    },
+    // A straight segment has no handles to be smooth with, so smoothing promotes it to the cubic that
+    // draws the identical line — `C p0 p3 p3` renders as its own chord. One promotion at a time, with
+    // a reparse between, because replacing a group inside a multi-group command renumbers the rest.
+    promote(src, idx, n, side) {
+      const hs = pathHandles(src, idx);
+      const a = around(hs, n);
+      if (!a) return null;
+      const h = side === "in" ? hs[a.j] : a.next && hs[hs.indexOf(a.next)];
+      if (!h) return null;
+      const segs = pathSegments(parsePath(attrVal(src, idx, "d")));
+      const seg = segs.find((sg) => sg.ci === h.ci && sg.o === h.o);
+      if (!seg) return null;                             // an M anchor: there is no segment here
+      if (seg.kind === "C") return src;                  // already a cubic
+      if (seg.kind !== "L") return null;                 // Q, A and Z are not ours to rewrite
+      const cmds = replaceGroup(parsePath(attrVal(src, idx, "d")), seg.ci, seg.o,
+                                [{ c: "C", a: [...seg.p0, ...seg.p3, ...seg.p3] }]);
+      return attrTextLens(idx, "d").put(printPath(cmds), src);
+    },
+    // The other direction: a cubic whose handles sit on its own endpoints *is* its chord, so once
+    // both are retracted the `C` is spelled `L` again — which is what makes smooth-then-corner give
+    // the author's original bytes back rather than a curve-shaped straight line.
+    demote(src, idx, n, side) {
+      const hs = pathHandles(src, idx);
+      const a = around(hs, n);
+      if (!a) return null;
+      const h = side === "in" ? hs[a.j] : a.next;
+      if (!h) return null;
+      const seg = pathSegments(parsePath(attrVal(src, idx, "d")))
+        .find((sg) => sg.ci === h.ci && sg.o === h.o);
+      const near = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-9;
+      if (!seg || seg.kind !== "C" || !near(seg.p1, seg.p0) || !near(seg.p2, seg.p3)) return null;
+      const cmds = replaceGroup(parsePath(attrVal(src, idx, "d")), seg.ci, seg.o,
+                                [{ c: "L", a: [...seg.p3] }]);
+      return attrTextLens(idx, "d").put(printPath(cmds), src);
+    },
+    // The toggle. Smooth becomes a corner by retracting both handles onto the anchor — the only
+    // reading that is visible in the drawing, and therefore the only one this editor can mean.
+    toggle(src, path, n) {
+      let idx;
+      try { idx = nodeAt(src, path).index; } catch (e) { return null; }
+      let cur = src, hs;
+      try { hs = pathHandles(cur, idx); } catch (e) { return null; }
+      if (smooth(hs, n)) {
+        const a = around(hs, n);
+        const cmds = parsePath(attrVal(cur, idx, "d"));
+        set(cmds, a.inH, a.anchor.x, a.anchor.y);
+        set(cmds, a.outH, a.anchor.x, a.anchor.y);
+        cur = attrTextLens(idx, "d").put(printPath(cmds), cur);
+        for (const side of ["out", "in"]) {              // outgoing first: it is the later command
+          const next = this.demote(cur, idx, n, side);
+          if (next !== null) cur = next;
+        }
+        return cur;
+      }
+      for (const side of ["out", "in"]) {                // outgoing first: it is the later command
+        const next = this.promote(cur, idx, n, side);
+        if (next === null) return null;
+        cur = next;
+      }
+      hs = pathHandles(cur, idx);
+      const a = around(hs, n);
+      if (!a || !a.inH || !a.outH || !a.prev || !a.next) return null;
+      const d = [a.next.x - a.prev.x, a.next.y - a.prev.y];
+      const m = Math.hypot(d[0], d[1]);
+      if (m < 1e-6) return null;
+      const u = [d[0] / m, d[1] / m];
+      const len = (h, fall) => {
+        const l = Math.hypot(h.x - a.anchor.x, h.y - a.anchor.y);
+        return l > 1e-6 ? l : Math.hypot(fall.x - a.anchor.x, fall.y - a.anchor.y) / 3;
+      };
+      const li = len(a.inH, a.prev), lo = len(a.outH, a.next);
+      const cmds = parsePath(attrVal(cur, idx, "d"));
+      set(cmds, a.inH, a.anchor.x - u[0] * li, a.anchor.y - u[1] * li);
+      set(cmds, a.outH, a.anchor.x + u[0] * lo, a.anchor.y + u[1] * lo);
+      return attrTextLens(idx, "d").put(printPath(cmds), cur);
+    }
+  };
+})()
+)};
+
+// The toggle as a command rather than as a double-click: double-clicking an anchor already means
+// *delete this vertex*, and that is tested behaviour. One held vertex, because "toggle" needs
+// something to be the opposite of.
+const _sl261 = function _cmdToggleSmooth(gestureDelta,pathSmooth,pathHandles,nodeAt){return(
+{
+  id: "toggle-smooth", label: "Smooth / corner", key: null,
+  plan(env) {
+    const vs = (env.vertices || []).filter((v) => v.kind === "anchor");
+    if (vs.length !== 1) return null;
+    const { path, n } = vs[0];
+    if (pathSmooth.toggle(env.src, path, n) === null) return null;   // ask once, T8
+    return gestureDelta.command("toggleSmooth", (src) => {
+      const next = pathSmooth.toggle(src, path, n);
+      return next === null ? src : next;
+    });
+  }
+}
+)};
+
+const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth){return(
 // A plain array, not an `Inputs.input`, for the same reason `svgShapes` is: pure code plans a command
 // and the laws exercise that headless, where there is no DOM to hold a view.
 [cmdGroup, cmdUngroup, cmdDuplicate, cmdCopy, cmdCut, cmdPaste(false), cmdPaste(true)]
   .concat(alignSpecs.map(cmdAlign))
   .concat([cmdDistribute("x"), cmdDistribute("y"),
-           cmdDeleteVertex, cmdClosePath(true), cmdClosePath(false)])
+           cmdDeleteVertex, cmdClosePath(true), cmdClosePath(false), cmdToggleSmooth])
 )};
 
 // Look one up, and answer "what does this keystroke mean" in one place. The binding is a
@@ -19833,6 +20083,7 @@ export default function define(runtime, observer) {
   $def("sl252", "test_group_ungroup", ["forAll","arb","mulberry32","NUM_RUNS","groupPlan","groupElements","ungroupElements","ungroupBlockers","childrenLens","nodeAt","cmdGroup"], _sl252);
   $def("sl257", "test_rebase_vertex", ["forAll","arb","mulberry32","NUM_RUNS","vertexAddress","rebaseVertex","pointsHandles","pathHandles","insertPoint","deletePoint","insertPathPoint","deletePathPoint","parsePoints","pathSegments","parsePath","attrVal"], _sl257);
   $def("sl253", "test_copy_paste", ["forAll","arb","mulberry32","NUM_RUNS","copyMarkup","pasteMarkup","freshenIds","idsIn","childrenLens","nodeAt","cmdPaste","offsetMarkup"], _sl253);
+  $def("sl262", "test_path_smooth", ["forAll","arb","mulberry32","NUM_RUNS","pathSmooth","pathHandles","parsePath","pathSegments","attrVal"], _sl262);
   $def("sl254", "test_align_commands", ["cmdAlign","cmdDistribute","alignSpecs","gestureDelta"], _sl254);
   $def("sl109b", "test_parse_vs_DOMParser", ["parseDoc","outsideDomain","attrVal","tokenize"], _sl109b);
   $def("sl20", "coreHeader", ["md"], _sl20);
@@ -19969,7 +20220,7 @@ export default function define(runtime, observer) {
   $def("sl128a", "previewDelta", ["gestureDelta"], _sl128a);
   $def("sl128b", "commitDelta", [], _sl128b);
   $def("sl128c", "revertDelta", [], _sl128c);
-  $def("sl120", "toolVertex", ["handleEdit","shapeLookup","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta","vertexAddress"], _sl120);
+  $def("sl120", "toolVertex", ["handleEdit","shapeLookup","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta","vertexAddress","pathSmooth"], _sl120);
   $def("sl119d", "scopedPath", [], _sl119d);
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
@@ -20015,9 +20266,11 @@ export default function define(runtime, observer) {
   $def("sl246", "alignSpecs", [], _sl246);
   $def("sl247", "cmdAlign", ["gestureDelta","translateLens"], _sl247);
   $def("sl248", "cmdDistribute", ["gestureDelta","translateLens"], _sl248);
+  $def("sl260", "pathSmooth", ["parsePath","printPath","pathHandles","pathSegments","attrVal","attrTextLens","nodeAt","replaceGroup"], _sl260);
+  $def("sl261", "cmdToggleSmooth", ["gestureDelta","pathSmooth","pathHandles","nodeAt"], _sl261);
   $def("sl258", "cmdDeleteVertex", ["gestureDelta","attrVal","parsePoints","parsePath","pathSegments","pathHandles","deletePoint","deletePathPoint"], _sl258);
   $def("sl259", "cmdClosePath", ["gestureDelta","attrVal","attrTextLens","nodeAt"], _sl259);
-  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath"], _sl250);
+  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth"], _sl250);
   $def("sl249", "commandLookup", [], _sl249);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
