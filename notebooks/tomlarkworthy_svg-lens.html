@@ -12279,10 +12279,40 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
   });
   paint(drawing.tool);
   drawing.addEventListener("lens-tool", (e) => paint(e.detail.tool));
+
+  // The command bar is *generated* from the registry, labels, bindings and all — so installing a
+  // command cell puts a button here without touching this cell. Whether a button is live is the plan
+  // itself (`canCommand`), asked fresh on every selection change: one answer, so a greyed-out button
+  // and a refusal to run cannot disagree.
+  const bar = htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap;margin:.25rem 0 0;flex-basis:100%"></div>`;
+  const KEYNAME = (k) => (k || "").replace("Mod", navigator.platform.startsWith("Mac") ? "⌘" : "Ctrl")
+                                  .replace("Shift", "⇧").replace(/-/g, "");
+  const cmdButtons = (drawing.commands ? drawing.commands() : []).map((c) => {
+    const b = htl.html`<button title="${c.label}${c.key ? " (" + KEYNAME(c.key) + ")" : ""}" style="padding:3px 8px;border-radius:6px;border:1px solid #cfd8cb;background:#fff;color:#243;font-size:12px;cursor:pointer">${c.label}</button>`;
+    b.onclick = () => drawing.command(c.id);
+    bar.appendChild(b);
+    return [c.id, b];
+  });
+  const repaintCommands = () => cmdButtons.forEach(([id, b]) => {
+    const on = drawing.canCommand(id);
+    b.disabled = !on;
+    b.style.opacity = on ? "1" : "0.35";
+    b.style.cursor = on ? "pointer" : "default";
+  });
+  repaintCommands();
+  drawing.addEventListener("lens-select", repaintCommands);
+  drawing.addEventListener("lens-put", repaintCommands);
   // Z-order and delete act on the selection, so they belong to whatever is selected, not to a tool.
   const Z = { "]": "raise", "[": "lower", "}": "front", "{": "back" };
   const onKey = (e) => {
     const typing = /^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.target.isContentEditable;
+    // Commands declare their own binding; the callsite only decides to honour it. Undo is checked
+    // first because editor-5 owns ⌘Z while you are in a cell, and a decline falls through to
+    // whatever the browser would have done — ⌘C with nothing selected still copies the page.
+    if (!typing && drawing.commandForEvent) {
+      const c = drawing.commandForEvent(e);
+      if (c && drawing.canCommand(c.id)) { e.preventDefault(); return void drawing.command(c.id); }
+    }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !typing) {
       e.preventDefault();                                // editor-5 owns undo while you are in a cell
       return void (e.shiftKey ? drawing.redo() : drawing.undo());
@@ -12329,6 +12359,7 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
   };
   document.addEventListener("keydown", onKey);
   invalidation.then(() => document.removeEventListener("keydown", onKey));
+  el.appendChild(bar);
   return el;
 };
 
@@ -14214,6 +14245,174 @@ const _sl79c = function _reorderElement(childrenLens){return(
 }
 )};
 
+// ---- structural commands, part 2: group, ungroup, and the copy/paste codec (S4, P8) -------------
+// Same shape as the three above — pure (document text, addresses) -> document text — so every law
+// that covers a put covers these too. Nothing here knows about the DOM, the pointer or the clipboard.
+
+// Where the new <g> lands, computed from the addresses alone: at the *topmost* member's depth once the
+// others below it have left, which is where every editor puts it. It is a separate function because
+// `apply` and `rebase` must not disagree about it — that is the M0.2 failure mode, which silently
+// drops the selection.
+const _sl79xa = function _groupPlan(){return(
+(paths) => {
+  if (!paths || !paths.length) throw new Error("nothing to group");
+  const parent = paths[0].slice(0, -1);
+  for (const p of paths)
+    if (p.length !== paths[0].length || !parent.every((v, i) => p[i] === v))
+      throw new Error("only siblings can be grouped");
+  const indices = [...new Set(paths.map((p) => p[p.length - 1]))].sort((a, b) => a - b);
+  return { parent, indices, at: indices[indices.length - 1] - indices.length + 1 };
+}
+)};
+
+const _sl79xb = function _groupElements(childrenLens,groupPlan,nodeAt){return(
+(src, paths, open = "<g>", close = "</g>") => {
+  const { parent, indices, at } = groupPlan(paths);
+  const l = childrenLens(parent);
+  const kids = l.get(src);
+  for (const i of indices)
+    if (kids[i] === undefined) throw new Error(`no element at path ${parent.concat(i).join("/")}`);
+  // The indentation the siblings already sit at, read from the source rather than assumed: the new
+  // <g> arrives at that depth (childrenLens gives it the same gap), so its contents go one further.
+  // Two things the property test had to teach me, in the order it found them.
+  //
+  // Indentation goes in the *gap* before each child and nowhere else: re-indenting a child's own
+  // lines rewrites bytes inside the element, which a multi-line <rect> caught.
+  //
+  // And each member takes its gap *with* it. `childrenLens` gives a newly inserted child the
+  // indentation of an existing gap but never the gap itself — deliberately, because a gap can hold a
+  // comment and copying it would reproduce the comment once per insertion. That is right for an
+  // element arriving from nowhere and wrong here: a grouped element is not new, it is the same
+  // element one level down, and the comment above it is about *it*. Read the gaps from the source and
+  // deepen them by one level.
+  const n = nodeAt(src, parent);
+  const gapOf = (i) => src.slice(i ? n.children[i - 1].end : n.innerStart, n.children[i].start);
+  const ind = /[ \t]*$/.exec(n.children.length ? gapOf(0) : "\n  ")[0];
+  const body = indices.map((i) => gapOf(i).replace(/\n/g, "\n  ") + kids[i]).join("");
+  const rest = kids.filter((_, i) => indices.indexOf(i) === -1);
+  rest.splice(at, 0, open + body + (body.includes("\n") ? "\n" + ind : "") + close);
+  return l.put(rest, src);
+}
+)};
+
+// What stops this group being dissolved. A <g> is a coordinate frame *and* an inheritance frame:
+// `transform` pushes down exactly, because composition is associative and that is what the renderer
+// was already doing. `fill` or `opacity` do not — group opacity composites the group as one object,
+// so moving it onto each child changes the picture. The honest answer to "can I ungroup this" is
+// therefore a list of reasons, and the command declines when it is non-empty rather than quietly
+// making the drawing look different. T8, as data.
+const _sl79xc = function _ungroupBlockers(nodeAt){return(
+(src, path) => {
+  let n;
+  try { n = nodeAt(src, path); } catch (e) { return [e.message]; }
+  if (n.tag !== "g") return [`${n.tag} is not a group`];
+  return Object.keys(n.attrs).filter((k) => k !== "transform");
+}
+)};
+
+// Splice the group's *inner text* back in place of the group. Not `childrenLens`, which would give
+// each child a fresh gap: the text between the children is the author's — indentation, comments —
+// and it belongs to them, not to the <g> that happened to be around it.
+const _sl79xd = function _ungroupElements(nodeAt,ungroupBlockers,attrTextLens){return(
+(src, path) => {
+  const blockers = ungroupBlockers(src, path);
+  if (blockers.length) throw new Error(`cannot ungroup: ${blockers.join(", ")}`);
+  const n = nodeAt(src, path);
+  const t = n.attrs.transform ? n.attrs.transform.value : null;
+  const l = attrTextLens(0, "transform", "");
+  // One level out — but only in the gaps, for the same reason grouping only indents the gaps: a line
+  // break inside an element is the author's, not the layout's. How far out is read from the source
+  // too: where the children sat, minus where the <g> itself sat.
+  const own = /[ \t]*$/.exec(src.slice(0, n.start))[0].length;
+  const first = n.children.length ? /[ \t]*$/.exec(src.slice(n.innerStart, n.children[0].start))[0].length : own;
+  const extra = Math.max(0, first - own);
+  const dedent = (g) => (extra ? g.replace(new RegExp(`\\n[ \\t]{0,${extra}}`, "g"), "\n") : g);
+  let body = "", pos = n.innerStart;
+  for (const c of n.children) {
+    const k = src.slice(c.start, c.end), o = l.get(k);
+    body += dedent(src.slice(pos, c.start)) + (t ? l.put(o ? t + " " + o : t, k) : k);
+    pos = c.end;
+  }
+  body += dedent(src.slice(pos, n.innerEnd));
+  return src.slice(0, n.start) + body.replace(/^\s+/, "").replace(/\s+$/, "") + src.slice(n.end);
+}
+)};
+
+// The clipboard payload is the author's own bytes. That is what makes paste-in-place byte-identical,
+// and what makes the payload interoperate with every other tool they own — paste it into a text
+// editor and you have SVG.
+const _sl79xe = function _copyMarkup(nodeAt){return(
+(src, paths) => paths.map((p) => { const n = nodeAt(src, p); return src.slice(n.start, n.end); })
+)};
+
+const _sl79xf = function _idsIn(parseDoc){return(
+(src) => {
+  const out = new Set();
+  const walk = (n) => { if (n.attrs && n.attrs.id) out.add(n.attrs.id.value); n.children.forEach(walk); };
+  walk(parseDoc(src));
+  return out;
+}
+)};
+
+// Two elements cannot share an id, so a pasted copy has to be renamed — but a reference *inside* the
+// pasted set has to follow the rename, or the copy silently points at the original's gradient. Only
+// ids the paste itself defines are touched: a reference out to something the document already had is
+// left exactly as the author wrote it, because that reference is still correct.
+const _sl79xg = function _freshenIds(idsIn){return(
+(markups, taken) => {
+  const defined = idsIn(markups.join("\n"));
+  const map = new Map();
+  for (const id of defined) {
+    if (!taken.has(id)) continue;
+    let i = 2, next = `${id}-${i}`;
+    while (taken.has(next) || defined.has(next)) next = `${id}-${++i}`;
+    map.set(id, next);
+    taken.add(next);
+  }
+  if (!map.size) return markups;
+  const esc = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rx = new RegExp(`(id="|url\\(#|href="#|xlink:href="#)(${[...map.keys()].map(esc).join("|")})(?=["\\)])`, "g");
+  return markups.map((m) => m.replace(rx, (_, pre, id) => pre + map.get(id)));
+}
+)};
+
+const _sl79xh = function _pasteMarkup(childrenLens,idsIn,freshenIds){return(
+(src, parent, at, markups) => {
+  const l = childrenLens(parent);
+  const kids = l.get(src).slice();
+  const i = at === null || at === undefined ? kids.length : Math.max(0, Math.min(kids.length, at));
+  kids.splice(i, 0, ...freshenIds(markups, idsIn(src)));
+  return l.put(kids, src);
+}
+)};
+
+// Offset a *detached* markup string, so a duplicate lands where you can see it. The same translate
+// lens a drag writes through, applied to a one-element document — which is all a clipboard entry is.
+const _sl79xi = function _offsetMarkup(compose,attrTextLens,translateLens){return(
+(markup, dx, dy) => {
+  if (!dx && !dy) return markup;
+  const l = compose(attrTextLens(0, "transform", ""), translateLens);
+  const [x, y] = l.get(markup);
+  const r = (v) => Math.round(v * 1e6) / 1e6;
+  return l.put([r(x + dx), r(y + dy)], markup);
+}
+)};
+
+// A structural command is more than one primitive edit, and an address has to survive all of them.
+// Two pieces: `moves` re-roots any address inside a subtree that was relocated wholesale, and `ops`
+// are the primitive insert/delete/move steps that everything else follows. Moves are checked first,
+// because an address inside a moved subtree was not deleted — it went somewhere.
+const _sl79xj = function _rebaseMoves(rebasePath){return(
+(moves, ops) => (p) => {
+  if (!p) return null;
+  for (const [from, to] of moves)
+    if (p.length >= from.length && from.every((v, i) => p[i] === v)) return to.concat(p.slice(from.length));
+  let q = p;
+  for (const op of ops) { q = rebasePath(q, op); if (!q) return null; }
+  return q;
+}
+)};
+
 // Adding and removing points needs no new lens: pointsLens already exposes a lawful list view.
 const _sl79d = function _insertPoint(nodeAt,attrTextLens,parsePoints,printPoints){return(
 (src, path, after, p) => {
@@ -15610,6 +15809,201 @@ const _sl108c = function _test_rebasePath(forAll,arb,mulberry32,NUM_RUNS,rebaseP
   return `✅ selection follows its element across insert, delete and move (${NUM_RUNS} runs)`;
 };
 
+// S4's falsifier, first half: `group ∘ ungroup ≠ id (modulo whitespace)`. Two qualifications, and the
+// property test forced both on run 2 rather than my noticing them:
+//
+//   - **modulo whitespace**, because grouping indents what it swallows. The strict form is therefore
+//     *counted* and reported rather than required, which is how a residue regression shows up as a
+//     number falling instead of as a test that was never checking anything.
+//   - **for a contiguous selection**. Group two elements with a third between them and that third
+//     cannot stay between them — they are one object now. Grouping non-adjacent siblings brings them
+//     together at the topmost member's depth, which is what every editor does and is a fact about
+//     grouping rather than a defect in this one. So the general law is the weaker, true one: the same
+//     children come back, in the same relative order, gathered where the group was.
+//
+// The last part is T7 for the new commands, by `test_rebasePath`'s ground-truth method: not "does the
+// rebase follow the rules I wrote" but "does the rebased address slice out the same bytes".
+//
+// The second half is T7 for the new commands, by `test_rebasePath`'s ground-truth method: not "does
+// the rebase follow the rules I wrote" but "does the rebased address slice out the same bytes".
+const _sl252 = function _test_group_ungroup(forAll,arb,mulberry32,NUM_RUNS,groupPlan,groupElements,ungroupElements,ungroupBlockers,childrenLens,nodeAt,cmdGroup)
+{
+  const rng = mulberry32(0x5EED0021);
+  const ws = (t) => t.replace(/\s+/g, " ").trim();
+  const gen = (r) => {
+    const doc = arb.svgDocStr(r);
+    const n = childrenLens([0]).get(doc).length;
+    return [doc, arb.int(r, 0, Math.max(0, n - 1)), arb.int(r, 0, Math.max(0, n - 1))];
+  };
+  let exact = 0, runs = 0, cont = 0;
+  forAll(NUM_RUNS, rng, gen, (doc, a, b) => {
+    const kids = childrenLens([0]).get(doc);
+    if (kids.length < 2) return true;
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    const paths = [...new Set([lo, hi])].map((i) => [0, i]);
+    const { at } = groupPlan(paths);
+    const gpath = [0, at];
+
+    const g = groupElements(doc, paths);
+    const n = nodeAt(g, gpath);
+    if (n.tag !== "g") throw new Error(`the group landed at ${gpath.join("/")}, where a <${n.tag}> is`);
+    if (childrenLens(gpath).get(g).length !== paths.length)
+      throw new Error("the group does not hold exactly what was selected");
+    if (ungroupBlockers(g, gpath).length)
+      throw new Error(`a group this command made cannot be undone: ${ungroupBlockers(g, gpath)}`);
+
+    // T7, generalised: every sibling — moved into the group or merely shifted — must still be
+    // findable at the address the command says it has, and must be the same bytes.
+    const rebase = cmdGroup.plan({ paths, src: doc, options: {} }).rebase;
+    for (let j = 0; j < kids.length; j++) {
+      const p = [0, j], to = rebase(p);
+      if (to === null) throw new Error(`grouping deleted ${p.join("/")}, which it must not`);
+      const m = nodeAt(g, to);
+      if (g.slice(m.start, m.end) !== kids[j])
+        throw new Error(`rebased ${p.join("/")} -> ${to.join("/")} lands on the wrong element`);
+    }
+
+    const back = ungroupElements(g, gpath);
+    const members = paths.map((q) => kids[q[1]]);
+    const rest = kids.filter((_, j) => !paths.some((q) => q[1] === j));
+    const want = rest.slice(0, at).concat(members, rest.slice(at));
+    const got = childrenLens([0]).get(back);
+    if (got.map(ws).join("\u0000") !== want.map(ws).join("\u0000"))
+      throw new Error(`group ∘ ungroup lost or reordered a child:\n${doc}\n---\n${back}`);
+    runs++;
+    const contiguous = paths[paths.length - 1][1] - paths[0][1] === paths.length - 1;
+    if (contiguous) {
+      cont++;
+      if (ws(back) !== ws(doc)) throw new Error(`group ∘ ungroup ≠ id:\n${doc}\n---\n${back}`);
+      if (back === doc) exact++;
+    }
+    return true;
+  }, "group ∘ ungroup = id");
+  return `✅ group ∘ ungroup returns the same children in the same order, and is exactly id for a `
+       + `contiguous selection (${runs} runs, ${cont} contiguous, ${exact} of those byte-identical); `
+       + `the rebase follows every sibling`;
+};
+
+// P8's falsifier: "copy-then-paste-in-place producing anything other than a byte-identical duplicate,
+// references included". Byte-identical is achievable exactly because the payload is the author's own
+// bytes — until two ids collide, which no document may allow, so the id case is stated separately
+// rather than waved at.
+const _sl253 = function _test_copy_paste(forAll,arb,mulberry32,NUM_RUNS,copyMarkup,pasteMarkup,freshenIds,idsIn,childrenLens,nodeAt,cmdPaste,offsetMarkup)
+{
+  const rng = mulberry32(0x5EED0022);
+  const gen = (r) => {
+    const doc = arb.svgDocStr(r);
+    const n = childrenLens([0]).get(doc).length;
+    return [doc, arb.int(r, 0, Math.max(0, n - 1))];
+  };
+  forAll(NUM_RUNS, rng, gen, (doc, i) => {
+    const kids = childrenLens([0]).get(doc);
+    if (!kids.length) return true;
+    const paths = [[0, i]];
+    const clip = copyMarkup(doc, paths);
+    if (clip[0] !== kids[i]) throw new Error("the payload is not the element's own bytes");
+    const next = pasteMarkup(doc, [0], null, clip);
+    const pasted = childrenLens([0]).get(next);
+    if (pasted.length !== kids.length + 1) throw new Error("paste-in-place added something else");
+    if (pasted[pasted.length - 1] !== clip[0])
+      throw new Error(`the duplicate is not byte-identical:\n${clip[0]}\n---\n${pasted[pasted.length - 1]}`);
+    // ...and it left every existing element exactly where and as it was.
+    for (let j = 0; j < kids.length; j++)
+      if (pasted[j] !== kids[j]) throw new Error(`paste disturbed sibling ${j}`);
+    return true;
+  }, "copy then paste-in-place is an exact duplicate");
+
+  // References. A reference *into* the pasted set follows the rename; one *out of* it does not,
+  // because it is still correct — the document it points into has not changed.
+  const IDS = `<svg><defs><linearGradient id="grad"/></defs><rect id="r" fill="url(#grad)"/></svg>`;
+  const both = freshenIds(copyMarkup(IDS, [[0, 0], [0, 1]]), idsIn(IDS));
+  if (!/id="grad-2"/.test(both[0]) || !/url\(#grad-2\)/.test(both[1]))
+    throw new Error(`an internal reference did not follow the rename: ${both.join(" ")}`);
+  if (/id="r"(?!-)/.test(both[1])) throw new Error("a colliding id was not renamed");
+  const out = freshenIds([`<rect fill="url(#grad)"/>`], idsIn(IDS));
+  if (out[0] !== `<rect fill="url(#grad)"/>`) throw new Error("an outward reference was rewritten");
+  // Nothing to rename is not a rewrite: the strings come back identical, not merely equal.
+  const clean = [`<rect x="1"/>`];
+  if (freshenIds(clean, idsIn(IDS))[0] !== clean[0]) throw new Error("freshenIds touched a clean payload");
+
+  // Paste declines with an empty clipboard, which is what greys the menu item out (T8).
+  if (cmdPaste(true).plan({ clipboard: () => [], scope: [0], childCount: () => 0, options: {} }) !== null)
+    throw new Error("pasting nothing is not an edit");
+  // ...and paste-in-place is the one that does not move what it pastes.
+  if (offsetMarkup(`<rect x="1"/>`, 0, 0) !== `<rect x="1"/>`) throw new Error("a zero offset wrote something");
+  return `✅ copy → paste-in-place is byte-identical (${NUM_RUNS} runs); internal references follow a `
+       + `rename, outward ones do not, and an empty clipboard declines`;
+};
+
+// G18's falsifier: "aligning an already-aligned set writing anything at all". It holds by the skip
+// rule rather than by a special case — so what this asserts is exactly the writer's own condition,
+// `gestureDelta.text(d) === d.base`, on the *second* plan.
+//
+// A fake `env`: boxes this test controls, an identity screen→parent map, no document and no browser.
+// That is the point of a command reading `env` and nothing else.
+const _sl254 = function _test_align_commands(cmdAlign,cmdDistribute,alignSpecs,gestureDelta)
+{
+  const mk = (boxes) => {
+    const T = boxes.map(() => [0, 0]);
+    const env = {
+      options: {},
+      paths: boxes.map((_, i) => [0, i]),
+      target: (p) => {
+        const i = p[1], t = T[i];
+        return { idx: i, el: null, Slin: [1, 0, 0, 1], T0: t.slice(), box: boxes[i],
+                 text: t[0] || t[1] ? `translate(${t[0]} ${t[1]})` : "" };
+      }
+    };
+    const apply = (ds) => {
+      for (const d of [].concat(ds)) {
+        const i = d.idx;
+        boxes[i] = { ...boxes[i], x: boxes[i].x + d.value[0] - T[i][0], y: boxes[i].y + d.value[1] - T[i][1] };
+        T[i] = d.value.slice();
+      }
+    };
+    return { env, apply, boxes: () => boxes };
+  };
+  const BOXES = () => ([{ x: 10, y: 4, width: 20, height: 10 },
+                        { x: 30, y: 20, width: 6, height: 6 },
+                        { x: 70, y: 50, width: 12, height: 30 }]);
+  const settled = (ds) => [].concat(ds).every((d) => gestureDelta.text(d) === d.base);
+
+  for (const spec of alignSpecs) {
+    const c = cmdAlign(spec), f = mk(BOXES());
+    const first = c.plan(f.env);
+    if (first === null) throw new Error(`${c.id} declined three elements`);
+    if (settled(first)) throw new Error(`${c.id} wrote nothing to an unaligned set`);
+    f.apply(first);
+    const [, , axis, frac] = spec;
+    const lo = axis === "x" ? "x" : "y", len = axis === "x" ? "width" : "height";
+    const edge = (b) => b[lo] + frac * b[len];
+    const got = f.boxes().map(edge);
+    if (Math.max(...got) - Math.min(...got) > 1e-9)
+      throw new Error(`${c.id} left the edges at ${got.join(", ")}`);
+    if (!settled(c.plan(f.env))) throw new Error(`${c.id} is not idempotent — T1 says it must be`);
+  }
+
+  for (const axis of ["x", "y"]) {
+    const c = cmdDistribute(axis), f = mk(BOXES());
+    const first = c.plan(f.env);
+    if (first === null) throw new Error(`${c.id} declined three elements`);
+    f.apply(first);
+    const lo = axis === "x" ? "x" : "y", len = axis === "x" ? "width" : "height";
+    const mid = f.boxes().map((b) => b[lo] + b[len] / 2).sort((a, b) => a - b);
+    if (Math.abs((mid[1] - mid[0]) - (mid[2] - mid[1])) > 1e-9)
+      throw new Error(`${c.id} left uneven gaps: ${mid.join(", ")}`);
+    if (!settled(c.plan(f.env))) throw new Error(`${c.id} is not idempotent`);
+    // The outermost two do not move — that is what makes it idempotent, and it is worth pinning.
+    if (mid[0] !== BOXES()[0][lo] + BOXES()[0][len] / 2 && axis === "x")
+      throw new Error("distribute moved the first element");
+    if (c.plan({ ...f.env, paths: f.env.paths.slice(0, 2) }) !== null)
+      throw new Error("distributing two elements is not a thing");
+  }
+  return `✅ ${alignSpecs.length} aligns and 2 distributes land their edges, are idempotent, and `
+       + `decline what they cannot do`;
+};
+
+
 
 // ================================================================================================
 // DIRECT MANIPULATION — the drawing edits its own cell
@@ -16544,7 +16938,14 @@ const _sl128 = function _gestureDelta(){return(
 {
   attr: (idx, name, value, { lens = null, base = "", dflt = null, was = null } = {}) =>
     ({ kind: "attr", idx, name, value, lens, base, dflt, was }),
-  command: (name, apply, { rebase = null } = {}) => ({ kind: "command", name, apply, rebase }),
+  // `select` is what the selection should be *after* the command — a function, because the addresses
+  // it names only exist once the edit has happened. A command that does not say leaves the selection
+  // to the rebase, which is the right answer for an edit that only moves things about.
+  command: (name, apply, { rebase = null, select = null } = {}) =>
+    ({ kind: "command", name, apply, rebase, select }),
+  // The clipboard is not the document, so putting something on it is not a source edit — same
+  // argument as `select` and `view`, and the reason copy can be a command at all (S4/P8).
+  clip: (markups) => ({ kind: "clip", markups }),
   // `toggle` is shift-click: in or out of the set. An empty `paths` clears.
   select: (paths, mode = null, { toggle = false } = {}) => ({ kind: "select", paths, mode, toggle }),
   // Something to *show* that the source cannot express: a hover outline, a rubber band, a readout.
@@ -16612,9 +17013,16 @@ async (ctx, ds) => {
     if (!d) continue;
     if (d.kind === "attr")
       out.push(await ctx.writer.commit(d.idx, d.name, d.value, d.dflt, d.lens, d.was));
-    else if (d.kind === "command")
-      out.push(await ctx.writer.runCommand(d.name, d.apply, { rebase: d.rebase }));
-    else if (d.kind === "select") {
+    else if (d.kind === "command") {
+      const rec = await ctx.writer.runCommand(d.name, d.apply, { rebase: d.rebase });
+      // After the put, so the addresses it names exist. The rebase has already run by now and moved
+      // whatever the selection was; this replaces it when the command knows better.
+      if (d.select) { const p = d.select(); if (p) ctx.focus.setAll(p); }
+      out.push(rec);
+    } else if (d.kind === "clip") {
+      ctx.clipboard.write(d.markups);
+      out.push(null);                                 // the clipboard is not the source
+    } else if (d.kind === "select") {
       if (d.toggle) for (const p of d.paths) ctx.focus.toggle(p);
       else if (d.paths.length === 1 && d.mode) ctx.focus.set(d.paths[0], d.mode);
       else ctx.focus.setAll(d.paths);
@@ -16867,7 +17275,23 @@ const _sl122b = function _toolScope(pathOfIndex,scopedPath,shapeLookup,gestureDe
 // several selected shapes moves them all — one commit each, since each writes its own attribute.
 // A tap with no movement selects instead: shift adds to the set, and tapping the shape that is
 // already primary cycles to the next shape underneath, which is how an occluded shape is reached.
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLookup,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta){return(
+// How a *screen* delta becomes one element's own translate. Screen space is where a drag, a snap and
+// an alignment are all measured — a bounding box is axis-aligned there whatever transforms its
+// element carries — and this is the single conversion back out of it. Shared by the move tool and by
+// align/distribute, so the two cannot drift into disagreeing about what "move it left by 3" means.
+const _sl251 = function _moveTargetOf(invert,ctmMat,translateLens){return(
+(ctx, idx) => {
+  const t = ctx.doc();
+  if (t === null) return null;
+  const el = ctx.elems()[idx];
+  const ps = el && ctx.screenCTM(el.parentNode);
+  if (!ps) return null;
+  const text = ctx.attr(t, idx, "transform") || "";
+  return { idx, el, text, Slin: invert(ctmMat(ps)), T0: translateLens.get(text) };
+}
+)};
+
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLookup,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta,moveTargetOf){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
@@ -16887,13 +17311,9 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     if (idx <= 0 || !el) return false;
     const targets = [];
     for (const i of sel.indexOf(idx) >= 0 ? sel : [idx]) {
-      const node = list[i];
-      const ps = node && ctx.screenCTM(node.parentNode);
-      if (!ps) continue;
-      const text = ctx.attr(t, i, "transform") || "";
-      targets.push({ idx: i, el: node, text,
-                     // screen delta → this element's parent space (linear part: a drag is a translation)
-                     Slin: invert(ctmMat(ps)), T0: translateLens.get(text) });
+      // screen delta → this element's parent space (linear part: a drag is a translation)
+      const g = moveTargetOf(ctx, i);
+      if (g) targets.push(g);
     }
     if (!targets.length) return false;
     // Snapping is measured in screen space, where every box is axis-aligned whatever transforms
@@ -18072,6 +18492,232 @@ Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarque
 )};
 const _sl123v = (G, _) => G.input(_);
 
+// ---- the command registry (S4) --------------------------------------------------------------------
+// A *command* is a verb that acts on the selection rather than on the pointer: group, duplicate,
+// paste, align. It is the fifth registry §6.1 asks for, and it earns the name by being the same kind
+// of thing a tool is — `plan(env)` returns **deltas**, so a command lands in the same sink a gesture
+// does, owes the same laws, and needs no second write path. A new verb is a new cell.
+//
+// `env` is to a command what `ctx` is to a tool: the only thing it may read. Pure data plus three
+// measured questions, so a command can be planned headless with a fake env and the plan compared
+// against what the browser does.
+//
+//   { src, paths, scope, index(path), childCount(parent), clipboard(), target(path), options }
+//
+// `plan` returning null is a decline (T8), and that is also how a menu knows to grey the item out —
+// one answer, asked once, rather than an `enabled` predicate that can disagree with the plan.
+
+const _sl240 = function _cmdGroup(gestureDelta,groupPlan,groupElements,rebaseMoves){return(
+{
+  id: "group", label: "Group", key: "Mod-g",
+  plan(env) {
+    if (!env.paths.length) return null;
+    let p;
+    try { p = groupPlan(env.paths); } catch (e) { return null; }   // not siblings: decline
+    const gpath = p.parent.concat([p.at]);
+    const order = env.paths.slice().sort((a, b) => a[a.length - 1] - b[b.length - 1]);
+    return gestureDelta.command("group", (src) => groupElements(src, env.paths), {
+      // A member did not vanish — it moved inside the new <g>, at the rank its index gives it.
+      rebase: rebaseMoves(order.map((q, k) => [q, gpath.concat([k])]),
+                          p.indices.slice().reverse().map((i) => ({ kind: "delete", path: p.parent.concat([i]) }))
+                            .concat([{ kind: "insert", parent: p.parent, at: p.at }])),
+      select: () => [gpath]
+    });
+  }
+}
+)};
+
+const _sl241 = function _cmdUngroup(gestureDelta,ungroupBlockers,ungroupElements,childrenLens,rebaseMoves){return(
+{
+  id: "ungroup", label: "Ungroup", key: "Mod-Shift-g",
+  plan(env) {
+    // Descending, so dissolving one group cannot invalidate the address of the next: replacing a
+    // child with n children only shifts what comes *after* it. Same argument as `removeSelection`.
+    const groups = env.paths.filter((p) => !ungroupBlockers(env.src, p).length)
+                            .sort((a, b) => { for (let i = 0; i < Math.max(a.length, b.length); i++) {
+                              const d = (b[i] === undefined ? -1 : b[i]) - (a[i] === undefined ? -1 : a[i]);
+                              if (d) return d; } return 0; });
+    if (!groups.length) return null;
+    return groups.map((path, k) => {
+      const parent = path.slice(0, -1), gi = path[path.length - 1];
+      const n = childrenLens(path).get(env.src).length;
+      const kids = Array.from({ length: n }, (_, j) => [path.concat([j]), parent.concat([gi + j])]);
+      return gestureDelta.command("ungroup", (src) => ungroupElements(src, path), {
+        rebase: rebaseMoves(kids, [{ kind: "delete", path }].concat(
+          Array.from({ length: n }, () => ({ kind: "insert", parent, at: gi })))),
+        // Only when one group was asked for: with several, the freed children of the first are
+        // already moving under the second, and guessing at that is how a selection ends up lying.
+        select: groups.length === 1 ? () => kids.map(([, to]) => to) : null
+      });
+    });
+  }
+}
+)};
+
+const _sl242 = function _cmdDuplicate(gestureDelta,copyMarkup,offsetMarkup,pasteMarkup){return(
+{
+  id: "duplicate", label: "Duplicate", key: "Mod-d",
+  plan(env) {
+    if (!env.paths.length) return null;
+    const parent = env.paths[0].slice(0, -1);
+    // One parent, because "offset by a nudge" is a statement in *that* parent's coordinates.
+    if (env.paths.some((p) => p.length !== env.paths[0].length || !parent.every((v, i) => p[i] === v)))
+      return null;
+    const d = env.options.duplicateOffset === undefined ? 8 : env.options.duplicateOffset;
+    const at = env.childCount(parent);
+    const copies = copyMarkup(env.src, env.paths).map((m) => offsetMarkup(m, d, d));
+    return gestureDelta.command("duplicate", (src) => pasteMarkup(src, parent, at, copies), {
+      // Appended after everything that already exists, so no existing address moves at all.
+      rebase: null,
+      select: () => copies.map((_, k) => parent.concat([at + k]))
+    });
+  }
+}
+)};
+
+const _sl243 = function _cmdCopy(gestureDelta,copyMarkup){return(
+{
+  id: "copy", label: "Copy", key: "Mod-c",
+  plan(env) {
+    if (!env.paths.length) return null;
+    return gestureDelta.clip(copyMarkup(env.src, env.paths));
+  }
+}
+)};
+
+const _sl244 = function _cmdCut(gestureDelta,copyMarkup,deleteElement,rebasePath){return(
+{
+  id: "cut", label: "Cut", key: "Mod-x",
+  plan(env) {
+    if (!env.paths.length) return null;
+    const order = env.paths.slice().sort((a, b) => {
+      for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        const d = (b[i] === undefined ? -1 : b[i]) - (a[i] === undefined ? -1 : a[i]);
+        if (d) return d;
+      }
+      return 0;
+    });
+    return [gestureDelta.clip(copyMarkup(env.src, env.paths))].concat(
+      order.map((path, k) => gestureDelta.command("deleteElement", (src) => deleteElement(src, path), {
+        rebase: (q) => rebasePath(q, { kind: "delete", path }),
+        select: k === order.length - 1 ? () => [] : null
+      })));
+  }
+}
+)};
+
+const _sl245 = function _cmdPaste(gestureDelta,pasteMarkup,offsetMarkup){return(
+// Two verbs, one plan: paste offsets so you can see that something arrived, paste-in-place does not,
+// which is what makes it the exact inverse of copy and therefore the thing a law can check.
+(inPlace) => ({
+  id: inPlace ? "paste-in-place" : "paste",
+  label: inPlace ? "Paste in place" : "Paste",
+  key: inPlace ? "Mod-Shift-v" : "Mod-v",
+  plan(env) {
+    const clip = env.clipboard();
+    if (!clip || !clip.length) return null;
+    const parent = env.scope && env.scope.length ? env.scope : [0];
+    const d = inPlace ? 0 : (env.options.duplicateOffset === undefined ? 8 : env.options.duplicateOffset);
+    const markups = d ? clip.map((m) => offsetMarkup(m, d, d)) : clip;
+    const at = env.childCount(parent);
+    return gestureDelta.command(inPlace ? "paste-in-place" : "paste",
+      (src) => pasteMarkup(src, parent, at, markups),
+      { rebase: null, select: () => markups.map((_, k) => parent.concat([at + k])) });
+  }
+})
+)};
+
+// Align and distribute are *not* structural: they are the move tool's write, aimed by arithmetic
+// instead of by a pointer. So they emit `attr` deltas through `translateLens` — the same commit a
+// drag performs — and G18's falsifier ("aligning an already-aligned set writes anything at all")
+// holds by the skip rule rather than by a special case: the put returns the same source, and the
+// writer stops. Measured in screen space, where every box is axis-aligned whatever transforms its
+// element carries, and converted back per element exactly as a drag is.
+const _sl246 = function _alignSpecs(){return(
+[["align-left", "Align left", "x", 0], ["align-center-h", "Align centres", "x", 0.5],
+ ["align-right", "Align right", "x", 1], ["align-top", "Align top", "y", 0],
+ ["align-middle-v", "Align middles", "y", 0.5], ["align-bottom", "Align bottom", "y", 1]]
+)};
+
+const _sl247 = function _cmdAlign(gestureDelta,translateLens){return(
+([id, label, axis, frac]) => ({
+  id, label, key: null,
+  plan(env) {
+    if (env.paths.length < 2) return null;
+    const ts = env.paths.map(env.target).filter((t) => t && t.box);
+    if (ts.length < 2) return null;
+    const lo = axis === "x" ? "x" : "y", len = axis === "x" ? "width" : "height";
+    const edge = (b) => b[lo] + frac * b[len];
+    const to = frac === 0 ? Math.min(...ts.map((t) => t.box[lo]))
+             : frac === 1 ? Math.max(...ts.map((t) => t.box[lo] + t.box[len]))
+             : (Math.min(...ts.map((t) => t.box[lo])) + Math.max(...ts.map((t) => t.box[lo] + t.box[len]))) / 2;
+    return ts.map((t) => {
+      const dx = axis === "x" ? to - edge(t.box) : 0, dy = axis === "y" ? to - edge(t.box) : 0;
+      const S = t.Slin, r = (v) => Math.round(v * 1e6) / 1e6;
+      const T = [r(t.T0[0] + S[0] * dx + S[2] * dy), r(t.T0[1] + S[1] * dx + S[3] * dy)];
+      return gestureDelta.attr(t.idx, "transform", T,
+                               { lens: translateLens, base: t.text, dflt: "", was: t.text });
+    });
+  }
+})
+)};
+
+const _sl248 = function _cmdDistribute(gestureDelta,translateLens){return(
+// Equal *gaps between centres*, with the outermost two left where they are — the only reading that
+// is idempotent, which is what makes T1 hold for it too.
+(axis) => ({
+  id: axis === "x" ? "distribute-h" : "distribute-v",
+  label: axis === "x" ? "Distribute horizontally" : "Distribute vertically",
+  key: null,
+  plan(env) {
+    if (env.paths.length < 3) return null;
+    const ts = env.paths.map(env.target).filter((t) => t && t.box);
+    if (ts.length < 3) return null;
+    const lo = axis === "x" ? "x" : "y", len = axis === "x" ? "width" : "height";
+    const mid = (t) => t.box[lo] + t.box[len] / 2;
+    const sorted = ts.slice().sort((a, b) => mid(a) - mid(b));
+    const first = mid(sorted[0]), last = mid(sorted[sorted.length - 1]);
+    const step = (last - first) / (sorted.length - 1);
+    return sorted.map((t, i) => {
+      const want = first + step * i;
+      const dx = axis === "x" ? want - mid(t) : 0, dy = axis === "y" ? want - mid(t) : 0;
+      const S = t.Slin, r = (v) => Math.round(v * 1e6) / 1e6;
+      const T = [r(t.T0[0] + S[0] * dx + S[2] * dy), r(t.T0[1] + S[1] * dx + S[3] * dy)];
+      return gestureDelta.attr(t.idx, "transform", T,
+                               { lens: translateLens, base: t.text, dflt: "", was: t.text });
+    });
+  }
+})
+)};
+
+const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs){return(
+// A plain array, not an `Inputs.input`, for the same reason `svgShapes` is: pure code plans a command
+// and the laws exercise that headless, where there is no DOM to hold a view.
+[cmdGroup, cmdUngroup, cmdDuplicate, cmdCopy, cmdCut, cmdPaste(false), cmdPaste(true)]
+  .concat(alignSpecs.map(cmdAlign))
+  .concat([cmdDistribute("x"), cmdDistribute("y")])
+)};
+
+// Look one up, and answer "what does this keystroke mean" in one place. The binding is a
+// *declaration* — the registry says what a command would like to be called by; whether a callsite
+// honours it is the callsite's business, exactly as it is for the tool shortcuts.
+const _sl249 = function _commandLookup(){return(
+{
+  byId: (cmds, id) => cmds.find((c) => c.id === id) || null,
+  forEvent: (cmds, e) => {
+    const mod = e.metaKey || e.ctrlKey, shift = e.shiftKey, alt = e.altKey;
+    const k = (e.key || "").toLowerCase();
+    return cmds.find((c) => {
+      if (!c.key) return false;
+      const parts = c.key.split("-");
+      const want = parts[parts.length - 1].toLowerCase();
+      return want === k && parts.includes("Mod") === !!mod
+          && parts.includes("Shift") === !!shift && parts.includes("Alt") === !!alt;
+    }) || null;
+  }
+}
+)};
+
 // ---- svgLens: wiring only ------------------------------------------------------------------------
 // ---- state that outlives a recompute ------------------------------------------------------------
 // A commit re-runs the cell, so the SVG element is replaced. Undo history, the selection and the
@@ -18082,11 +18728,16 @@ const _sl113s = function _lensState(){return(
 new Map()
 )};
 
-const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox)
+const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,commandLookup,copyMarkup,moveTargetOf,commitDelta,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox)
 {
   // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
   // node that is the cell's value now, rather than the one its gesture started on.
   const ctxByNode = new WeakMap();
+  // One clipboard for every drawing on the page, because copying out of one and pasting into another
+  // is the whole point of the payload being source text. The system clipboard is written too, best
+  // effort — it is permission-gated and asynchronous, so it can be a *copy* of the truth but not the
+  // truth itself, and a paste that had to wait on a permission prompt would not be a paste.
+  const clip = { markups: [] };
   return function svgLens(node, options = {}) {
     // The installed tools, taken at the callsite. An array pins this drawing to exactly that set —
     // which is how a test runs one tool in isolation, and how a figure shows a reduced editor — and a
@@ -18097,6 +18748,16 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     // Same contract for which tags have editable geometry (design note S2).
     const shapes = typeof options.shapes === "function" ? options.shapes(svgShapes)
                  : options.shapes || svgShapes;
+    // ...and which verbs the selection has (design note S4).
+    const commands = typeof options.commands === "function" ? options.commands(svgCommands)
+                   : options.commands || svgCommands;
+    const clipboard = {
+      read: () => clip.markups.slice(),
+      write: (markups) => {
+        clip.markups = markups.slice();
+        try { navigator.clipboard.writeText(markups.join("\n")).catch(() => {}); } catch (e) { /* no permission, no matter */ }
+      }
+    };
     const grid = options.grid === undefined ? 0.5 : options.grid;
     const snap = (v) => (grid ? Math.round(v / grid) * grid : v);
     // Markup for a shape dropped on empty canvas. UX policy, not geometry, so it is overridable.
@@ -18305,7 +18966,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     };
 
     const ctx = {
-      node, target, writer, focus, snap, overlay, setTool, guides, shapes,
+      node, target, writer, focus, snap, overlay, setTool, guides, shapes, commands, clipboard,
       get state() { return gesture(); },
       tool: () => toolNow(),
       childCount: kidCount,
@@ -18460,6 +19121,44 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       });
     };
     node.edit = (name, fn, opts) => writer.runCommand(name, fn, opts);
+    // ---- commands (S4) ---------------------------------------------------------------------------
+    // What a command may read, and nothing else: `env` is to a command what `ctx` is to a tool. Three
+    // of these are measurements, and they go through `ctx` like every other measurement (P5), so a
+    // command can be planned against a fake env with no document at all.
+    const commandEnv = () => {
+      const src = target.doc();
+      if (src === null) return null;
+      return {
+        src, paths: focus.paths, scope: scopeNow(), options,
+        index: (path) => nodeAt(src, path).index,
+        childCount: kidCount,
+        clipboard: clipboard.read,
+        // Everything align needs about one element, measured the way a drag measures it.
+        target: (path) => {
+          let n;
+          try { n = nodeAt(src, path); } catch (e) { return null; }
+          const g = moveTargetOf(ctx, n.index);
+          return g && { ...g, box: ctx.screenBox(g.el) };
+        }
+      };
+    };
+    // The plan *is* the answer to "can I do this" — asked once, so a greyed-out menu item and a
+    // refusal to run cannot disagree. null means the command declines (T8).
+    node.commandPlan = (id) => {
+      const c = commandLookup.byId(commands, id);
+      const env = c && commandEnv();
+      if (!env) return null;
+      try { return c.plan(env); } catch (e) { return null; }
+    };
+    node.canCommand = (id) => node.commandPlan(id) !== null;
+    node.commands = () => commands.map((c) => ({ id: c.id, label: c.label, key: c.key }));
+    node.command = async (id) => {
+      const d = node.commandPlan(id);
+      return d === null ? null : commitDelta(liveCtx, d);
+    };
+    // "What does this keystroke mean" — the registry answers, the callsite decides whether to ask.
+    node.commandForEvent = (e) => commandLookup.forEvent(commands, e);
+    node.copySelection = () => copyMarkup(target.doc() || "", focus.paths);
     // Z-order over the same reorder command. SVG paints in document order, so "front" is last.
     node.zOrder = (path, kind) =>
       node.moveTo(path, zTarget(kind, path[path.length - 1], kidCount(path.slice(0, -1))));
@@ -18719,6 +19418,9 @@ export default function define(runtime, observer) {
   $def("sl126t", "test_pen_path", ["penPath","parsePath","printPath"], _sl126t);
   $def("sl108d", "test_path_subdivision_exact", ["forAll","arb","mulberry32","NUM_RUNS","parsePath","printPath","pathSegments","pointOnSegment","splitPathSegment","deletePathAnchor"], _sl108d);
   $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
+  $def("sl252", "test_group_ungroup", ["forAll","arb","mulberry32","NUM_RUNS","groupPlan","groupElements","ungroupElements","ungroupBlockers","childrenLens","nodeAt","cmdGroup"], _sl252);
+  $def("sl253", "test_copy_paste", ["forAll","arb","mulberry32","NUM_RUNS","copyMarkup","pasteMarkup","freshenIds","idsIn","childrenLens","nodeAt","cmdPaste","offsetMarkup"], _sl253);
+  $def("sl254", "test_align_commands", ["cmdAlign","cmdDistribute","alignSpecs","gestureDelta"], _sl254);
   $def("sl109b", "test_parse_vs_DOMParser", ["parseDoc","outsideDomain","attrVal","tokenize"], _sl109b);
   $def("sl20", "coreHeader", ["md"], _sl20);
   $def("sl21", "lens", [], _sl21);
@@ -18797,6 +19499,16 @@ export default function define(runtime, observer) {
   $def("sl79a", "insertElement", ["childrenLens"], _sl79a);
   $def("sl79b", "deleteElement", ["childrenLens"], _sl79b);
   $def("sl79c", "reorderElement", ["childrenLens"], _sl79c);
+  $def("sl79xa", "groupPlan", [], _sl79xa);
+  $def("sl79xb", "groupElements", ["childrenLens","groupPlan","nodeAt"], _sl79xb);
+  $def("sl79xc", "ungroupBlockers", ["nodeAt"], _sl79xc);
+  $def("sl79xd", "ungroupElements", ["nodeAt","ungroupBlockers","attrTextLens"], _sl79xd);
+  $def("sl79xe", "copyMarkup", ["nodeAt"], _sl79xe);
+  $def("sl79xf", "idsIn", ["parseDoc"], _sl79xf);
+  $def("sl79xg", "freshenIds", ["idsIn"], _sl79xg);
+  $def("sl79xh", "pasteMarkup", ["childrenLens","idsIn","freshenIds"], _sl79xh);
+  $def("sl79xi", "offsetMarkup", ["compose","attrTextLens","translateLens"], _sl79xi);
+  $def("sl79xj", "rebaseMoves", ["rebasePath"], _sl79xj);
   $def("sl79d", "insertPoint", ["nodeAt","attrTextLens","parsePoints","printPoints"], _sl79d);
   $def("sl79e", "deletePoint", ["nodeAt","attrTextLens","parsePoints","printPoints"], _sl79e);
   $def("sl79f", "nearestSegment", [], _sl79f);
@@ -18846,7 +19558,8 @@ export default function define(runtime, observer) {
   $def("sl119d", "scopedPath", [], _sl119d);
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl121);
+  $def("sl251", "moveTargetOf", ["invert","ctmMat","translateLens"], _sl251);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta","moveTargetOf"], _sl121);
   $def("sl125z", "toolZoom", ["grabPointer"], _sl125z);
   $def("sl122b", "toolScope", ["pathOfIndex","scopedPath","shapeLookup","gestureDelta","commitDelta"], _sl122b);
   $def("sl121b", "toolMarquee", ["pathOfIndex","scopedPath","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
@@ -18878,9 +19591,20 @@ export default function define(runtime, observer) {
   $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit","test_gesture_hit_agreement","test_gesture_view_is_not_an_edit"], _sl139);
   $def("sl127h", "toolHover", ["gestureDelta","previewDelta"], _sl127h);
   $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl123);
+  $def("sl240", "cmdGroup", ["gestureDelta","groupPlan","groupElements","rebaseMoves"], _sl240);
+  $def("sl241", "cmdUngroup", ["gestureDelta","ungroupBlockers","ungroupElements","childrenLens","rebaseMoves"], _sl241);
+  $def("sl242", "cmdDuplicate", ["gestureDelta","copyMarkup","offsetMarkup","pasteMarkup"], _sl242);
+  $def("sl243", "cmdCopy", ["gestureDelta","copyMarkup"], _sl243);
+  $def("sl244", "cmdCut", ["gestureDelta","copyMarkup","deleteElement","rebasePath"], _sl244);
+  $def("sl245", "cmdPaste", ["gestureDelta","pasteMarkup","offsetMarkup"], _sl245);
+  $def("sl246", "alignSpecs", [], _sl246);
+  $def("sl247", "cmdAlign", ["gestureDelta","translateLens"], _sl247);
+  $def("sl248", "cmdDistribute", ["gestureDelta","translateLens"], _sl248);
+  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs"], _sl250);
+  $def("sl249", "commandLookup", [], _sl249);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox"], _sl114);
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","commandLookup","copyMarkup","moveTargetOf","commitDelta","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
