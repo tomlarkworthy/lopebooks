@@ -16919,7 +16919,61 @@ const _sl117 = function _svgWriter(runtime,realize,settle,literalLens,cellAttrLe
     return applySource(next, record);
   }
 
-  return { applySource, runCommand, commit };
+  // G44. One gesture is one edit, even when it moves several attributes of several elements — a rect
+  // drag writes `x` and `y`, a corner-resize writes four. Committing them one at a time mints a node
+  // and a history entry per attribute, so a single drag cost several undos. This folds every plain
+  // attribute put into one running source string and calls `applySource` **once**: one redefine, one
+  // remount, one entry in the change history. Order among the puts does not matter — each targets a
+  // different (idx, name) and re-reads the literal from scratch, so `spliceAttr`'s shifting offsets
+  // never cross. An edit whose attribute is an interpolated `${…}` hole is a different sink (upstream
+  // or locked), which this does not fold; a group containing one falls back to the sequential path,
+  // which is correct if less tidy — no gesture the editor has today mixes the two.
+  async function commitMany(edits) {
+    const s0 = target.cellSource();
+    if (s0 === null) return edits.map(() => null);
+    const alias = target.alias();
+    const hasHole = edits.some((e) => {
+      const t = cellAttrLens(alias, e.idx, e.name, e.dflt).get(s0);
+      return t !== null && holeSpans(t).length > 0;
+    });
+    if (hasHole) {                                       // not foldable: keep each its own edit
+      const out = [];
+      for (const e of edits) out.push(await commit(e.idx, e.name, e.value, e.dflt, e.inner, e.was));
+      return out;
+    }
+    let next = s0;
+    const records = [];
+    for (const e of edits) {
+      const base = cellAttrLens(alias, e.idx, e.name, e.dflt);
+      const l = e.inner ? compose(base, e.inner) : base;
+      const before = l.get(next);
+      const after = l.put(e.value, next);
+      const same = (a, b) => (Array.isArray(a) ? Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]) : a === b);
+      const el = target.elems()[e.idx];
+      records.push({
+        target: (el ? el.localName : "?") + "[" + e.idx + "]", attribute: e.name,
+        before: String(before), after: String(l.get(after)),
+        GetPut: l.put(l.get(after), after) === after, PutGet: same(l.get(after), e.value), span: null
+      });
+      next = after;
+    }
+    if (next === s0) {                                   // the whole group was a no-op: reconcile the DOM
+      for (const e of edits) {
+        const v = attrVal(target.doc(), e.idx, e.name);
+        const el = target.elems()[e.idx];
+        if (el) { if (v === null) el.removeAttribute(e.name); else el.setAttribute(e.name, v); }
+      }
+      records.forEach(emit);
+      return records;
+    }
+    const merged = { target: records[0].target, attribute: records.map((r) => r.attribute).join("+"),
+                     before: "", after: "", GetPut: records.every((r) => r.GetPut),
+                     PutGet: records.every((r) => r.PutGet), span: null, group: records };
+    await applySource(next, merged);
+    return records;
+  }
+
+  return { applySource, runCommand, commit, commitMany };
 }
 )};
 
@@ -17326,8 +17380,15 @@ const _sl128c = function _revertDelta(){return(
 
 const _sl128b = function _commitDelta(){return(
 async (ctx, ds) => {
+  const list = [].concat(ds).filter(Boolean);
+  // G44: a gesture that is only attribute puts commits as one edit — one undo entry — through
+  // `commitMany`. Anything else (a command, a selection, a mixed list) keeps the per-delta path,
+  // which no current gesture needs to fold across.
+  if (list.length > 1 && list.every((d) => d.kind === "attr"))
+    return ctx.writer.commitMany(list.map((d) => ({ idx: d.idx, name: d.name, value: d.value,
+                                                    dflt: d.dflt, inner: d.lens, was: d.was })));
   const out = [];
-  for (const d of [].concat(ds)) {
+  for (const d of list) {
     if (!d) continue;
     if (d.kind === "attr")
       out.push(await ctx.writer.commit(d.idx, d.name, d.value, d.dflt, d.lens, d.was));
@@ -18522,10 +18583,12 @@ const _sl136 = function _test_gesture_commits_against_its_origin(withFixture,ges
     const off = moved.findIndex(([a, b]) => Math.abs(a - dx) > 0.5 || Math.abs(b - dy) > 0.5);
     if (off >= 0)
       throw new Error(`element ${off} of ${sel} moved by (${moved[off]}) where the first moved by (${dx}, ${dy}) — the tail of the gesture committed against a stale node`);
-    // An element may take more than one edit (a rect writes `x` and `y`); it may not take none.
-    if (gained < sel)
-      throw new Error(`${sel} elements were dragged but only ${gained} edits appeared`);
-    return `✅ T4: a ${sel}-element move moved all ${sel} by the same delta, in ${gained} edits`;
+    // G44: one gesture is one edit, however many elements and attributes it touched — so this drag
+    // is a single undo entry, not one per element. It must be exactly 1: 0 means nothing committed,
+    // more than 1 means the fold broke.
+    if (gained !== 1)
+      throw new Error(`the ${sel}-element move produced ${gained} undo entries — a gesture must be one edit (G44)`);
+    return `✅ T4: a ${sel}-element move moved all ${sel} by the same delta, in one edit`;
   });
 };
 
