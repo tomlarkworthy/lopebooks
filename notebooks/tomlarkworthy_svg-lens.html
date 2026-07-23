@@ -16554,6 +16554,9 @@ const _sl113e = function _shapeRect(geomOf,numText,rxInset){return(
 {
   mode: "rect", tags: ["rect"], writes: ["x", "y", "width", "height", "rx"], rotatable: true,
   reads: (src, idx) => { geomOf.rect(src, idx); return true; },
+  origin: (src, idx) => { const r = geomOf.rect(src, idx); return [r.x, r.y]; },
+  move: (src, idx, x, y) => [{ name: "x", value: numText(x), dflt: "0" },
+                             { name: "y", value: numText(y), dflt: "0" }],
   handles: (src, idx) => {
     const r = geomOf.rect(src, idx);
     const mx = r.x + r.width / 2, my = r.y + r.height / 2;
@@ -16598,6 +16601,9 @@ const _sl113f = function _shapeCircle(geomOf,numText){return(
 {
   mode: "circle", tags: ["circle"], writes: ["r"],
   reads: (src, idx) => { geomOf.circle(src, idx); return true; },
+  origin: (src, idx) => { const c = geomOf.circle(src, idx); return [c.cx, c.cy]; },
+  move: (src, idx, x, y) => [{ name: "cx", value: numText(x), dflt: "0" },
+                             { name: "cy", value: numText(y), dflt: "0" }],
   handles: (src, idx) => {
     const c = geomOf.circle(src, idx);
     return [
@@ -16619,6 +16625,9 @@ const _sl113g = function _shapeEllipse(geomOf,numText){return(
 {
   mode: "ellipse", tags: ["ellipse"], writes: ["rx", "ry"], rotatable: true,
   reads: (src, idx) => { geomOf.ellipse(src, idx); return true; },
+  origin: (src, idx) => { const c = geomOf.ellipse(src, idx); return [c.cx, c.cy]; },
+  move: (src, idx, x, y) => [{ name: "cx", value: numText(x), dflt: "0" },
+                             { name: "cy", value: numText(y), dflt: "0" }],
   handles: (src, idx) => {
     const c = geomOf.ellipse(src, idx);
     const H = (key, x, y, kind) => ({ key, kind, x, y });
@@ -16647,6 +16656,15 @@ const _sl113h = function _shapeLine(geomOf,numText){return(
 {
   mode: "line", tags: ["line"], writes: ["x1", "y1", "x2", "y2"],
   reads: (src, idx) => { geomOf.line(src, idx); return true; },
+  // The first endpoint is the origin; the second follows by the same delta, so a move is a move and
+  // not a stretch.
+  origin: (src, idx) => { const l = geomOf.line(src, idx); return [l.x1, l.y1]; },
+  move: (src, idx, x, y) => {
+    const l = geomOf.line(src, idx), dx = x - l.x1, dy = y - l.y1;
+    return [{ name: "x1", value: numText(x), dflt: "0" }, { name: "y1", value: numText(y), dflt: "0" },
+            { name: "x2", value: numText(l.x2 + dx), dflt: "0" },
+            { name: "y2", value: numText(l.y2 + dy), dflt: "0" }];
+  },
   handles: (src, idx) => {
     const l = geomOf.line(src, idx);
     return [{ key: "1", kind: "anchor", x: l.x1, y: l.y1 },
@@ -17594,7 +17612,7 @@ const _sl122b = function _toolScope(pathOfIndex,scopedPath,shapeLookup,gestureDe
 // an alignment are all measured — a bounding box is axis-aligned there whatever transforms its
 // element carries — and this is the single conversion back out of it. Shared by the move tool and by
 // align/distribute, so the two cannot drift into disagreeing about what "move it left by 3" means.
-const _sl251 = function _moveTargetOf(invert,ctmMat,translateLens){return(
+const _sl251 = function _moveTargetOf(invert,ctmMat,translateLens,shapeLookup){return(
 (ctx, idx) => {
   const t = ctx.doc();
   if (t === null) return null;
@@ -17602,11 +17620,58 @@ const _sl251 = function _moveTargetOf(invert,ctmMat,translateLens){return(
   const ps = el && ctx.screenCTM(el.parentNode);
   if (!ps) return null;
   const text = ctx.attr(t, idx, "transform") || "";
-  return { idx, el, text, Slin: invert(ctmMat(ps)), T0: translateLens.get(text) };
+  // Two frames, because a move can land in two different places (see `moveDeltas`). `Slin` takes a
+  // screen delta into the *parent's* space, where a `transform` is written; `Elin` takes it into the
+  // element's own space, where `x`/`cx`/`x1` live — that is the element's own transform included, so
+  // nudging a rotated rect still follows the pointer rather than its own tilted axes.
+  const entry = el ? shapeLookup.forTag(ctx.shapes, el.localName, t, idx) : null;
+  const es = entry && entry.move && entry.origin ? ctx.screenCTM(el) : null;
+  return { idx, el, text, src: t, entry,
+           Slin: invert(ctmMat(ps)), Elin: es ? invert(ctmMat(es)) : null,
+           T0: translateLens.get(text) };
 }
 )};
 
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLookup,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta,moveTargetOf){return(
+// Where a move lands. A `transform="translate(…)"` is the general answer and the wrong default: an
+// author who wrote `<rect x="16" y="0">` and drags it two units expects `x="18"`, not a wrapper that
+// says the rect is somewhere other than where it says it is. So a move writes **the shape's own
+// coordinates whenever it has any**, and falls back to `transform` when it does not.
+// The line between the two is not "which tags do we like": it is whether the position is an
+// attribute of its own. `rect`/`image`, `circle`/`ellipse` and `line` keep their position in
+// dedicated numeric attributes, and rewriting one is a local edit that leaves every other byte
+// alone. A `polygon`'s position is spread through `points` and a `path`'s through `d`, so moving
+// them by coordinates would reprint the entire geometry — including the author's own spacing, which
+// the demo drawing exists to show surviving a drag. Those, and `<g>`, still translate.
+// Snapping is applied to the resulting *origin*, not to each coordinate, or a line would be
+// stretched onto the grid rather than moved onto it.
+const _sl263 = function _moveDeltas(gestureDelta,translateLens,attrVal){return(
+(g, dx, dy, { q = (v) => v } = {}) => {
+  if (g.entry && g.entry.move && g.entry.origin && g.Elin && g.src) {
+    const E = g.Elin;
+    let o = null;
+    try { o = g.entry.origin(g.src, g.idx); } catch (err) {}
+    if (o) {
+      const x = q(o[0] + E[0] * dx + E[2] * dy, "x"), y = q(o[1] + E[1] * dx + E[3] * dy, "y");
+      const out = [];
+      for (const ed of g.entry.move(g.src, g.idx, x, y)) {
+        const was = attrVal(g.src, g.idx, ed.name);
+        const dflt = ed.dflt === undefined ? null : ed.dflt;
+        // An attribute the move did not change is not written — the same rule `edit` follows, and
+        // what makes a drag that ends where it began a null edit (T1) rather than a reformat.
+        if (was === null ? String(ed.value) === dflt : String(ed.value) === was) continue;
+        out.push(gestureDelta.attr(g.idx, ed.name, ed.value, { dflt, was }));
+      }
+      return out;
+    }
+  }
+  const S = g.Slin;
+  const T = [q(g.T0[0] + S[0] * dx + S[2] * dy, "x"), q(g.T0[1] + S[1] * dx + S[3] * dy, "y")];
+  return [gestureDelta.attr(g.idx, "transform", T,
+                            { lens: translateLens, base: g.text, dflt: "", was: g.text })];
+}
+)};
+
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLookup,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta,moveTargetOf,moveDeltas){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
@@ -17671,17 +17736,18 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
       if (frozen === "y") { dy = 0; aligned.y = false; }
       else if (frozen === "x") { dx = 0; aligned.x = false; }
     }
-    // One delta per element the gesture claimed — which is what makes T4's "one commit per claimed
-    // element" literal rather than inferred.
-    d.deltas = d.targets.map((g) => {
-      const S = g.Slin;
-      // Per axis: an aligned axis keeps its exact value (rounded only to kill float noise, or the
-      // source fills up with 10.476190476190474), an unaligned one still lands on the grid.
-      const q = (v, on) => (on ? Math.round(v * 1e6) / 1e6 : ctx.snap(v));
-      g.T = [q(g.T0[0] + S[0] * dx + S[2] * dy, aligned.x), q(g.T0[1] + S[1] * dx + S[3] * dy, aligned.y)];
-      return gestureDelta.attr(g.idx, "transform", g.T,
-                               { lens: translateLens, base: g.text, dflt: "", was: g.text });
-    });
+    // Per axis: an aligned axis keeps its exact value (rounded only to kill float noise, or the
+    // source fills up with 10.476190476190474), an unaligned one still lands on the grid.
+    // 1e-4 and not 1e-6, because an alignment is measured in *screen* space and converted back
+    // through the inverse CTM, and that round trip leaves noise of its own — 1e-6 was fine enough to
+    // preserve it, which is how a circle aligned to a neighbour committed `cx="86.000002"`. A tenth
+    // of a thousandth of a user unit is below anything an author would write and far below anything
+    // a screen can show, and it is a *fixed* precision rather than a zoom-derived one, so the same
+    // drag still commits the same bytes at every zoom (T11).
+    const q = (v, axis) => (aligned[axis] ? Math.round(v * 1e4) / 1e4 : ctx.snap(v));
+    // One *element* per element the gesture claimed — how many attributes that turns into is the
+    // shape's business, not the tool's.
+    d.deltas = d.targets.flatMap((g) => moveDeltas(g, dx, dy, { q }));
     previewDelta(ctx, d.deltas);
     ctx.focus.refresh();                                 // clears the overlay, so guides come after
     ctx.guides(guides);
@@ -18428,20 +18494,38 @@ const _sl135 = function _test_gesture_path_independence(withFixture,gestureCorpu
 // L4 · T4 origin — d-PutInc, `dom P(X, α) = X`. A gesture commits against the state it started from.
 // Each commit mints a new node, so a multi-element move finishes against instances that no longer
 // exist; before this was fixed only the first element of a selection moved, silently.
-const _sl136 = function _test_gesture_commits_against_its_origin(withFixture,gestureCorpus,playGesture)
+const _sl136 = function _test_gesture_commits_against_its_origin(withFixture,gestureCorpus,playGesture,nodeAt)
 {
   if (typeof document === "undefined") return () => "⏭ needs a browser";
+  // What this law is *about* is that the tail of a multi-element gesture is not silently dropped:
+  // each commit mints a new node, so the second element is committed against an instance that no
+  // longer exists. Counting undo entries used to stand in for that, and stopped being able to when
+  // G43 let one element write two attributes (a rect moves by `x` *and* `y`). So measure the claim
+  // directly: every element the gesture claimed ends up moved, by the same delta.
+  const boxes = (f) => f.focusPaths().map((p) => {
+    const el = f.elems()[nodeAt(f.doc(), p).index];
+    const b = el.getBoundingClientRect();
+    return { x: b.x, y: b.y };
+  });
   return () => withFixture(gestureCorpus.basic, {}, async (f) => {
     // marquee the polygon and the path together, then drag one of them
     await playGesture(f, playGesture.drag([[10, 20], [60, 60], [190, 110]]));
     const sel = f.focusPaths().length;
     if (sel < 2) throw new Error(`the marquee selected ${sel} elements, so this law is untested`);
-    const h0 = f.historyDepth();
+    const before = boxes(f), h0 = f.historyDepth();
     await playGesture(f, playGesture.drag([[60, 80], [66, 84], [72, 90]]));
-    const gained = f.historyDepth() - h0;
-    if (gained !== sel)
-      throw new Error(`${sel} elements were dragged but ${gained} undo entries appeared — the tail of the gesture committed against a stale node`);
-    return `✅ T4: a ${sel}-element move commits ${gained} edits, one per element it claimed`;
+    const after = boxes(f), gained = f.historyDepth() - h0;
+    const moved = after.map((b, i) => [b.x - before[i].x, b.y - before[i].y]);
+    const [dx, dy] = moved[0];
+    if (Math.hypot(dx, dy) < 1)
+      throw new Error("the drag moved nothing, so this law is untested");
+    const off = moved.findIndex(([a, b]) => Math.abs(a - dx) > 0.5 || Math.abs(b - dy) > 0.5);
+    if (off >= 0)
+      throw new Error(`element ${off} of ${sel} moved by (${moved[off]}) where the first moved by (${dx}, ${dy}) — the tail of the gesture committed against a stale node`);
+    // An element may take more than one edit (a rect writes `x` and `y`); it may not take none.
+    if (gained < sel)
+      throw new Error(`${sel} elements were dragged but only ${gained} edits appeared`);
+    return `✅ T4: a ${sel}-element move moved all ${sel} by the same delta, in ${gained} edits`;
   });
 };
 
@@ -19047,7 +19131,7 @@ const _sl246 = function _alignSpecs(){return(
  ["align-middle-v", "Align middles", "y", 0.5], ["align-bottom", "Align bottom", "y", 1]]
 )};
 
-const _sl247 = function _cmdAlign(gestureDelta,translateLens){return(
+const _sl247 = function _cmdAlign(moveDeltas){return(
 ([id, label, axis, frac]) => ({
   id, label, key: null,
   plan(env) {
@@ -19061,16 +19145,13 @@ const _sl247 = function _cmdAlign(gestureDelta,translateLens){return(
              : (Math.min(...ts.map((t) => t.box[lo])) + Math.max(...ts.map((t) => t.box[lo] + t.box[len]))) / 2;
     return ts.map((t) => {
       const dx = axis === "x" ? to - edge(t.box) : 0, dy = axis === "y" ? to - edge(t.box) : 0;
-      const S = t.Slin, r = (v) => Math.round(v * 1e6) / 1e6;
-      const T = [r(t.T0[0] + S[0] * dx + S[2] * dy), r(t.T0[1] + S[1] * dx + S[3] * dy)];
-      return gestureDelta.attr(t.idx, "transform", T,
-                               { lens: translateLens, base: t.text, dflt: "", was: t.text });
-    });
+      return moveDeltas(t, dx, dy, { q: (v) => Math.round(v * 1e4) / 1e4 });   // see toolMove on 1e-4
+    }).flat();
   }
 })
 )};
 
-const _sl248 = function _cmdDistribute(gestureDelta,translateLens){return(
+const _sl248 = function _cmdDistribute(moveDeltas){return(
 // Equal *gaps between centres*, with the outermost two left where they are — the only reading that
 // is idempotent, which is what makes T1 hold for it too.
 (axis) => ({
@@ -19089,11 +19170,8 @@ const _sl248 = function _cmdDistribute(gestureDelta,translateLens){return(
     return sorted.map((t, i) => {
       const want = first + step * i;
       const dx = axis === "x" ? want - mid(t) : 0, dy = axis === "y" ? want - mid(t) : 0;
-      const S = t.Slin, r = (v) => Math.round(v * 1e6) / 1e6;
-      const T = [r(t.T0[0] + S[0] * dx + S[2] * dy), r(t.T0[1] + S[1] * dx + S[3] * dy)];
-      return gestureDelta.attr(t.idx, "transform", T,
-                               { lens: translateLens, base: t.text, dflt: "", was: t.text });
-    });
+      return moveDeltas(t, dx, dy, { q: (v) => Math.round(v * 1e4) / 1e4 });   // see toolMove on 1e-4
+    }).flat();
   }
 })
 )};
@@ -20290,8 +20368,9 @@ export default function define(runtime, observer) {
   $def("sl119d", "scopedPath", [], _sl119d);
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
-  $def("sl251", "moveTargetOf", ["invert","ctmMat","translateLens"], _sl251);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta","moveTargetOf"], _sl121);
+  $def("sl251", "moveTargetOf", ["invert","ctmMat","translateLens","shapeLookup"], _sl251);
+  $def("sl263", "moveDeltas", ["gestureDelta","translateLens","attrVal"], _sl263);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta","moveTargetOf","moveDeltas"], _sl121);
   $def("sl125z", "toolZoom", ["grabPointer"], _sl125z);
   $def("sl122b", "toolScope", ["pathOfIndex","scopedPath","shapeLookup","gestureDelta","commitDelta"], _sl122b);
   $def("sl121b", "toolMarquee", ["pathOfIndex","scopedPath","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
@@ -20309,7 +20388,7 @@ export default function define(runtime, observer) {
   $def("sl133", "withFixture", ["gestureFixture"], _sl133);
   $def("sl134", "test_gesture_identity", ["withFixture","gestureCorpus","playGesture","domShape"], _sl134);
   $def("sl135", "test_gesture_path_independence", ["withFixture","gestureCorpus","playGesture"], _sl135);
-  $def("sl136", "test_gesture_commits_against_its_origin", ["withFixture","gestureCorpus","playGesture"], _sl136);
+  $def("sl136", "test_gesture_commits_against_its_origin", ["withFixture","gestureCorpus","playGesture","nodeAt"], _sl136);
   $def("sl137", "test_gesture_confinement", ["withFixture","gestureCorpus","playGesture","svgTools"], _sl137);
   $def("sl138", "test_gesture_selection_is_not_an_edit", ["withFixture","gestureCorpus","playGesture","toolMarquee"], _sl138);
   $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl144);
@@ -20330,8 +20409,8 @@ export default function define(runtime, observer) {
   $def("sl244", "cmdCut", ["gestureDelta","copyMarkup","deleteElement","rebasePath"], _sl244);
   $def("sl245", "cmdPaste", ["gestureDelta","pasteMarkup","offsetMarkup"], _sl245);
   $def("sl246", "alignSpecs", [], _sl246);
-  $def("sl247", "cmdAlign", ["gestureDelta","translateLens"], _sl247);
-  $def("sl248", "cmdDistribute", ["gestureDelta","translateLens"], _sl248);
+  $def("sl247", "cmdAlign", ["moveDeltas"], _sl247);
+  $def("sl248", "cmdDistribute", ["moveDeltas"], _sl248);
   $def("sl260", "pathSmooth", ["parsePath","printPath","pathHandles","pathSegments","attrVal","attrTextLens","nodeAt","replaceGroup"], _sl260);
   $def("sl261", "cmdToggleSmooth", ["gestureDelta","pathSmooth","pathHandles","nodeAt"], _sl261);
   $def("sl258", "cmdDeleteVertex", ["gestureDelta","attrVal","parsePoints","parsePath","pathSegments","pathHandles","deletePoint","deletePathPoint"], _sl258);
