@@ -17321,10 +17321,19 @@ const _sl128 = function _gestureDelta(){return(
   // `toggle` is shift-click: in or out of the set. An empty `paths` clears.
   select: (paths, mode = null, { toggle = false } = {}) => ({ kind: "select", paths, mode, toggle }),
   // Something to *show* that the source cannot express: a hover outline, a rubber band, a readout.
-  // `marks` are overlay primitives `{tag, attrs, layer}` and `key` names the group they replace, so
-  // emitting the same key each frame is idempotent rather than cumulative. Without this a gesture
+  // `marks` are overlay primitives `{tag, attrs, layer, text}` and `key` names the group they replace,
+  // so emitting the same key each frame is idempotent rather than cumulative. Without this a gesture
   // that only decorates would have to reach into the DOM itself, which L3 forbids.
   view: (marks, { key = "view", cursor = null } = {}) => ({ kind: "view", marks, key, cursor }),
+  // G13: a numeric readout during a drag — dx/dy, w×h, an angle. It is a `view` (T9: showing a
+  // number is not editing the source), drawn in the root layer at a user-space point. `font` is in
+  // user units so the caller divides out the zoom; a white stroke under the fill keeps it legible
+  // over any drawing. Keyed "readout", so each frame replaces the last.
+  readout: (text, [ux, uy], font) => ({ kind: "view", key: "readout", cursor: null, marks: [{
+    layer: "root", tag: "text", text,
+    attrs: { x: ux + font * 0.8, y: uy - font * 0.8, "font-size": font, "font-family": "ui-monospace,monospace",
+             fill: "#111", stroke: "#fff", "stroke-width": font * 0.28, "paint-order": "stroke",
+             "stroke-linejoin": "round", "pointer-events": "none" } }] }),
   // The attribute text this delta stands for. One expression, read by both sinks.
   text: (d) => (d.lens ? d.lens.put(d.value, d.base) : String(d.value))
 }
@@ -17343,6 +17352,7 @@ const _sl128a = function _previewDelta(gestureDelta){return(
         for (const n of [...layer.querySelectorAll(`[data-view-key="${d.key}"]`)]) n.remove();
       for (const m of d.marks || []) {
         const n = (m.layer === "el" ? ctx.overlay.add : ctx.overlay.addRoot)(m.tag, m.attrs);
+        if (m.text != null) n.textContent = m.text;      // G13: a readout is a text mark
         n.dataset.viewKey = d.key;
         out.push(n);
       }
@@ -17451,14 +17461,22 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
     if (d.key === "rot") {
       const a = Math.atan2(p[1] - d.centre[1], p[0] - d.centre[0]) * 180 / Math.PI + 90;
       const step = e.shiftKey ? 15 : 1;
-      d.ops = rotateAbout(d.base, Math.round(a / step) * step, d.centre[0], d.centre[1]);
+      const ang = Math.round(a / step) * step;
+      d.ops = rotateAbout(d.base, ang, d.centre[0], d.centre[1]);
+      d.read = `${((ang % 360) + 360) % 360}°`;
     } else {
-      const w = d.b.width || 1, h = d.b.height || 1;
-      const sx = Math.abs((p[0] - d.pivot[0]) / (/w$/.test(d.key) ? -w : w)) || 0.01;
-      const sy = Math.abs((p[1] - d.pivot[1]) / (/^n/.test(d.key) ? -h : h)) || 0.01;
+      // G11: alt scales about the centre, so both sides move symmetrically — the pivot becomes the
+      // centre and the reference dimension a half, which is exactly what keeps a corner under the
+      // pointer. `abs` already makes the sign robust either way.
+      const alt = e.altKey;
+      const pivot = alt ? d.centre : d.pivot;
+      const w = (d.b.width || 1) * (alt ? 0.5 : 1), h = (d.b.height || 1) * (alt ? 0.5 : 1);
+      const sx = Math.abs((p[0] - pivot[0]) / (/w$/.test(d.key) ? -w : w)) || 0.01;
+      const sy = Math.abs((p[1] - pivot[1]) / (/^n/.test(d.key) ? -h : h)) || 0.01;
       const k = e.shiftKey ? Math.max(sx, sy) : null;    // shift keeps the aspect ratio
-      d.ops = scaleAbout(d.base, ctx.snap(k === null ? sx : k), ctx.snap(k === null ? sy : k),
-                         d.pivot[0], d.pivot[1]);
+      const fx = ctx.snap(k === null ? sx : k), fy = ctx.snap(k === null ? sy : k);
+      d.ops = scaleAbout(d.base, fx, fy, pivot[0], pivot[1]);
+      d.read = `${Math.round(fx * 100)}% × ${Math.round(fy * 100)}%`;
     }
     // One delta, both sinks. `opsLens.put` keeps the residue (`10,20`, `.5`, `1e2`) that reprinting
     // every op would flatten — and because the preview goes through the same `gestureDelta.text`
@@ -17467,6 +17485,9 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
                                 { lens: opsLens, base: d.text, dflt: "", was: d.text });
     previewDelta(ctx, d.delta);
     ctx.focus.refresh();
+    // G13: angle or scale, at the pointer, after the overlay clear.
+    const at = ctx.localPoint(ctx.node, e);
+    if (at && d.read) previewDelta(ctx, gestureDelta.readout(d.read, at, ctx.readoutFont()));
   },
   async onPointerUp(ctx) {
     const d = ctx.state.drag;
@@ -17481,6 +17502,7 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
     const d = ctx.state.drag;
     if (!d || d.tool !== "transform") return false;
     ctx.state.drag = null;
+    previewDelta(ctx, gestureDelta.view([], { key: "readout" }));   // G13
     revertDelta(ctx, d.delta || []);
     return true;
   }
@@ -17541,6 +17563,9 @@ const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDe
                                   was: d.was && d.was[ed.name] }));
     previewDelta(ctx, d.delta);
     ctx.focus.refresh();
+    // G13: the point the handle is at, in the element's own coordinates, shown at the pointer.
+    const at = ctx.localPoint(ctx.node, e);
+    if (at) previewDelta(ctx, gestureDelta.readout(`${p[0].toFixed(1)}, ${p[1].toFixed(1)}`, at, ctx.readoutFont()));
   },
   async onPointerUp(ctx) {
     const d = ctx.state.drag;
@@ -17551,6 +17576,7 @@ const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDe
     const d = ctx.state.drag;
     if (!d || d.tool !== "vertex") return false;
     ctx.state.drag = null;
+    previewDelta(ctx, gestureDelta.view([], { key: "readout" }));   // G13
     revertDelta(ctx, d.delta || []);
     return true;
   }
@@ -17812,6 +17838,11 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     previewDelta(ctx, d.deltas);
     ctx.focus.refresh();                                 // clears the overlay, so guides come after
     ctx.guides(guides);
+    // G13: the displacement, in user units, drawn last so the overlay clear above does not eat it.
+    // `readoutFont()` is 12/zoom, so the zoom it already measured comes back as 12/font — no tool
+    // reaches past `ctx` for the CTM (P5).
+    const at = ctx.localPoint(ctx.node, e), font = ctx.readoutFont(), z = 12 / (font || 1);
+    if (at) previewDelta(ctx, gestureDelta.readout(`${(dx / z).toFixed(1)}, ${(dy / z).toFixed(1)}`, at, font));
   },
   async onPointerUp(ctx, e) {
     const d = ctx.state.drag;
@@ -17850,6 +17881,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     if (!d || d.tool !== "move") return false;
     ctx.state.drag = null;
     ctx.guides([]);
+    previewDelta(ctx, gestureDelta.view([], { key: "readout" }));   // G13: clear the readout
     revertDelta(ctx, d.deltas || []);
     return true;
   }
@@ -18062,7 +18094,7 @@ const _sl125d = function _penPath(){return(
 
 // Drag on empty canvas to create a rect, an ellipse or a line. Preview lives in the overlay — the
 // source gets exactly one put, on release, and only if the drag was big enough to mean it.
-const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grabPointer,gestureDelta,commitDelta){return(
+const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grabPointer,gestureDelta,previewDelta,commitDelta){return(
 {
   id: "draw",
   onPointerDown(ctx, e) {
@@ -18087,10 +18119,14 @@ const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grab
       if (d.preview) d.preview.remove();
       d.preview = ctx.overlay.addRoot(spec.tag, { ...spec.attrs, opacity: 0.6 });   // root user space
     } else for (const k in spec.attrs) d.preview.setAttribute(k, spec.attrs[k]);
+    // G13: the size being drawn, at the pointer.
+    previewDelta(ctx, gestureDelta.readout(
+      `${Math.abs(d.x1 - d.x0).toFixed(1)} × ${Math.abs(d.y1 - d.y0).toFixed(1)}`, p, ctx.readoutFont()));
   },
   async onPointerUp(ctx) {
     const d = ctx.state.draw;
     ctx.state.draw = null;
+    previewDelta(ctx, gestureDelta.view([], { key: "readout" }));   // G13: clear
     if (!d) return;
     if (d.preview) d.preview.remove();
     const b = dragBox(d.x0, d.y0, d.x1, d.y1, d.square);
@@ -18112,6 +18148,7 @@ const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grab
   onCancel(ctx) {
     const d = ctx.state.draw;
     ctx.state.draw = null;
+    previewDelta(ctx, gestureDelta.view([], { key: "readout" }));   // G13
     if (!d) return false;
     if (d.preview) d.preview.remove();
     return true;
@@ -19823,6 +19860,9 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       // questions a tool is allowed to ask it, which is what lets a fake `ctx` drive a tool with no
       // document at all, and what stops a tool inventing a fifth way to measure a hit.
       bbox: (el) => { try { return el && el.getBBox ? el.getBBox() : null; } catch (e) { return null; } },
+      // G13: a readout font in *user* units — a fixed ~12 screen px divided by the root's zoom, so it
+      // reads the same size at every zoom. A measurement, so it lives beside the other P5 helpers.
+      readoutFont: () => { const m = node.getScreenCTM(); const z = m ? Math.hypot(m.a, m.b) : 1; return 12 / (z || 1); },
       screenCTM: (el) => (el && el.getScreenCTM ? el.getScreenCTM() : null),
       screenBox: (el) => (el && el.getBoundingClientRect ? el.getBoundingClientRect() : null),
       // The selection box in the root's user space, where a marquee is drawn and compared.
@@ -20443,7 +20483,7 @@ export default function define(runtime, observer) {
   $def("sl125b", "shapeSpec", ["dragBox"], _sl125b);
   $def("sl125c", "shapeMarkup", ["shapeSpec"], _sl125c);
   $def("sl125d", "penPath", [], _sl125d);
-  $def("sl125", "toolDraw", ["shapeLookup","shapeSpec","shapeMarkup","dragBox","grabPointer","gestureDelta","commitDelta"], _sl125);
+  $def("sl125", "toolDraw", ["shapeLookup","shapeSpec","shapeMarkup","dragBox","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl125);
   $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer","gestureDelta","previewDelta","commitDelta","pathHandles","pathOfIndex"], _sl126);
   $def("sl130", "gestureFixture", ["runtime","realize","settle","literalSpan","nodeAt","svgLens","svg"], _sl130);
   $def("sl131", "playGesture", [], _sl131);
