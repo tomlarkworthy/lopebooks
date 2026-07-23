@@ -12265,7 +12265,7 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
 {
   const drawing = $0;                                    // viewof drawing — the editor node
   const TOOLS = [["select", "Select", "V"], ["rect", "Rect", "R"], ["ellipse", "Ellipse", "E"],
-                 ["line", "Line", "L"], ["pen", "Pen", "P"]];
+                 ["line", "Line", "L"], ["pen", "Pen", "P"], ["scribble", "Scribble", "S"]];
   const el = htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap;margin:.5rem 0"></div>`;
   const buttons = TOOLS.map(([id, label, key]) => {
     const b = htl.html`<button title="${label} (${key})" style="padding:4px 10px;border-radius:6px;border:1px solid #b9c4b4;cursor:pointer">${label}</button>`;
@@ -12364,6 +12364,47 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
   };
   document.addEventListener("keydown", onKey);
   invalidation.then(() => document.removeEventListener("keydown", onKey));
+
+  // G8. Right-click renders the same registry the bar does, so it costs nothing as the registry fills.
+  // The click first selects what is under the pointer (unless that is already in the selection), then
+  // the menu lists every command that is live *for that selection* — `canCommand` is the one authority,
+  // exactly as it is for the buttons. Only commands are shown; keyboard-only view verbs stay off it.
+  let menu = null;
+  const closeMenu = () => { if (menu) { menu.remove(); menu = null; } };
+  const openMenu = (x, y) => {
+    closeMenu();
+    const live = (drawing.commands ? drawing.commands() : []).filter((c) => drawing.canCommand(c.id));
+    if (!live.length) return;
+    menu = htl.html`<div style="position:fixed;left:${x}px;top:${y}px;z-index:9999;background:#fff;border:1px solid #b9c4b4;border-radius:8px;padding:4px;box-shadow:0 6px 18px rgba(0,0,0,.18);min-width:160px;font:13px system-ui,sans-serif"></div>`;
+    for (const c of live) {
+      const item = htl.html`<div style="display:flex;justify-content:space-between;gap:16px;padding:5px 10px;border-radius:5px;cursor:pointer;color:#243"><span>${c.label}</span><span style="opacity:.5;font-size:11px">${c.key ? KEYNAME(c.key) : ""}</span></div>`;
+      item.onmouseenter = () => (item.style.background = "#eef3ea");
+      item.onmouseleave = () => (item.style.background = "");
+      item.onclick = () => { closeMenu(); drawing.command(c.id); };
+      menu.appendChild(item);
+    }
+    document.body.appendChild(menu);
+  };
+  const onContext = (e) => {
+    e.preventDefault();
+    const hit = drawing.pickAt ? drawing.pickAt(e) : [];
+    const sel = drawing.selectionPaths();
+    const inSel = hit[0] && sel.some((p) => p.join("/") === hit[0].join("/"));
+    if (hit[0] && !inSel) drawing.select([hit[0]], "transform");
+    else if (!hit[0] && !sel.length) drawing.select([]);
+    openMenu(e.clientX, e.clientY);
+  };
+  drawing.addEventListener("contextmenu", onContext);
+  const onDocDown = (e) => { if (menu && !menu.contains(e.target)) closeMenu(); };
+  document.addEventListener("pointerdown", onDocDown, true);
+  document.addEventListener("scroll", closeMenu, true);
+  invalidation.then(() => {
+    closeMenu();
+    drawing.removeEventListener("contextmenu", onContext);
+    document.removeEventListener("pointerdown", onDocDown, true);
+    document.removeEventListener("scroll", closeMenu, true);
+  });
+
   el.appendChild(bar);
   return el;
 };
@@ -12408,6 +12449,75 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,$0)
   };
   render();
   const on = () => render();
+  drawing.addEventListener("lens-select", on);
+  drawing.addEventListener("lens-put", on);
+  invalidation.then(() => {
+    drawing.removeEventListener("lens-select", on);
+    drawing.removeEventListener("lens-put", on);
+  });
+  return el;
+};
+
+// G46. The field panel: the enums an author asked for ("dotted lines and line caps") given somewhere
+// to live. It is a pure projection of `drawing.fields(path)` — the registry decides which fields exist
+// and reads their current values, this cell only picks a widget per `kind` and writes the change back
+// through `drawing.setField`, which is `setProperty` → `commitDelta`, the one write path. So a widget's
+// commit is byte-identical to `setAttr`, adding a field is a line in the registry (no change here), and
+// a change applies to *every* selected element (the align commands' "one delta per claimed element",
+// G40). Colour gets both a native picker and a text box: the text preserves the author's own notation
+// (`darkseagreen` stays `darkseagreen`), the picker is the swatch. Re-renders on select and on commit.
+const _sl271 = function _fieldPanel(htl,Inputs,invalidation,$0)
+{
+  const drawing = $0;
+  const el = htl.html`<div style="margin:.5rem 0;display:grid;gap:4px"></div>`;
+  const commit = (paths, prop, value) => { for (const p of paths) drawing.setField(p, prop, value); };
+  const row = (label, control) => htl.html`<label style="display:flex;align-items:center;gap:8px;font:12px ui-monospace,monospace">
+    <span style="flex:0 0 96px;opacity:.7">${label}</span>${control}</label>`;
+  const render = () => {
+    const paths = drawing.selectionPaths();
+    el.textContent = "";
+    if (!paths.length) {
+      el.append(htl.html`<span style="font:12px/1.5 ui-monospace,monospace;opacity:.6">select a shape to edit its paint</span>`);
+      return;
+    }
+    const fields = drawing.fields(paths[0]);
+    const rows = fields.map((f) => {
+      if (f.kind === "enum") {
+        const opts = f.options.includes(f.value) && f.value !== "" ? f.options : [f.value || ""].concat(f.options);
+        const sel = htl.html`<select style="font:12px ui-monospace,monospace;padding:2px 4px"></select>`;
+        for (const o of opts) {
+          const op = document.createElement("option");
+          op.value = o; op.textContent = o === "" ? "(default)" : o;
+          if (o === f.value) op.selected = true;
+          sel.append(op);
+        }
+        sel.addEventListener("change", () => commit(paths, f.prop, sel.value));
+        return row(f.label, sel);
+      }
+      if (f.kind === "color") {
+        const txt = htl.html`<input type="text" value="${f.value}" placeholder="${f.dflt || "none"}" style="font:12px ui-monospace,monospace;width:120px">`;
+        const sw = htl.html`<input type="color" style="width:28px;height:22px;padding:0;border:none;background:none">`;
+        try { if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(f.value)) sw.value = f.value.length === 4
+          ? "#" + f.value.slice(1).split("").map((c) => c + c).join("") : f.value; } catch (e) {}
+        txt.addEventListener("change", () => commit(paths, f.prop, txt.value.trim()));
+        sw.addEventListener("change", () => { txt.value = sw.value; commit(paths, f.prop, sw.value); });
+        return row(f.label, htl.html`<span style="display:flex;gap:6px;align-items:center">${sw}${txt}</span>`);
+      }
+      const inp = htl.html`<input type="${f.kind === "number" ? "number" : "text"}" value="${f.value}" placeholder="${f.dflt || ""}" style="font:12px ui-monospace,monospace;width:120px">`;
+      if (f.min !== undefined) inp.min = f.min;
+      if (f.max !== undefined) inp.max = f.max;
+      if (f.step !== undefined) inp.step = f.step;
+      inp.addEventListener("change", () => commit(paths, f.prop, inp.value.trim()));
+      return row(f.label, inp);
+    });
+    el.append(htl.html`<fieldset style="border:1px solid #b9c4b4;border-radius:6px;padding:6px 10px 8px;margin:0;display:grid;gap:4px">
+      <legend style="font:12px ui-monospace,monospace;padding:0 4px">paint &amp; stroke${paths.length > 1 ? ` · ${paths.length} selected` : ""}</legend>
+      ${rows}</fieldset>`);
+  };
+  // `lens-select`/`lens-put` dispatch synchronously inside the drawing's own `draw()`; a listener that
+  // throws would break that render, so the panel must never let one escape.
+  const on = () => { try { render(); } catch (e) { el.textContent = ""; el.append(htl.html`<span style="font:12px ui-monospace,monospace;color:#a33">${String(e.message || e)}</span>`); } };
+  on();
   drawing.addEventListener("lens-select", on);
   drawing.addEventListener("lens-put", on);
   invalidation.then(() => {
@@ -14163,6 +14273,51 @@ const _sl31h = function _setProperty(attrVal,styleLens){return(
     return { name: "style", value: styleLens.put(styleLens.get(style).map(([k, v]) => (k === prop ? [k, value] : [k, v])), style) };
   return { name: prop, value };                          // no declaration to update: the attribute it is
 }
+)};
+
+// S6/G46. The field registry: paint and stroke properties as *data*, so a panel that shows the fields
+// of the current selection and a chip that offers one on the canvas read the same list, and adding a
+// property is a line here rather than a branch in a form. Every field is universal to graphics
+// elements, which is why it is one flat list and not a per-tag contribution (geometry stays with the
+// shape entries — this is the "everything offers a stroke and a fill" half of S9). `kind` is what a
+// surface needs to pick a widget: `number`, `color`, `enum` (with `options`), or `text` (a dash list,
+// a transform). `read` returns the *source* value — style declaration first, then attribute, then the
+// SVG default — so the panel shows the bytes the author has, and a write that equals them is skipped
+// upstream (T1). Nothing here writes: a field names a property, and `node.setField` routes it through
+// `setProperty` → `commitDelta`, the one write path, so a widget's commit is byte-identical to a
+// `setAttr` by construction.
+const _sl270 = function _svgFields(attrVal,styleLens){return(
+(() => {
+  const N = (label, prop, extra = {}) => ({ prop, label, kind: "number", ...extra });
+  const E = (label, prop, options) => ({ prop, label, kind: "enum", options });
+  const list = [
+    { prop: "fill", label: "Fill", kind: "color" },
+    { prop: "stroke", label: "Stroke", kind: "color" },
+    N("Stroke width", "stroke-width", { min: 0, step: 0.5, dflt: "1" }),      // G30
+    N("Opacity", "opacity", { min: 0, max: 1, step: 0.05, dflt: "1" }),        // G34
+    N("Fill opacity", "fill-opacity", { min: 0, max: 1, step: 0.05, dflt: "1" }),
+    N("Stroke opacity", "stroke-opacity", { min: 0, max: 1, step: 0.05, dflt: "1" }),
+    { prop: "stroke-dasharray", label: "Dash array", kind: "text", dflt: "none" },  // G31
+    N("Dash offset", "stroke-dashoffset", { step: 1, dflt: "0" }),
+    E("Line cap", "stroke-linecap", ["butt", "round", "square"]),              // G32
+    E("Line join", "stroke-linejoin", ["miter", "round", "bevel", "arcs", "miter-clip"]),
+    N("Miter limit", "stroke-miterlimit", { min: 1, step: 1, dflt: "4" }),
+    E("Paint order", "paint-order", ["normal", "stroke fill markers", "fill stroke markers"]),  // G37
+    E("Fill rule", "fill-rule", ["nonzero", "evenodd"]),
+    E("Vector effect", "vector-effect", ["none", "non-scaling-stroke"])
+  ];
+  // Read a property the same way `setProperty` writes one: a `style` declaration wins over the
+  // attribute, and an absent value reads as "" (the panel then shows the placeholder default).
+  const read = (doc, idx, prop) => {
+    let s = null;
+    try { s = attrVal(doc, idx, "style"); } catch (e) {}
+    if (s !== null) { const d = styleLens.get(s).find(([k]) => k === prop); if (d) return d[1].trim(); }
+    let v = null;
+    try { v = attrVal(doc, idx, prop); } catch (e) {}
+    return v === null ? "" : String(v).trim();
+  };
+  return { list, read };
+})()
 )};
 
 const _sl78 = function _cellAttrLens(compose,literalLens,attrTextLens){return(
@@ -17510,34 +17665,128 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
 )};
 
 // Drag a vertex or control point: the `points` and path `d` lenses.
-const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta,vertexAddress,pathSmooth){return(
+// G22. Translate a *set* of held vertices by one local delta, as one attribute edit per element — the
+// "one delta per claimed element" of a move (G43), refined to the claimed vertices inside it. Anchors
+// carry the control handles incident to them (a control links to the anchor it curves toward), so a
+// curve translates rigidly rather than shearing; a control selected on its own moves alone. Relative
+// commands are handled by re-deriving each argument from the *new* running pen position, so a rel
+// chain where an earlier anchor also moved does not double-count. `H`/`V` anchors move only along
+// their one axis, exactly as `handleEdit` moves them — the cross-axis component is simply dropped.
+const _sl267 = function _moveVertices(vertexAddress,parsePath,printPath,parsePoints,printPoints,attrVal,PATH_ARG_COUNT){return(
+(entry, src, idx, addrs, dlx, dly) => {
+  const hs = entry.handles(src, idx);
+  const sel = addrs.map((a) => vertexAddress.resolve(hs, a)).filter(Boolean);
+  if (!sel.length) return [];
+  if (entry.mode === "points") {
+    const pts = parsePoints(attrVal(src, idx, "points"));
+    for (const h of sel) if (h.i != null && pts[h.i]) pts[h.i] = [pts[h.i][0] + dlx, pts[h.i][1] + dly];
+    return [{ name: "points", value: printPoints(pts) }];
+  }
+  if (entry.mode !== "path") return [];
+  const anchors = sel.filter((h) => h.kind === "anchor");
+  const near = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by) < 1e-6;
+  const moved = new Set(sel.map((h) => h.key));
+  for (const h of hs)
+    if (h.kind === "ctrl" && h.link && anchors.some((a) => near(h.link[0], h.link[1], a.x, a.y)))
+      moved.add(h.key);
+  const cmds = parsePath(attrVal(src, idx, "d"));
+  let ocx = 0, ocy = 0, ncx = 0, ncy = 0, osx = 0, osy = 0, nsx = 0, nsy = 0;
+  cmds.forEach((cmd, ci) => {
+    const U = cmd.c.toUpperCase(), u = PATH_ARG_COUNT[U], rel = cmd.c !== U, A = cmd.a;
+    if (u === 0) { ocx = osx; ocy = osy; ncx = nsx; ncy = nsy; return; }   // Z
+    for (let o = 0; o < A.length; o += u) {
+      const obx = ocx, oby = ocy, nbx = ncx, nby = ncy;
+      const put = (ix, iy) => {
+        const key = ci + ":" + o + ":" + ix + ":" + iy;
+        const ox = rel ? obx + A[o + ix] : A[o + ix], oy = rel ? oby + A[o + iy] : A[o + iy];
+        const nx = moved.has(key) ? ox + dlx : ox, ny = moved.has(key) ? oy + dly : oy;
+        A[o + ix] = rel ? nx - nbx : nx;
+        A[o + iy] = rel ? ny - nby : ny;
+        return [ox, oy, nx, ny];
+      };
+      const setPen = (r) => { ocx = r[0]; ocy = r[1]; ncx = r[2]; ncy = r[3]; };
+      switch (U) {
+        case "M": { const r = put(0, 1); setPen(r); if (o === 0) { osx = r[0]; osy = r[1]; nsx = r[2]; nsy = r[3]; } break; }
+        case "L": case "T": setPen(put(0, 1)); break;
+        case "H": { const key = ci + ":" + o + ":0:-1", ox = rel ? obx + A[o] : A[o];
+                    const nx = moved.has(key) ? ox + dlx : ox; A[o] = rel ? nx - nbx : nx;
+                    ocx = ox; ncx = nx; break; }
+        case "V": { const key = ci + ":" + o + ":-1:0", oy = rel ? oby + A[o] : A[o];
+                    const ny = moved.has(key) ? oy + dly : oy; A[o] = rel ? ny - nby : ny;
+                    ocy = oy; ncy = ny; break; }
+        case "C": put(0, 1); put(2, 3); setPen(put(4, 5)); break;
+        case "S": case "Q": put(0, 1); setPen(put(2, 3)); break;
+        case "A": setPen(put(5, 6)); break;                 // radii/flags (0..4) are untouched
+      }
+    }
+  });
+  return [{ name: "d", value: printPath(cmds) }];
+}
+)};
+
+const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta,vertexAddress,pathSmooth,moveVertices,dragBox){return(
 {
   id: "vertex",
   onPointerDown(ctx, e) {
     const key = e.target.dataset && e.target.dataset.key;
     const mode = ctx.focus.mode;
-    if (key === undefined || ctx.focus.index === null) return false;
+    if (ctx.focus.index === null) return false;
     // Any mode the registry knows; `transform` is not one of them, because the gizmo owns its own
     // handles. Adding a shape entry is therefore all it takes to make its handles draggable.
     const entry = shapeLookup.forMode(ctx.shapes, mode);
     if (!entry) return false;
+    // G22. A press on *empty* canvas, while a shape's vertices are on show, bands a set of them — the
+    // same way the marquee bands a set of elements, and a selection gesture, so it writes nothing (T9).
+    // It must claim only empty canvas: a press on the shape body (to move it) or on another element (to
+    // reselect) has to fall through to the move/marquee tools, exactly as it did before this tool grew
+    // a marquee — otherwise `toolVertex` swallows every ordinary select/move press. `ctx.pick` is the
+    // one hit contract (S1, P5), so "nothing here" is the same answer a click would get.
+    if (key === undefined) {
+      if (e.button !== 0 || ctx.pick(e).length) return false;
+      const p = ctx.localPoint(ctx.node, e);
+      if (!p) return false;
+      e.preventDefault();
+      grabPointer(ctx.node, e);
+      ctx.state.vband = { x0: p[0], y0: p[1], x1: p[0], y1: p[1], add: e.shiftKey, box: null, moved: false };
+      return true;
+    }
     e.preventDefault();
     grabPointer(ctx.node, e);
     // Grabbing a handle selects that vertex, by address rather than by key (P7): shift adds to the
     // set, anything else replaces it. This is what makes a vertex a thing you can hold — and it
     // survives the commit, because an ordinal is rebasable and a key is not.
     const ord = vertexAddress.ordinalOf(ctx.focus.handles(), key);
-    if (ord) {
-      const a = vertexAddress.of(ctx.focus.path, ord.kind, ord.n);
-      if (e.shiftKey) ctx.focus.toggleVertex(a); else ctx.focus.setVertices([a]);
+    const a = ord ? vertexAddress.of(ctx.focus.path, ord.kind, ord.n) : null;
+    const set = ctx.focus.vertices || [];
+    const inSet = a && set.some((s) => vertexAddress.same(s, a));
+    // G22. Grabbing a vertex that is already part of a multi-selection drags the whole set; a press
+    // that does not turn into a drag collapses to just that one (decided on release). Shift toggles.
+    let multi = false;
+    if (a) {
+      if (e.shiftKey) ctx.focus.toggleVertex(a);
+      else if (inSet && set.length > 1) multi = true;
+      else ctx.focus.setVertices([a]);
     }
     const el0 = ctx.elems()[ctx.focus.index];
-    ctx.state.drag = { tool: "vertex", key, idx: ctx.focus.index, mode, started: false, x0: e.clientX, y0: e.clientY,
+    ctx.state.drag = { tool: "vertex", key, idx: ctx.focus.index, mode, entry, started: false,
+                       x0: e.clientX, y0: e.clientY, multi, addr: a,
+                       addrs: multi ? set.slice() : (a ? [a] : []),
+                       press: el0 ? ctx.localPoint(el0, e) : null,
                        // what it rendered before the preview overwrites it (see writer.commit)
                        was: el0 ? Object.fromEntries(entry.writes.map((n) => [n, el0.getAttribute(n)])) : null };
     return true;
   },
   onPointerMove(ctx, e) {
+    const vb = ctx.state.vband;
+    if (vb) {
+      const p = ctx.localPoint(ctx.node, e);
+      if (!p) return;
+      vb.x1 = p[0]; vb.y1 = p[1]; vb.moved = true;
+      const r = dragBox(vb.x0, vb.y0, vb.x1, vb.y1);
+      if (!vb.box || !vb.box.isConnected) vb.box = ctx.overlay.addRoot("rect", { class: "box" });
+      for (const k of ["x", "y", "width", "height"]) vb.box.setAttribute(k, r[k]);
+      return;
+    }
     const d = ctx.state.drag;
     if (!d) return;
     if (!d.started && Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < 3) return;
@@ -17546,33 +17795,76 @@ const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDe
     const p = el && ctx.localPoint(el, e);
     const t = ctx.doc();
     if (!p || t === null) return;
-    // G21. A smooth anchor moves both of its handles; alt breaks the pair for this drag, which is
-    // how you make a corner without saying so — the geometry stops being collinear and that *is* the
-    // corner. Reading `altKey` off the live event, not off the press, so the decision is revocable
-    // mid-drag like every other modifier here.
-    const paired = d.mode === "path" && !e.altKey
-      ? pathSmooth.couple(t, d.idx, d.key, p[0], p[1]) : null;
-    const edits = paired !== null ? [{ name: "d", value: paired }]
-                                  : handleEdit(d.mode, t, d.idx, d.key, p[0], p[1], ctx.shapes);
-    if (!edits.length) return;
-    // `handleEdit` already reprints the whole attribute, so there is no lens here: the delta's value
-    // *is* the text. One delta per attribute the handle moves — a rect corner moves four — and an
-    // attribute the drag did not change is not in the list, so T1 still holds edge by edge.
+    let edits, label;
+    if (d.multi && d.press) {
+      // G22. One local delta, applied to the whole held set as one attribute edit (see moveVertices).
+      const dlx = p[0] - d.press[0], dly = p[1] - d.press[1];
+      edits = moveVertices(d.entry, t, d.idx, d.addrs, dlx, dly);
+      label = `${d.addrs.length} pts`;
+    } else {
+      // G21. A smooth anchor moves both of its handles; alt breaks the pair for this drag, which is
+      // how you make a corner without saying so — the geometry stops being collinear and that *is* the
+      // corner. Reading `altKey` off the live event, not off the press, so the decision is revocable
+      // mid-drag like every other modifier here.
+      const paired = d.mode === "path" && !e.altKey
+        ? pathSmooth.couple(t, d.idx, d.key, p[0], p[1]) : null;
+      edits = paired !== null ? [{ name: "d", value: paired }]
+                              : handleEdit(d.mode, t, d.idx, d.key, p[0], p[1], ctx.shapes);
+      label = `${p[0].toFixed(1)}, ${p[1].toFixed(1)}`;
+    }
+    if (!edits || !edits.length) return;
+    // `handleEdit`/`moveVertices` already reprint the whole attribute, so there is no lens here: the
+    // delta's value *is* the text. One delta per attribute the drag moves — a rect corner moves four —
+    // and an attribute the drag did not change is not in the list, so T1 still holds edge by edge.
     d.delta = edits.map((ed) => gestureDelta.attr(d.idx, ed.name, ed.value,
                                 { dflt: ed.dflt === undefined ? null : ed.dflt,
                                   was: d.was && d.was[ed.name] }));
     previewDelta(ctx, d.delta);
     ctx.focus.refresh();
-    // G13: the point the handle is at, in the element's own coordinates, shown at the pointer.
+    // G13: the point (or how many points) the drag is moving, shown at the pointer.
     const at = ctx.localPoint(ctx.node, e);
-    if (at) previewDelta(ctx, gestureDelta.readout(`${p[0].toFixed(1)}, ${p[1].toFixed(1)}`, at, ctx.readoutFont()));
+    if (at) previewDelta(ctx, gestureDelta.readout(label, at, ctx.readoutFont()));
   },
   async onPointerUp(ctx) {
+    const vb = ctx.state.vband;
+    if (vb) {
+      ctx.state.vband = null;
+      if (vb.box) vb.box.remove();
+      const entry = shapeLookup.forMode(ctx.shapes, ctx.focus.mode);
+      const t = ctx.doc();
+      // A bare click on empty canvas deselects — the same thing the marquee does in select mode, so
+      // clicking off a path leaves node editing rather than only emptying the vertex set.
+      if (!vb.moved) return void (vb.add ? null : commitDelta(ctx, gestureDelta.select([])));
+      if (!entry || t === null) return;
+      const r = dragBox(vb.x0, vb.y0, vb.x1, vb.y1);
+      const el = ctx.elems()[ctx.focus.index];
+      const hs = entry.handles(t, ctx.focus.index);
+      const hits = [];
+      for (const h of hs) {
+        if (h.kind !== "anchor") continue;                  // anchors are the vertices; controls ride them
+        const rp = ctx.rootPoint(el, h.x, h.y);
+        if (rp && rp[0] >= r.x && rp[0] <= r.x + r.width && rp[1] >= r.y && rp[1] <= r.y + r.height) {
+          const ord = vertexAddress.ordinalOf(hs, h.key);
+          if (ord) hits.push(vertexAddress.of(ctx.focus.path, ord.kind, ord.n));
+        }
+      }
+      const all = (vb.add ? (ctx.focus.vertices || []) : []).slice();
+      for (const a of hits) if (!all.some((s) => vertexAddress.same(s, a))) all.push(a);
+      ctx.focus.setVertices(all);
+      return;
+    }
     const d = ctx.state.drag;
     ctx.state.drag = null;
-    if (d && d.started && d.delta) await commitDelta(ctx, d.delta);
+    if (!d) return;
+    if (!d.started) {                                        // a press that never dragged
+      if (d.multi && d.addr) ctx.focus.setVertices([d.addr]);   // collapse the set to the one grabbed
+      return;
+    }
+    if (d.delta) await commitDelta(ctx, d.delta);
   },
   onCancel(ctx) {
+    const vb = ctx.state.vband;
+    if (vb) { ctx.state.vband = null; if (vb.box) vb.box.remove(); return true; }
     const d = ctx.state.drag;
     if (!d || d.tool !== "vertex") return false;
     ctx.state.drag = null;
@@ -17758,7 +18050,7 @@ const _sl263 = function _moveDeltas(gestureDelta,translateLens,attrVal){return(
 }
 )};
 
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLookup,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta,moveTargetOf,moveDeltas){return(
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLookup,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta,moveTargetOf,moveDeltas,copyMarkup,offsetMarkup,pasteMarkup){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
@@ -17791,6 +18083,11 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
       tool: "move",
       idx, hits, tag: el.localName, targets,      // `hits` are picks, not raw elements
       x0: e.clientX, y0: e.clientY, started: false,
+      // G14: alt held at the *start* means "drag a copy, leave the original". The decision is taken
+      // once, at pointerdown, so it cannot flip mid-gesture — and it means a duplicate-drag does not
+      // also snap (alt is spent), which is the modifier trade this needs.
+      duplicate: e.altKey,
+      paths: ctx.focus.paths.slice(),
       thresh: e.pointerType === "mouse" ? 3 : 10,
       box: snapping ? ctx.screenBox(el) : null,
       others: snapping ? list.slice(1).filter((n) => n !== el && !n.contains(el) && !el.contains(n))
@@ -17842,6 +18139,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     // `readoutFont()` is 12/zoom, so the zoom it already measured comes back as 12/font — no tool
     // reaches past `ctx` for the CTM (P5).
     const at = ctx.localPoint(ctx.node, e), font = ctx.readoutFont(), z = 12 / (font || 1);
+    d.userDelta = [dx / z, dy / z];                      // G14: the offset a duplicate would land at
     if (at) previewDelta(ctx, gestureDelta.readout(`${(dx / z).toFixed(1)}, ${(dy / z).toFixed(1)}`, at, font));
   },
   async onPointerUp(ctx, e) {
@@ -17850,6 +18148,23 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     if (!d) return;
     if (d.started) {
       ctx.guides([]);
+      previewDelta(ctx, gestureDelta.view([], { key: "readout" }));   // G13: clear
+      // G14: leave the original where it was and drop a copy at the drag's end, offset by the same
+      // delta. Reuses the paste codec — `copyMarkup` gives the author's own bytes, `offsetMarkup`
+      // translates them, `pasteMarkup` appends. One structural edit; the copies become the selection.
+      if (d.duplicate && d.paths.length && d.userDelta) {
+        revertDelta(ctx, d.deltas || []);                // originals snap back to where they were
+        const src = ctx.doc();
+        if (src === null) return;
+        const [dux, duy] = d.userDelta;
+        const clip = copyMarkup(src, d.paths).map((m) => offsetMarkup(m, dux, duy));
+        const parent = ctx.scope().length ? ctx.scope() : [0];
+        const at = ctx.childCount(parent);
+        await commitDelta(ctx, gestureDelta.command("duplicate",
+          (s) => pasteMarkup(s, parent, at, clip),
+          { select: () => clip.map((_, k) => parent.concat([at + k])) }));
+        return;
+      }
       if (d.deltas) await commitDelta(ctx, d.deltas);
       return;
     }
@@ -18092,6 +18407,91 @@ const _sl125d = function _penPath(){return(
 }
 )};
 
+// G45. Fit a freehand polyline to a chain of cubic Béziers (Schneider's algorithm: least-squares one
+// cubic, measure the worst deviation, reparameterise a few times, and split there and recurse if it
+// still misses). Pure and browser-free — `error` is a distance in the *same* units as the points, so
+// the tool converts a screen-px tolerance through the CTM once and hands user units in, which is what
+// keeps the fit a function of the drawing and not of the zoom (T11). The polyline is first split at
+// corners (a direction change sharper than `cornerAngle`), so a deliberate kink stays a corner instead
+// of being rounded through. Returns an array of `[p0, c1, c2, p3]`; consecutive cubics share an anchor.
+const _sl268 = function _fitCurve(){return(
+(() => {
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1]], add = (a, b) => [a[0] + b[0], a[1] + b[1]],
+        mul = (a, s) => [a[0] * s, a[1] * s], dot = (a, b) => a[0] * b[0] + a[1] * b[1],
+        norm = (a) => Math.hypot(a[0], a[1]);
+  const unit = (v) => { const n = norm(v) || 1; return [v[0] / n, v[1] / n]; };
+  const bern = (n, i, t) => { const c = n === 3 ? [1, 3, 3, 1][i] : n === 2 ? [1, 2, 1][i] : [1, 1][i];
+                              return c * Math.pow(t, i) * Math.pow(1 - t, n - i); };
+  const q = (bez, t) => bez.reduce((r, p, i) => add(r, mul(p, bern(3, i, t))), [0, 0]);
+  const chord = (pts) => { const u = [0];
+    for (let i = 1; i < pts.length; i++) u.push(u[i - 1] + norm(sub(pts[i], pts[i - 1])));
+    const last = u[u.length - 1] || 1; return u.map((x) => x / last); };
+  const bezierFor = (pts, u, t1, t2) => {
+    const n = pts.length, first = pts[0], last = pts[n - 1];
+    const A = u.map((uu) => [mul(t1, bern(3, 1, uu)), mul(t2, bern(3, 2, uu))]);
+    let c00 = 0, c01 = 0, c11 = 0, x0 = 0, x1 = 0;
+    for (let i = 0; i < n; i++) {
+      c00 += dot(A[i][0], A[i][0]); c01 += dot(A[i][0], A[i][1]); c11 += dot(A[i][1], A[i][1]);
+      const tmp = sub(pts[i], q([first, first, last, last], u[i]));
+      x0 += dot(A[i][0], tmp); x1 += dot(A[i][1], tmp);
+    }
+    const det = c00 * c11 - c01 * c01;
+    let a1 = det === 0 ? 0 : (x0 * c11 - c01 * x1) / det;
+    let a2 = det === 0 ? 0 : (c00 * x1 - c01 * x0) / det;
+    const len = norm(sub(last, first)), eps = 1e-6 * len;
+    if (a1 < eps || a2 < eps) { a1 = a2 = len / 3; }
+    return [first, add(first, mul(t1, a1)), add(last, mul(t2, a2)), last];
+  };
+  const deriv = (arr, t) => arr.reduce((r, p, i) => add(r, mul(p, bern(arr.length - 1, i, t))), [0, 0]);
+  const newton = (p, bez, u) => {
+    const q1 = [0, 1, 2].map((i) => mul(sub(bez[i + 1], bez[i]), 3));
+    const q2 = [0, 1].map((i) => mul(sub(q1[i + 1], q1[i]), 2));
+    const d = sub(q(bez, u), p), d1 = deriv(q1, u), d2 = deriv(q2, u);
+    const den = dot(d1, d1) + dot(d, d2);
+    return den === 0 ? u : u - dot(d, d1) / den;
+  };
+  const worst = (pts, bez, u) => { let max = 0, idx = (pts.length / 2) | 0;
+    for (let i = 0; i < pts.length; i++) { const e = norm(sub(q(bez, u[i]), pts[i])); if (e > max) { max = e; idx = i; } }
+    return [max, idx]; };
+  const fit = (pts, t1, t2, error, out) => {
+    if (pts.length === 2) { const d = norm(sub(pts[1], pts[0])) / 3;
+      out.push([pts[0], add(pts[0], mul(t1, d)), add(pts[1], mul(t2, d)), pts[1]]); return; }
+    let u = chord(pts), bez = bezierFor(pts, u, t1, t2), [err, idx] = worst(pts, bez, u);
+    if (err < error) return void out.push(bez);
+    if (err < error * 4)
+      for (let k = 0; k < 4; k++) {
+        u = pts.map((p, i) => newton(p, bez, u[i]));
+        bez = bezierFor(pts, u, t1, t2); [err, idx] = worst(pts, bez, u);
+        if (err < error) return void out.push(bez);
+      }
+    if (idx <= 0 || idx >= pts.length - 1) idx = (pts.length / 2) | 0;   // a split must make progress
+    const c = unit(sub(pts[idx - 1], pts[idx + 1]));
+    fit(pts.slice(0, idx + 1), t1, c, error, out);
+    fit(pts.slice(idx), mul(c, -1), t2, error, out);
+  };
+  const dedupe = (pts) => { const o = pts.length ? [pts[0]] : [];
+    for (let i = 1; i < pts.length; i++) if (norm(sub(pts[i], o[o.length - 1])) > 1e-9) o.push(pts[i]);
+    return o; };
+  const corners = (pts, angle) => { const idx = [0];
+    for (let i = 1; i < pts.length - 1; i++) {
+      const a = unit(sub(pts[i], pts[i - 1])), b = unit(sub(pts[i + 1], pts[i]));
+      if (Math.acos(Math.min(1, Math.max(-1, dot(a, b)))) > angle) idx.push(i);
+    }
+    idx.push(pts.length - 1); return idx; };
+  return (points, error = 4, cornerAngle = Math.PI / 2) => {
+    const pts = dedupe(points || []);
+    if (pts.length < 2) return [];
+    const ci = corners(pts, cornerAngle), out = [];
+    for (let k = 0; k < ci.length - 1; k++) {
+      const run = pts.slice(ci[k], ci[k + 1] + 1);
+      if (run.length < 2) continue;
+      fit(run, unit(sub(run[1], run[0])), unit(sub(run[run.length - 2], run[run.length - 1])), error, out);
+    }
+    return out;
+  };
+})()
+)};
+
 // Drag on empty canvas to create a rect, an ellipse or a line. Preview lives in the overlay — the
 // source gets exactly one put, on release, and only if the drag was big enough to mean it.
 const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grabPointer,gestureDelta,previewDelta,commitDelta){return(
@@ -18297,6 +18697,65 @@ const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta
     if (pen.band) pen.band.remove();
     ctx.state.pen = null;
     ctx.setTool("select");
+    return true;
+  }
+}
+)};
+
+// G45. Scribble a freehand stroke; on release it is fitted (Schneider, `fitCurve`) to a chain of
+// cubics and committed as one `<path>`, after which every vertex gesture (G19–G23) applies to it —
+// which is the whole point of landing in the same representation rather than in a "sketch" object.
+// The stroke previews as an overlay polyline and writes nothing until release, so an abandoned
+// scribble is T1 by construction. The tolerance is a screen distance, divided out through the CTM the
+// way every measurement is (readoutFont is 12px/zoom), so the same user-space input fits the same
+// bytes at any zoom (T11), and points closer than half the tolerance are dropped — a trackpad emits
+// far more samples than the fit needs, and that oversampling is what makes a naive fit wobble.
+const _sl269 = function _toolScribble(fitCurve,grabPointer,gestureDelta,previewDelta,commitDelta){return(
+{
+  id: "scribble",
+  tolU: (ctx) => ctx.readoutFont() * ((ctx.options.scribbleTolerance === undefined ? 4 : ctx.options.scribbleTolerance) / 12),
+  onPointerDown(ctx, e) {
+    if (ctx.tool() !== "scribble") return false;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return false;
+    e.preventDefault();
+    grabPointer(ctx.node, e);
+    commitDelta(ctx, gestureDelta.select([]));
+    ctx.state.scribble = { pts: [p], band: null };
+    return true;
+  },
+  onPointerMove(ctx, e) {
+    const s = ctx.state.scribble;
+    if (!s) return;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return;
+    const last = s.pts[s.pts.length - 1];
+    if (Math.hypot(p[0] - last[0], p[1] - last[1]) < this.tolU(ctx) / 2) return;   // decimate
+    s.pts.push(p);
+    if (!s.band || !s.band.isConnected) s.band = ctx.overlay.addRoot("polyline", { class: "link", fill: "none" });
+    s.band.setAttribute("points", s.pts.map((q) => `${q[0]},${q[1]}`).join(" "));
+  },
+  async onPointerUp(ctx) {
+    const s = ctx.state.scribble;
+    ctx.state.scribble = null;
+    if (!s) return;
+    if (s.band) s.band.remove();
+    if (s.pts.length < 2) return void ctx.setTool("select");
+    const segs = fitCurve(s.pts, this.tolU(ctx));
+    if (!segs.length) return void ctx.setTool("select");
+    const r = (v) => Math.round(v * 1e3) / 1e3;
+    let d = `M ${r(segs[0][0][0])} ${r(segs[0][0][1])}`;
+    for (const sg of segs) d += ` C ${r(sg[1][0])} ${r(sg[1][1])} ${r(sg[2][0])} ${r(sg[2][1])} ${r(sg[3][0])} ${r(sg[3][1])}`;
+    const at = ctx.childCount([0]);
+    const style = ctx.options.penStyle || 'fill="none" stroke="#4C7FD1" stroke-width="3" stroke-linecap="round"';
+    const rec = await ctx.addShape(`<path d="${d}" ${style}/>`);
+    if (rec) await commitDelta(ctx, gestureDelta.select([[0, at]], "path"));
+  },
+  onCancel(ctx) {
+    const s = ctx.state.scribble;
+    if (!s) return false;
+    ctx.state.scribble = null;
+    if (s.band) s.band.remove();
     return true;
   }
 }
@@ -18844,9 +19303,9 @@ const _sl142 = function _test_gesture_partiality(withFixture,gestureCorpus,playG
 // the point: this is a claim about how the tools are *written*, and it fails the moment one is
 // written differently. The tools are listed rather than read from `svgTools`, which is an
 // `Inputs.input` and so needs a DOM this law does not.
-const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover)
+const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,toolScribble,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover)
 {
-  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover];
+  const tools = [toolDraw, toolPen, toolScribble, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover];
   const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave", "onWheel"];
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
   const bad = [];
@@ -18879,9 +19338,9 @@ const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,too
 // facade to `getBBox`/`getScreenCTM`/`elementsFromPoint` has a hidden input, and hidden inputs are
 // exactly what the laws cannot see. `hitTest` still asks the browser; the point is that it is the
 // one place that does, reachable as `ctx.hit`.
-const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover)
+const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolScribble,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover)
 {
-  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover];
+  const tools = [toolDraw, toolPen, toolScribble, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover];
   const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave", "onWheel"];
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
   const BANNED = /\b(getBBox|getScreenCTM|getBoundingClientRect|elementsFromPoint|getTotalLength|getPointAtLength)\s*\(/g;
@@ -19079,8 +19538,8 @@ const _sl127h = function _toolHover(gestureDelta,previewDelta){return(
 }
 )};
 
-const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover){return(
-Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover])
+const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolScribble,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover){return(
+Inputs.input([toolDraw, toolPen, toolScribble, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover])
 )};
 const _sl123v = (G, _) => G.input(_);
 
@@ -19493,6 +19952,105 @@ const _sl260 = function _pathSmooth(parsePath,printPath,pathHandles,pathSegments
 })()
 )};
 
+// ---- G47: change a segment's type ----------------------------------------------------------------
+// The kind an author drew (L / C / Q / A) used to be the kind they were stuck with. This is the
+// conversion registry that makes the kind editable: an entry per ordered `(from, to)` pair it knows
+// how to rewrite, each returning the replacement command group *or null* when the conversion would
+// have to guess. Every entry here is shape-preserving — `L↔C` is byte-exact, `C↔Q` is exact in the
+// direction that loses nothing and declines the other (the same "decline rather than guess" `demote`
+// uses), and `A→C` reproduces the arc within a sub-pixel tolerance (a cubic cannot draw a circular
+// arc *exactly* — the (4/3)·tan(θ/4) approximation is the standard every renderer uses — so this
+// entry is honestly an approximation, deliberately one-way, and is the explicit conversion arcs need
+// before their interior can be edited at all). `pathConvert` only rewrites `d`; addressing, undo and
+// the write path stay `commitDelta`'s.
+const _sl265 = function _pathConvert(pathSegments,replaceGroup,absoluteGroup){return(
+(() => {
+  const near = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-9;
+  // The quadratic a cubic came from, if it came from one: degree-elevating `Q c` gives controls at
+  // the ⅔ points, so a cubic is a raised quadratic exactly when both recovered controls agree.
+  const quadOf = (s) => {
+    const c1 = [s.p0[0] + 1.5 * (s.p1[0] - s.p0[0]), s.p0[1] + 1.5 * (s.p1[1] - s.p0[1])];
+    const c2 = [s.p3[0] + 1.5 * (s.p2[0] - s.p3[0]), s.p3[1] + 1.5 * (s.p2[1] - s.p3[1])];
+    return near(c1, c2) ? c1 : null;
+  };
+  // Endpoint→centre arc parameterisation (SVG F.6.5/F.6.6), split into ≤90° cubics (F.6.4-style
+  // magic constant). The last endpoint is pinned to `p3` so the join is bit-for-bit the arc's own end.
+  const arcToCubics = (s) => {
+    let [rx, ry, phiDeg, fa, fs] = s.args;
+    const [x1, y1] = s.p0, [x2, y2] = s.p3;
+    rx = Math.abs(rx); ry = Math.abs(ry);
+    if (rx < 1e-9 || ry < 1e-9 || near(s.p0, s.p3)) return [{ c: "L", a: [x2, y2] }];
+    const phi = (phiDeg * Math.PI) / 180, cosp = Math.cos(phi), sinp = Math.sin(phi);
+    const dx = (x1 - x2) / 2, dy = (y1 - y2) / 2;
+    const x1p = cosp * dx + sinp * dy, y1p = -sinp * dx + cosp * dy;
+    let lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+    if (lam > 1) { const k = Math.sqrt(lam); rx *= k; ry *= k; }
+    const sign = fa !== fs ? 1 : -1;
+    const num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+    const den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+    const co = sign * Math.sqrt(Math.max(0, num / den));
+    const cxp = (co * (rx * y1p)) / ry, cyp = (co * -(ry * x1p)) / rx;
+    const cx = cosp * cxp - sinp * cyp + (x1 + x2) / 2;
+    const cy = sinp * cxp + cosp * cyp + (y1 + y2) / 2;
+    const ang = (ux, uy, vx, vy) => {
+      const d = ux * vx + uy * vy, l = Math.hypot(ux, uy) * Math.hypot(vx, vy);
+      let a = Math.acos(Math.min(1, Math.max(-1, d / l)));
+      return ux * vy - uy * vx < 0 ? -a : a;
+    };
+    const t1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+    let dt = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    if (!fs && dt > 0) dt -= 2 * Math.PI;
+    if (fs && dt < 0) dt += 2 * Math.PI;
+    const nseg = Math.max(1, Math.ceil(Math.abs(dt) / (Math.PI / 2) - 1e-9));
+    const delta = dt / nseg, tc = (4 / 3) * Math.tan(delta / 4);
+    const pt = (t) => [cx + rx * Math.cos(t) * cosp - ry * Math.sin(t) * sinp,
+                       cy + rx * Math.cos(t) * sinp + ry * Math.sin(t) * cosp];
+    const der = (t) => [-rx * Math.sin(t) * cosp - ry * Math.cos(t) * sinp,
+                        -rx * Math.sin(t) * sinp + ry * Math.cos(t) * cosp];
+    const out = [];
+    let th = t1;
+    for (let i = 0; i < nseg; i++) {
+      const a = pt(th), da = der(th), b = pt(th + delta), db = der(th + delta);
+      out.push({ c: "C", a: [a[0] + tc * da[0], a[1] + tc * da[1],
+                             b[0] - tc * db[0], b[1] - tc * db[1], b[0], b[1]] });
+      th += delta;
+    }
+    const last = out[out.length - 1].a;
+    last[4] = x2; last[5] = y2;                            // pin the endpoint exactly
+    return out;
+  };
+  const registry = {
+    "L>C": (s) => [{ c: "C", a: [...s.p0, ...s.p3, ...s.p3] }],
+    "C>L": (s) => (near(s.p1, s.p0) && near(s.p2, s.p3)) ? [{ c: "L", a: [...s.p3] }] : null,
+    "Q>C": (s) => [{ c: "C", a: [s.p0[0] + (2 / 3) * (s.p1[0] - s.p0[0]), s.p0[1] + (2 / 3) * (s.p1[1] - s.p0[1]),
+                               s.p3[0] + (2 / 3) * (s.p1[0] - s.p3[0]), s.p3[1] + (2 / 3) * (s.p1[1] - s.p3[1]),
+                               ...s.p3] }],
+    "C>Q": (s) => { const c = quadOf(s); return c ? [{ c: "Q", a: [...c, ...s.p3] }] : null; },
+    "A>C": (s) => arcToCubics(s)
+  };
+  return {
+    // What this segment can become, given its current kind — used to grey out a menu item.
+    targets: (seg) => Object.keys(registry).filter((k) => k.startsWith(seg.kind + ">")).map((k) => k.slice(2)),
+    // Rewrite segment `segIndex` to kind `to`, or null if the registry declines. A following smooth
+    // command (S/T) reflects off this segment's controls, so it is made absolute first, exactly as
+    // `splitPathSegment` does — otherwise the reflection base moves out from under it.
+    convert(cmds, segIndex, to) {
+      const segs = pathSegments(cmds);
+      const seg = segs[segIndex];
+      if (!seg) return null;
+      const fn = registry[seg.kind + ">" + to];
+      if (!fn) return null;
+      const repl = fn(seg);
+      if (!repl) return null;
+      let out = cmds.map((c) => ({ c: c.c, a: c.a.slice() }));
+      const next = segs[segIndex + 1];
+      if (next && /^[STst]$/.test(next.letter)) out = absoluteGroup(out, next);
+      return replaceGroup(out, seg.ci, seg.o, repl);
+    }
+  };
+})()
+)};
+
 // The toggle as a command rather than as a double-click: double-clicking an anchor already means
 // *delete this vertex*, and that is tested behaviour. One held vertex, because "toggle" needs
 // something to be the opposite of.
@@ -19512,13 +20070,86 @@ const _sl261 = function _cmdToggleSmooth(gestureDelta,pathSmooth,pathHandles,nod
 }
 )};
 
-const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth){return(
+// G47. The convert verb as commands, one per target kind, over whatever anchors are held (P7). The
+// segment an anchor governs is the one it terminates — the same reading `delete-vertex` uses — and a
+// held set is converted highest-index-first so an `A→C` expansion above never shifts the segments
+// below it. Each item is live only where `pathConvert` actually accepts the rewrite (asked once, T8),
+// so "straighten" greys out on a segment that is not a straight cubic, and "to bézier" lights up on a
+// line or a quadratic or an arc. These are the discoverable face of the conversion registry until the
+// S9 affordance panel exists; today they surface through the context menu (G8).
+const _sl266 = function _cmdConvertSegment(gestureDelta,attrVal,parsePath,printPath,pathSegments,pathHandles,attrTextLens,nodeAt,pathConvert){return(
+(to) => ({
+  id: "convert-to-" + { L: "line", C: "curve", Q: "quad" }[to],
+  label: { L: "Straighten segment", C: "Segment to bézier", Q: "Segment to quadratic" }[to],
+  key: null,
+  plan(env) {
+    const vs = (env.vertices || []).filter((v) => v.kind === "anchor");
+    if (!vs.length) return null;
+    const key = (q) => q.join("/");
+    if (vs.some((v) => key(v.path) !== key(vs[0].path))) return null;   // one element at a time
+    const path = vs[0].path;
+    let idx;
+    try { idx = env.index(path); } catch (e) { return null; }
+    const d0 = attrVal(env.src, idx, "d");
+    if (d0 === null) return null;
+    const segs = pathSegments(parsePath(d0));
+    const hs = pathHandles(env.src, idx).filter((h) => h.kind === "anchor");
+    const sis = vs.map((v) => {
+      const h = hs[v.n];
+      return h ? segs.findIndex((sg) => sg.ci === h.ci && sg.o === h.o) : -1;
+    }).filter((i) => i >= 0).sort((a, b) => b - a);
+    const out = [];
+    for (const si of sis) {
+      if (pathConvert.convert(parsePath(d0), si, to) === null) continue;  // declines here, T8
+      out.push(gestureDelta.command("convertSegment", (src) => {
+        let j;
+        try { j = nodeAt(src, path).index; } catch (e) { return src; }
+        const next = pathConvert.convert(parsePath(attrVal(src, j, "d")), si, to);
+        return next === null ? src : attrTextLens(j, "d").put(printPath(next), src);
+      }));
+    }
+    return out.length ? out : null;
+  }
+})
+)};
+
+// G7. Selection is not a source edit (T9), so these plan a `select` delta rather than a `command`
+// one — the same delta a tool emits on a click. "Same" is judged among the current scope's own
+// children, which is the working level; a `same-fill` includes the primary itself, so it is
+// idempotent. Each declines (T1/T8) when it would change nothing: select-none with an empty
+// selection, select-all with nothing to select, "same" with no primary.
+const _sl264 = function _cmdSelect(gestureDelta,nodeAt){return(
+(kind) => ({
+  id: { all: "select-all", none: "select-none", "same-fill": "select-same-fill", "same-tag": "select-same-tag" }[kind],
+  label: { all: "Select all", none: "Select none", "same-fill": "Select same fill", "same-tag": "Select same tag" }[kind],
+  key: kind === "all" ? "Mod-a" : null,
+  plan(env) {
+    if (kind === "none") return env.paths.length ? gestureDelta.select([]) : null;
+    let container;
+    try { container = nodeAt(env.src, env.scope); } catch (e) { return null; }
+    const kids = container.children || [];
+    if (!kids.length) return null;
+    if (kind === "all") return gestureDelta.select(kids.map((c) => c.path));
+    if (!env.paths.length) return null;
+    let primary;
+    try { primary = nodeAt(env.src, env.paths[0]); } catch (e) { return null; }
+    const fill = (n) => (n.attrs && n.attrs.fill ? n.attrs.fill.value : null);
+    const match = kind === "same-tag" ? (n) => n.tag === primary.tag : (n) => fill(n) === fill(primary);
+    const paths = kids.filter(match).map((c) => c.path);
+    return paths.length ? gestureDelta.select(paths) : null;
+  }
+})
+)};
+
+const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth,cmdSelect,cmdConvertSegment){return(
 // A plain array, not an `Inputs.input`, for the same reason `svgShapes` is: pure code plans a command
 // and the laws exercise that headless, where there is no DOM to hold a view.
 [cmdGroup, cmdUngroup, cmdDuplicate, cmdCopy, cmdCut, cmdPaste(false), cmdPaste(true)]
   .concat(alignSpecs.map(cmdAlign))
   .concat([cmdDistribute("x"), cmdDistribute("y"),
            cmdDeleteVertex, cmdClosePath(true), cmdClosePath(false), cmdToggleSmooth])
+  .concat(["all", "none", "same-fill", "same-tag"].map(cmdSelect))
+  .concat(["L", "C", "Q"].map(cmdConvertSegment))
 )};
 
 // Look one up, and answer "what does this keystroke mean" in one place. The binding is a
@@ -19551,7 +20182,7 @@ const _sl113s = function _lensState(){return(
 new Map()
 )};
 
-const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,commandLookup,copyMarkup,moveTargetOf,commitDelta,rebaseVertex,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox)
+const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,svgFields,commandLookup,copyMarkup,moveTargetOf,commitDelta,rebaseVertex,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox)
 {
   // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
   // node that is the cell's value now, rather than the one its gesture started on.
@@ -19867,6 +20498,15 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       screenBox: (el) => (el && el.getBoundingClientRect ? el.getBoundingClientRect() : null),
       // The selection box in the root's user space, where a marquee is drawn and compared.
       rootBox: (el) => boxInRoot(el, node),
+      // An element-local point projected into the root's user space — the point-sized companion to
+      // `rootBox`, for comparing a handle against a marquee band drawn in root space (G22). Stays a
+      // P5 measurement: it only composes the two CTMs `ctx` already exposes.
+      rootPoint: (el, x, y) => {
+        const em = ctx.screenCTM(el), nm = ctx.screenCTM(node);
+        if (!em || !nm) return null;
+        const s = applyPoint(ctmMat(em), x, y);
+        return applyPoint(invert(ctmMat(nm)), s[0], s[1]);
+      },
       // What is under the pointer, front to back. Painted geometry first, then near-misses.
       hit: (e, opts = {}) =>
         hitTest(ctx, e, { tolerance: options.hitTolerance, ...opts }),
@@ -20104,6 +20744,9 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       return s ? { undo: s.undo.length, redo: s.redo.length } : { undo: 0, redo: 0 };
     };
 
+    // What is under a pointer event, topmost first — the very hit-test a click uses (S1), exposed so a
+    // right-click can select before it opens a menu (G8). Measurement stays inside `ctx`, so P5 holds.
+    node.pickAt = (e) => ctx.pick(e).map((h) => h.path);
     node.selection = () => focus.path;
     node.selectionPaths = () => focus.paths;
     node.selectionMode = () => focus.mode;
@@ -20150,6 +20793,29 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       if (t === null) return null;
       const idx = nodeAt(t, path).index;
       const w = setProperty(t, idx, prop, value);
+      return writer.commit(idx, w.name, w.value, null);
+    };
+    // S6/G46. The typed field surface: what paint/stroke properties this element has and their current
+    // source values, and a setter that writes one back through `setProperty` — the same path
+    // `setAttr` uses, so a widget commit is byte-identical to it. A write that would not change the
+    // bytes is skipped (T1), which is what lets the panel re-render from the selection on every commit
+    // without a colour picker reporting the same hex re-serialising `darkseagreen`.
+    node.fields = (path) => {
+      const t = target.doc();
+      if (t === null) return [];
+      let idx;
+      try { idx = nodeAt(t, path).index; } catch (e) { return []; }
+      return svgFields.list.map((f) => ({ ...f, value: svgFields.read(t, idx, f.prop) }));
+    };
+    node.setField = (path, prop, value) => {
+      const t = target.doc();
+      if (t === null) return null;
+      let idx;
+      try { idx = nodeAt(t, path).index; } catch (e) { return null; }
+      const v = value == null ? "" : String(value).trim();
+      const cur = svgFields.read(t, idx, prop);
+      if (v === "" || v === cur) return null;                // no clear-to-default yet; no-op if unchanged (T1)
+      const w = setProperty(t, idx, prop, v);
       return writer.commit(idx, w.name, w.value, null);
     };
     node.refs = (path) => {
@@ -20217,6 +20883,7 @@ export default function define(runtime, observer) {
   // The inspector's height follows the selection, so it sits *below* the drawing: above it, every
   // change of selection would shift the picture under the pointer mid-gesture.
   $def("sl02c", "inspector", ["htl","Inputs","invalidation","viewof drawing"], _sl02c);
+  $def("sl271", "fieldPanel", ["htl","Inputs","invalidation","viewof drawing"], _sl271);
   $def("sl04", "howToDrive", ["md","ref"], _sl04);
   $def("sl05", "putTable", ["Generators","viewof drawing","Inputs","invalidation"], _sl05);
   $def("sl08", "useIt", ["md"], _sl08);
@@ -20405,6 +21072,7 @@ export default function define(runtime, observer) {
   $def("sl31f", "printStyle", [], _sl31f);
   $def("sl31g", "styleLens", ["lens","parseStyle","printStyle"], _sl31g);
   $def("sl31h", "setProperty", ["attrVal","styleLens"], _sl31h);
+  $def("sl270", "svgFields", ["attrVal","styleLens"], _sl270);
   $def("sl78", "cellAttrLens", ["compose","literalLens","attrTextLens"], _sl78);
   $def("sl79", "childrenLens", ["lens","nodeAt","parseDoc"], _sl79);
   $def("sl79a", "insertElement", ["childrenLens"], _sl79a);
@@ -20467,13 +21135,14 @@ export default function define(runtime, observer) {
   $def("sl128a", "previewDelta", ["gestureDelta"], _sl128a);
   $def("sl128b", "commitDelta", [], _sl128b);
   $def("sl128c", "revertDelta", [], _sl128c);
-  $def("sl120", "toolVertex", ["handleEdit","shapeLookup","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta","vertexAddress","pathSmooth"], _sl120);
+  $def("sl267", "moveVertices", ["vertexAddress","parsePath","printPath","parsePoints","printPoints","attrVal","PATH_ARG_COUNT"], _sl267);
+  $def("sl120", "toolVertex", ["handleEdit","shapeLookup","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta","vertexAddress","pathSmooth","moveVertices","dragBox"], _sl120);
   $def("sl119d", "scopedPath", [], _sl119d);
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
   $def("sl251", "moveTargetOf", ["invert","ctmMat","translateLens","shapeLookup"], _sl251);
   $def("sl263", "moveDeltas", ["gestureDelta","translateLens","attrVal"], _sl263);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta","moveTargetOf","moveDeltas"], _sl121);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta","moveTargetOf","moveDeltas","copyMarkup","offsetMarkup","pasteMarkup"], _sl121);
   $def("sl125z", "toolZoom", ["grabPointer"], _sl125z);
   $def("sl122b", "toolScope", ["pathOfIndex","scopedPath","shapeLookup","gestureDelta","commitDelta"], _sl122b);
   $def("sl121b", "toolMarquee", ["pathOfIndex","scopedPath","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
@@ -20485,6 +21154,8 @@ export default function define(runtime, observer) {
   $def("sl125d", "penPath", [], _sl125d);
   $def("sl125", "toolDraw", ["shapeLookup","shapeSpec","shapeMarkup","dragBox","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl125);
   $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer","gestureDelta","previewDelta","commitDelta","pathHandles","pathOfIndex"], _sl126);
+  $def("sl268", "fitCurve", [], _sl268);
+  $def("sl269", "toolScribble", ["fitCurve","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl269);
   $def("sl130", "gestureFixture", ["runtime","realize","settle","literalSpan","nodeAt","svgLens","svg"], _sl130);
   $def("sl131", "playGesture", [], _sl131);
   $def("sl132", "gestureCorpus", [], _sl132);
@@ -20494,8 +21165,8 @@ export default function define(runtime, observer) {
   $def("sl136", "test_gesture_commits_against_its_origin", ["withFixture","gestureCorpus","playGesture","nodeAt"], _sl136);
   $def("sl137", "test_gesture_confinement", ["withFixture","gestureCorpus","playGesture","svgTools"], _sl137);
   $def("sl138", "test_gesture_selection_is_not_an_edit", ["withFixture","gestureCorpus","playGesture","toolMarquee"], _sl138);
-  $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl144);
-  $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl143);
+  $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolScribble","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl144);
+  $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolScribble","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl143);
   $def("sl140a", "domShape", [], _sl140a);
   $def("sl140", "test_gesture_render_consistency", ["withFixture","gestureCorpus","playGesture","domShape"], _sl140);
   $def("sl141", "test_gesture_rebase_agreement", ["withFixture","gestureCorpus","nodeAt","childrenLens","insertPoint"], _sl141);
@@ -20504,7 +21175,7 @@ export default function define(runtime, observer) {
   $def("sl145", "test_gesture_hit_agreement", ["withFixture","gestureCorpus","playGesture","boxInRoot"], _sl145);
   $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit","test_gesture_hit_agreement","test_gesture_view_is_not_an_edit"], _sl139);
   $def("sl127h", "toolHover", ["gestureDelta","previewDelta"], _sl127h);
-  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl123);
+  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolScribble","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl123);
   $def("sl240", "cmdGroup", ["gestureDelta","groupPlan","groupElements","rebaseMoves"], _sl240);
   $def("sl241", "cmdUngroup", ["gestureDelta","ungroupBlockers","ungroupElements","childrenLens","rebaseMoves"], _sl241);
   $def("sl242", "cmdDuplicate", ["gestureDelta","copyMarkup","offsetMarkup","pasteMarkup"], _sl242);
@@ -20518,11 +21189,14 @@ export default function define(runtime, observer) {
   $def("sl261", "cmdToggleSmooth", ["gestureDelta","pathSmooth","pathHandles","nodeAt"], _sl261);
   $def("sl258", "cmdDeleteVertex", ["gestureDelta","attrVal","parsePoints","parsePath","pathSegments","pathHandles","deletePoint","deletePathPoint"], _sl258);
   $def("sl259", "cmdClosePath", ["gestureDelta","attrVal","attrTextLens","nodeAt"], _sl259);
-  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth"], _sl250);
+  $def("sl264", "cmdSelect", ["gestureDelta","nodeAt"], _sl264);
+  $def("sl265", "pathConvert", ["pathSegments","replaceGroup","absoluteGroup"], _sl265);
+  $def("sl266", "cmdConvertSegment", ["gestureDelta","attrVal","parsePath","printPath","pathSegments","pathHandles","attrTextLens","nodeAt","pathConvert"], _sl266);
+  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth","cmdSelect","cmdConvertSegment"], _sl250);
   $def("sl249", "commandLookup", [], _sl249);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox"], _sl114);
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","svgFields","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
