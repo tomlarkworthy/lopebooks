@@ -12287,6 +12287,14 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
       e.preventDefault();                                // editor-5 owns undo while you are in a cell
       return void (e.shiftKey ? drawing.redo() : drawing.undo());
     }
+    // ⌘0 fits the drawing, ⌘1 is 100%, ⌘2 fits the selection. The drawing offers the verbs; which
+    // key means what is the callsite's business, like every other shortcut here.
+    if ((e.metaKey || e.ctrlKey) && !typing && "012".includes(e.key)) {
+      e.preventDefault();
+      return void (e.key === "1" ? drawing.resetView()
+                 : e.key === "2" ? drawing.fitView(drawing.selectionPaths())
+                 : drawing.fitView([]));
+    }
     if (e.metaKey || e.ctrlKey || e.altKey || typing) return;
     const sel = drawing.selectionPaths();
     if (Z[e.key] && sel.length) {
@@ -16793,6 +16801,39 @@ const _sl121a = function _hitTest(){return(
 }
 )};
 
+// Zoom and pan (G25). The wheel zooms about the pointer; the middle button drags the view. Both are
+// pure view state, so this is the one tool with no `commitDelta` in it at all — which is exactly what
+// T11 says out loud. It writes nothing, so it is also the cheapest possible witness for T6.
+const _sl125z = function _toolZoom(grabPointer){return(
+{
+  id: "zoom",
+  onWheel(ctx, e) {
+    // Ctrl+wheel is the pinch gesture browsers synthesise; plain wheel is a trackpad scroll. Both
+    // mean zoom here, because the drawing has no scroll of its own to compete with.
+    e.preventDefault();
+    ctx.zoomAt(Math.pow(1.0015, -e.deltaY * (e.ctrlKey ? 4 : 1)), e.clientX, e.clientY);
+    return true;
+  },
+  onPointerDown(ctx, e) {
+    if (e.button !== 1) return false;                  // middle drag; everything else is someone's
+    e.preventDefault();
+    grabPointer(ctx.node, e);
+    ctx.state.pan = { x: e.clientX, y: e.clientY };
+    return true;
+  },
+  onPointerMove(ctx, e) {
+    const p = ctx.state.pan;
+    if (!p) return;
+    ctx.panBy(e.clientX - p.x, e.clientY - p.y);
+    p.x = e.clientX; p.y = e.clientY;
+  },
+  onPointerUp(ctx) { ctx.state.pan = null; },
+  // Abandoning a pan is not "put the view back" — the view is not an edit, so there is nothing to
+  // undo. It reports false so Escape falls through to whatever else wants it.
+  onCancel(ctx) { ctx.state.pan = null; return false; }
+}
+)};
+
 // Enter a group (G6). Double-click descends one level and selects what is under the pointer at the
 // new depth; `node.ascendScope()` (Escape, at the callsite) comes back out. It sits before
 // `toolStructure` in the registry so a double-click on a group enters it rather than falling through
@@ -17403,6 +17444,9 @@ const _sl131 = function _playGesture(){return(
         else if (kind === "up") node.dispatchEvent(pev("pointerup", cx, cy, o));
         else if (kind === "dbl") at(node, cx, cy).dispatchEvent(new MouseEvent("dblclick", {
           clientX: cx, clientY: cy, bubbles: true, cancelable: true }));
+        else if (kind === "wheel") node.dispatchEvent(new WheelEvent("wheel", {
+          clientX: cx, clientY: cy, deltaY: o.deltaY || 0, bubbles: true, cancelable: true,
+          ctrlKey: !!o.ctrlKey }));
         else if (kind === "key") document.dispatchEvent(new KeyboardEvent("keydown", {
           key: x, bubbles: true, cancelable: true, ...o }));
         await new Promise((r) => setTimeout(r, 0));
@@ -17420,6 +17464,7 @@ const _sl131 = function _playGesture(){return(
   play.hold = (pts, o = {}) => () => [["down", pts[0][0], pts[0][1], o],
     ...pts.slice(1).map(([x, y]) => ["move", x, y, o])];
   play.dblclick = (x, y) => () => [["dbl", x, y, {}]];
+  play.wheel = (x, y, deltaY, o = {}) => () => [["wheel", x, y, { deltaY, ...o }]];
   play.press = (key, o = {}) => () => [["key", key, 0, o]];
   return play;
 })()
@@ -17787,10 +17832,10 @@ const _sl142 = function _test_gesture_partiality(withFixture,gestureCorpus,playG
 // the point: this is a claim about how the tools are *written*, and it fails the moment one is
 // written differently. The tools are listed rather than read from `svgTools`, which is an
 // `Inputs.input` and so needs a DOM this law does not.
-const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolStructure,toolHover)
+const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover)
 {
-  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolStructure, toolHover];
-  const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave"];
+  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover];
+  const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave", "onWheel"];
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
   const bad = [];
   let previews = 0;
@@ -17822,10 +17867,10 @@ const _sl143 = function _test_tools_write_through_the_delta(toolDraw,toolPen,too
 // facade to `getBBox`/`getScreenCTM`/`elementsFromPoint` has a hidden input, and hidden inputs are
 // exactly what the laws cannot see. `hitTest` still asks the browser; the point is that it is the
 // one place that does, reachable as `ctx.hit`.
-const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolStructure,toolHover)
+const _sl144 = function _test_tools_measure_through_ctx(toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover)
 {
-  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolStructure, toolHover];
-  const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave"];
+  const tools = [toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover];
+  const HANDLERS = ["onPointerDown", "onPointerMove", "onPointerUp", "onDblClick", "onHover", "onPointerLeave", "onWheel"];
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
   const BANNED = /\b(getBBox|getScreenCTM|getBoundingClientRect|elementsFromPoint|getTotalLength|getPointAtLength)\s*\(/g;
   const bad = [];
@@ -17906,7 +17951,72 @@ const _sl145 = function _test_gesture_hit_agreement(withFixture,gestureCorpus,pl
   });
 };
 
-const _sl139 = function _gestureLaws(test_gesture_identity,test_gesture_path_independence,test_gesture_commits_against_its_origin,test_gesture_render_consistency,test_gesture_confinement,test_gesture_rebase_agreement,test_gesture_partiality,test_gesture_selection_is_not_an_edit,test_gesture_hit_agreement){return(
+// T11 — the view is not an edit (S7/G25). Ours. Two halves, and they are S7's falsifier verbatim:
+// zooming and panning must leave the source byte-identical, and the *same drag in the drawing's own
+// units* must commit the same bytes at any zoom. The second half is the interesting one — it is what
+// makes "no tool needed changing for zoom" a claim rather than a hope, and it holds because every
+// measurement goes through `ctx` (P5) and `getScreenCTM` already carries the viewBox.
+//
+// **With alignment snapping off**, and the qualifier is the finding rather than an excuse. Snapping
+// is magnetism: `snapRects` measures it in *screen* pixels, so at 2.5× a neighbour two units away is
+// five pixels away and pulls when it did not before. That is the right behaviour — you snap to what
+// looks close — but it makes the committed bytes a function of the zoom, so the law names the one
+// deliberate screen-space affordance instead of pretending the whole pipeline is scale-free.
+// Both arms assert they actually *committed*, because the first version of this law compared two
+// drags that had silently missed (the zoom put the shape outside the viewport) and would have passed
+// on two empty results.
+const _sl146 = function _test_gesture_view_is_not_an_edit(withFixture,gestureCorpus,playGesture)
+{
+  if (typeof document === "undefined") return () => "⏭ needs a browser";
+  // alt: no magnetism, so only the geometry pipeline is under test.
+  const dragPoly = playGesture.drag([[60, 80], [66, 84], [72, 88]], { altKey: true });
+  const moved = (doc) => (doc.match(/<polygon[^>]*>/) || [""])[0];
+  // Two fixtures, one after the other and *not* nested: `withFixture` serialises on one queue, so a
+  // nested call waits for the outer one to finish and neither ever does.
+  return async () => {
+  const at1 = await withFixture(gestureCorpus.basic, {}, async (f) => {
+    const doc0 = f.doc(), h0 = f.historyDepth().undo;
+    const moves = [
+      ["wheel in",  playGesture.wheel(60, 80, -400)],
+      ["wheel out", playGesture.wheel(60, 80, 260)],
+      ["fit",       () => []]
+    ];
+    for (const [what, step] of moves) {
+      await playGesture(f, step);
+      if (what === "fit") f.node.fitView([]);
+      if (f.doc() !== doc0) throw new Error(`${what} wrote to the source`);
+      if (f.historyDepth().undo !== h0) throw new Error(`${what} pushed an undo entry`);
+    }
+    f.node.panBy(37, -19);
+    if (f.doc() !== doc0) throw new Error("panning wrote to the source");
+    const zoomed = f.node.view().k;
+    if (!(zoomed > 0) || zoomed === 1) throw new Error(`the view never actually changed (k=${zoomed})`);
+
+    // ...and the same drag, in the drawing's units, commits the same bytes at any zoom.
+    f.node.resetView();
+    await playGesture(f, playGesture.tap(60, 80));
+    await playGesture(f, dragPoly);
+    if (!/transform=/.test(moved(f.doc()))) throw new Error("the zoom-1 drag committed nothing");
+    return f.doc();
+  });
+  return withFixture(gestureCorpus.basic, {}, async (g) => {
+    // Centred on the drag: at 2.5× the viewport is 80×48 user units, and a view that leaves the
+    // shape outside it means the pointer lands on the page, not on the drawing.
+    g.node.setView({ k: 2.5, x: 20, y: 56 });
+    await playGesture(g, playGesture.tap(60, 80));
+    if (!g.node.selectionPaths().length) throw new Error("nothing was selectable at zoom 2.5");
+    await playGesture(g, dragPoly);
+    if (!/transform=/.test(moved(g.doc()))) throw new Error("the zoom-2.5 drag committed nothing");
+    if (g.doc() !== at1)
+      throw new Error(`the same drag committed different bytes at zoom 2.5:\n${moved(at1)}\nvs\n${moved(g.doc())}`);
+    if (g.node.view().k !== 2.5) throw new Error("the commit lost the view");
+    return `✅ T11: 4 view changes wrote nothing, and the same drag commits the same bytes at `
+         + `zoom 1 and at zoom 2.5 (snapping off — it is magnetism, and magnetism is screen-space)`;
+  });
+  };
+};
+
+const _sl139 = function _gestureLaws(test_gesture_identity,test_gesture_path_independence,test_gesture_commits_against_its_origin,test_gesture_render_consistency,test_gesture_confinement,test_gesture_rebase_agreement,test_gesture_partiality,test_gesture_selection_is_not_an_edit,test_gesture_hit_agreement,test_gesture_view_is_not_an_edit){return(
 {
   laws: {
     "T1 identity": test_gesture_identity,
@@ -17917,7 +18027,8 @@ const _sl139 = function _gestureLaws(test_gesture_identity,test_gesture_path_ind
     "T7 rebase agreement": test_gesture_rebase_agreement,
     "T8 partiality": test_gesture_partiality,
     "T9 selection is not an edit": test_gesture_selection_is_not_an_edit,
-    "T10 hit agreement": test_gesture_hit_agreement
+    "T10 hit agreement": test_gesture_hit_agreement,
+    "T11 the view is not an edit": test_gesture_view_is_not_an_edit
   },
   async run() {
     const out = {};
@@ -17956,8 +18067,8 @@ const _sl127h = function _toolHover(gestureDelta,previewDelta){return(
 }
 )};
 
-const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolStructure,toolHover){return(
-Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolStructure, toolHover])
+const _sl123 = function _svgTools(Inputs,toolDraw,toolPen,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover){return(
+Inputs.input([toolDraw, toolPen, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover])
 )};
 const _sl123v = (G, _) => G.input(_);
 
@@ -17971,7 +18082,7 @@ const _sl113s = function _lensState(){return(
 new Map()
 )};
 
-const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex)
+const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox)
 {
   // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
   // node that is the cell's value now, rather than the one its gesture started on.
@@ -18012,7 +18123,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       myVar = v;
       let s = lensState.get(v);
       if (!s) lensState.set(v, s = { undo: [], redo: [], paths: null, mode: "replace", tool: null,
-                                     gesture: {}, scope: null });
+                                     gesture: {}, scope: null, view: null });
       return (shared = s);
     };
     const focus = svgFocus(overlay, target, () => {
@@ -18049,6 +18160,105 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       setScope(sc.slice(0, -1));
       focus.set(left, "transform");                      // select the group just stepped out of
       return true;
+    };
+
+    // ---- the view (S7) --------------------------------------------------------------------------
+    // Zoom and pan change what you see and never what the source says, so the view is state, not an
+    // edit: `{k, x, y}` — a scale and the top-left corner, in the source's own user units. It is
+    // written to the *live* root's `viewBox`, recomputed from the source's viewBox every time, so
+    // editing that attribute still works and the view composes with it rather than fighting it.
+    // At identity nothing is written at all, which is why every law that predates zoom is untouched.
+    //
+    // No tool needed changing for this. Every measurement already goes through `ctx.screenCTM` /
+    // `screenBox` / `localPoint` (P5), and `getScreenCTM` includes the viewBox — so a drag at zoom
+    // 2.5 computes the same user-space numbers as the same drag at zoom 1, for free.
+    const VIEW1 = { k: 1, x: null, y: null };
+    let localView = VIEW1;
+    const viewNow = () => { const st = stateOf(); return (st && st.view) || localView; };
+    const isIdentity = (v) => v.k === 1 && v.x === null && v.y === null;
+    // What the source says the view is: its viewBox, else its width/height, else what it renders as.
+    const baseBox = () => {
+      const d = target.doc();
+      if (d !== null) {
+        try { const vb = attrVal(d, 0, "viewBox"); if (vb) return parseViewBox(vb); } catch (err) {}
+        try {
+          const w = parseFloat(attrVal(d, 0, "width")), h = parseFloat(attrVal(d, 0, "height"));
+          if (w > 0 && h > 0) return { minX: 0, minY: 0, width: w, height: h };
+        } catch (err) {}
+      }
+      const b = node.getBBox ? node.getBBox() : null;
+      return b && b.width > 0 ? { minX: b.x, minY: b.y, width: b.width, height: b.height }
+                              : { minX: 0, minY: 0, width: 1, height: 1 };
+    };
+    const viewBoxNow = () => {
+      const v = viewNow(), base = baseBox();
+      return { minX: v.x === null ? base.minX : v.x, minY: v.y === null ? base.minY : v.y,
+               width: base.width / v.k, height: base.height / v.k };
+    };
+    // Put the source's own view back, byte for byte — including "there was no viewBox".
+    const restoreView = () => {
+      const d = target.doc();
+      let vb = null;
+      try { vb = d === null ? null : attrVal(d, 0, "viewBox"); } catch (err) {}
+      if (vb === null) node.removeAttribute("viewBox"); else node.setAttribute("viewBox", vb);
+    };
+    const applyView = () => {
+      const v = viewNow();
+      if (isIdentity(v)) return;                       // the commit already rendered the source's own
+      node.setAttribute("viewBox", printViewBox(viewBoxNow()));
+    };
+    const setView = (v) => {
+      const next = { k: Math.max(0.02, Math.min(200, v.k)), x: v.x, y: v.y };
+      localView = next;
+      const st = stateOf();
+      if (st) st.view = next;
+      if (isIdentity(next)) restoreView(); else applyView();
+      focus.refresh();
+      node.dispatchEvent(new CustomEvent("lens-view", { detail: { ...next, box: viewBoxNow() } }));
+      return next;
+    };
+    // Zoom about a screen point: whatever user-space point is under the pointer stays under it.
+    node.zoomAt = (factor, clientX, clientY) => {
+      const v = viewNow(), base = baseBox(), box = viewBoxNow();
+      const m = node.getScreenCTM();
+      if (!m) return v;
+      const inv = m.inverse();
+      const px = inv.a * clientX + inv.c * clientY + inv.e;
+      const py = inv.b * clientX + inv.d * clientY + inv.f;
+      const fx = box.width ? (px - box.minX) / box.width : 0.5;
+      const fy = box.height ? (py - box.minY) / box.height : 0.5;
+      const k = Math.max(0.02, Math.min(200, v.k * factor));
+      return setView({ k, x: px - fx * (base.width / k), y: py - fy * (base.height / k) });
+    };
+    // Pan by a screen delta, converted through the same matrix everything else measures with.
+    node.panBy = (dx, dy) => {
+      const v = viewNow(), box = viewBoxNow();
+      const m = node.getScreenCTM();
+      if (!m) return v;
+      const inv = m.inverse();
+      return setView({ k: v.k, x: box.minX - (inv.a * dx + inv.c * dy),
+                                y: box.minY - (inv.b * dx + inv.d * dy) });
+    };
+    node.view = () => ({ ...viewNow(), box: viewBoxNow() });
+    node.setView = (v) => setView(v || VIEW1);
+    node.resetView = () => setView(VIEW1);
+    // Fit a set of elements (or the whole drawing) into the viewport, with a margin.
+    node.fitView = (paths = null, margin = 0.06) => {
+      const els = (paths && paths.length ? paths : focus.paths).length
+        ? (paths || focus.paths).map((p) => { try { return target.elems()[nodeAt(target.doc(), p).index]; }
+                                              catch (err) { return null; } }).filter(Boolean)
+        : [...node.children].filter((n) => !n.hasAttribute("data-svg-lens-overlay"));
+      const boxes = els.map((el) => boxInRoot(el, node)).filter(Boolean);
+      if (!boxes.length) return setView(VIEW1);
+      const x0 = Math.min(...boxes.map((b) => b.x)), y0 = Math.min(...boxes.map((b) => b.y));
+      const x1 = Math.max(...boxes.map((b) => b.x + b.width));
+      const y1 = Math.max(...boxes.map((b) => b.y + b.height));
+      const base = baseBox();
+      const pad = Math.max(x1 - x0, y1 - y0) * margin;
+      const w = Math.max(1e-6, x1 - x0 + 2 * pad), h = Math.max(1e-6, y1 - y0 + 2 * pad);
+      const k = Math.min(base.width / w, base.height / h);
+      return setView({ k, x: (x0 + x1) / 2 - base.width / (2 * k),
+                          y: (y0 + y1) / 2 - base.height / (2 * k) });
     };
 
     // The active tool, and the scratch a half-finished gesture keeps. A gesture means different
@@ -18149,7 +18359,10 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
         return out;
       },
       scope: scopeNow,
-      setScope
+      setScope,
+      view: () => node.view(),
+      zoomAt: (f, x, y) => node.zoomAt(f, x, y),
+      panBy: (dx, dy) => node.panBy(dx, dy)
     };
 
     ctxByNode.set(node, ctx);
@@ -18202,6 +18415,9 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     node.addEventListener("pointerleave", (e) => {
       for (const t of tools) if (t.onPointerLeave) t.onPointerLeave(liveCtx, e);
     });
+    node.addEventListener("wheel", (e) => {
+      for (const t of tools) if (t.onWheel && t.onWheel(liveCtx, e)) return;
+    }, { passive: false });
     node.addEventListener("dblclick", async (e) => {
       e.preventDefault();
       for (const t of tools) if (t.onDblClick && await t.onDblClick(liveCtx, e)) return;
@@ -18212,6 +18428,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     // writer knows nothing about selection — it just says what it did.
     node.addEventListener("lens-put", (e) => {
       if (e.detail.rebase) focus.rebase(e.detail.rebase);
+      applyView();                                     // the render just put the source's view back
       focus.refresh();
     });
 
@@ -18362,6 +18579,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     setTimeout(() => {
       const s = stateOf();
       if (!s) return;
+      applyView();                                     // a remount renders the source's own view
       if (s.paths && s.paths.length) focus.setAll(s.paths, s.mode);
     }, 0);
     return node;
@@ -18629,6 +18847,7 @@ export default function define(runtime, observer) {
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
   $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl121);
+  $def("sl125z", "toolZoom", ["grabPointer"], _sl125z);
   $def("sl122b", "toolScope", ["pathOfIndex","scopedPath","shapeLookup","gestureDelta","commitDelta"], _sl122b);
   $def("sl121b", "toolMarquee", ["pathOfIndex","scopedPath","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
   $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint","gestureDelta","commitDelta"], _sl122);
@@ -18648,19 +18867,20 @@ export default function define(runtime, observer) {
   $def("sl136", "test_gesture_commits_against_its_origin", ["withFixture","gestureCorpus","playGesture"], _sl136);
   $def("sl137", "test_gesture_confinement", ["withFixture","gestureCorpus","playGesture","svgTools"], _sl137);
   $def("sl138", "test_gesture_selection_is_not_an_edit", ["withFixture","gestureCorpus","playGesture","toolMarquee"], _sl138);
-  $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolStructure","toolHover"], _sl144);
-  $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolStructure","toolHover"], _sl143);
+  $def("sl144", "test_tools_measure_through_ctx", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl144);
+  $def("sl143", "test_tools_write_through_the_delta", ["toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl143);
   $def("sl140a", "domShape", [], _sl140a);
   $def("sl140", "test_gesture_render_consistency", ["withFixture","gestureCorpus","playGesture","domShape"], _sl140);
   $def("sl141", "test_gesture_rebase_agreement", ["withFixture","gestureCorpus","nodeAt","childrenLens","insertPoint"], _sl141);
   $def("sl142", "test_gesture_partiality", ["withFixture","gestureCorpus","playGesture"], _sl142);
+  $def("sl146", "test_gesture_view_is_not_an_edit", ["withFixture","gestureCorpus","playGesture"], _sl146);
   $def("sl145", "test_gesture_hit_agreement", ["withFixture","gestureCorpus","playGesture","boxInRoot"], _sl145);
-  $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit","test_gesture_hit_agreement"], _sl139);
+  $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit","test_gesture_hit_agreement","test_gesture_view_is_not_an_edit"], _sl139);
   $def("sl127h", "toolHover", ["gestureDelta","previewDelta"], _sl127h);
-  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolStructure","toolHover"], _sl123);
+  $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex"], _sl114);
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
