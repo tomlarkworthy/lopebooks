@@ -18132,6 +18132,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
       duplicate: e.altKey,
       paths: ctx.focus.paths.slice(),
       thresh: e.pointerType === "mouse" ? 3 : 10,
+      snapped: { x: false, y: false },            // B1: per-axis snap hysteresis state
       box: snapping ? ctx.screenBox(el) : null,
       others: snapping ? list.slice(1).filter((n) => n !== el && !n.contains(el) && !el.contains(n))
                               .map((n) => ctx.screenBox(n)) : null
@@ -18145,6 +18146,13 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     let dx = e.clientX - d.x0, dy = e.clientY - d.y0;
     if (!d.started && Math.hypot(dx, dy) < d.thresh) return;
     d.started = true;
+    // B1: a dead zone, not a trigger. The threshold used to gate *whether* the drag started and then
+    // apply the whole offset from the press — so the first committed frame jumped `thresh` pixels. Now
+    // the offset's magnitude is shrunk by `thresh`: `raw · max(0, |raw|−thresh)/|raw|`. It is a pure
+    // function of the *current* offset, so a slow and a fast drag to one endpoint land identically (T2),
+    // it is continuous at the threshold (no jump), and it costs every drag landing `thresh` short of the
+    // pointer. The ratio dx:dy is preserved, so the axis-lock decision below is unchanged.
+    { const r = Math.hypot(dx, dy); if (r > 0) { const f = Math.max(0, r - d.thresh) / r; dx *= f; dy *= f; } }
     // Shift locks the drag to whichever axis it has travelled furthest along, measured from the
     // origin rather than the last frame, so the lock is a function of where the pointer *is* and T2
     // still holds. Shift on a tap already means toggle-select; the disambiguation is drag-vs-tap,
@@ -18154,7 +18162,12 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
     let guides = [], aligned = { x: false, y: false };
     if (d.box && !e.altKey) {                            // alt is the usual "ignore snapping" modifier
       const moved = { x: d.box.x + dx, y: d.box.y + dy, width: d.box.width, height: d.box.height };
-      const snap = snapRects(moved, d.others, ctx.options.snapTolerance);
+      // B1: snapping hysteresis. Live snapping on the first frames, when the shape has barely moved,
+      // let any neighbour within `snapTolerance` capture it. Once an axis is snapped it now holds
+      // through a *larger* movement (2× the tolerance) before breaking away — the sticky state lives in
+      // `d.snapped`, the C-complement a gesture is allowed to carry, not a closure.
+      const tol = ctx.options.snapTolerance * ((d.snapped.x || d.snapped.y) ? 2 : 1);
+      const snap = snapRects(moved, d.others, tol);
       dx += snap.dx; dy += snap.dy;
       guides = snap.guides;
       aligned = snap.snapped;                            // an alignment beats the grid: it is exact
@@ -18162,6 +18175,7 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLooku
       // sideways whenever a neighbour happens to line up.
       if (frozen === "y") { dy = 0; aligned.y = false; }
       else if (frozen === "x") { dx = 0; aligned.x = false; }
+      d.snapped = { x: aligned.x, y: aligned.y };        // remembered for next frame's hysteresis
     }
     // Per axis: an aligned axis keeps its exact value (rounded only to kill float noise, or the
     // source fills up with 10.476190476190474), an unaligned one still lands on the grid.
@@ -19552,6 +19566,52 @@ const _sl139 = function _gestureLaws(test_gesture_identity,test_gesture_path_ind
     return out;
   }
 }
+)};
+
+// B3. The measurements the K-section bugs were caught by, written by hand each time, made a harness:
+// T5 applied *per frame* of a gesture rather than per commit. It samples the drawing every
+// `requestAnimationFrame` while a scripted drag plays, and asserts what a mid-gesture frame must never
+// do — lose the selection between two frames (the M17 undo-drops-selection class), let the overlay
+// drift from the shape it frames (the group-space boxGap), or render the drawing at a scale its
+// neighbours do not (the B2 unzoomed flash, which was exactly one frame at 2.64×). Needs a browser;
+// headless it reports ⏭. `frameBudget.run()`, the frame-level sibling of `gestureLaws.run()`.
+const _sl274 = function _frameBudget(withFixture,gestureCorpus,playGesture){return(
+(() => {
+  if (typeof document === "undefined") return { run: async () => "⏭ needs a browser" };
+  const scaleOf = (el) => { const m = el && el.getScreenCTM && el.getScreenCTM(); return m ? Math.hypot(m.a, m.b) : null; };
+  // Sample per rAF for the life of `promise` (a gesture in flight). The tools commit on macrotasks, so
+  // frames land between the moves and the settle-polls — this is the only view of a partial gesture.
+  const sampleWhile = async (f, promise) => {
+    const frames = [];
+    let on = true;
+    const tick = () => { if (!on) return; frames.push({ sel: f.focusPaths().length, gap: f.boxGap(), scale: scaleOf(f.node) }); requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+    await promise;
+    on = false;
+    return frames;
+  };
+  const run = async () => withFixture(gestureCorpus.basic, {}, async (f) => {
+    await playGesture(f, playGesture.tap(60, 80));                 // select the polygon
+    if (f.focusPaths().length !== 1) throw new Error("setup: the polygon did not select");
+    const drag = playGesture.drag([[60, 80], [66, 84], [74, 90], [82, 96], [90, 100]]);
+    const frames = await sampleWhile(f, playGesture(f, drag));
+    const withBox = frames.filter((s) => s.gap !== null);
+    const bad = [];
+    if (frames.some((s) => s.sel === 0)) bad.push("the selection went empty between two frames of the drag");
+    const maxGap = Math.max(0, ...withBox.map((s) => s.gap));
+    if (maxGap > 2) bad.push(`the overlay drifted ${maxGap.toFixed(1)}px from the shape mid-gesture`);
+    let maxJump = 1;
+    for (let i = 1; i < frames.length; i++) {
+      const a = frames[i - 1].scale, b = frames[i].scale;
+      if (a && b) maxJump = Math.max(maxJump, a > b ? a / b : b / a);
+    }
+    if (maxJump > 1.5) bad.push(`the drawing scale jumped ${maxJump.toFixed(2)}× between two frames (a view applied a frame late)`);
+    if (bad.length) throw new Error(bad.join("; "));
+    return `✅ B3: ${frames.length} sampled frames through a drag — selection held (≥1), overlay within `
+         + `${maxGap.toFixed(1)}px every frame, no scale flash (max neighbour ratio ${maxJump.toFixed(2)}×)`;
+  });
+  return { run, sampleWhile };
+})()
 )};
 
 
@@ -21398,6 +21458,7 @@ export default function define(runtime, observer) {
   $def("sl146", "test_gesture_view_is_not_an_edit", ["withFixture","gestureCorpus","playGesture"], _sl146);
   $def("sl145", "test_gesture_hit_agreement", ["withFixture","gestureCorpus","playGesture","boxInRoot"], _sl145);
   $def("sl139", "gestureLaws", ["test_gesture_identity","test_gesture_path_independence","test_gesture_commits_against_its_origin","test_gesture_render_consistency","test_gesture_confinement","test_gesture_rebase_agreement","test_gesture_partiality","test_gesture_selection_is_not_an_edit","test_gesture_hit_agreement","test_gesture_view_is_not_an_edit"], _sl139);
+  $def("sl274", "frameBudget", ["withFixture","gestureCorpus","playGesture"], _sl274);
   $def("sl127h", "toolHover", ["gestureDelta","previewDelta"], _sl127h);
   $def("sl123", "viewof svgTools", ["Inputs","toolAffordance","toolDraw","toolPen","toolScribble","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl123);
   $def("sl273", "toolAffordance", ["grabPointer","previewDelta","gestureDelta","revertDelta"], _sl273);
