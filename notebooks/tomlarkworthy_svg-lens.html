@@ -15661,7 +15661,7 @@ const _sl119u = function _test_topmost_selection(topmostPaths)
 
 // The pen writes an ordinary `d` attribute, so a half-drawn path is always a real path. Closing is
 // idempotent — a double click on the first anchor must not append two Zs.
-const _sl126t = function _test_pen_path(penPath,parsePath,printPath)
+const _sl126t = function _test_pen_path(penPath,parsePath,printPath,pathSegments,pointOnSegment)
 {
   const d0 = penPath.start(3, 4);
   if (printPath(parsePath(d0)) !== "M 3 4") throw new Error(`start is not a moveto: ${d0}`);
@@ -15674,7 +15674,36 @@ const _sl126t = function _test_pen_path(penPath,parsePath,printPath)
   if (parsePath(closed).slice(-1)[0].c !== "Z") throw new Error("close did not append Z");
   if (penPath.close(closed) !== closed) throw new Error("close is not idempotent");
   if (penPath.close("M 1 2 L 3 4 z") !== "M 1 2 L 3 4 z") throw new Error("an already-closed path was reclosed");
-  return "✅ pen builds a parseable path anchor by anchor; close is idempotent";
+
+  // G19: the same builder makes curves. A handle is a point; `mirror` is what makes the pair
+  // symmetric, and it must be an involution or dragging one handle would drift the other.
+  const P = [10, 10], Q = [16, 4];
+  const m = penPath.mirror(P, Q);
+  if (penPath.mirror(P, m).join() !== Q.join()) throw new Error("mirror is not an involution");
+  if (penPath.mirror(P, P).join() !== P.join()) throw new Error("an undragged handle did not stay put");
+
+  const curved = penPath.curveTo(penPath.start(0, 0), [10, 0], [20, 30], 30, 30);
+  const cc = parsePath(curved);
+  if (cc.length !== 2 || cc[1].c !== "C") throw new Error(`curveTo did not emit a cubic: ${curved}`);
+  if (printPath(cc) !== "M 0 0 C 10 0 20 30 30 30") throw new Error(`curveTo does not round-trip: ${printPath(cc)}`);
+
+  // A cubic whose handles sit on their own anchors *is* the straight line between them — which is why
+  // one function covers a click after a drag without a case of its own. Sampled, not asserted.
+  const straight = penPath.curveTo(penPath.start(0, 0), [0, 0], [12, 8], 12, 8);
+  const segs = pathSegments(parsePath(straight));
+  for (const t of [0.25, 0.5, 0.75]) {
+    const [x, y] = pointOnSegment(segs[0], t);
+    // handles at [0,0] and the far anchor: the curve leaves straight and arrives straight, so it
+    // stays inside the chord's box and hits the far end exactly.
+    if (x < -1e-9 || x > 12 + 1e-9 || y < -1e-9 || y > 8 + 1e-9)
+      throw new Error(`a degenerate cubic left its chord's box at t=${t}: ${x},${y}`);
+  }
+  const [ex, ey] = pointOnSegment(segs[0], 1);
+  if (Math.abs(ex - 12) > 1e-9 || Math.abs(ey - 8) > 1e-9)
+    throw new Error(`a cubic does not end on its anchor: ${ex},${ey}`);
+  if (parsePath(penPath.close(curved)).slice(-1)[0].c !== "Z") throw new Error("a curve cannot be closed");
+  return "✅ pen builds a parseable path anchor by anchor, straight or curved; mirror is an "
+       + "involution, a handle-less cubic is its own chord, and close is idempotent";
 };
 
 // Subdivision must be invisible: the curve through the new anchor is the curve that was there. This
@@ -17597,6 +17626,14 @@ const _sl125d = function _penPath(){return(
 {
   start: (x, y) => `M ${x} ${y}`,
   lineTo: (d, x, y) => `${d} L ${x} ${y}`,
+  // A cubic written in terms of the two anchors' *handles*: `out` belongs to the anchor the segment
+  // leaves, `in` to the one it arrives at. A handle sitting on its own anchor is no curvature at that
+  // end, which is exactly what an undragged click gives — so one function covers straight-into-curve
+  // and curve-into-straight without a case for each.
+  curveTo: (d, out, inn, x, y) => `${d} C ${out[0]} ${out[1]} ${inn[0]} ${inn[1]} ${x} ${y}`,
+  // Dragging an anchor's outgoing handle to `q` puts its incoming handle opposite: that symmetry is
+  // what makes the pen draw smooth curves rather than a chain of independent arcs.
+  mirror: (p, q) => [2 * p[0] - q[0], 2 * p[1] - q[1]],
   close: (d) => (/[Zz]\s*$/.test(d) ? d : `${d} Z`)
 }
 )};
@@ -17663,7 +17700,7 @@ const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grab
 // Click to place anchors; click the first anchor to close, or double-click to finish open. The path
 // exists in the source from the first click, so there is no builder state that can diverge from it —
 // the only state the tool keeps is which path it is extending.
-const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta,commitDelta){return(
+const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta,previewDelta,commitDelta){return(
 {
   id: "pen",
   onPointerDown(ctx, e) {
@@ -17672,29 +17709,60 @@ const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta
     if (!p) return false;
     e.preventDefault();
     grabPointer(ctx.node, e);
-    ctx.state.penClick = p;
+    // The anchor is where you pressed; where you *drag to* is its outgoing handle (G19). Nothing is
+    // decided until release, so a click and a drag are the same gesture with a different ending.
+    ctx.state.penClick = { p, q: null };
     return true;
+  },
+  // Dragging out a handle. Both arms are drawn, because the one you are not holding — the mirrored
+  // incoming handle — is the one that decides how the curve *arrives*, and it is the surprising half.
+  onPointerMove(ctx, e) {
+    const c = ctx.state.penClick;
+    if (!c) return;
+    const q = ctx.localPoint(ctx.node, e);
+    if (!q) return;
+    c.q = q;
+    const m = penPath.mirror(c.p, q);
+    previewDelta(ctx, gestureDelta.view([
+      { tag: "line", attrs: { class: "link", x1: m[0], y1: m[1], x2: q[0], y2: q[1] } },
+      { tag: "circle", attrs: { class: "ctrl", cx: q[0], cy: q[1], r: 3 } },
+      { tag: "circle", attrs: { class: "ctrl", cx: m[0], cy: m[1], r: 3 } }
+    ], { key: "pen-handle" }));
   },
   onHover(ctx, e) {                                     // rubber band from the last anchor
     const pen = ctx.state.pen;
     if (!pen) return;
     const p = ctx.localPoint(ctx.node, e);
     if (!p) return;
-    if (!pen.band || !pen.band.isConnected) pen.band = ctx.overlay.addRoot("line", { class: "link" });
-    for (const [k, v] of [["x1", pen.last[0]], ["y1", pen.last[1]], ["x2", p[0]], ["y2", p[1]]])
+    // With a handle out, the band shows the curve you would get rather than the chord you would not:
+    // the far end has no handle yet, so it is straight there, which is also what clicking would give.
+    const tag = pen.out ? "path" : "line";
+    if (!pen.band || !pen.band.isConnected || pen.band.localName !== tag) {
+      if (pen.band) pen.band.remove();
+      pen.band = ctx.overlay.addRoot(tag, { class: "link", fill: "none" });
+    }
+    if (tag === "path")
+      pen.band.setAttribute("d", penPath.curveTo(penPath.start(pen.last[0], pen.last[1]),
+                                                 pen.out, p, p[0], p[1]));
+    else for (const [k, v] of [["x1", pen.last[0]], ["y1", pen.last[1]], ["x2", p[0]], ["y2", p[1]]])
       pen.band.setAttribute(k, v);
   },
   async onPointerUp(ctx) {
-    const p = ctx.state.penClick;
+    const c = ctx.state.penClick;
     ctx.state.penClick = null;
-    if (!p) return;
+    if (!c) return;
+    previewDelta(ctx, gestureDelta.view([], { key: "pen-handle" }));
+    const p = c.p;
+    // A drag shorter than the threshold is a click: it means "no curvature here", not "a tiny one".
+    const min = ctx.options.penHandleMin === undefined ? 2 : ctx.options.penHandleMin;
+    const out = c.q && Math.hypot(c.q[0] - p[0], c.q[1] - p[1]) >= min ? c.q : null;
     const pen = ctx.state.pen;
     if (!pen) {
       const at = ctx.childCount([0]);
       const s = ctx.options.penStyle || 'fill="none" stroke="#4C7FD1" stroke-width="3" stroke-linecap="round"';
       const rec = await ctx.addShape(`<path d="${penPath.start(p[0], p[1])}" ${s}/>`);
       if (!rec) return;
-      ctx.state.pen = { path: [0, at], start: p, last: p, band: null };
+      ctx.state.pen = { path: [0, at], start: p, last: p, out, startOut: out, band: null };
       await commitDelta(ctx, gestureDelta.select([[0, at]], "path"));
       return;
     }
@@ -17704,12 +17772,24 @@ const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta
     try { idx = nodeAt(t, pen.path).index; } catch (err) { return void ctx.setTool("select"); }
     const d = ctx.attr(t, idx, "d");
     const r = ctx.options.penCloseRadius === undefined ? 8 : ctx.options.penCloseRadius;
+    // Closing on the first anchor. If either end of the last segment carries a handle the closing
+    // segment is a curve *to the start*, and only then Z — otherwise Z alone would straighten it.
     if (Math.hypot(p[0] - pen.start[0], p[1] - pen.start[1]) <= r) {
-      await commitDelta(ctx, gestureDelta.attr(idx, "d", penPath.close(d)));
+      const back = pen.out || pen.startOut
+        ? penPath.curveTo(d, pen.out || pen.last, pen.startOut ? penPath.mirror(pen.start, pen.startOut) : pen.start,
+                          pen.start[0], pen.start[1])
+        : d;
+      await commitDelta(ctx, gestureDelta.attr(idx, "d", penPath.close(back)));
       return void ctx.setTool("select");
     }
+    // A segment is a curve when either of its ends has a handle; a straight one is the special case,
+    // not the other way round.
+    const next = pen.out || out
+      ? penPath.curveTo(d, pen.out || pen.last, out ? penPath.mirror(p, out) : p, p[0], p[1])
+      : penPath.lineTo(d, p[0], p[1]);
     pen.last = p;
-    await commitDelta(ctx, gestureDelta.attr(idx, "d", penPath.lineTo(d, p[0], p[1])));
+    pen.out = out;
+    await commitDelta(ctx, gestureDelta.attr(idx, "d", next));
   },
   async onDblClick(ctx) {
     if (!ctx.state.pen) return false;
@@ -19415,7 +19495,7 @@ export default function define(runtime, observer) {
   $def("sl127t", "test_snapRects", ["forAll","arb","mulberry32","NUM_RUNS","snapRects"], _sl127t);
   $def("sl119u", "test_topmost_selection", ["topmostPaths"], _sl119u);
   $def("sl119t", "test_z_order", ["forAll","arb","mulberry32","NUM_RUNS","zTarget","reorderElement","childrenLens"], _sl119t);
-  $def("sl126t", "test_pen_path", ["penPath","parsePath","printPath"], _sl126t);
+  $def("sl126t", "test_pen_path", ["penPath","parsePath","printPath","pathSegments","pointOnSegment"], _sl126t);
   $def("sl108d", "test_path_subdivision_exact", ["forAll","arb","mulberry32","NUM_RUNS","parsePath","printPath","pathSegments","pointOnSegment","splitPathSegment","deletePathAnchor"], _sl108d);
   $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
   $def("sl252", "test_group_ungroup", ["forAll","arb","mulberry32","NUM_RUNS","groupPlan","groupElements","ungroupElements","ungroupBlockers","childrenLens","nodeAt","cmdGroup"], _sl252);
@@ -19570,7 +19650,7 @@ export default function define(runtime, observer) {
   $def("sl125c", "shapeMarkup", ["shapeSpec"], _sl125c);
   $def("sl125d", "penPath", [], _sl125d);
   $def("sl125", "toolDraw", ["shapeLookup","shapeSpec","shapeMarkup","dragBox","grabPointer","gestureDelta","commitDelta"], _sl125);
-  $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer","gestureDelta","commitDelta"], _sl126);
+  $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl126);
   $def("sl130", "gestureFixture", ["runtime","realize","settle","literalSpan","nodeAt","svgLens","svg"], _sl130);
   $def("sl131", "playGesture", [], _sl131);
   $def("sl132", "gestureCorpus", [], _sl132);
