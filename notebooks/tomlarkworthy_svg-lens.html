@@ -13525,18 +13525,24 @@ const _sl48i = function _scaleAbout(setGizmoOp,holdFixed){return(
 
 // Handles for the bounding box: four corners to scale by, one stalk to rotate by. Pure — the caller
 // supplies the box, which is the element's own untransformed geometry.
-const _sl48g = function _transformHandles(){return(
+// Rotation is the one thing no geometry attribute can express, so a shape entry that writes its own
+// geometry still borrows this stalk (`rotatable`) and lets `toolTransform` own the angle.
+const _sl48m = function _rotateHandle(){return(
 (b) => {
   const stalk = Math.max(b.width, b.height) * 0.18 + 8;
   const cx = b.x + b.width / 2;
-  return [
-    { key: "nw", kind: "scale", x: b.x, y: b.y },
-    { key: "ne", kind: "scale", x: b.x + b.width, y: b.y },
-    { key: "se", kind: "scale", x: b.x + b.width, y: b.y + b.height },
-    { key: "sw", kind: "scale", x: b.x, y: b.y + b.height },
-    { key: "rot", kind: "rotate", x: cx, y: b.y - stalk, link: [cx, b.y] }
-  ];
+  return { key: "rot", kind: "rotate", x: cx, y: b.y - stalk, link: [cx, b.y] };
 }
+)};
+
+const _sl48g = function _transformHandles(rotateHandle){return(
+(b) => [
+  { key: "nw", kind: "scale", x: b.x, y: b.y },
+  { key: "ne", kind: "scale", x: b.x + b.width, y: b.y },
+  { key: "se", kind: "scale", x: b.x + b.width, y: b.y + b.height },
+  { key: "sw", kind: "scale", x: b.x, y: b.y + b.height },
+  rotateHandle(b)
+]
 )};
 
 const _sl49 = function _det(){return(
@@ -15006,6 +15012,118 @@ const _sl108g = function _test_commands_commute(forAll,arb,mulberry32,NUM_RUNS,t
   return `✅ attribute puts at disjoint addresses commute (${NUM_RUNS} runs)`;
 };
 
+// The shape registry, checked three ways (design note S3). The one the stage names is **resize
+// agreement**: a rect corner dragged through the registry (writing `width`) and the same corner
+// dragged through the gizmo (writing `transform`) have to leave the shape rendering in the same
+// place, or "direct geometry" would quietly mean "a different editor for rects".
+// The other two are the registry's own contract: a handle put where it already is writes nothing
+// (T1 at the level of one entry), and moving a handle puts it where you asked (PutGet for handles).
+const _sl113t = function _test_shape_registry(forAll,arb,mulberry32,NUM_RUNS,scaleAbout,printOp,parseTransform,applyPoint,svgShapes,shapeLookup,attrTextLens)
+{
+  const doc = (el) => `<svg xmlns="http://www.w3.org/2000/svg">${el}</svg>`;
+  const apply = (src, idx, edits) =>
+    edits.reduce((acc, e) => attrTextLens(idx, e.name, null).put(e.value, acc), src);
+  const drag = (src, idx, mode, key, lx, ly) => {
+    const entry = shapeLookup.forMode(svgShapes, mode);
+    const h = entry.handles(src, idx).find((x) => x.key === key);
+    if (!h) throw new Error(`no handle ${key} in ${mode}`);
+    return [].concat(entry.edit(src, idx, h, lx, ly));
+  };
+  const at = (src, idx, mode, key) =>
+    shapeLookup.forMode(svgShapes, mode).handles(src, idx).find((x) => x.key === key);
+
+  // ---- 1. resize agreement ------------------------------------------------------------------
+  const CORNER = { se: [0, 0], sw: [1, 0], ne: [0, 1], nw: [1, 1] };   // which corner is the pivot
+  const rng = mulberry32(0x5EED0031);
+  forAll(NUM_RUNS, rng,
+    (r) => [arb.int(r, -80, 80), arb.int(r, -80, 80), arb.int(r, 10, 90), arb.int(r, 10, 90),
+            arb.pick(r, Object.keys(CORNER)), arb.int(r, 5, 120), arb.int(r, 5, 120)],
+    (X, Y, W, H, key, dw, dh) => {
+      const src = doc(`<rect x="${X}" y="${Y}" width="${W}" height="${H}"/>`);
+      const [px, py] = CORNER[key];
+      const pivot = [X + px * W, Y + py * H];
+      // where the dragged corner is put, always on the far side of the pivot so neither route flips
+      const lx = pivot[0] + (px ? -dw : dw), ly = pivot[1] + (py ? -dh : dh);
+
+      const next = apply(src, 1, drag(src, 1, "rect", key, lx, ly));
+      const g = shapeLookup.forMode(svgShapes, "rect").handles(next, 1);
+      const nw = g.find((h) => h.key === "nw"), se = g.find((h) => h.key === "se");
+      const direct = [nw.x, nw.y, se.x, se.y];
+
+      // the same drag as `toolTransform` computes it, applied to the *original* box
+      const sx = Math.abs((lx - pivot[0]) / (/w$/.test(key) ? -W : W));
+      const sy = Math.abs((ly - pivot[1]) / (/^n/.test(key) ? -H : H));
+      const m = parseTransform(scaleAbout([], sx, sy, pivot[0], pivot[1]).map(printOp).join(" "));
+      const cs = [[X, Y], [X + W, Y], [X + W, Y + H], [X, Y + H]].map(([x, y]) => applyPoint(m, x, y));
+      const via = [Math.min(...cs.map((c) => c[0])), Math.min(...cs.map((c) => c[1])),
+                   Math.max(...cs.map((c) => c[0])), Math.max(...cs.map((c) => c[1]))];
+      if (direct.some((v, i) => Math.abs(v - via[i]) > 1e-6))
+        throw new Error(`resizing ${key} disagrees: registry ${direct} vs transform ${via}`);
+      return true;
+    }, "a registry resize and a transform resize leave the same box");
+
+  // ---- 2. a handle put back where it is writes nothing (T1, per entry) ------------------------
+  const SHAPES = [
+    ["points", `<polygon points="0,0 40,0 40,30"/>`],
+    ["path", `<path d="M 0 0 L 40 0 C 50 10 50 20 40 30 Z"/>`],
+    ["rect", `<rect x="10" y="20" width="30" height="40" rx="4"/>`],
+    ["circle", `<circle cx="50" cy="60" r="25"/>`],
+    ["ellipse", `<ellipse cx="50" cy="60" rx="25" ry="15"/>`],
+    ["line", `<line x1="4" y1="8" x2="44" y2="38"/>`]
+  ];
+  for (const [mode, el] of SHAPES) {
+    const src = doc(el);
+    const entry = shapeLookup.forMode(svgShapes, mode);
+    if (!entry.reads(src, 1)) throw new Error(`${mode} cannot read its own example`);
+    for (const h of entry.handles(src, 1)) {
+      const edits = [].concat(entry.edit(src, 1, h, h.x, h.y));
+      const moved = apply(src, 1, edits);
+      if (moved !== src)
+        throw new Error(`${mode}: putting handle ${h.key} back where it was rewrote the source:\n${moved}`);
+    }
+  }
+
+  // ---- 3. moving a handle puts it where you asked (PutGet for handles) ------------------------
+  const MOVES = [
+    ["points", `<polygon points="0,0 40,0 40,30"/>`, "p1", 55, -12],
+    ["path", `<path d="M 0 0 L 40 0 C 50 10 50 20 40 30 Z"/>`, "1:0:0:1", 61, 7],
+    ["rect", `<rect x="10" y="20" width="30" height="40"/>`, "se", 70, 90],
+    ["rect", `<rect x="10" y="20" width="30" height="40"/>`, "nw", 2, 5],
+    ["rect", `<rect x="10" y="20" width="30" height="40"/>`, "e", 70, 40],
+    ["rect", `<rect x="10" y="20" width="30" height="40"/>`, "rx", 24, 20],
+    ["circle", `<circle cx="50" cy="60" r="25"/>`, "e", 90, 60],
+    ["ellipse", `<ellipse cx="50" cy="60" rx="25" ry="15"/>`, "n", 50, 30],
+    ["ellipse", `<ellipse cx="50" cy="60" rx="25" ry="15"/>`, "se", 80, 100],
+    ["line", `<line x1="4" y1="8" x2="44" y2="38"/>`, "2", -6, 90]
+  ];
+  for (const [mode, el, key, lx, ly] of MOVES) {
+    const src = doc(el);
+    const next = apply(src, 1, drag(src, 1, mode, key, lx, ly));
+    const h = at(next, 1, mode, key);
+    if (!h || Math.abs(h.x - lx) > 1e-6 || Math.abs(h.y - ly) > 1e-6)
+      throw new Error(`${mode}: dragging ${key} to (${lx},${ly}) left it at (${h && h.x},${h && h.y})`);
+  }
+
+  // ---- 4. partiality: what the registry cannot read, it declines (T8) -------------------------
+  const OUTSIDE = [
+    ["rect", `<rect x="10" y="20" width="\${w}" height="40"/>`],
+    ["rect", `<rect x="10" y="20" height="40"/>`],
+    ["circle", `<circle cx="50" cy="60" r="10px"/>`],
+    ["polygon", `<polygon points="0,0 40,"/>`]
+  ];
+  for (const [tag, el] of OUTSIDE) {
+    const src = doc(el);
+    if (shapeLookup.forTag(svgShapes, tag, src, 1) !== null)
+      throw new Error(`the registry claimed an element it cannot read: ${el}`);
+  }
+  const inside = doc(`<rect x="1" y="2" width="3" height="4"/>`);
+  if ((shapeLookup.forTag(svgShapes, "rect", inside, 1) || {}).mode !== "rect")
+    throw new Error("the registry declined a rect it can read");
+
+  return `✅ resize agreement (${NUM_RUNS} runs), ${SHAPES.length} entries write nothing when unmoved, `
+       + `${MOVES.length} drags land on target, ${OUTSIDE.length} unreadable elements declined`;
+};
+
 const _sl125t = function _test_shape_creation(forAll,arb,mulberry32,NUM_RUNS,dragBox,shapeSpec,shapeMarkup,insertElement,childrenLens,attrVal,nodeAt)
 {
   const rng = mulberry32(0x5EED001A);
@@ -15625,22 +15743,235 @@ const _sl112 = function _pathHandles(parsePath,attrVal,PATH_ARG_COUNT){return(
 )};
 
 // Pure: move one handle, return the attribute the lens should be asked to hold.
-const _sl113 = function _handleEdit(pointsHandles,parsePoints,attrVal,printPoints,pathHandles,parsePath,printPath){return(
-(mode, src, idx, key, lx, ly) => {
-  if (mode === "points") {
-    const h = pointsHandles(src, idx).find((h) => h.key === key);
-    if (!h) return null;
+// ---- the shape registry (design note S2) ---------------------------------------------------------
+// Which tags have editable geometry, as data. Each entry answers three questions about one family of
+// elements: can the lens read this one (`reads` — the partiality of T8, decided per tag rather than
+// by a chain of `if (tag === …)`), where are its handles, and what does dragging one write. `mode`
+// is the name the focus already uses for "which geometry am I editing", so the registry is keyed by
+// it and nothing else needed a new vocabulary.
+//
+// The transform gizmo is deliberately NOT an entry: it is the fallback for everything the registry
+// cannot read, which is what keeps a document with an unparseable shape editable at all.
+//
+// A plain array, not an `Inputs.input` like `svgTools`. The difference is not taste: this registry is
+// read by *pure* code — `handleEdit`, and the focus deciding where to draw handles — which the lens
+// laws exercise headlessly, and an `Inputs.input` needs a DOM. Tools can afford to be a live input
+// because a tool is a browser thing anyway. Extending is the callsite parameter instead, which is
+// P2's pattern: `svgLens(node, {shapes})` takes an array or `defaults => array`.
+const _sl113a = function _numAttr(attrVal){return(
+(src, idx, name, dflt = null) => {
+  const v = attrVal(src, idx, name);
+  if (v === null || v === "") {
+    if (dflt === null) throw new Error(`${name} is absent`);
+    return dflt;
+  }
+  const n = Number(v);
+  // An interpolated `${w}` gives NaN, and so does `10px`. Refusing here is what puts the element
+  // outside this entry's domain, so it keeps the transform gizmo instead of getting broken handles.
+  if (!Number.isFinite(n)) throw new Error(`${name}="${v}" is not a number`);
+  return n;
+}
+)};
+
+// Trim float dust without pretending to more precision than the author had. `localPoint` already
+// snaps to the grid, so this only cleans up what the arithmetic below adds.
+const _sl113b = function _numText(){return(
+(v) => String(Math.round(v * 1e6) / 1e6)
+)};
+
+// The numbers each tag's geometry is made of, read strictly and defaulted the way SVG defaults them.
+// One place where "what does this element's geometry consist of" is written down; a tag that cannot
+// answer throws, and its entry's `reads` turns that into "not my domain".
+const _sl113c = function _geomOf(numAttr){return(
+{
+  rect: (src, idx) => ({ x: numAttr(src, idx, "x", 0), y: numAttr(src, idx, "y", 0),
+                         width: numAttr(src, idx, "width"), height: numAttr(src, idx, "height"),
+                         rx: numAttr(src, idx, "rx", 0) }),
+  circle: (src, idx) => ({ cx: numAttr(src, idx, "cx", 0), cy: numAttr(src, idx, "cy", 0),
+                           r: numAttr(src, idx, "r") }),
+  ellipse: (src, idx) => ({ cx: numAttr(src, idx, "cx", 0), cy: numAttr(src, idx, "cy", 0),
+                            rx: numAttr(src, idx, "rx"), ry: numAttr(src, idx, "ry") }),
+  line: (src, idx) => ({ x1: numAttr(src, idx, "x1", 0), y1: numAttr(src, idx, "y1", 0),
+                         x2: numAttr(src, idx, "x2", 0), y2: numAttr(src, idx, "y2", 0) })
+}
+)};
+
+// ---- one cell per tag ----------------------------------------------------------------------------
+const _sl113p = function _shapePoints(pointsHandles,parsePoints,attrVal,printPoints){return(
+{
+  mode: "points", tags: ["polygon", "polyline"], writes: ["points"],
+  reads: (src, idx) => { parsePoints(attrVal(src, idx, "points")); return true; },
+  handles: pointsHandles,
+  edit: (src, idx, h, lx, ly) => {
     const pts = parsePoints(attrVal(src, idx, "points"));
     pts[h.i] = [lx, ly];
-    return { name: "points", value: printPoints(pts) };
+    return [{ name: "points", value: printPoints(pts) }];
   }
-  const h = pathHandles(src, idx).find((h) => h.key === key);
-  if (!h) return null;
-  const cmds = parsePath(attrVal(src, idx, "d"));
-  const A = cmds[h.ci].a;
-  if (h.ix >= 0) A[h.o + h.ix] = h.rel ? lx - h.base[0] : lx;
-  if (h.iy >= 0) A[h.o + h.iy] = h.rel ? ly - h.base[1] : ly;
-  return { name: "d", value: printPath(cmds) };
+}
+)};
+
+const _sl113d = function _shapePath(pathHandles,parsePath,attrVal,printPath){return(
+{
+  mode: "path", tags: ["path"], writes: ["d"],
+  reads: (src, idx) => { parsePath(attrVal(src, idx, "d")); return true; },
+  handles: pathHandles,
+  edit: (src, idx, h, lx, ly) => {
+    const cmds = parsePath(attrVal(src, idx, "d"));
+    const A = cmds[h.ci].a;
+    if (h.ix >= 0) A[h.o + h.ix] = h.rel ? lx - h.base[0] : lx;
+    if (h.iy >= 0) A[h.o + h.iy] = h.rel ? ly - h.base[1] : ly;
+    return [{ name: "d", value: printPath(cmds) }];
+  }
+}
+)};
+
+// How far along the top edge the corner-radius handle sits when the radius is zero. A function of
+// the rect's own geometry, so it is stable for the whole drag and both halves of the entry agree.
+const _sl113i = function _rxInset(){return(
+(r) => Math.min(10, r.width / 4)
+)};
+
+// A rectangle, at last: eight box handles writing `x`/`y`/`width`/`height` directly, and a ninth for
+// the corner radius (G5). `rotatable` keeps the gizmo's rotate stalk, because a rect has no
+// attribute for its angle — rotation is a `transform` no matter what, and only rotation is.
+// A handle's key names the edges it moves, so `nw` is `n` and `w`: the opposite edges stay where the
+// *source* put them, which is why the drag never accumulates and dragging past an edge just flips it.
+const _sl113e = function _shapeRect(geomOf,numText,rxInset){return(
+{
+  mode: "rect", tags: ["rect"], writes: ["x", "y", "width", "height", "rx"], rotatable: true,
+  reads: (src, idx) => { geomOf.rect(src, idx); return true; },
+  handles: (src, idx) => {
+    const r = geomOf.rect(src, idx);
+    const mx = r.x + r.width / 2, my = r.y + r.height / 2;
+    return [
+      { key: "nw", kind: "scale", x: r.x, y: r.y },
+      { key: "n",  kind: "scale", x: mx, y: r.y },
+      { key: "ne", kind: "scale", x: r.x + r.width, y: r.y },
+      { key: "e",  kind: "scale", x: r.x + r.width, y: my },
+      { key: "se", kind: "scale", x: r.x + r.width, y: r.y + r.height },
+      { key: "s",  kind: "scale", x: mx, y: r.y + r.height },
+      { key: "sw", kind: "scale", x: r.x, y: r.y + r.height },
+      { key: "w",  kind: "scale", x: r.x, y: my },
+      // Offset along the top edge by a fixed inset, or at rx = 0 it lands exactly on the `nw`
+      // corner, is drawn last, and steals the corner's clicks. `edit` subtracts the same inset, so
+      // the offset is a bijection and putting the handle back still writes nothing.
+      { key: "rx", kind: "ctrl", x: r.x + rxInset(r) + Math.min(r.rx, r.width / 2), y: r.y }
+    ];
+  },
+  edit: (src, idx, h, lx, ly) => {
+    const r = geomOf.rect(src, idx);
+    if (h.key === "rx") {
+      const rx = Math.max(0, Math.min(lx - r.x - rxInset(r), r.width / 2));
+      return [{ name: "rx", value: numText(rx), dflt: "0" }];
+    }
+    let x0 = r.x, y0 = r.y, x1 = r.x + r.width, y1 = r.y + r.height;
+    if (h.key.includes("n")) y0 = ly;
+    if (h.key.includes("s")) y1 = ly;
+    if (h.key.includes("w")) x0 = lx;
+    if (h.key.includes("e")) x1 = lx;
+    const next = { x: Math.min(x0, x1), y: Math.min(y0, y1),
+                   width: Math.abs(x1 - x0), height: Math.abs(y1 - y0) };
+    const cur = { x: r.x, y: r.y, width: r.width, height: r.height };
+    // Only what moved. An unchanged attribute would still be a put, and T1 says a null gesture is a
+    // null edit — dragging the east edge must not rewrite `y`.
+    return Object.keys(next).filter((k) => next[k] !== cur[k])
+      .map((k) => ({ name: k, value: numText(next[k]), dflt: k === "x" || k === "y" ? "0" : null }));
+  }
+}
+)};
+
+const _sl113f = function _shapeCircle(geomOf,numText){return(
+{
+  mode: "circle", tags: ["circle"], writes: ["r"],
+  reads: (src, idx) => { geomOf.circle(src, idx); return true; },
+  handles: (src, idx) => {
+    const c = geomOf.circle(src, idx);
+    return [
+      { key: "n", kind: "scale", x: c.cx, y: c.cy - c.r },
+      { key: "e", kind: "scale", x: c.cx + c.r, y: c.cy },
+      { key: "s", kind: "scale", x: c.cx, y: c.cy + c.r },
+      { key: "w", kind: "scale", x: c.cx - c.r, y: c.cy }
+    ];
+  },
+  edit: (src, idx, h, lx, ly) => {
+    const c = geomOf.circle(src, idx);
+    const r = h.key === "n" || h.key === "s" ? Math.abs(ly - c.cy) : Math.abs(lx - c.cx);
+    return [{ name: "r", value: numText(r) }];
+  }
+}
+)};
+
+const _sl113g = function _shapeEllipse(geomOf,numText){return(
+{
+  mode: "ellipse", tags: ["ellipse"], writes: ["rx", "ry"], rotatable: true,
+  reads: (src, idx) => { geomOf.ellipse(src, idx); return true; },
+  handles: (src, idx) => {
+    const c = geomOf.ellipse(src, idx);
+    const H = (key, x, y, kind) => ({ key, kind, x, y });
+    return [
+      H("n", c.cx, c.cy - c.ry, "scale"), H("e", c.cx + c.rx, c.cy, "scale"),
+      H("s", c.cx, c.cy + c.ry, "scale"), H("w", c.cx - c.rx, c.cy, "scale"),
+      H("nw", c.cx - c.rx, c.cy - c.ry, "ctrl"), H("ne", c.cx + c.rx, c.cy - c.ry, "ctrl"),
+      H("se", c.cx + c.rx, c.cy + c.ry, "ctrl"), H("sw", c.cx - c.rx, c.cy + c.ry, "ctrl")
+    ];
+  },
+  edit: (src, idx, h, lx, ly) => {
+    const c = geomOf.ellipse(src, idx);
+    const out = [];
+    if (/[ew]/.test(h.key) && Math.abs(lx - c.cx) !== c.rx)
+      out.push({ name: "rx", value: numText(Math.abs(lx - c.cx)) });
+    if (/[ns]/.test(h.key) && Math.abs(ly - c.cy) !== c.ry)
+      out.push({ name: "ry", value: numText(Math.abs(ly - c.cy)) });
+    return out;
+  }
+}
+)};
+
+// A `<line>` had no editable geometry at all before this: four scale handles that wrote `transform`,
+// and not one that touched an endpoint.
+const _sl113h = function _shapeLine(geomOf,numText){return(
+{
+  mode: "line", tags: ["line"], writes: ["x1", "y1", "x2", "y2"],
+  reads: (src, idx) => { geomOf.line(src, idx); return true; },
+  handles: (src, idx) => {
+    const l = geomOf.line(src, idx);
+    return [{ key: "1", kind: "anchor", x: l.x1, y: l.y1 },
+            { key: "2", kind: "anchor", x: l.x2, y: l.y2 }];
+  },
+  edit: (src, idx, h, lx, ly) => [
+    { name: "x" + h.key, value: numText(lx), dflt: "0" },
+    { name: "y" + h.key, value: numText(ly), dflt: "0" }
+  ]
+}
+)};
+
+const _sl113r = function _svgShapes(shapePoints,shapePath,shapeRect,shapeCircle,shapeEllipse,shapeLine){return(
+([shapePoints, shapePath, shapeRect, shapeCircle, shapeEllipse, shapeLine])
+)};
+// Look an entry up, and answer partiality in one place: `forTag` is what a click asks ("what can I
+// offer on this element?"), `forMode` is what a drag asks ("what am I editing?").
+const _sl113s2 = function _shapeLookup(){return(
+{
+  forMode: (shapes, mode) => shapes.find((e) => e.mode === mode) || null,
+  // The first entry whose tag matches *and* which can actually read this element. A polygon with an
+  // unparseable points list falls through to null, and the caller offers the gizmo — T8, as data.
+  forTag: (shapes, tag, src, idx) => {
+    for (const e of shapes) {
+      if (!e.tags.includes(tag)) continue;
+      try { if (e.reads(src, idx)) return e; } catch (err) { /* outside the lens domain */ }
+    }
+    return null;
+  }
+}
+)};
+
+// Kept as the one-call form the vertex tool uses: find the handle, then ask its entry what to write.
+const _sl113 = function _handleEdit(svgShapes,shapeLookup){return(
+(mode, src, idx, key, lx, ly, shapes = svgShapes) => {
+  const e = shapeLookup.forMode(shapes, mode);
+  if (!e) return null;
+  const h = e.handles(src, idx).find((h) => h.key === key);
+  return h ? [].concat(e.edit(src, idx, h, lx, ly)) : [];
 }
 )};
 
@@ -15907,7 +16238,19 @@ const _sl118 = function _svgOverlay(){return(
     root: node,
     // Handles are drawn in the focused element's own user space, so no screen-space maths is needed
     // to place them — the browser applies the same CTM it applies to the shape.
-    alignTo: (target) => el.setAttribute("transform", target ? (target.getAttribute("transform") || "") : "")
+    //
+    // The element's *cumulative* transform, not the `transform` attribute it happens to carry: a
+    // shape inside `<g transform="translate(150,10)">` has no attribute of its own, and reading one
+    // drew its handles at the root's origin instead of on the shape. Two screen matrices divide out
+    // to exactly "target's user space, expressed in the root's", which is this layer's job.
+    alignTo: (target) => {
+      if (!target) return el.setAttribute("transform", "");
+      const t = target.getScreenCTM && target.getScreenCTM();
+      const r = node.getScreenCTM && node.getScreenCTM();
+      if (!t || !r) return el.setAttribute("transform", target.getAttribute("transform") || "");
+      const m = r.inverse().multiply(t);
+      el.setAttribute("transform", `matrix(${m.a} ${m.b} ${m.c} ${m.d} ${m.e} ${m.f})`);
+    }
   };
 }
 )};
@@ -15996,8 +16339,8 @@ const _sl119b = function _zTarget(){return(
 // Selection is held as a *path*, not an index: an index into document order is invalidated by any
 // insert or delete before it, a path only by an edit to its own parent chain. `index` stays available
 // because the handle lenses address elements the way tokenize() does.
-const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nodeAt,boxInRoot,topmostPaths,attrVal,holeSpans){return(
-(overlay, target, onChange = () => {}) => {
+const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateHandle,nodeAt,boxInRoot,topmostPaths,attrVal,holeSpans){return(
+(overlay, target, onChange = () => {}, shapes = svgShapes) => {
   // A set, ordered by when each element was added. The first is the primary: handles, and everything
   // that only makes sense for one element, follow it. Single selection is the one-element case, so
   // the tools that predate multi-select need no changes.
@@ -16023,8 +16366,15 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
     }
     const t = target.doc();
     if (t === null) return [];
-    try { return mode === "points" ? pointsHandles(t, idx) : pathHandles(t, idx); }
-    catch (e) { return []; }                            // outside the lens domain: no handles
+    const e = shapeLookup.forMode(shapes, mode);
+    if (!e) return [];
+    let hs;
+    try { hs = e.handles(t, idx); }
+    catch (err) { return []; }                          // outside the lens domain: no handles
+    if (!e.rotatable) return hs;
+    const el = element();                               // borrow the stalk, nothing else
+    if (!el || !el.getBBox) return hs;
+    try { return hs.concat(rotateHandle(el.getBBox())); } catch (err) { return hs; }
   };
   const scaleOf = (el) => { const m = el.getScreenCTM(); return m ? Math.hypot(m.a, m.b) : 1; };
   const paint = () => {
@@ -16045,7 +16395,9 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
     overlay.alignTo(el);
     const r = 5 / Math.max(0.2, scaleOf(el));
     const hs = handles();
-    if (mode === "transform" && el.getBBox) {
+    const framed = mode === "transform"
+                || !!(shapeLookup.forMode(shapes, mode) || {}).rotatable;
+    if (framed && el.getBBox) {
       const b = el.getBBox();
       overlay.add("rect", { class: "box", x: b.x, y: b.y, width: b.width, height: b.height });
     }
@@ -16054,11 +16406,11 @@ const _sl119 = function _svgFocus(pointsHandles,pathHandles,transformHandles,nod
     const locked = (() => {
       const t = target.doc();
       if (t === null) return false;
-      const name = mode === "points" ? "points" : mode === "path" ? "d" : "transform";
+      const e = shapeLookup.forMode(shapes, mode);
+      const names = e ? e.writes : ["transform"];
       try {
-        const v = attrVal(t, idx, name);
-        return !!(v && holeSpans(v).length);
-      } catch (e) { return false; }
+        return names.some((n) => { const v = attrVal(t, idx, n); return !!(v && holeSpans(v).length); });
+      } catch (err) { return false; }
     })();
     for (const h of hs) if (h.link) overlay.add("line", { class: "link", x1: h.x, y1: h.y, x2: h.link[0], y2: h.link[1] });
     for (const h of hs) {
@@ -16227,7 +16579,9 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
   id: "transform",
   onPointerDown(ctx, e) {
     const key = e.target.dataset && e.target.dataset.key;
-    if (key === undefined || ctx.focus.mode !== "transform") return false;
+    // Scale handles only in the gizmo's own mode; the rotate stalk in any mode, because a shape
+    // entry that writes its own geometry still has no attribute for an angle (`rotatable`).
+    if (key === undefined || (ctx.focus.mode !== "transform" && key !== "rot")) return false;
     const idx = ctx.focus.index;
     const el = ctx.elems()[idx];
     const t = ctx.doc();
@@ -16295,21 +16649,23 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
 )};
 
 // Drag a vertex or control point: the `points` and path `d` lenses.
-const _sl120 = function _toolVertex(handleEdit,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta){return(
+const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta){return(
 {
   id: "vertex",
   onPointerDown(ctx, e) {
     const key = e.target.dataset && e.target.dataset.key;
     const mode = ctx.focus.mode;
     if (key === undefined || ctx.focus.index === null) return false;
-    if (mode !== "points" && mode !== "path") return false;          // the gizmo owns its own handles
+    // Any mode the registry knows; `transform` is not one of them, because the gizmo owns its own
+    // handles. Adding a shape entry is therefore all it takes to make its handles draggable.
+    const entry = shapeLookup.forMode(ctx.shapes, mode);
+    if (!entry) return false;
     e.preventDefault();
     grabPointer(ctx.node, e);
     const el0 = ctx.elems()[ctx.focus.index];
-    const name = mode === "points" ? "points" : "d";
     ctx.state.drag = { tool: "vertex", key, idx: ctx.focus.index, mode, started: false, x0: e.clientX, y0: e.clientY,
                        // what it rendered before the preview overwrites it (see writer.commit)
-                       was: el0 ? { [name]: el0.getAttribute(name) } : null };
+                       was: el0 ? Object.fromEntries(entry.writes.map((n) => [n, el0.getAttribute(n)])) : null };
     return true;
   },
   onPointerMove(ctx, e) {
@@ -16321,11 +16677,14 @@ const _sl120 = function _toolVertex(handleEdit,grabPointer,gestureDelta,previewD
     const p = el && ctx.localPoint(el, e);
     const t = ctx.doc();
     if (!p || t === null) return;
-    const edit = handleEdit(d.mode, t, d.idx, d.key, p[0], p[1]);
-    if (!edit) return;
+    const edits = handleEdit(d.mode, t, d.idx, d.key, p[0], p[1], ctx.shapes);
+    if (!edits.length) return;
     // `handleEdit` already reprints the whole attribute, so there is no lens here: the delta's value
-    // *is* the text. Live only; the source waits for release.
-    d.delta = gestureDelta.attr(d.idx, edit.name, edit.value, { was: d.was && d.was[edit.name] });
+    // *is* the text. One delta per attribute the handle moves — a rect corner moves four — and an
+    // attribute the drag did not change is not in the list, so T1 still holds edge by edge.
+    d.delta = edits.map((ed) => gestureDelta.attr(d.idx, ed.name, ed.value,
+                                { dflt: ed.dflt === undefined ? null : ed.dflt,
+                                  was: d.was && d.was[ed.name] }));
     previewDelta(ctx, d.delta);
     ctx.focus.refresh();
   },
@@ -16380,7 +16739,7 @@ const _sl121a = function _hitTest(){return(
 // several selected shapes moves them all — one commit each, since each writes its own attribute.
 // A tap with no movement selects instead: shift adds to the set, and tapping the shape that is
 // already primary cycles to the next shape underneath, which is how an occluded shape is reached.
-const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoints,parsePath,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta){return(
+const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,shapeLookup,pathOfIndex,grabPointer,snapRects,gestureDelta,previewDelta,commitDelta,revertDelta){return(
 {
   id: "move",
   onPointerDown(ctx, e) {
@@ -16484,20 +16843,12 @@ const _sl121 = function _toolMove(translateLens,attrVal,invert,ctmMat,parsePoint
     const idx = list.indexOf(pick);
     if (idx <= 0) return;
     const tag = pick.localName;
-    // Which mode a tap offers is decided by whether the lens can *read* the attribute, not by the
-    // tag: an unparseable `points` list falls through to the gizmo rather than to broken handles.
-    // This is the partiality law (T8) written as one line of product code.
-    const mode = (() => {
-      const readable = (name, parse) => {
-        const v = ctx.attr(t, idx, name);
-        if (v === null) return false;
-        try { parse(v); return true; } catch (err) { return false; }   // outside the lens domain
-      };
-      if ((tag === "polygon" || tag === "polyline") && readable("points", parsePoints)) return "points";
-      if (tag === "path" && readable("d", parsePath)) return "path";
-      return "transform";
-    })();
-    await commitDelta(ctx, gestureDelta.select([pathOfIndex(t, idx)], mode));
+    // Which mode a tap offers is the registry's decision, and it turns on whether the lens can
+    // actually *read* this element rather than on its tag: a polygon with an unparseable points list
+    // falls through to the gizmo rather than to broken handles. That is the partiality law (T8) as
+    // one lookup, and adding a tag to the registry is now the whole of teaching this the new shape.
+    const entry = shapeLookup.forTag(ctx.shapes, tag, t, idx);
+    await commitDelta(ctx, gestureDelta.select([pathOfIndex(t, idx)], entry ? entry.mode : "transform"));
   },
   onCancel(ctx) {
     const d = ctx.state.drag;
@@ -16692,7 +17043,7 @@ const _sl125d = function _penPath(){return(
 
 // Drag on empty canvas to create a rect, an ellipse or a line. Preview lives in the overlay — the
 // source gets exactly one put, on release, and only if the drag was big enough to mean it.
-const _sl125 = function _toolDraw(shapeSpec,shapeMarkup,dragBox,grabPointer,gestureDelta,commitDelta){return(
+const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grabPointer,gestureDelta,commitDelta){return(
 {
   id: "draw",
   onPointerDown(ctx, e) {
@@ -16729,8 +17080,12 @@ const _sl125 = function _toolDraw(shapeSpec,shapeMarkup,dragBox,grabPointer,gest
     const at = ctx.childCount([0]);
     const rec = await ctx.addShape(
       shapeMarkup(d.kind, d.x0, d.y0, d.x1, d.y1, { square: d.square, ...ctx.options.shapeStyle }));
-    // hand the new shape straight to the gizmo
-    if (rec) await commitDelta(ctx, gestureDelta.select([[0, at]], "transform"));
+    // Hand the new shape straight to whatever can edit it — its own geometry if the registry knows
+    // the tag, the gizmo otherwise. Drawing a rect and then dragging its corner writes `width`.
+    const t = ctx.doc();
+    const entry = t === null ? null
+                : shapeLookup.forTag(ctx.shapes, shapeSpec(d.kind, 0, 0, 1, 1, {}).tag, t, at);
+    if (rec) await commitDelta(ctx, gestureDelta.select([[0, at]], entry ? entry.mode : "transform"));
     ctx.setTool("select");
   },
   // The shape does not exist in the source until release, so abandoning is dropping the ghost. The
@@ -17213,14 +17568,22 @@ const _sl140 = function _test_gesture_render_consistency(withFixture,gestureCorp
       ["drag its body",        playGesture.drag([[60, 80], [66, 84], [72, 88]])],
       ["drag one of its vertices", playGesture.drag([[26, 104], [30, 108], [34, 110]])],
       ["select the rect",      playGesture.tap(35, 18)],
-      ["drag the rect",        playGesture.drag([[35, 18], [42, 24], [48, 30]])]
+      ["drag the rect",        playGesture.drag([[35, 18], [42, 24], [48, 30]])],
+      // inside a <g transform=…>: the case where the overlay and the drawing can disagree about
+      // which space they are in. `boxGap` was written for this and never asserted, and the answer
+      // was 150px — the handles for anything in a group were drawn at the root's origin.
+      ["select the circle in the group", playGesture.tap(150, 18)]
     ];
     for (const [what, step] of script) {
       await playGesture(f, step);
       if (live(f.node) !== fromSource(f.doc()))
         throw new Error(`after "${what}" the drawing is not a rendering of its own source`);
+      const gap = f.boxGap();
+      if (gap !== null && gap > 1.5)
+        throw new Error(`after "${what}" the overlay is ${gap.toFixed(1)}px from what it frames`);
     }
-    return `✅ T5: the view is a re-render of the committed source after ${script.length} gestures`;
+    return `✅ T5: the view is a re-render of the committed source after ${script.length} gestures, `
+         + `and the overlay frames what is selected`;
   });
 };
 
@@ -17447,7 +17810,7 @@ const _sl113s = function _lensState(){return(
 new Map()
 )};
 
-const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest)
+const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest)
 {
   // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
   // node that is the cell's value now, rather than the one its gesture started on.
@@ -17459,6 +17822,9 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     // ambient registry, so the plugin bus still works and today's behaviour is unchanged.
     const tools = typeof options.tools === "function" ? options.tools(svgTools)
                 : options.tools || svgTools;
+    // Same contract for which tags have editable geometry (design note S2).
+    const shapes = typeof options.shapes === "function" ? options.shapes(svgShapes)
+                 : options.shapes || svgShapes;
     const grid = options.grid === undefined ? 0.5 : options.grid;
     const snap = (v) => (grid ? Math.round(v / grid) * grid : v);
     // Markup for a shape dropped on empty canvas. UX policy, not geometry, so it is overridable.
@@ -17492,7 +17858,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       const s = stateOf();
       if (s) { s.paths = focus.paths.slice(); s.mode = focus.mode; }
       node.dispatchEvent(new CustomEvent("lens-select", { detail: { paths: focus.paths, mode: focus.mode } }));
-    });
+    }, shapes);
     node.style.touchAction = "none";
 
     // The active tool, and the scratch a half-finished gesture keeps. A gesture means different
@@ -17539,7 +17905,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     };
 
     const ctx = {
-      node, target, writer, focus, snap, overlay, setTool, guides,
+      node, target, writer, focus, snap, overlay, setTool, guides, shapes,
       get state() { return gesture(); },
       tool: () => toolNow(),
       childCount: kidCount,
@@ -17906,6 +18272,7 @@ export default function define(runtime, observer) {
   $def("sl108e", "test_opsLens_laws", ["forAll","lensLaws","opsLens","arb","mulberry32","NUM_RUNS","printOp"], _sl108e);
   $def("sl108f", "test_transform_gizmo", ["forAll","arb","mulberry32","NUM_RUNS","rotateAbout","scaleAbout","printOp","parseTransform","applyPoint"], _sl108f);
   $def("sl108g", "test_commands_commute", ["forAll","arb","mulberry32","NUM_RUNS","tokenize","attrTextLens"], _sl108g);
+  $def("sl113t", "test_shape_registry", ["forAll","arb","mulberry32","NUM_RUNS","scaleAbout","printOp","parseTransform","applyPoint","svgShapes","shapeLookup","attrTextLens"], _sl113t);
   $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
   $def("sl74t", "test_domain_boundary", ["outsideDomain","parseDoc","tokenize","childrenLens"], _sl74t);
   $def("sl31t", "test_units_and_style", ["forAll","arb","mulberry32","NUM_RUNS","lengthLens","parseLength","printLength","styleLens","parseStyle","setProperty"], _sl31t);
@@ -17952,7 +18319,8 @@ export default function define(runtime, observer) {
   $def("sl48k", "setGizmoOp", ["opSlot","opToMat","multiply","applyPoint","IDENTITY"], _sl48k);
   $def("sl48h", "rotateAbout", ["setGizmoOp","holdFixed"], _sl48h);
   $def("sl48i", "scaleAbout", ["setGizmoOp","holdFixed"], _sl48i);
-  $def("sl48g", "transformHandles", [], _sl48g);
+  $def("sl48m", "rotateHandle", [], _sl48m);
+  $def("sl48g", "transformHandles", ["rotateHandle"], _sl48g);
   $def("sl49", "det", [], _sl49);
   $def("sl50", "invert", ["det"], _sl50);
   $def("sl51", "invertIso", ["invert"], _sl51);
@@ -18010,7 +18378,19 @@ export default function define(runtime, observer) {
   $def("sl110", "manipulationHeader", ["md","ref"], _sl110);
   $def("sl111", "pointsHandles", ["parsePoints","attrVal"], _sl111);
   $def("sl112", "pathHandles", ["parsePath","attrVal","PATH_ARG_COUNT"], _sl112);
-  $def("sl113", "handleEdit", ["pointsHandles","parsePoints","attrVal","printPoints","pathHandles","parsePath","printPath"], _sl113);
+  $def("sl113a", "numAttr", ["attrVal"], _sl113a);
+  $def("sl113b", "numText", [], _sl113b);
+  $def("sl113c", "geomOf", ["numAttr"], _sl113c);
+  $def("sl113p", "shapePoints", ["pointsHandles","parsePoints","attrVal","printPoints"], _sl113p);
+  $def("sl113d", "shapePath", ["pathHandles","parsePath","attrVal","printPath"], _sl113d);
+  $def("sl113i", "rxInset", [], _sl113i);
+  $def("sl113e", "shapeRect", ["geomOf","numText","rxInset"], _sl113e);
+  $def("sl113f", "shapeCircle", ["geomOf","numText"], _sl113f);
+  $def("sl113g", "shapeEllipse", ["geomOf","numText"], _sl113g);
+  $def("sl113h", "shapeLine", ["geomOf","numText"], _sl113h);
+  $def("sl113r", "svgShapes", ["shapePoints","shapePath","shapeRect","shapeCircle","shapeEllipse","shapeLine"], _sl113r);
+  $def("sl113s2", "shapeLookup", [], _sl113s2);
+  $def("sl113", "handleEdit", ["svgShapes","shapeLookup"], _sl113);
   $def("sl116", "svgTarget", ["runtime","literalSpan"], _sl116);
   $def("sl71b", "holeSpans", [], _sl71b);
   $def("sl71c", "slotsOf", ["holeSpans"], _sl71c);
@@ -18021,16 +18401,16 @@ export default function define(runtime, observer) {
   $def("sl119a", "boxInRoot", [], _sl119a);
   $def("sl119c", "topmostPaths", [], _sl119c);
   $def("sl119b", "zTarget", [], _sl119b);
-  $def("sl119", "svgFocus", ["pointsHandles","pathHandles","transformHandles","nodeAt","boxInRoot","topmostPaths","attrVal","holeSpans"], _sl119);
+  $def("sl119", "svgFocus", ["shapeLookup","svgShapes","transformHandles","rotateHandle","nodeAt","boxInRoot","topmostPaths","attrVal","holeSpans"], _sl119);
   $def("sl124c", "grabPointer", [], _sl124c);
   $def("sl128", "gestureDelta", [], _sl128);
   $def("sl128a", "previewDelta", ["gestureDelta"], _sl128a);
   $def("sl128b", "commitDelta", [], _sl128b);
   $def("sl128c", "revertDelta", [], _sl128c);
-  $def("sl120", "toolVertex", ["handleEdit","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl120);
+  $def("sl120", "toolVertex", ["handleEdit","shapeLookup","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl120);
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
-  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","parsePoints","parsePath","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl121);
+  $def("sl121", "toolMove", ["translateLens","attrVal","invert","ctmMat","shapeLookup","pathOfIndex","grabPointer","snapRects","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl121);
   $def("sl121b", "toolMarquee", ["pathOfIndex","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
   $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint","gestureDelta","commitDelta"], _sl122);
   $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl124);
@@ -18038,7 +18418,7 @@ export default function define(runtime, observer) {
   $def("sl125b", "shapeSpec", ["dragBox"], _sl125b);
   $def("sl125c", "shapeMarkup", ["shapeSpec"], _sl125c);
   $def("sl125d", "penPath", [], _sl125d);
-  $def("sl125", "toolDraw", ["shapeSpec","shapeMarkup","dragBox","grabPointer","gestureDelta","commitDelta"], _sl125);
+  $def("sl125", "toolDraw", ["shapeLookup","shapeSpec","shapeMarkup","dragBox","grabPointer","gestureDelta","commitDelta"], _sl125);
   $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer","gestureDelta","commitDelta"], _sl126);
   $def("sl130", "gestureFixture", ["runtime","realize","settle","literalSpan","nodeAt","svgLens","svg"], _sl130);
   $def("sl131", "playGesture", [], _sl131);
@@ -18060,7 +18440,7 @@ export default function define(runtime, observer) {
   $def("sl123", "viewof svgTools", ["Inputs","toolDraw","toolPen","toolTransform","toolVertex","toolMove","toolMarquee","toolStructure","toolHover"], _sl123);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest"], _sl114);
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
