@@ -14637,6 +14637,65 @@ const _sl79g = function _rebasePath(){return(
 }
 )};
 
+// ---- P7: an address smaller than an element -----------------------------------------------------
+// `focus` addresses an element by *path* rather than by index, because an index is not stable across
+// a structural edit. A vertex has the same problem one level down, and until now had no answer at
+// all: it was named by a handle `key` living in one tool's gesture scratch, which is why
+// multi-vertex selection, corner↔smooth and deleting a segment were all blocked on this.
+//
+// The stable name is an **ordinal within a kind** — "the 3rd anchor of the element at 0/2" — and not
+// the handle key. A key is a position in the attribute's own microsyntax (`p3` for a points list,
+// `ci:o:ix:iy` for a path command list), and both of those renumber unpredictably when a segment is
+// split: `replaceGroup` can turn one command into two. The ordinal renumbers *predictably*, because
+// inserting an anchor shifts exactly the anchors after it. So the key stays transient — resolved from
+// the live handle list at the moment of the drag — and the address is what is stored and rebased.
+const _sl255 = function _vertexAddress(){return(
+{
+  of: (path, kind, n) => ({ path, kind, n }),
+  print: (a) => `${a.path.join("/")}#${a.kind === "ctrl" ? "c" : "a"}${a.n}`,
+  parse: (s) => {
+    const m = /^([\d/]*)#([ac])(\d+)$/.exec(s);
+    if (!m) throw new Error(`not a vertex address: ${s}`);
+    return { path: m[1] === "" ? [] : m[1].split("/").map(Number),
+             kind: m[2] === "c" ? "ctrl" : "anchor", n: Number(m[3]) };
+  },
+  same: (a, b) => !!a && !!b && a.kind === b.kind && a.n === b.n
+                  && a.path.length === b.path.length && a.path.every((v, i) => v === b.path[i]),
+  // Address -> the handle it names, right now. Partial by construction: an ordinal that no longer
+  // exists resolves to null, which is the same answer `focus` gives for a path that no longer
+  // resolves, and it is what makes the address safe to hold across a commit.
+  resolve: (handles, a) => handles.filter((h) => h.kind === a.kind)[a.n] || null,
+  // ...and back, for a handle the pointer just grabbed.
+  ordinalOf: (handles, key) => {
+    const h = handles.find((x) => x.key === key);
+    if (!h) return null;
+    const kind = h.kind === "ctrl" ? "ctrl" : "anchor";
+    return { kind, n: handles.filter((x) => x.kind === kind).indexOf(h) };
+  }
+}
+)};
+
+// T7 one level down. Element-level ops move the *path*; vertex-level ops renumber within one element,
+// and only within the element they name. The op is supplied by whoever performed the edit, exactly as
+// `rebasePath`'s is — a rebase that guesses at what an edit did is the M0.2 failure mode.
+const _sl256 = function _rebaseVertex(rebasePath){return(
+(a, op) => {
+  if (!a) return null;
+  if (op.kind === "insert" || op.kind === "delete" || op.kind === "move") {
+    const path = rebasePath(a.path, op);
+    return path && { ...a, path };
+  }
+  const p = op.path;
+  if (a.path.length !== p.length || !p.every((v, i) => a.path[i] === v)) return a;   // another element
+  if (op.kind === "vertex-insert") return a.n >= op.at ? { ...a, n: a.n + 1 } : a;
+  if (op.kind === "vertex-delete") {
+    if (a.n === op.at) return null;                     // this is the vertex that was removed
+    return a.n > op.at ? { ...a, n: a.n - 1 } : a;
+  }
+  throw new Error(`unknown op kind: ${op.kind}`);
+}
+)};
+
 // Nearest segment to a point, for "double-click an edge to add a vertex".
 const _sl79f = function _nearestSegment(){return(
 (pts, x, y, closed = true) => {
@@ -15913,6 +15972,113 @@ const _sl252 = function _test_group_ungroup(forAll,arb,mulberry32,NUM_RUNS,group
        + `the rebase follows every sibling`;
 };
 
+// P7's falsifier: "a vertex address surviving a commit that changes an earlier vertex". T7 one level
+// down, and checked the way `test_rebasePath` checks it — not "does the rebase follow the rules I
+// wrote" but "does the rebased address name the same *point*". Coordinates are the ground truth here,
+// the way element bytes are up there.
+//
+// Both microsyntaxes, because they are exactly where the naive answer fails: a points list renumbers
+// predictably, while a path's command list does not — splitting one segment can turn one command into
+// two and shift every `ci` after it — which is why the address is an ordinal within a kind and not a
+// handle key.
+const _sl257 = function _test_rebase_vertex(forAll,arb,mulberry32,NUM_RUNS,vertexAddress,rebaseVertex,pointsHandles,pathHandles,insertPoint,deletePoint,insertPathPoint,deletePathPoint,parsePoints,pathSegments,parsePath,attrVal)
+{
+  const rng = mulberry32(0x5EED0031);
+  const IDX = 1;                                        // element 0 is the <svg> itself
+  const A = (n, kind = "anchor") => vertexAddress.of([0, 0], kind, n);
+  const near = (a, b) => Math.abs(a - b) < 1e-6;
+
+  // The address is a name, and a name must round-trip through its printed form.
+  for (const a of [A(0), A(7), A(3, "ctrl"), vertexAddress.of([0, 2, 1], "anchor", 12)]) {
+    const back = vertexAddress.parse(vertexAddress.print(a));
+    if (!vertexAddress.same(back, a) || back.path.join("/") !== a.path.join("/"))
+      throw new Error(`${vertexAddress.print(a)} does not round-trip`);
+  }
+  if (vertexAddress.resolve([], A(0)) !== null) throw new Error("an address into nothing is not null");
+
+  // ---- a points list -----------------------------------------------------------------------------
+  const gen = (r) => {
+    const n = arb.int(r, 3, 7);
+    const pts = Array.from({ length: n }, () => `${arb.int(r, -50, 50)},${arb.int(r, -50, 50)}`);
+    return [`<svg><polygon points="${pts.join(" ")}"/></svg>`, arb.int(r, 0, n - 1),
+            [arb.int(r, -50, 50), arb.int(r, -50, 50)]];
+  };
+  forAll(NUM_RUNS, rng, gen, (doc, i, p) => {
+    const before = pointsHandles(doc, 1);
+    const at = [0, 0];
+
+    const ins = insertPoint(doc, at, i, p);
+    const insH = pointsHandles(ins, 1);
+    for (let n = 0; n < before.length; n++) {
+      const to = rebaseVertex(A(n), { kind: "vertex-insert", path: at, at: i + 1 });
+      if (!to) throw new Error("inserting a point deleted one");
+      const h = vertexAddress.resolve(insH, to);
+      if (!h || !near(h.x, before[n].x) || !near(h.y, before[n].y))
+        throw new Error(`anchor ${n} -> ${to.n} lands on the wrong point after an insert at ${i}`);
+    }
+    // ...and the new vertex is where the address says it is.
+    const fresh = vertexAddress.resolve(insH, A(i + 1));
+    if (!fresh || !near(fresh.x, p[0]) || !near(fresh.y, p[1]))
+      throw new Error("the inserted point is not at the address the op declared");
+
+    if (before.length > 2) {
+      const del = deletePoint(doc, at, i);
+      const delH = pointsHandles(del, 1);
+      for (let n = 0; n < before.length; n++) {
+        const to = rebaseVertex(A(n), { kind: "vertex-delete", path: at, at: i });
+        if (n === i) { if (to !== null) throw new Error("the deleted vertex kept its address"); continue; }
+        const h = vertexAddress.resolve(delH, to);
+        if (!h || !near(h.x, before[n].x) || !near(h.y, before[n].y))
+          throw new Error(`anchor ${n} -> ${to.n} lands on the wrong point after a delete at ${i}`);
+      }
+    }
+    // An address in another element is not this edit's business.
+    const other = vertexAddress.of([0, 1], "anchor", 3);
+    if (rebaseVertex(other, { kind: "vertex-insert", path: at, at: 0 }).n !== 3)
+      throw new Error("a vertex edit renumbered another element's vertices");
+    return true;
+  }, "a vertex address follows its point through insert and delete");
+
+  // ---- a path's command list ---------------------------------------------------------------------
+  // The case the ordinal exists for. `M` then a mix of lines and curves, split and deleted at every
+  // segment, with the ordinals computed exactly as `toolStructure` computes them.
+  const PATHS = ["M 0 0 L 10 0 L 10 10 L 0 10 Z", "M 0 0 C 4 0 8 4 8 8 L 20 8",
+                 "M 2 3 L 9 3 C 12 3 14 6 14 9 L 4 9 Z", "M 0 0 Q 5 -5 10 0 L 10 10"];
+  for (const d of PATHS) {
+    const doc = `<svg><path d="${d}"/></svg>`;
+    const at = [0, 0];
+    const before = pathHandles(doc, 1);
+    const segs = pathSegments(parsePath(attrVal(doc, 1, "d")));
+    for (let i = 0; i < segs.length; i++) {
+      if (segs[i].kind === "A") continue;
+      const ord = segs.slice(0, i).filter((sg) => sg.kind !== "Z").length + 1;
+      const ins = pathHandles(insertPathPoint(doc, at, i, 0.5), 1);
+      for (let n = 0; n < before.filter((h) => h.kind === "anchor").length; n++) {
+        const was = vertexAddress.resolve(before, A(n));
+        const to = rebaseVertex(A(n), { kind: "vertex-insert", path: at, at: ord });
+        const h = vertexAddress.resolve(ins, to);
+        if (!h || !near(h.x, was.x) || !near(h.y, was.y))
+          throw new Error(`${d}: anchor ${n} -> ${to.n} moved when segment ${i} was split`);
+      }
+      if (segs.filter((sg) => sg.kind !== "Z").length < 2 || segs[i].kind === "Z") continue;
+      const dord = segs.slice(0, i + 1).filter((sg) => sg.kind !== "Z").length;
+      const del = pathHandles(deletePathPoint(doc, at, i), 1);
+      const nAnch = before.filter((h) => h.kind === "anchor").length;
+      for (let n = 0; n < nAnch; n++) {
+        const to = rebaseVertex(A(n), { kind: "vertex-delete", path: at, at: dord });
+        if (n === dord) { if (to !== null) throw new Error("the deleted anchor kept its address"); continue; }
+        const was = vertexAddress.resolve(before, A(n));
+        const h = vertexAddress.resolve(del, to);
+        if (!h || !near(h.x, was.x) || !near(h.y, was.y))
+          throw new Error(`${d}: anchor ${n} -> ${to.n} moved when segment ${i}'s anchor was deleted`);
+      }
+    }
+  }
+  return `✅ a vertex address follows its point through insert and delete, in a points list `
+       + `(${NUM_RUNS} runs) and in ${PATHS.length} paths at every segment; another element's `
+       + `vertices are left alone`;
+};
+
 // P8's falsifier: "copy-then-paste-in-place producing anything other than a byte-identical duplicate,
 // references included". Byte-identical is achievable exactly because the payload is the author's own
 // bytes — until two ids collide, which no document may allow, so the id case is stated separately
@@ -16545,12 +16711,14 @@ const _sl117 = function _svgWriter(runtime,realize,settle,literalLens,cellAttrLe
   // into the cell definition, and the writer renders it.
   // `rebase` maps an address across this edit, for whoever is holding one. The writer never applies
   // it — it does not know that selection exists — it just reports it on the event.
-  async function runCommand(name, fn, { rebase = null } = {}) {
+  async function runCommand(name, fn, { rebase = null, vertex = null } = {}) {
     const s = target.cellSource();
     if (s === null) return null;
     const L = literalLens(target.alias());
     const next = L.put(fn(L.get(s)), s);
-    const record = { target: name, attribute: "(structure)", before: "", after: "", rebase,
+    // `vertex` is the sub-element half of the same promise (P7): an op describing how this edit
+    // renumbers vertices within one element, for whoever is holding an address inside it.
+    const record = { target: name, attribute: "(structure)", before: "", after: "", rebase, vertex,
                      GetPut: L.put(L.get(next), next) === next, PutGet: true, span: null };
     if (next === s) { node.lastPut = record; return record; }
     return applySource(next, record);
@@ -16681,7 +16849,8 @@ const _sl118 = function _svgOverlay(){return(
       [data-svg-lens-overlay] .link{stroke:#8A63D2;stroke-dasharray:3 3;stroke-width:1;fill:none;opacity:.7}
       [data-svg-lens-overlay] .guide{stroke:#E4572E;stroke-width:1;opacity:.9}
       [data-svg-lens-overlay] .locked{fill:#cfcfcf;stroke:#9a9a9a;stroke-dasharray:2 2;cursor:not-allowed}
-      [data-svg-lens-overlay] .hover{fill:none;stroke:#2F6BFF;stroke-width:1.5;opacity:.5;pointer-events:none}`;
+      [data-svg-lens-overlay] .hover{fill:none;stroke:#2F6BFF;stroke-width:1.5;opacity:.5;pointer-events:none}
+      [data-svg-lens-overlay] .sel{fill:#2F6BFF;stroke:#fff}`;
   el.appendChild(style);
   node.appendChild(el);
   // Two layers, because the overlay draws in two coordinate systems. `el` carries the focused
@@ -16814,12 +16983,15 @@ const _sl119b = function _zTarget(){return(
 // Selection is held as a *path*, not an index: an index into document order is invalidated by any
 // insert or delete before it, a path only by an edit to its own parent chain. `index` stays available
 // because the handle lenses address elements the way tokenize() does.
-const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateHandle,nodeAt,boxInRoot,topmostPaths,attrVal,holeSpans){return(
+const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateHandle,nodeAt,boxInRoot,topmostPaths,attrVal,holeSpans,vertexAddress){return(
 (overlay, target, onChange = () => {}, shapes = svgShapes) => {
   // A set, ordered by when each element was added. The first is the primary: handles, and everything
   // that only makes sense for one element, follow it. Single selection is the one-element case, so
   // the tools that predate multi-select need no changes.
   let paths = [], mode = null;
+  // Which vertices are selected, as P7 addresses rather than handle keys — so a selected vertex
+  // survives a commit that renumbers the ones before it.
+  let verts = [];
   const key = (p) => p.join("/");
   const indexOfPath = (p) => {
     if (!p) return null;
@@ -16888,10 +17060,20 @@ const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateH
       } catch (err) { return false; }
     })();
     for (const h of hs) if (h.link) overlay.add("line", { class: "link", x1: h.x, y1: h.y, x2: h.link[0], y2: h.link[1] });
+    // Which of these handles the vertex selection names, resolved now rather than remembered: an
+    // address is an ordinal, and the handle it points at is whatever the source says it is today.
+    const chosen = new Set();
+    for (const a of verts) {
+      if (key(a.path) !== key(paths[0] || [])) continue;
+      const h = vertexAddress.resolve(hs, a);
+      if (h) chosen.add(h.key);
+    }
     for (const h of hs) {
       const cls = locked ? "locked"
                 : h.kind === "anchor" || h.kind === "scale" || h.kind === "rotate" ? h.kind : "ctrl";
-      overlay.add("circle", { class: cls, r: cls === "ctrl" ? r * 0.8 : r, cx: h.x, cy: h.y });
+      const on = chosen.has(h.key);
+      overlay.add("circle", { class: cls + (on ? " sel" : ""),
+                              r: (cls === "ctrl" ? r * 0.8 : r) * (on ? 1.35 : 1), cx: h.x, cy: h.y });
       overlay.add("circle", { class: "hit", r: r * 2.6, cx: h.x, cy: h.y }).dataset.key = h.key;
     }
   };
@@ -16914,12 +17096,22 @@ const _sl119 = function _svgFocus(shapeLookup,svgShapes,transformHandles,rotateH
       if (paths.length !== 1) mode = null;
       draw();
     },
-    clear() { paths = []; mode = null; draw(); },
+    clear() { paths = []; verts = []; mode = null; draw(); },
+    // ---- the vertex selection (P7) ---------------------------------------------------------------
+    get vertices() { return verts.slice(); },
+    setVertices(list) { verts = (list || []).slice(); draw(); },
+    toggleVertex(a) {
+      const i = verts.findIndex((v) => vertexAddress.same(v, a));
+      if (i >= 0) verts.splice(i, 1); else verts.push(a);
+      draw();
+    },
     // Carry the selection across a structural edit; a dropped path means that element was deleted.
     rebase(fn) {
       paths = paths.map(fn).filter(Boolean);
       if (paths.length !== 1) mode = null;
-    }
+    },
+    // The same promise one level down. A dropped address means that vertex is the one that went.
+    rebaseVertices(fn) { verts = fn ? verts.map(fn).filter(Boolean) : verts; }
   };
 }
 )};
@@ -16970,8 +17162,8 @@ const _sl128 = function _gestureDelta(){return(
   // `select` is what the selection should be *after* the command — a function, because the addresses
   // it names only exist once the edit has happened. A command that does not say leaves the selection
   // to the rebase, which is the right answer for an edit that only moves things about.
-  command: (name, apply, { rebase = null, select = null } = {}) =>
-    ({ kind: "command", name, apply, rebase, select }),
+  command: (name, apply, { rebase = null, select = null, vertex = null } = {}) =>
+    ({ kind: "command", name, apply, rebase, select, vertex }),
   // The clipboard is not the document, so putting something on it is not a source edit — same
   // argument as `select` and `view`, and the reason copy can be a command at all (S4/P8).
   clip: (markups) => ({ kind: "clip", markups }),
@@ -17043,7 +17235,7 @@ async (ctx, ds) => {
     if (d.kind === "attr")
       out.push(await ctx.writer.commit(d.idx, d.name, d.value, d.dflt, d.lens, d.was));
     else if (d.kind === "command") {
-      const rec = await ctx.writer.runCommand(d.name, d.apply, { rebase: d.rebase });
+      const rec = await ctx.writer.runCommand(d.name, d.apply, { rebase: d.rebase, vertex: d.vertex });
       // After the put, so the addresses it names exist. The rebase has already run by now and moved
       // whatever the selection was; this replaces it when the command knows better.
       if (d.select) { const p = d.select(); if (p) ctx.focus.setAll(p); }
@@ -17138,7 +17330,7 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
 )};
 
 // Drag a vertex or control point: the `points` and path `d` lenses.
-const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta){return(
+const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDelta,previewDelta,commitDelta,revertDelta,vertexAddress){return(
 {
   id: "vertex",
   onPointerDown(ctx, e) {
@@ -17151,6 +17343,14 @@ const _sl120 = function _toolVertex(handleEdit,shapeLookup,grabPointer,gestureDe
     if (!entry) return false;
     e.preventDefault();
     grabPointer(ctx.node, e);
+    // Grabbing a handle selects that vertex, by address rather than by key (P7): shift adds to the
+    // set, anything else replaces it. This is what makes a vertex a thing you can hold — and it
+    // survives the commit, because an ordinal is rebasable and a key is not.
+    const ord = vertexAddress.ordinalOf(ctx.focus.handles(), key);
+    if (ord) {
+      const a = vertexAddress.of(ctx.focus.path, ord.kind, ord.n);
+      if (e.shiftKey) ctx.focus.toggleVertex(a); else ctx.focus.setVertices([a]);
+    }
     const el0 = ctx.elems()[ctx.focus.index];
     ctx.state.drag = { tool: "vertex", key, idx: ctx.focus.index, mode, started: false, x0: e.clientX, y0: e.clientY,
                        // what it rendered before the preview overwrites it (see writer.commit)
@@ -17520,7 +17720,8 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
     if (key !== undefined && sel && focus.mode === "points") {
       const h = pointsHandles(t, focus.index).find((x) => x.key === key);
       if (!h) return false;
-      await commitDelta(ctx, gestureDelta.command("deletePoint", (d) => deletePoint(d, sel, h.i)));
+      await commitDelta(ctx, gestureDelta.command("deletePoint", (d) => deletePoint(d, sel, h.i),
+        { vertex: { kind: "vertex-delete", path: sel, at: h.i } }));
       return true;
     }
 
@@ -17532,7 +17733,11 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
       const segs = pathSegments(parsePath(ctx.attr(t, focus.index, "d")));
       const i = segs.findIndex((s) => s.ci === h.ci && s.o === h.o);
       if (i < 0) return false;
-      await commitDelta(ctx, gestureDelta.command("deletePathPoint", (d) => deletePathPoint(d, sel, i)));
+      // Deleting "the anchor with this key" removes the segment it terminates, so the ordinal that
+      // goes is that segment's *end* anchor: one per non-Z segment up to and including this one.
+      await commitDelta(ctx, gestureDelta.command("deletePathPoint", (d) => deletePathPoint(d, sel, i),
+        { vertex: { kind: "vertex-delete", path: sel,
+                    at: segs.slice(0, i + 1).filter((sg) => sg.kind !== "Z").length } }));
       return true;
     }
 
@@ -17548,7 +17753,8 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
       if (!p) return false;
       const closed = el.localName !== "polyline";
       const seg = nearestSegment(parsePoints(ctx.attr(t, focus.index, "points")), p[0], p[1], closed);
-      await commitDelta(ctx, gestureDelta.command("insertPoint", (d) => insertPoint(d, sel, seg.index, p)));
+      await commitDelta(ctx, gestureDelta.command("insertPoint", (d) => insertPoint(d, sel, seg.index, p),
+        { vertex: { kind: "vertex-insert", path: sel, at: seg.index + 1 } }));
       return true;
     }
 
@@ -17558,7 +17764,10 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
       const segs = pathSegments(parsePath(ctx.attr(t, focus.index, "d")));
       const near = nearestPathSegment(segs, p[0], p[1]);
       if (near.index < 0 || segs[near.index].kind === "A") return false;
-      await commitDelta(ctx, gestureDelta.command("insertPathPoint", (d) => insertPathPoint(d, sel, near.index, near.t)));
+      // The new anchor lands between the split segment's start and end anchors.
+      await commitDelta(ctx, gestureDelta.command("insertPathPoint", (d) => insertPathPoint(d, sel, near.index, near.t),
+        { vertex: { kind: "vertex-insert", path: sel,
+                    at: segs.slice(0, near.index).filter((sg) => sg.kind !== "Z").length + 1 } }));
       return true;
     }
 
@@ -18808,7 +19017,7 @@ const _sl113s = function _lensState(){return(
 new Map()
 )};
 
-const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,commandLookup,copyMarkup,moveTargetOf,commitDelta,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox)
+const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,commandLookup,copyMarkup,moveTargetOf,commitDelta,rebaseVertex,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox)
 {
   // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
   // node that is the cell's value now, rather than the one its gesture started on.
@@ -18863,13 +19072,13 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       if (!v) return null;
       myVar = v;
       let s = lensState.get(v);
-      if (!s) lensState.set(v, s = { undo: [], redo: [], paths: null, mode: "replace", tool: null,
+      if (!s) lensState.set(v, s = { undo: [], redo: [], paths: null, verts: [], mode: "replace", tool: null,
                                      gesture: {}, scope: null, view: null });
       return (shared = s);
     };
     const focus = svgFocus(overlay, target, () => {
       const s = stateOf();
-      if (s) { s.paths = focus.paths.slice(); s.mode = focus.mode; }
+      if (s) { s.paths = focus.paths.slice(); s.mode = focus.mode; s.verts = focus.vertices; }
       node.dispatchEvent(new CustomEvent("lens-select", { detail: { paths: focus.paths, mode: focus.mode } }));
     }, shapes);
     node.style.touchAction = "none";
@@ -19168,7 +19377,14 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     // carries a rebase; refresh() drops the selection by itself if the path no longer resolves. The
     // writer knows nothing about selection — it just says what it did.
     node.addEventListener("lens-put", (e) => {
-      if (e.detail.rebase) focus.rebase(e.detail.rebase);
+      // Both halves of T7: the element rebase moves paths, and a vertex address moves either because
+      // its element moved (the same function, applied to its path) or because the edit renumbered
+      // vertices inside it (the op the command declared).
+      const v = e.detail.vertex, r = e.detail.rebase;
+      focus.rebaseVertices(v ? (a) => rebaseVertex(a, v)
+                             : r ? (a) => { const p = r(a.path); return p && { ...a, path: p }; }
+                             : null);
+      if (r) focus.rebase(r);
       applyView();                                     // the render just put the source's view back
       focus.refresh();
     });
@@ -19299,7 +19515,11 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
 
     node.selection = () => focus.path;
     node.selectionPaths = () => focus.paths;
+    node.selectionMode = () => focus.mode;
     node.select = (paths, mode) => focus.setAll(paths, mode);
+    // The sub-element selection (P7). Addresses, not handle keys, so what you hold survives a commit.
+    node.selectedVertices = () => focus.vertices;
+    node.selectVertices = (list) => focus.setVertices(list);
 
     // Keyboard nudge and typed values go through the very same lens a drag does — no second write
     // path, so the laws and the residue rules cover them without restating anything.
@@ -19359,7 +19579,13 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       const s = stateOf();
       if (!s) return;
       applyView();                                     // a remount renders the source's own view
+      // Read both *before* restoring either: `setAll` repaints, the repaint announces, and the
+      // announcement writes the (still empty) vertex selection back over the one being restored.
+      const verts = s.verts || [];
       if (s.paths && s.paths.length) focus.setAll(s.paths, s.mode);
+      // The sub-element selection travels the same way (P7). It is stored as an address, so a commit
+      // that renumbered vertices has already moved it — restoring is a read, not a repair.
+      if (verts.length) focus.setVertices(verts);
     }, 0);
     return node;
   };
@@ -19499,6 +19725,7 @@ export default function define(runtime, observer) {
   $def("sl108d", "test_path_subdivision_exact", ["forAll","arb","mulberry32","NUM_RUNS","parsePath","printPath","pathSegments","pointOnSegment","splitPathSegment","deletePathAnchor"], _sl108d);
   $def("sl108c", "test_rebasePath", ["forAll","arb","mulberry32","NUM_RUNS","rebasePath","nodeAt","childrenLens","insertElement","deleteElement","reorderElement"], _sl108c);
   $def("sl252", "test_group_ungroup", ["forAll","arb","mulberry32","NUM_RUNS","groupPlan","groupElements","ungroupElements","ungroupBlockers","childrenLens","nodeAt","cmdGroup"], _sl252);
+  $def("sl257", "test_rebase_vertex", ["forAll","arb","mulberry32","NUM_RUNS","vertexAddress","rebaseVertex","pointsHandles","pathHandles","insertPoint","deletePoint","insertPathPoint","deletePathPoint","parsePoints","pathSegments","parsePath","attrVal"], _sl257);
   $def("sl253", "test_copy_paste", ["forAll","arb","mulberry32","NUM_RUNS","copyMarkup","pasteMarkup","freshenIds","idsIn","childrenLens","nodeAt","cmdPaste","offsetMarkup"], _sl253);
   $def("sl254", "test_align_commands", ["cmdAlign","cmdDistribute","alignSpecs","gestureDelta"], _sl254);
   $def("sl109b", "test_parse_vs_DOMParser", ["parseDoc","outsideDomain","attrVal","tokenize"], _sl109b);
@@ -19593,6 +19820,8 @@ export default function define(runtime, observer) {
   $def("sl79e", "deletePoint", ["nodeAt","attrTextLens","parsePoints","printPoints"], _sl79e);
   $def("sl79f", "nearestSegment", [], _sl79f);
   $def("sl79g", "rebasePath", [], _sl79g);
+  $def("sl255", "vertexAddress", [], _sl255);
+  $def("sl256", "rebaseVertex", ["rebasePath"], _sl256);
   $def("sl79h", "pathSegments", ["PATH_ARG_COUNT"], _sl79h);
   $def("sl79i", "pointOnSegment", [], _sl79i);
   $def("sl79j", "replaceGroup", ["PATH_ARG_COUNT"], _sl79j);
@@ -19628,13 +19857,13 @@ export default function define(runtime, observer) {
   $def("sl119a", "boxInRoot", [], _sl119a);
   $def("sl119c", "topmostPaths", [], _sl119c);
   $def("sl119b", "zTarget", [], _sl119b);
-  $def("sl119", "svgFocus", ["shapeLookup","svgShapes","transformHandles","rotateHandle","nodeAt","boxInRoot","topmostPaths","attrVal","holeSpans"], _sl119);
+  $def("sl119", "svgFocus", ["shapeLookup","svgShapes","transformHandles","rotateHandle","nodeAt","boxInRoot","topmostPaths","attrVal","holeSpans","vertexAddress"], _sl119);
   $def("sl124c", "grabPointer", [], _sl124c);
   $def("sl128", "gestureDelta", [], _sl128);
   $def("sl128a", "previewDelta", ["gestureDelta"], _sl128a);
   $def("sl128b", "commitDelta", [], _sl128b);
   $def("sl128c", "revertDelta", [], _sl128c);
-  $def("sl120", "toolVertex", ["handleEdit","shapeLookup","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl120);
+  $def("sl120", "toolVertex", ["handleEdit","shapeLookup","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta","vertexAddress"], _sl120);
   $def("sl119d", "scopedPath", [], _sl119d);
   $def("sl121a", "hitTest", [], _sl121a);
   $def("sl127", "snapRects", [], _sl127);
@@ -19684,7 +19913,7 @@ export default function define(runtime, observer) {
   $def("sl249", "commandLookup", [], _sl249);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","commandLookup","copyMarkup","moveTargetOf","commitDelta","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox"], _sl114);
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
