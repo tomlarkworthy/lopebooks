@@ -12345,9 +12345,14 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
       const k = e.shiftKey ? 10 : 1;
       return void drawing.nudge(ARROW[e.key][0] * k, ARROW[e.key][1] * k);
     }
-    if ((e.key === "Delete" || e.key === "Backspace") && sel.length) {
-      e.preventDefault();
-      return void drawing.removeSelection();
+    if (e.key === "Delete" || e.key === "Backspace") {
+      // A held vertex is the finer selection, so it is what the key means; only with none held does
+      // Delete take the whole element.
+      if (drawing.canCommand("delete-vertex")) {
+        e.preventDefault();
+        return void drawing.command("delete-vertex");
+      }
+      if (sel.length) { e.preventDefault(); return void drawing.removeSelection(); }
     }
     const hit = TOOLS.find(([, , k]) => k.toLowerCase() === e.key.toLowerCase());
     if (hit) drawing.setTool(hit[0]);
@@ -17909,9 +17914,33 @@ const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grab
 // Click to place anchors; click the first anchor to close, or double-click to finish open. The path
 // exists in the source from the first click, so there is no builder state that can diverge from it —
 // the only state the tool keeps is which path it is extending.
-const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta,previewDelta,commitDelta){return(
+const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta,previewDelta,commitDelta,pathHandles,pathOfIndex){return(
 {
   id: "pen",
+  // G20. With no path in progress, a click on an open path's *free end* continues that path instead
+  // of starting a new one — which is the difference between a pen and a line tool. Only the end, not
+  // the start: extending backwards means reversing the author's `d`, and reversing it would rewrite
+  // every byte of an attribute the gesture is not otherwise touching.
+  freeEnd(ctx, p) {
+    const t = ctx.doc();
+    if (t === null) return null;
+    const list = ctx.elems();
+    const r = ctx.options.penCloseRadius === undefined ? 8 : ctx.options.penCloseRadius;
+    for (let i = list.length - 1; i > 0; i--) {          // front to back, like every other hit test
+      const el = list[i];
+      if (!el || el.localName !== "path") continue;
+      const d = ctx.attr(t, i, "d");
+      if (!d || /[Zz]\s*$/.test(d)) continue;             // closed: it has no free end
+      let hs;
+      try { hs = pathHandles(t, i); } catch (e) { continue; }
+      const anchors = hs.filter((h) => h.kind === "anchor");
+      const last = anchors[anchors.length - 1], first = anchors[0];
+      if (!last || Math.hypot(p[0] - last.x, p[1] - last.y) > r) continue;
+      try { return { path: pathOfIndex(t, i), start: [first.x, first.y], last: [last.x, last.y] }; }
+      catch (e) { return null; }
+    }
+    return null;
+  },
   onPointerDown(ctx, e) {
     if (ctx.tool() !== "pen") return false;
     const p = ctx.localPoint(ctx.node, e);
@@ -17967,6 +17996,15 @@ const _sl126 = function _toolPen(penPath,attrVal,nodeAt,grabPointer,gestureDelta
     const out = c.q && Math.hypot(c.q[0] - p[0], c.q[1] - p[1]) >= min ? c.q : null;
     const pen = ctx.state.pen;
     if (!pen) {
+      // Picking up a free end is not an edit: nothing is committed until the next anchor, so this
+      // costs the source nothing and T9 covers it — it is a selection, and it says so.
+      const found = this.freeEnd(ctx, p);
+      if (found) {
+        ctx.state.pen = { path: found.path, start: found.start, last: found.last,
+                          out, startOut: null, band: null };
+        await commitDelta(ctx, gestureDelta.select([found.path], "path"));
+        return;
+      }
       const at = ctx.childCount([0]);
       const s = ctx.options.penStyle || 'fill="none" stroke="#4C7FD1" stroke-width="3" stroke-linecap="round"';
       const rec = await ctx.addShape(`<path d="${penPath.start(p[0], p[1])}" ${s}/>`);
@@ -18979,12 +19017,80 @@ const _sl248 = function _cmdDistribute(gestureDelta,translateLens){return(
 })
 )};
 
-const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs){return(
+// ---- G23: the two verbs a path shape needs -------------------------------------------------------
+// Deleting a *vertex* rather than an element. The finer selection is the one the key means: with
+// vertices held (P7), Delete takes them and leaves the shape alone. Descending by ordinal, so each
+// delete leaves the ordinals of the ones still queued exactly where they were.
+const _sl258 = function _cmdDeleteVertex(gestureDelta,attrVal,parsePoints,parsePath,pathSegments,pathHandles,deletePoint,deletePathPoint){return(
+{
+  id: "delete-vertex", label: "Delete vertex", key: "Delete",
+  plan(env) {
+    const vs = (env.vertices || []).filter((v) => v.kind === "anchor");
+    if (!vs.length) return null;
+    const key = (q) => q.join("/");
+    if (vs.some((v) => key(v.path) !== key(vs[0].path))) return null;   // one element at a time
+    const path = vs[0].path;
+    let idx;
+    try { idx = env.index(path); } catch (e) { return null; }
+    const ns = vs.map((v) => v.n).sort((a, b) => b - a);
+    const pts = attrVal(env.src, idx, "points");
+    if (pts !== null) {
+      if (parsePoints(pts).length - ns.length < 2) return null;         // a polygon needs two
+      return ns.map((n) => gestureDelta.command("deletePoint", (d) => deletePoint(d, path, n),
+        { vertex: { kind: "vertex-delete", path, at: n } }));
+    }
+    const d0 = attrVal(env.src, idx, "d");
+    if (d0 === null) return null;
+    const segs = pathSegments(parsePath(d0));
+    const hs = pathHandles(env.src, idx).filter((h) => h.kind === "anchor");
+    const out = ns.map((n) => {
+      const h = hs[n];
+      if (!h) return null;
+      // Same reading as the double-click: the anchor that goes is the one its segment terminates.
+      const i = segs.findIndex((sg) => sg.ci === h.ci && sg.o === h.o);
+      if (i < 0) return null;                                          // the M anchor ends no segment
+      return gestureDelta.command("deletePathPoint", (d) => deletePathPoint(d, path, i),
+        { vertex: { kind: "vertex-delete", path,
+                    at: segs.slice(0, i + 1).filter((sg) => sg.kind !== "Z").length } });
+    });
+    return out.every(Boolean) ? out : null;
+  }
+}
+)};
+
+// Close a path, or open it again: one `Z`, on or off. Only `d` — a polyline is not a polygon with a
+// flag, it is a different element, and swapping the tag is a different edit than this one claims to
+// be. With several subpaths this closes the last, which is what the trailing `Z` means.
+const _sl259 = function _cmdClosePath(gestureDelta,attrVal,attrTextLens,nodeAt){return(
+(close) => ({
+  id: close ? "close-path" : "open-path",
+  label: close ? "Close path" : "Open path",
+  key: null,
+  plan(env) {
+    const out = [];
+    for (const p of env.paths) {
+      let n;
+      try { n = nodeAt(env.src, p); } catch (e) { return null; }
+      const d = attrVal(env.src, n.index, "d");
+      if (d === null) continue;                                        // not a path: nothing to close
+      if (/[Zz]\s*$/.test(d) === close) continue;                      // already as asked (T1)
+      const l = attrTextLens(n.index, "d");
+      const next = close ? d.replace(/\s*$/, "") + " Z" : d.replace(/\s*[Zz]\s*$/, "");
+      // No handle appears or disappears — `Z` takes no arguments — so no vertex op is owed.
+      out.push(gestureDelta.command(close ? "closePath" : "openPath", (src) => l.put(next, src)));
+    }
+    return out.length ? out : null;
+  }
+})
+)};
+
+const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath){return(
 // A plain array, not an `Inputs.input`, for the same reason `svgShapes` is: pure code plans a command
 // and the laws exercise that headless, where there is no DOM to hold a view.
 [cmdGroup, cmdUngroup, cmdDuplicate, cmdCopy, cmdCut, cmdPaste(false), cmdPaste(true)]
   .concat(alignSpecs.map(cmdAlign))
-  .concat([cmdDistribute("x"), cmdDistribute("y")])
+  .concat([cmdDistribute("x"), cmdDistribute("y"),
+           cmdDeleteVertex, cmdClosePath(true), cmdClosePath(false)])
 )};
 
 // Look one up, and answer "what does this keystroke mean" in one place. The binding is a
@@ -19425,7 +19531,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       const src = target.doc();
       if (src === null) return null;
       return {
-        src, paths: focus.paths, scope: scopeNow(), options,
+        src, paths: focus.paths, vertices: focus.vertices, scope: scopeNow(), options,
         index: (path) => nodeAt(src, path).index,
         childCount: kidCount,
         clipboard: clipboard.read,
@@ -19879,7 +19985,7 @@ export default function define(runtime, observer) {
   $def("sl125c", "shapeMarkup", ["shapeSpec"], _sl125c);
   $def("sl125d", "penPath", [], _sl125d);
   $def("sl125", "toolDraw", ["shapeLookup","shapeSpec","shapeMarkup","dragBox","grabPointer","gestureDelta","commitDelta"], _sl125);
-  $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl126);
+  $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer","gestureDelta","previewDelta","commitDelta","pathHandles","pathOfIndex"], _sl126);
   $def("sl130", "gestureFixture", ["runtime","realize","settle","literalSpan","nodeAt","svgLens","svg"], _sl130);
   $def("sl131", "playGesture", [], _sl131);
   $def("sl132", "gestureCorpus", [], _sl132);
@@ -19909,7 +20015,9 @@ export default function define(runtime, observer) {
   $def("sl246", "alignSpecs", [], _sl246);
   $def("sl247", "cmdAlign", ["gestureDelta","translateLens"], _sl247);
   $def("sl248", "cmdDistribute", ["gestureDelta","translateLens"], _sl248);
-  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs"], _sl250);
+  $def("sl258", "cmdDeleteVertex", ["gestureDelta","attrVal","parsePoints","parsePath","pathSegments","pathHandles","deletePoint","deletePathPoint"], _sl258);
+  $def("sl259", "cmdClosePath", ["gestureDelta","attrVal","attrTextLens","nodeAt"], _sl259);
+  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath"], _sl250);
   $def("sl249", "commandLookup", [], _sl249);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl113s", "lensState", [], _sl113s);
