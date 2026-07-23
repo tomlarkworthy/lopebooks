@@ -19524,6 +19524,43 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       // 2.0107 is exactly `1/k`, which is the fallback's signature.
       if (target.doc() === null) return;
       node.setAttribute("viewBox", printViewBox(viewBoxNow()));
+      armHandover();
+    };
+    // ---- handing the view to the node that replaces us -------------------------------------------
+    // The view is deliberately not in the source, so every node the runtime mints starts without one,
+    // and a fresh node cannot resolve the `Variable` its view is filed under — the runtime has not
+    // taken its value yet. It therefore renders at the source's own scale, and the frame it is
+    // inserted in paints that. `requestAnimationFrame` does not save it: if the recompute lands after
+    // that frame's animation-frame callbacks have already run, the restore is a whole frame late.
+    // That is the flash Tom filmed on release, measured off the video at 3.958 px/unit against a
+    // steady 1.500 — a 320-unit window where the view asked for 845.
+    //
+    // At that instant the outgoing node is the only object that still knows the view, so it hands it
+    // over: watch our own parent, and when something replaces us there, copy our live `viewBox` onto
+    // it. Two properties make this the right mechanism rather than another race:
+    //   * MutationObserver callbacks are microtasks, so this runs before the *rendering steps of the
+    //     same frame*. rAF gives no such guarantee, and that is precisely what went wrong.
+    //   * it identifies the heir positionally — the node that took our place in our parent — so it
+    //     never has to guess which `Variable` a fresh node belongs to.
+    // It is a paint, not an edit: only the attribute the view already owns is written, and the heir
+    // recomputes the same value for itself as soon as it can resolve its state.
+    let handover = null;
+    const armHandover = () => {
+      const parent = node.parentNode;
+      if (!parent || handover || isIdentity(viewNow())) return;   // nothing to hand over at 1:1
+      handover = new MutationObserver(() => {
+        if (node.isConnected) return;                    // still on screen: nothing has replaced us
+        const box = node.getAttribute("viewBox");        // a detached node keeps its attributes
+        const heir = [...parent.childNodes].find(
+          (n) => n !== node && n.nodeType === 1 && n.localName === "svg");
+        if (heir && box !== null && !heir.hasAttribute("data-lens-view")) {
+          heir.setAttribute("viewBox", box);
+          heir.setAttribute("data-lens-view", "inherited");
+        }
+        handover.disconnect();
+        handover = null;
+      });
+      handover.observe(parent, { childList: true });
     };
     const setView = (v) => {
       const next = { k: Math.max(0.02, Math.min(200, v.k)), x: v.x, y: v.y };
@@ -19703,6 +19740,11 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
 
     let active = null;
     node.addEventListener("pointerdown", (e) => {
+      // The one moment this node is certainly on screen, which is what arming needs — `applyView`
+      // often runs from the restore rAF *before* the runtime has inserted us, so it finds no parent
+      // to watch. A gesture is also the only thing that can cause the replacement being guarded
+      // against, so arming here is both sufficient and free.
+      armHandover();
       for (const t of tools) if (t.onPointerDown && t.onPointerDown(liveCtx, e)) { active = t; return; }
       active = null;
     });
@@ -19949,6 +19991,7 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       const s = stateOf();
       if (!s) return false;
       resumed = true;
+      node.removeAttribute("data-lens-view");          // the inherited paint has served its purpose
       applyView();                                     // a remount renders the source's own view
       // Read both *before* restoring either: `setAll` repaints, the repaint announces, and the
       // announcement writes the (still empty) vertex selection back over the one being restored.
@@ -19959,14 +20002,11 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       if (verts.length) focus.setVertices(verts);
       return true;
     };
-    // Before the next *paint*, not merely on the next task. A fresh node cannot resolve its own
-    // Variable yet, so `viewNow()` reads identity, `applyView` declines, and the node renders the
-    // source's own viewBox — at 100%. A macrotask restore may be separated from this node's
-    // insertion by a rendered frame, and that frame shows the drawing unzoomed: the flash after a
-    // zoom, reported 2026-07-23. `requestAnimationFrame` runs before the paint of the frame it is
-    // scheduled for, and the runtime has bound the value by then, so no frame can show the wrong
-    // view. The timeout stays as the fallback for a node in a tab that never paints, where rAF
-    // never fires; whichever wins, `resumed` makes the other a no-op.
+    // Neither of these is what keeps the view on screen across a commit — the handover above is,
+    // because it is the only one that cannot be a frame late. These restore the rest of the session
+    // (selection, vertices) as soon as the variable resolves, and re-derive the view properly. rAF
+    // first because it is usually sooner; the timeout is the fallback for a node in a tab that never
+    // paints, where rAF never fires. Whichever wins, `resumed` makes the other a no-op.
     requestAnimationFrame(resume);
     setTimeout(resume, 0);
     return node;
