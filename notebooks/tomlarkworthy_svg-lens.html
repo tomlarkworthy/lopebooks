@@ -22664,12 +22664,21 @@ const _sl265 = function _pathConvert(pathSegments,replaceGroup,absoluteGroup){re
     "C>Q": (s) => { const c = quadOf(s); return c ? [{ c: "Q", a: [...c, ...s.p3] }] : null; },
     "A>C": (s) => arcToCubics(s)
   };
+  // Splice `repl` in for segment `segIndex`. A following smooth command (S/T) reflects off this
+  // segment's controls, so it is made absolute first, exactly as `splitPathSegment` does — otherwise
+  // the reflection base moves out from under it.
+  const apply = (cmds, segs, segIndex, repl) => {
+    const seg = segs[segIndex], next = segs[segIndex + 1];
+    let out = cmds.map((c) => ({ c: c.c, a: c.a.slice() }));
+    if (next && /^[STst]$/.test(next.letter)) out = absoluteGroup(out, next);
+    return replaceGroup(out, seg.ci, seg.o, repl);
+  };
   return {
     // What this segment can become, given its current kind — used to grey out a menu item.
     targets: (seg) => Object.keys(registry).filter((k) => k.startsWith(seg.kind + ">")).map((k) => k.slice(2)),
-    // Rewrite segment `segIndex` to kind `to`, or null if the registry declines. A following smooth
-    // command (S/T) reflects off this segment's controls, so it is made absolute first, exactly as
-    // `splitPathSegment` does — otherwise the reflection base moves out from under it.
+    // Rewrite segment `segIndex` to kind `to`, or null if the registry declines. Lossless: `C>L` only
+    // fires on a cubic already straight, `C>Q` only on one that is a raised quadratic. For the lossy
+    // "flatten a curve into a line" a user means by *straighten*, see `straighten`.
     convert(cmds, segIndex, to) {
       const segs = pathSegments(cmds);
       const seg = segs[segIndex];
@@ -22678,10 +22687,16 @@ const _sl265 = function _pathConvert(pathSegments,replaceGroup,absoluteGroup){re
       if (!fn) return null;
       const repl = fn(seg);
       if (!repl) return null;
-      let out = cmds.map((c) => ({ c: c.c, a: c.a.slice() }));
-      const next = segs[segIndex + 1];
-      if (next && /^[STst]$/.test(next.letter)) out = absoluteGroup(out, next);
-      return replaceGroup(out, seg.ci, seg.o, repl);
+      return apply(cmds, segs, segIndex, repl);
+    },
+    // Flatten a curved segment (C/Q/A) into a straight `L` to its own endpoint, dropping the controls.
+    // Lossy — it destroys the curve — which is what "straighten" means, unlike `convert`'s `C>L`. A
+    // line or a move/close has nothing to straighten, so it declines (T8), which greys the menu item.
+    straighten(cmds, segIndex) {
+      const segs = pathSegments(cmds);
+      const seg = segs[segIndex];
+      if (!seg || (seg.kind !== "C" && seg.kind !== "Q" && seg.kind !== "A")) return null;
+      return apply(cmds, segs, segIndex, [{ c: "L", a: [...seg.p3] }]);
     }
   };
 })()
@@ -22709,10 +22724,11 @@ const _sl261 = function _cmdToggleSmooth(gestureDelta,pathSmooth,pathHandles,nod
 // G47. The convert verb as commands, one per target kind, over whatever anchors are held (P7). The
 // segment an anchor governs is the one it terminates — the same reading `delete-vertex` uses — and a
 // held set is converted highest-index-first so an `A→C` expansion above never shifts the segments
-// below it. Each item is live only where `pathConvert` actually accepts the rewrite (asked once, T8),
-// so "straighten" greys out on a segment that is not a straight cubic, and "to bézier" lights up on a
-// line or a quadratic or an arc. These are the discoverable face of the conversion registry until the
-// S9 affordance panel exists; today they surface through the context menu (G8).
+// below it. Each item is live only where its rewrite accepts (asked once, T8): "Straighten segment"
+// (`L`) flattens any curve to a line, so it lights up on any C/Q/A and greys on a segment already
+// straight; "to bézier"/"to quadratic" are the lossless kind-changes and light up where those hold.
+// These are the discoverable face of the conversion registry until the S9 affordance panel exists;
+// today they surface through the context menu (G8).
 const _sl266 = function _cmdConvertSegment(gestureDelta,attrVal,parsePath,printPath,pathSegments,pathHandles,attrTextLens,nodeAt,pathConvert){return(
 (to) => ({
   id: "convert-to-" + { L: "line", C: "curve", Q: "quad" }[to],
@@ -22734,13 +22750,18 @@ const _sl266 = function _cmdConvertSegment(gestureDelta,attrVal,parsePath,printP
       const h = hs[v.n];
       return h ? segs.findIndex((sg) => sg.ci === h.ci && sg.o === h.o) : -1;
     }).filter((i) => i >= 0).sort((a, b) => b - a);
+    // `L` means *straighten* — flatten the curve into a line (lossy). `C`/`Q` are the lossless
+    // kind-changes. Both plan through the same held-anchor scaffold; only the per-segment rewrite differs.
+    const rewrite = to === "L"
+      ? (cmds, si) => pathConvert.straighten(cmds, si)
+      : (cmds, si) => pathConvert.convert(cmds, si, to);
     const out = [];
     for (const si of sis) {
-      if (pathConvert.convert(parsePath(d0), si, to) === null) continue;  // declines here, T8
+      if (rewrite(parsePath(d0), si) === null) continue;                 // declines here, T8
       out.push(gestureDelta.command("convertSegment", (src) => {
         let j;
         try { j = nodeAt(src, path).index; } catch (e) { return src; }
-        const next = pathConvert.convert(parsePath(attrVal(src, j, "d")), si, to);
+        const next = rewrite(parsePath(attrVal(src, j, "d")), si);
         return next === null ? src : attrTextLens(j, "d").put(printPath(next), src);
       }));
     }
