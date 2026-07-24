@@ -14673,7 +14673,6 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
 const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
 {
   const drawing = $0;
-  const owned = new Set(svgFields.list.map((f) => f.prop));
   const el = htl.html`<div style="margin:.5rem 0;min-height:2.2em;display:grid;gap:8px"></div>`;
   const render = () => {
     const paths = drawing.selectionPaths();
@@ -14686,6 +14685,9 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
     for (const path of paths) {
       const info = drawing.describe(path);
       if (!info) continue;
+      // Hide any attribute the field registry owns *for this element's tag* — paint lives in the panel
+      // for a shape, stop-colour/offset for a stop — so each value has exactly one surface (§9.1).
+      const owned = new Set(svgFields.forTag(info.tag).map((f) => f.prop));
       const fields = info.attrs.filter(([name]) => !owned.has(name)).map(([name, value]) => {
         const field = Inputs.text({ label: name, value, width: 220 });
         const box = field.querySelector("input");
@@ -14699,10 +14701,28 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
         else { b.disabled = true; b.title = "nothing in this document has that id"; }
         return b;
       });
+      // G1. When the selection is a gradient (or a shape whose paint points at one), surface its stops
+      // as click-to-select swatches so the <defs> child is reachable without a manual tree descent,
+      // plus a + that runs the add-stop command on the resolved gradient (G4).
+      const g = drawing.gradientStops ? drawing.gradientStops(path) : null;
+      let strip = "";
+      if (g && g.stops.length) {
+        strip = htl.html`<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-top:6px">
+          <span style="font:11px ui-monospace,monospace;opacity:.6">stops</span></div>`;
+        for (const s of g.stops) {
+          const sw = htl.html`<button title="offset ${s.offset} · ${s.color} — click to edit" style="width:20px;height:20px;border-radius:4px;border:1px solid #b9c4b4;background:${s.color};cursor:pointer;padding:0"></button>`;
+          sw.onclick = () => drawing.select([s.path], "transform");
+          strip.append(sw);
+        }
+        const add = htl.html`<button title="add a stop" style="width:20px;height:20px;border-radius:4px;border:1px dashed #b9c4b4;background:#fff;cursor:pointer;padding:0;font:13px ui-monospace,monospace;line-height:1">+</button>`;
+        add.onclick = async () => { drawing.select([g.gradient], "transform"); await drawing.command("add-stop"); };
+        strip.append(add);
+      }
       el.append(htl.html`<fieldset style="border:1px solid #b9c4b4;border-radius:6px;padding:6px 10px 8px;margin:0">
         <legend style="font:12px ui-monospace,monospace;padding:0 4px">&lt;${info.tag}&gt; ${path.join(".")}</legend>
         ${Inputs.form(fields)}
         ${jumps.length ? htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">${jumps}</div>` : ""}
+        ${strip}
       </fieldset>`);
     }
   };
@@ -14740,6 +14760,9 @@ const _sl271 = function _fieldPanel(htl,Inputs,invalidation,$0)
       return;
     }
     const fields = drawing.fields(paths[0]);
+    const tag = (drawing.describe(paths[0]) || {}).tag || "";
+    const title = tag === "stop" ? "stop"
+                : /^(linear|radial)Gradient$/.test(tag) ? "gradient" : "paint & stroke";
     const rows = fields.map((f) => {
       if (f.kind === "enum") {
         const opts = f.options.includes(f.value) && f.value !== "" ? f.options : [f.value || ""].concat(f.options);
@@ -14770,7 +14793,7 @@ const _sl271 = function _fieldPanel(htl,Inputs,invalidation,$0)
       return row(f.label, inp);
     });
     el.append(htl.html`<fieldset style="border:1px solid #b9c4b4;border-radius:6px;padding:6px 10px 8px;margin:0;display:grid;gap:4px">
-      <legend style="font:12px ui-monospace,monospace;padding:0 4px">paint &amp; stroke${paths.length > 1 ? ` · ${paths.length} selected` : ""}</legend>
+      <legend style="font:12px ui-monospace,monospace;padding:0 4px">${title}${paths.length > 1 ? ` · ${paths.length} selected` : ""}</legend>
       ${rows}</fieldset>`);
   };
   // `lens-select`/`lens-put` dispatch synchronously inside the drawing's own `draw()`; a listener that
@@ -16758,14 +16781,18 @@ const _sl270 = function _svgFields(attrVal,styleLens){return(
 (() => {
   const N = (label, prop, extra = {}) => ({ prop, label, kind: "number", ...extra });
   const E = (label, prop, options) => ({ prop, label, kind: "enum", options });
-  const list = [
-    { prop: "fill", label: "Fill", kind: "color" },
-    { prop: "stroke", label: "Stroke", kind: "color" },
+  const T = (label, prop, extra = {}) => ({ prop, label, kind: "text", ...extra });
+  const C = (label, prop, extra = {}) => ({ prop, label, kind: "color", ...extra });
+  // The universal paint/stroke fields every graphics element offers (S9). This is `list`, the default
+  // contribution and the set the inspector treats as "owned" for a shape.
+  const paint = [
+    C("Fill", "fill"),
+    C("Stroke", "stroke"),
     N("Stroke width", "stroke-width", { min: 0, step: 0.5, dflt: "1" }),      // G30
     N("Opacity", "opacity", { min: 0, max: 1, step: 0.05, dflt: "1" }),        // G34
     N("Fill opacity", "fill-opacity", { min: 0, max: 1, step: 0.05, dflt: "1" }),
     N("Stroke opacity", "stroke-opacity", { min: 0, max: 1, step: 0.05, dflt: "1" }),
-    { prop: "stroke-dasharray", label: "Dash array", kind: "text", dflt: "none" },  // G31
+    T("Dash array", "stroke-dasharray", { dflt: "none" }),                    // G31
     N("Dash offset", "stroke-dashoffset", { step: 1, dflt: "0" }),
     E("Line cap", "stroke-linecap", ["butt", "round", "square"]),              // G32
     E("Line join", "stroke-linejoin", ["miter", "round", "bevel", "arcs", "miter-clip"]),
@@ -16774,6 +16801,25 @@ const _sl270 = function _svgFields(attrVal,styleLens){return(
     E("Fill rule", "fill-rule", ["nonzero", "evenodd"]),
     E("Vector effect", "vector-effect", ["none", "non-scaling-stroke"])
   ];
+  // G2/G4/G5. A <stop> and a gradient are elements too, and their properties are the ones that make a
+  // gradient a gradient. Coordinates stay `text`, not `number`, because a gradient in the default
+  // `objectBoundingBox` units is written in fractions *or* percentages (`x2="100%"`), and a number
+  // widget would silently drop the `%` — the same residue rule `lengthLens` keeps for a shape.
+  const stop = [
+    C("Stop color", "stop-color", { dflt: "#000000" }),
+    N("Stop opacity", "stop-opacity", { min: 0, max: 1, step: 0.05, dflt: "1" }),
+    T("Offset", "offset", { dflt: "0" })
+  ];
+  const gradientCommon = [
+    E("Units", "gradientUnits", ["objectBoundingBox", "userSpaceOnUse"]),      // G5: redefines the coords
+    E("Spread", "spreadMethod", ["pad", "reflect", "repeat"]),
+    T("Transform", "gradientTransform", { dflt: "" })
+  ];
+  const linearGradient = [T("x1", "x1", { dflt: "0" }), T("y1", "y1", { dflt: "0" }),
+                          T("x2", "x2", { dflt: "1" }), T("y2", "y2", { dflt: "0" })].concat(gradientCommon);
+  const radialGradient = [T("cx", "cx", { dflt: "0.5" }), T("cy", "cy", { dflt: "0.5" }), T("r", "r", { dflt: "0.5" }),
+                          T("fx", "fx"), T("fy", "fy")].concat(gradientCommon);
+  const byTag = { stop, linearGradient, radialGradient };
   // Read a property the same way `setProperty` writes one: a `style` declaration wins over the
   // attribute, and an absent value reads as "" (the panel then shows the placeholder default).
   const read = (doc, idx, prop) => {
@@ -16784,7 +16830,9 @@ const _sl270 = function _svgFields(attrVal,styleLens){return(
     try { v = attrVal(doc, idx, prop); } catch (e) {}
     return v === null ? "" : String(v).trim();
   };
-  return { list, read };
+  // The fields a given tag offers: its own contribution, or the universal paint set for a shape.
+  const forTag = (tag) => byTag[tag] || paint;
+  return { list: paint, read, forTag };
 })()
 )};
 
@@ -18314,6 +18362,77 @@ const _sl74u = function _test_refs(refsOf,pathOfId)
   if (!use || !eq(use.path, [0, 0, 1])) throw new Error("href=\"#id\" not followed");
   if (refsOf(doc, [0, 0, 1]).length !== 0) throw new Error("an id attribute is not a reference");
   return "✅ url(#id) and href=#id resolve to a path; dangling references say so";
+};
+
+// G2/G4/G5. The gradient-editing surface, headless: per-tag fields exist and are typed right; add-stop
+// lands a stop at the midpoint of the widest offset gap with the left stop's colour; delete-stop obeys
+// the >=2 minimum (T8). A command delta is `{apply, select}`, so this exercises the real plan with a
+// tiny env and no DOM — the same way the structural-command law does.
+const _sl303t = function _test_gradient_stops(svgFields,cmdStop,nodeAt)
+{
+  const doc = [
+    '<svg>',
+    '  <defs>',
+    '    <linearGradient id="g1" x1="0" y1="0" x2="1" y2="0">',
+    '      <stop offset="0" stop-color="#f00"/>',
+    '      <stop offset="1" stop-color="#00f"/>',
+    '    </linearGradient>',
+    '  </defs>',
+    '  <rect fill="url(#g1)" width="10" height="10"/>',
+    '</svg>'
+  ].join("\n");
+  const gp = [0, 0, 0];
+  const props = (tag) => svgFields.forTag(tag).map((f) => f.prop);
+  const offOf = (c) => (c.attrs && c.attrs.offset ? c.attrs.offset.value : null);
+  const colOf = (c) => (c.attrs && c.attrs["stop-color"] ? c.attrs["stop-color"].value : null);
+  const stopsOf = (src) => nodeAt(src, gp).children.filter((c) => c.tag === "stop");
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  // G2/G5: per-tag fields, correctly typed
+  if (!props("stop").includes("stop-color") || !props("stop").includes("offset"))
+    throw new Error("stop is missing stop-color/offset fields");
+  if (svgFields.forTag("stop").find((f) => f.prop === "stop-color").kind !== "color")
+    throw new Error("stop-color must be a colour field");
+  if (!props("linearGradient").includes("gradientUnits") || !props("linearGradient").includes("x2"))
+    throw new Error("linearGradient is missing gradientUnits/x2 fields");
+  if (props("rect")[0] !== "fill") throw new Error("a shape must still get the universal paint fields");
+  // G4 add: midpoint of the 0..1 gap, colour copied from the left stop, selection lands on the new stop
+  const add = cmdStop("add").plan({ src: doc, paths: [gp] });
+  if (!add) throw new Error("add-stop declined on a two-stop gradient");
+  const added = add.apply(doc);
+  const s2 = stopsOf(added);
+  if (s2.length !== 3) throw new Error(`add-stop produced ${s2.length} stops, want 3`);
+  if (offOf(s2[1]) !== "0.5") throw new Error(`new stop at offset ${offOf(s2[1])}, want 0.5`);
+  if (colOf(s2[1]) !== "#f00") throw new Error("new stop did not copy the left stop's colour");
+  if (!eq(add.select(), [[0, 0, 0, 1]])) throw new Error(`add-stop selects ${JSON.stringify(add.select())}`);
+  // G4 delete: declines at 2 (T8), removes one at 3
+  if (cmdStop("delete").plan({ src: doc, paths: [[0, 0, 0, 0]] }) !== null)
+    throw new Error("delete-stop must decline at two stops (T8)");
+  const del = cmdStop("delete").plan({ src: added, paths: [[0, 0, 0, 1]] });
+  if (!del) throw new Error("delete-stop declined at three stops");
+  if (stopsOf(del.apply(added)).length !== 2) throw new Error("delete-stop did not remove a stop");
+  // add-stop declines on a plain shape
+  if (cmdStop("add").plan({ src: doc, paths: [[0, 1]] }) !== null)
+    throw new Error("add-stop must decline on a non-gradient");
+  return "✅ per-tag fields; add-stop midpoint+colour+selection; delete-stop >=2 guard";
+};
+
+// G6. The gradient-gizmo geometry, headless: default handle positions, the drag inverse, percentage
+// parsing, and the radial centre/radius pair. The DOM mapping (fraction -> canvas via ctx) is not
+// here — only the pure model the interactive gizmo drives, which is what a law can pin.
+const _sl304t = function _test_gradient_gizmo(gradientGizmo)
+{
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const lin = gradientGizmo.handles("linearGradient", { x1: "0", y1: "0", x2: "1", y2: "0" });
+  if (!eq(lin, [{ key: "p1", x: 0, y: 0 }, { key: "p2", x: 1, y: 0 }])) throw new Error("linear default handles: " + JSON.stringify(lin));
+  const pct = gradientGizmo.handles("linearGradient", { x2: "100%", y2: "50%" });
+  if (pct[1].x !== 1 || pct[1].y !== 0.5) throw new Error("percentage did not parse to a fraction");
+  const w = gradientGizmo.writeFor("linearGradient", {}, "p2", 0.5, 0.25);
+  if (!eq(w, [{ prop: "x2", num: 0.5 }, { prop: "y2", num: 0.25 }])) throw new Error("p2 drag writes wrong attrs");
+  const rad = gradientGizmo.handles("radialGradient", { cx: "0.5", cy: "0.5", r: "0.5" });
+  if (!eq(rad, [{ key: "c", x: 0.5, y: 0.5 }, { key: "r", x: 1, y: 0.5 }])) throw new Error("radial handles: " + JSON.stringify(rad));
+  const rw = gradientGizmo.writeFor("radialGradient", { cx: "0.5", cy: "0.5" }, "r", 1, 0.5);
+  if (rw[0].prop !== "r" || Math.abs(rw[0].num - 0.5) > 1e-9) throw new Error("radius drag: " + JSON.stringify(rw));
+  return "✅ gizmo handles + drag inverse (linear, radial, %)";
 };
 
 // Snapping's claim: after applying the returned delta, some edge or centre of the moving box lies
@@ -22854,7 +22973,111 @@ defsCommand({
 })
 )};
 
-const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth,cmdSelect,cmdConvertSegment,cmdAddGradient,cmdAddMarker){return(
+// G4. Add or remove a gradient stop — the follow-through `cmdAddGradient` was missing (§9.4). Both are
+// ordinary structural puts on the gradient's children (the same `insertElement`/`deleteElement` the
+// shape verbs use), so the laws cover them; neither is a new write path. `add` places a stop at the
+// midpoint of the largest offset gap, colour copied from the stop on its left, so one click widens the
+// palette predictably. `delete` declines (T8) below two stops, the minimum a gradient needs. The
+// selection may be the gradient itself (the inspector's + selects it first) or one of its stops.
+// Reorder is deliberately not a command: stops paint in document order, and retyping a stop's `offset`
+// past a neighbour is the ordering the author sees — a separate move verb would be a second way to say it.
+const _sl302 = function _cmdStop(gestureDelta,nodeAt,insertElement,deleteElement){return(
+(kind) => ({
+  id: kind === "add" ? "add-stop" : "delete-stop",
+  label: kind === "add" ? "Add stop" : "Delete stop",
+  key: null,
+  plan(env) {
+    if (!env.paths.length) return null;
+    const path = env.paths[0];
+    const isGrad = (tag) => tag === "linearGradient" || tag === "radialGradient";
+    const parseOff = (v) => {
+      const s = v == null ? "" : String(v).trim();
+      const n = s.endsWith("%") ? parseFloat(s) / 100 : parseFloat(s);
+      return Number.isFinite(n) ? n : 0;
+    };
+    let n;
+    try { n = nodeAt(env.src, path); } catch (e) { return null; }
+    if (kind === "delete") {
+      if (n.tag !== "stop") return null;
+      const gp = path.slice(0, -1);
+      let g; try { g = nodeAt(env.src, gp); } catch (e) { return null; }
+      if (!isGrad(g.tag)) return null;
+      const count = (g.children || []).filter((c) => c.tag === "stop").length;
+      if (count <= 2) return null;                              // a gradient needs >= 2 stops (T8)
+      return gestureDelta.command("delete-stop", (src) => deleteElement(src, path),
+        { rebase: null, select: () => [gp] });
+    }
+    // add: resolve the selection to a gradient — the element itself, or the parent of a selected stop.
+    let gp, g;
+    if (isGrad(n.tag)) { gp = path; g = n; }
+    else if (n.tag === "stop") { gp = path.slice(0, -1); try { g = nodeAt(env.src, gp); } catch (e) { return null; } if (!isGrad(g.tag)) return null; }
+    else return null;
+    const kids = g.children || [];
+    const stops = kids.map((c, i) => ({
+      i, num: parseOff(c.attrs && c.attrs.offset && c.attrs.offset.value),
+      color: c.attrs && c.attrs["stop-color"] ? c.attrs["stop-color"].value : "#888888",
+      isStop: c.tag === "stop"
+    })).filter((s) => s.isStop);
+    const round = (x) => Math.round(Math.max(0, Math.min(1, x)) * 1000) / 1000;
+    let at, off, color;
+    if (!stops.length) { at = kids.length; off = 0; color = "#888888"; }
+    else if (stops.length === 1) {
+      const o = stops[0];
+      if (o.num <= 0.5) { off = 1; at = o.i + 1; } else { off = 0; at = o.i; }
+      color = o.color;
+    } else {
+      let best = 0, bestGap = -Infinity;
+      for (let k = 0; k < stops.length - 1; k++) {
+        const gap = stops[k + 1].num - stops[k].num;
+        if (gap > bestGap) { bestGap = gap; best = k; }
+      }
+      off = (stops[best].num + stops[best + 1].num) / 2;
+      at = stops[best + 1].i;
+      color = stops[best].color;
+    }
+    const markup = `<stop offset="${round(off)}" stop-color="${color}"/>`;
+    return gestureDelta.command("add-stop", (src) => insertElement(src, gp, at, markup),
+      { rebase: null, select: () => [gp.concat([at])] });   // land on the new stop, ready to recolour
+  }
+})
+)};
+
+// G6. The gradient axis as data: where its handles sit (in the gradient's own units, for the caller
+// to map onto the referring shape's box) and, inverted, which attributes a dragged handle writes.
+// Pure — no DOM — so the geometry is a law, and the interactive part in `svgLens` is only the mapping
+// through `ctx` (P5) and the commit through `setProperty` (the one write path). A percentage parses to
+// its fraction; a linear gradient has two endpoint handles, a radial one a centre and a radius handle.
+const _sl304 = function _gradientGizmo(){return(
+(() => {
+  const num = (v, d) => {
+    const s = v == null ? "" : String(v).trim();
+    const n = s.endsWith("%") ? parseFloat(s) / 100 : parseFloat(s);
+    return Number.isFinite(n) ? n : d;
+  };
+  return {
+    handles: (tag, attrs) => {
+      if (tag === "radialGradient") {
+        const cx = num(attrs.cx, 0.5), cy = num(attrs.cy, 0.5), r = num(attrs.r, 0.5);
+        return [{ key: "c", x: cx, y: cy }, { key: "r", x: cx + r, y: cy }];
+      }
+      return [{ key: "p1", x: num(attrs.x1, 0), y: num(attrs.y1, 0) },
+              { key: "p2", x: num(attrs.x2, 1), y: num(attrs.y2, 0) }];
+    },
+    // The dragged handle lands at (fx, fy) in the gradient's units — which attributes that is.
+    writeFor: (tag, attrs, key, fx, fy) => {
+      if (tag === "radialGradient") {
+        if (key === "c") return [{ prop: "cx", num: fx }, { prop: "cy", num: fy }];
+        const cx = num(attrs.cx, 0.5), cy = num(attrs.cy, 0.5);
+        return [{ prop: "r", num: Math.hypot(fx - cx, fy - cy) }];
+      }
+      return key === "p1" ? [{ prop: "x1", num: fx }, { prop: "y1", num: fy }]
+                          : [{ prop: "x2", num: fx }, { prop: "y2", num: fy }];
+    }
+  };
+})()
+)};
+
+const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth,cmdSelect,cmdConvertSegment,cmdAddGradient,cmdAddMarker,cmdStop){return(
 // A plain array, not an `Inputs.input`, for the same reason `svgShapes` is: pure code plans a command
 // and the laws exercise that headless, where there is no DOM to hold a view.
 [cmdGroup, cmdUngroup, cmdDuplicate, cmdCopy, cmdCut, cmdPaste(false), cmdPaste(true)]
@@ -22863,7 +23086,7 @@ const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cm
            cmdDeleteVertex, cmdClosePath(true), cmdClosePath(false), cmdToggleSmooth])
   .concat(["all", "none", "same-fill", "same-tag"].map(cmdSelect))
   .concat(["L", "C", "Q"].map(cmdConvertSegment))
-  .concat([cmdAddGradient, cmdAddMarker])
+  .concat([cmdAddGradient, cmdAddMarker, cmdStop("add"), cmdStop("delete")])
 )};
 
 // Look one up, and answer "what does this keystroke mean" in one place. The binding is a
@@ -23039,7 +23262,7 @@ const _sl113s = function _lensState(){return(
 new Map()
 )};
 
-const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,svgFields,svgAffordances,commandLookup,copyMarkup,moveTargetOf,commitDelta,rebaseVertex,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox)
+const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,svgFields,svgAffordances,commandLookup,copyMarkup,moveTargetOf,commitDelta,rebaseVertex,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox,gradientGizmo,attrTextLens)
 {
   // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
   // node that is the cell's value now, rather than the one its gesture started on.
@@ -23651,6 +23874,17 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       const w = setProperty(t, idx, prop, value);
       return writer.commit(idx, w.name, w.value, null);
     };
+    // Several properties in one commit, so a gizmo drag that moves an (x, y) pair is one history entry,
+    // not two — each write is style-aware (`setProperty`) and applied to the running source in order.
+    node.setProperties = (path, pairs) => node.edit("setProperties", (src) => {
+      let out = src;
+      for (const [prop, value] of pairs) {
+        const idx = nodeAt(out, path).index;
+        const w = setProperty(out, idx, prop, value);
+        out = attrTextLens(idx, w.name).put(w.value, out);
+      }
+      return out;
+    });
     // S6/G46. The typed field surface: what paint/stroke properties this element has and their current
     // source values, and a setter that writes one back through `setProperty` — the same path the
     // inspector and a drag use, so a widget commit is byte-identical to a raw attribute write. A write that would not change the
@@ -23659,9 +23893,9 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
     node.fields = (path) => {
       const t = target.doc();
       if (t === null) return [];
-      let idx;
-      try { idx = nodeAt(t, path).index; } catch (e) { return []; }
-      return svgFields.list.map((f) => ({ ...f, value: svgFields.read(t, idx, f.prop) }));
+      let n;
+      try { n = nodeAt(t, path); } catch (e) { return []; }
+      return svgFields.forTag(n.tag).map((f) => ({ ...f, value: svgFields.read(t, n.index, f.prop) }));
     };
     node.setField = (path, prop, value) => {
       const t = target.doc();
@@ -23678,6 +23912,36 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       const t = target.doc();
       if (t === null) return [];
       try { return refsOf(t, path); } catch (e) { return []; }
+    };
+    // G1. Resolve a selection to a gradient and list its stops. `path` may BE a gradient, a <stop>
+    // inside one, or a shape whose paint points at one via `url(#id)` (`refsOf` reports where) — all
+    // three answer the same "which stops am I editing". Returns the gradient's path and, per stop, its
+    // path plus the colour/offset a swatch needs; null when nothing here resolves to a gradient.
+    node.gradientStops = (path) => {
+      const t = target.doc();
+      if (t === null) return null;
+      const isGrad = (tag) => tag === "linearGradient" || tag === "radialGradient";
+      const gradPath = () => {
+        let n;
+        try { n = nodeAt(t, path); } catch (e) { return null; }
+        if (isGrad(n.tag)) return path;
+        const parent = path.slice(0, -1);           // a <stop>: its gradient is the parent
+        try { if (parent.length && isGrad(nodeAt(t, parent).tag)) return parent; } catch (e) {}
+        for (const ref of node.refs(path)) {          // a shape: follow its paint reference
+          if (ref.path) { try { if (isGrad(nodeAt(t, ref.path).tag)) return ref.path; } catch (e) {} }
+        }
+        return null;
+      };
+      const gp = gradPath();
+      if (!gp) return null;
+      let g;
+      try { g = nodeAt(t, gp); } catch (e) { return null; }
+      const stops = (g.children || []).filter((c) => c.tag === "stop").map((c) => ({
+        path: c.path,
+        color: c.attrs && c.attrs["stop-color"] ? c.attrs["stop-color"].value : "#000000",
+        offset: c.attrs && c.attrs.offset ? c.attrs.offset.value : "0"
+      }));
+      return { gradient: gp, stops };
     };
     // ---- affordances (S9) -----------------------------------------------------------------------
     // A chip's `env`: the selection and the same measured questions a command gets, plus the one it
@@ -23721,6 +23985,72 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
         }
         i++;
       }
+      // G6. A gradient-filled shape also gets its gradient's axis drawn as draggable handles. The
+      // handles are the gizmo's pure model mapped onto this shape's box through `ctx` (P5); a drag
+      // previews on the live gradient element (transient DOM) and commits x1..y2 / cx,cy,r through
+      // `setProperties`, the one write path. Wrapped so a gizmo failure never breaks the chip render.
+      try {
+        if (a.path && a.index !== null && a.tag !== "linearGradient" && a.tag !== "radialGradient" && a.tag !== "stop") {
+          const info = node.gradientStops(a.path);
+          const refEl = info ? ctx.elems()[a.index] : null;
+          let gradN = null; if (info) { try { gradN = nodeAt(a.doc, info.gradient); } catch (e) {} }
+          const bbox = refEl && refEl.getBBox ? ctx.bbox(refEl) : null;
+          if (info && refEl && gradN && bbox) {
+            const gtag = gradN.tag;
+            const attrs = {};
+            for (const k of Object.keys(gradN.attrs || {})) attrs[k] = gradN.attrs[k].value;
+            const units = attrs.gradientUnits || "objectBoundingBox";
+            const gradEl = ctx.elems()[gradN.index] || null;
+            const round = (x) => Math.round(x * 1000) / 1000;
+            const toRoot = (fx, fy) => ctx.rootPoint(refEl,
+              units === "userSpaceOnUse" ? fx : bbox.x + fx * bbox.width,
+              units === "userSpaceOnUse" ? fy : bbox.y + fy * bbox.height);
+            const fracOf = (e) => {
+              const lp = ctx.localPoint(refEl, e);
+              if (!lp) return null;
+              return units === "userSpaceOnUse" ? [lp[0], lp[1]]
+                : [(lp[0] - bbox.x) / (bbox.width || 1), (lp[1] - bbox.y) / (bbox.height || 1)];
+            };
+            const positions = () => gradientGizmo.handles(gtag, attrs).map((h) => ({ h, rp: toRoot(h.x, h.y) }));
+            const pos = positions();
+            if (pos.length >= 2 && pos.every((o) => o.rp)) {
+              const line = overlay.addRoot("line", { x1: pos[0].rp[0], y1: pos[0].rp[1], x2: pos[1].rp[0], y2: pos[1].rp[1],
+                stroke: "#4679b8", "stroke-width": s * 0.22, "stroke-dasharray": `${s * 0.6} ${s * 0.5}`, "pointer-events": "none" });
+              const circles = {};
+              const redraw = () => {
+                const np = positions();
+                if (np[0].rp && np[1].rp) { line.setAttribute("x1", np[0].rp[0]); line.setAttribute("y1", np[0].rp[1]); line.setAttribute("x2", np[1].rp[0]); line.setAttribute("y2", np[1].rp[1]); }
+                for (const { h, rp } of np) { const cc = circles[h.key]; if (cc && rp) { cc.setAttribute("cx", rp[0]); cc.setAttribute("cy", rp[1]); } }
+              };
+              for (const { h, rp } of pos) {
+                const c = overlay.addRoot("circle", { class: "grad-handle", r: s * 0.7, cx: rp[0], cy: rp[1], fill: "#fff", stroke: "#4679b8", "stroke-width": s * 0.22 });
+                c.style.cursor = "move"; c.dataset.grad = h.key; circles[h.key] = c;
+                const onMove = (ev) => {
+                  const f = fracOf(ev); if (!f) return;
+                  for (const { prop, num } of gradientGizmo.writeFor(gtag, attrs, h.key, f[0], f[1])) {
+                    attrs[prop] = String(round(num));
+                    if (gradEl) gradEl.setAttribute(prop, round(num));   // live preview; discarded on the commit re-render
+                  }
+                  redraw();
+                };
+                const onUp = async (ev) => {
+                  window.removeEventListener("pointermove", onMove);
+                  window.removeEventListener("pointerup", onUp);
+                  try { c.releasePointerCapture(ev.pointerId); } catch (er) {}
+                  const props = gtag === "radialGradient" ? (h.key === "c" ? ["cx", "cy"] : ["r"]) : (h.key === "p1" ? ["x1", "y1"] : ["x2", "y2"]);
+                  await node.setProperties(info.gradient, props.map((p) => [p, attrs[p]]));   // one commit
+                };
+                c.addEventListener("pointerdown", (ev) => {
+                  ev.preventDefault(); ev.stopPropagation();
+                  try { c.setPointerCapture(ev.pointerId); } catch (er) {}
+                  window.addEventListener("pointermove", onMove);
+                  window.addEventListener("pointerup", onUp);
+                });
+              }
+            }
+          }
+        }
+      } catch (e) { /* the gizmo is decoration; never let it break the chip render */ }
     });
     node.setTool = setTool;
     Object.defineProperty(node, "tool", { configurable: true, get: () => toolNow() });
@@ -23891,6 +24221,8 @@ export default function define(runtime, observer) {
   $def("sl31t", "test_units_and_style", ["forAll","arb","mulberry32","NUM_RUNS","lengthLens","parseLength","printLength","styleLens","parseStyle","setProperty"], _sl31t);
   $def("sl71t", "test_interpolation_slots", ["holeSpans","slotsOf","mergeInterpolated","literalSpan","literalLens"], _sl71t);
   $def("sl74u", "test_refs", ["refsOf","pathOfId"], _sl74u);
+  $def("sl303t", "test_gradient_stops", ["svgFields","cmdStop","nodeAt"], _sl303t);
+  $def("sl304t", "test_gradient_gizmo", ["gradientGizmo"], _sl304t);
   $def("sl127t", "test_snapRects", ["forAll","arb","mulberry32","NUM_RUNS","snapRects"], _sl127t);
   $def("sl119u", "test_topmost_selection", ["topmostPaths"], _sl119u);
   $def("sl119t", "test_z_order", ["forAll","arb","mulberry32","NUM_RUNS","zTarget","reorderElement","childrenLens"], _sl119t);
@@ -24119,13 +24451,15 @@ export default function define(runtime, observer) {
   $def("sl300", "defsCommand", ["gestureDelta","nodeAt","attrVal","setProperty","attrTextLens","mintId","defsInsert"], _sl300);
   $def("sl277", "cmdAddGradient", ["defsCommand"], _sl277);
   $def("sl278", "cmdAddMarker", ["defsCommand"], _sl278);
-  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth","cmdSelect","cmdConvertSegment","cmdAddGradient","cmdAddMarker"], _sl250);
+  $def("sl302", "cmdStop", ["gestureDelta","nodeAt","insertElement","deleteElement"], _sl302);
+  $def("sl304", "gradientGizmo", [], _sl304);
+  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth","cmdSelect","cmdConvertSegment","cmdAddGradient","cmdAddMarker","cmdStop"], _sl250);
   $def("sl272", "svgAffordances", ["gestureDelta","previewDelta","setProperty","nodeAt"], _sl272);
   $def("sl249", "commandLookup", [], _sl249);
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl299", "hAssembly", ["md"], _sl299);
   $def("sl113s", "lensState", [], _sl113s);
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","svgFields","svgAffordances","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox"], _sl114);
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","svgFields","svgAffordances","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox","gradientGizmo","attrTextLens"], _sl114);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
   // Prose is click-to-edit, as in @tomlarkworthy/lopecode-live-2026.
