@@ -14665,12 +14665,15 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
   return el;
 };
 
-// Type an exact value. The inspector reads the selected element's attributes out of the source and
-// writes them back through `setAttr` — the same commit a drag performs — so nothing here is a second
-// write path. It re-renders on `lens-select`, which the focus emits whenever it repaints.
-const _sl02c = function _inspector(htl,Inputs,invalidation,$0)
+// Type an exact value for an attribute the typed panel does not own — geometry, a transform, a custom
+// attribute. Paint and stroke belong to `fieldPanel` (the svgFields registry), so the inspector hides
+// any attribute a registry field already edits: fill has exactly one surface. It writes through
+// `setProperty` — the same style-aware commit `fieldPanel` and a drag use — so there is one write path,
+// not a second. Re-renders on `lens-select`, which the focus emits whenever it repaints.
+const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
 {
   const drawing = $0;
+  const owned = new Set(svgFields.list.map((f) => f.prop));
   const el = htl.html`<div style="margin:.5rem 0;min-height:2.2em;display:grid;gap:8px"></div>`;
   const render = () => {
     const paths = drawing.selectionPaths();
@@ -14683,11 +14686,11 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,$0)
     for (const path of paths) {
       const info = drawing.describe(path);
       if (!info) continue;
-      const fields = info.attrs.map(([name, value]) => {
+      const fields = info.attrs.filter(([name]) => !owned.has(name)).map(([name, value]) => {
         const field = Inputs.text({ label: name, value, width: 220 });
         const box = field.querySelector("input");
         // `change`, not `input`: one commit per finished edit, like one commit per finished drag.
-        box.addEventListener("change", () => drawing.setAttr(path, name, box.value));
+        box.addEventListener("change", () => drawing.setProperty(path, name, box.value));
         return field;
       });
       const jumps = drawing.refs(path).map((ref) => {
@@ -14718,7 +14721,7 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,$0)
 // to live. It is a pure projection of `drawing.fields(path)` — the registry decides which fields exist
 // and reads their current values, this cell only picks a widget per `kind` and writes the change back
 // through `drawing.setField`, which is `setProperty` → `commitDelta`, the one write path. So a widget's
-// commit is byte-identical to `setAttr`, adding a field is a line in the registry (no change here), and
+// commit is byte-identical to a raw attribute write, adding a field is a line in the registry (no change here), and
 // a change applies to *every* selected element (the align commands' "one delta per claimed element",
 // G40). Colour gets both a native picker and a text box: the text preserves the author's own notation
 // (`darkseagreen` stays `darkseagreen`), the picker is the swatch. Re-renders on select and on commit.
@@ -15712,22 +15715,15 @@ const _sl08c = async function _keepYourEdits(htl,downloadAnchor,lookupVariable,s
   </div>`;
 };
 
-// Every gesture, with the laws re-checked on the source it produced.
-// Cumulative snapshots: the runtime keeps only the latest yield, so re-render the whole log.
-const _sl05 = function _putTable(Generators,$0,Inputs,invalidation){return(
-Generators.observe((change) => {
-  const log = [];
-  const render = () => change(Inputs.table(log.slice(-8).reverse(), {
-    columns: ["target", "attribute", "before", "after", "GetPut", "PutGet"],
-    format: { GetPut: (ok) => (ok ? "✅" : "❌"), PutGet: (ok) => (ok ? "✅" : "❌") },
-    rows: 8, layout: "auto",
-    width: { attribute: "8%", GetPut: "6%", PutGet: "6%" }
-  }));
-  const onPut = (e) => { log.push(e.detail); render(); };
-  render();
-  $0.addEventListener("lens-put", onPut);
-  invalidation.then(() => $0.removeEventListener("lens-put", onPut));
-  return () => $0.removeEventListener("lens-put", onPut);
+// Every gesture on the drawing, with the laws re-checked on the source it produced. Reads the shared
+// `putLog` (the "drawing" rows `edits` already records) rather than keeping a second live listener on
+// the same node; `edits` is listed as an input purely to recompute when the buffer grows.
+const _sl05 = function _putTable(putLog,edits,Inputs){return(
+Inputs.table(putLog.filter((e) => e.source === "drawing").map((e) => e.detail).slice(-8).reverse(), {
+  columns: ["target", "attribute", "before", "after", "GetPut", "PutGet"],
+  format: { GetPut: (ok) => (ok ? "✅" : "❌"), PutGet: (ok) => (ok ? "✅" : "❌") },
+  rows: 8, layout: "auto",
+  width: { attribute: "8%", GetPut: "6%", PutGet: "6%" }
 })
 )};
 
@@ -16753,8 +16749,8 @@ const _sl31h = function _setProperty(attrVal,styleLens){return(
 // a transform). `read` returns the *source* value — style declaration first, then attribute, then the
 // SVG default — so the panel shows the bytes the author has, and a write that equals them is skipped
 // upstream (T1). Nothing here writes: a field names a property, and `node.setField` routes it through
-// `setProperty` → `commitDelta`, the one write path, so a widget's commit is byte-identical to a
-// `setAttr` by construction.
+// `setProperty` → `commitDelta`, the one write path, so a widget's commit is byte-identical to a raw
+// attribute write by construction.
 const _sl270 = function _svgFields(attrVal,styleLens){return(
 (() => {
   const N = (label, prop, extra = {}) => ({ prop, label, kind: "number", ...extra });
@@ -20128,9 +20124,23 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
     if (key === "pivot") { ctx.state.drag = { tool: "transform", key, idx, el, pivotMove: true, started: false }; return true; }
     const text = ctx.attr(t, idx, "transform") || "";
     const centre = ctx.focus.pivot || [b.x + b.width / 2, b.y + b.height / 2];
+    // A rotate drag is *relative*: capture where the grab started and the box's current angle, so the
+    // shape turns with the pointer from where it already is instead of snapping its top to the pointer.
+    // Measured in screen space (which does not spin with the element, unlike `localPoint`, whose frame
+    // rotates as the box does and so always reads the handle as straight up — the snap this avoids).
+    let rotStart = null;
+    if (key === "rot") {
+      const m = ctx.screenCTM(el);
+      if (m) {
+        const csx = m.a * centre[0] + m.c * centre[1] + m.e;   // pivot in screen px (fixed under a spin)
+        const csy = m.b * centre[0] + m.d * centre[1] + m.f;
+        rotStart = { centreScreen: [csx, csy], baseAngle: Math.atan2(m.b, m.a) * 180 / Math.PI,
+                     grab: Math.atan2(e.clientY - csy, e.clientX - csx) };
+      }
+    }
     ctx.state.drag = {
       tool: "transform",                                 // see the note on `onCancel` below
-      key, idx, el, b, text, base: opsLens.get(text), ops: opsLens.get(text), started: false,
+      key, idx, el, b, text, base: opsLens.get(text), ops: opsLens.get(text), started: false, rotStart,
       centre: [b.x + b.width / 2, b.y + b.height / 2],   // the box centre: what alt-scale scales about
       rotCentre: centre,                                  // G12: the (possibly moved) rotation pivot
       // the corner opposite the one being dragged: the point that must not move
@@ -20155,11 +20165,16 @@ const _sl124 = function _toolTransform(opsLens,rotateAbout,scaleAbout,grabPointe
       return;
     }
     if (d.key === "rot") {
-      const a = Math.atan2(p[1] - d.rotCentre[1], p[0] - d.rotCentre[0]) * 180 / Math.PI + 90;
+      // Relative turn: base angle plus how far the pointer has swept around the pivot since the grab,
+      // both measured in screen space. The fallback (no CTM) keeps the old absolute behaviour.
+      const rs = d.rotStart;
+      const a = rs
+        ? rs.baseAngle + (Math.atan2(e.clientY - rs.centreScreen[1], e.clientX - rs.centreScreen[0]) - rs.grab) * 180 / Math.PI
+        : Math.atan2(p[1] - d.rotCentre[1], p[0] - d.rotCentre[0]) * 180 / Math.PI + 90;
       const step = e.shiftKey ? 15 : 1;
       const ang = Math.round(a / step) * step;
       d.ops = rotateAbout(d.base, ang, d.rotCentre[0], d.rotCentre[1]);
-      d.read = `${((ang % 360) + 360) % 360}°`;
+      d.read = `${((Math.round(ang) % 360) + 360) % 360}°`;
     } else {
       // G11: alt scales about the centre, so both sides move symmetrically — the pivot becomes the
       // centre and the reference dimension a half, which is exactly what keeps a corner under the
@@ -20823,7 +20838,7 @@ const _sl121b = function _toolMarquee(pathOfIndex,scopedPath,grabPointer,dragBox
 
 // Structural editing by double-click: add a vertex on an edge, remove the one under the pointer, or
 // drop a new shape on empty canvas. Every branch is a pure command.
-const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nearestSegment,pointsHandles,parsePoints,attrVal,childrenLens,rebasePath,pathHandles,parsePath,pathSegments,nearestPathSegment,insertPathPoint,deletePathPoint,gestureDelta,commitDelta){return(
+const _sl122 = function _toolStructure(insertElement,insertPoint,cmdDeleteVertex,nearestSegment,pointsHandles,parsePoints,attrVal,childrenLens,rebasePath,pathHandles,parsePath,pathSegments,nearestPathSegment,insertPathPoint,gestureDelta,commitDelta){return(
 {
   id: "structure",
   async onDblClick(ctx, e) {
@@ -20834,27 +20849,33 @@ const _sl122 = function _toolStructure(insertElement,insertPoint,deletePoint,nea
     // A point edit leaves the element tree alone, so every path — including the selection's — holds.
     const sel = focus.path;
 
+    // Double-click delete and the Delete key are one implementation, two triggers: resolve the clicked
+    // handle to a vertex ordinal and dispatch cmdDeleteVertex, rather than re-building the delta here.
+    const dispatchDelete = (n) => {
+      const plan = cmdDeleteVertex.plan({
+        src: t, vertices: [{ kind: "anchor", path: sel, n }], index: () => focus.index
+      });
+      return plan;
+    };
+
     if (key !== undefined && sel && focus.mode === "points") {
       const h = pointsHandles(t, focus.index).find((x) => x.key === key);
       if (!h) return false;
-      await commitDelta(ctx, gestureDelta.command("deletePoint", (d) => deletePoint(d, sel, h.i),
-        { vertex: { kind: "vertex-delete", path: sel, at: h.i } }));
+      const plan = dispatchDelete(h.i);
+      if (!plan) return false;
+      await commitDelta(ctx, plan);
       return true;
     }
 
-    // The same two gestures on a path. An anchor handle ends a segment, so deleting "the anchor with
-    // this key" is deleting the segment it terminates.
+    // The same two gestures on a path. An anchor handle ends a segment; deleting "the anchor with this
+    // key" is deleting the segment it terminates — cmdDeleteVertex owns that reading, keyed by the
+    // anchor's ordinal among the path's anchor handles.
     if (key !== undefined && sel && focus.mode === "path") {
-      const h = pathHandles(t, focus.index).find((x) => x.key === key);
-      if (!h || h.kind !== "anchor") return false;
-      const segs = pathSegments(parsePath(ctx.attr(t, focus.index, "d")));
-      const i = segs.findIndex((s) => s.ci === h.ci && s.o === h.o);
-      if (i < 0) return false;
-      // Deleting "the anchor with this key" removes the segment it terminates, so the ordinal that
-      // goes is that segment's *end* anchor: one per non-Z segment up to and including this one.
-      await commitDelta(ctx, gestureDelta.command("deletePathPoint", (d) => deletePathPoint(d, sel, i),
-        { vertex: { kind: "vertex-delete", path: sel,
-                    at: segs.slice(0, i + 1).filter((sg) => sg.kind !== "Z").length } }));
+      const n = pathHandles(t, focus.index).filter((x) => x.kind === "anchor").findIndex((x) => x.key === key);
+      if (n < 0) return false;
+      const plan = dispatchDelete(n);
+      if (!plan) return false;
+      await commitDelta(ctx, plan);
       return true;
     }
 
@@ -22210,7 +22231,19 @@ const _sl241 = function _cmdUngroup(gestureDelta,ungroupBlockers,ungroupElements
 }
 )};
 
-const _sl242 = function _cmdDuplicate(gestureDelta,copyMarkup,offsetMarkup,pasteMarkup){return(
+const _sl301 = function _pasteInto(gestureDelta,offsetMarkup,pasteMarkup){return(
+// Shared tail of duplicate/paste: nudge each markup by d, append under `parent` at `at`, select the
+// new children. Appended after everything that exists, so no existing address moves — rebase is null.
+(id, parent, markups, at, d) => {
+  const placed = d ? markups.map((m) => offsetMarkup(m, d, d)) : markups;
+  return gestureDelta.command(id, (src) => pasteMarkup(src, parent, at, placed), {
+    rebase: null,
+    select: () => placed.map((_, k) => parent.concat([at + k]))
+  });
+}
+)};
+
+const _sl242 = function _cmdDuplicate(copyMarkup,pasteInto){return(
 {
   id: "duplicate", label: "Duplicate", key: "Mod-d",
   plan(env) {
@@ -22220,13 +22253,7 @@ const _sl242 = function _cmdDuplicate(gestureDelta,copyMarkup,offsetMarkup,paste
     if (env.paths.some((p) => p.length !== env.paths[0].length || !parent.every((v, i) => p[i] === v)))
       return null;
     const d = env.options.duplicateOffset === undefined ? 8 : env.options.duplicateOffset;
-    const at = env.childCount(parent);
-    const copies = copyMarkup(env.src, env.paths).map((m) => offsetMarkup(m, d, d));
-    return gestureDelta.command("duplicate", (src) => pasteMarkup(src, parent, at, copies), {
-      // Appended after everything that already exists, so no existing address moves at all.
-      rebase: null,
-      select: () => copies.map((_, k) => parent.concat([at + k]))
-    });
+    return pasteInto("duplicate", parent, copyMarkup(env.src, env.paths), env.childCount(parent), d);
   }
 }
 )};
@@ -22262,7 +22289,7 @@ const _sl244 = function _cmdCut(gestureDelta,copyMarkup,deleteElement,rebasePath
 }
 )};
 
-const _sl245 = function _cmdPaste(gestureDelta,pasteMarkup,offsetMarkup){return(
+const _sl245 = function _cmdPaste(pasteInto){return(
 // Two verbs, one plan: paste offsets so you can see that something arrived, paste-in-place does not,
 // which is what makes it the exact inverse of copy and therefore the thing a law can check.
 (inPlace) => ({
@@ -22274,11 +22301,7 @@ const _sl245 = function _cmdPaste(gestureDelta,pasteMarkup,offsetMarkup){return(
     if (!clip || !clip.length) return null;
     const parent = env.scope && env.scope.length ? env.scope : [0];
     const d = inPlace ? 0 : (env.options.duplicateOffset === undefined ? 8 : env.options.duplicateOffset);
-    const markups = d ? clip.map((m) => offsetMarkup(m, d, d)) : clip;
-    const at = env.childCount(parent);
-    return gestureDelta.command(inPlace ? "paste-in-place" : "paste",
-      (src) => pasteMarkup(src, parent, at, markups),
-      { rebase: null, select: () => markups.map((_, k) => parent.concat([at + k])) });
+    return pasteInto(inPlace ? "paste-in-place" : "paste", parent, clip, env.childCount(parent), d);
   }
 })
 )};
@@ -22752,53 +22775,54 @@ const _sl264 = function _cmdSelect(gestureDelta,nodeAt){return(
 // in the same tree. One shape, because "point *this* fill at a new gradient" names one referrer; a
 // pasted copy of the shape carries the url and `freshenIds` renames the gradient with it, so the copy
 // gets its own — S10's paste-collision falsifier holds through the existing codec, not a special case.
-const _sl277 = function _cmdAddGradient(gestureDelta,nodeAt,attrVal,setProperty,attrTextLens,mintId,defsInsert){return(
-{
-  id: "add-gradient", label: "Add gradient", key: null,
+const _sl300 = function _defsCommand(gestureDelta,nodeAt,attrVal,setProperty,attrTextLens,mintId,defsInsert){return(
+// Factory for commands that add a <defs> entry and point one attribute at it via url(#id).
+// spec: { id, label, key, tags, sourceAttr, targetAttr, prefix, markup(id, cur) }
+(spec) => ({
+  id: spec.id, label: spec.label, key: spec.key,
   plan(env) {
     if (env.paths.length !== 1) return null;
     const path = env.paths[0];
     let n; try { n = nodeAt(env.src, path); } catch (e) { return null; }
-    const paintable = ["rect", "circle", "ellipse", "polygon", "path", "line", "polyline", "text"];
-    if (!paintable.includes(n.tag)) return null;
-    const cur = attrVal(env.src, n.index, "fill");
-    return gestureDelta.command("add-gradient", (src) => {
+    if (!spec.tags.includes(n.tag)) return null;
+    const cur = attrVal(env.src, n.index, spec.sourceAttr);
+    return gestureDelta.command(spec.id, (src) => {
       const idx = nodeAt(src, path).index;
-      const id = mintId(src, "grad");
-      const base = cur && !/^\s*url\(/.test(cur) && cur !== "none" ? cur : "#888888";
-      const grad = `<linearGradient id="${id}" x1="0" y1="0" x2="1" y2="0">`
-                 + `<stop offset="0" stop-color="${base}"/><stop offset="1" stop-color="#ffffff"/></linearGradient>`;
-      const w = setProperty(src, idx, "fill", `url(#${id})`);
-      return defsInsert(attrTextLens(idx, w.name).put(w.value, src), grad);
+      const id = mintId(src, spec.prefix);
+      const w = setProperty(src, idx, spec.targetAttr, `url(#${id})`);
+      return defsInsert(attrTextLens(idx, w.name).put(w.value, src), spec.markup(id, cur));
     }, { rebase: null, select: () => [path] });
   }
-}
+})
+)};
+
+const _sl277 = function _cmdAddGradient(defsCommand){return(
+defsCommand({
+  id: "add-gradient", label: "Add gradient", key: null,
+  tags: ["rect", "circle", "ellipse", "polygon", "path", "line", "polyline", "text"],
+  sourceAttr: "fill", targetAttr: "fill", prefix: "grad",
+  markup(id, cur) {
+    const base = cur && !/^\s*url\(/.test(cur) && cur !== "none" ? cur : "#888888";
+    return `<linearGradient id="${id}" x1="0" y1="0" x2="1" y2="0">`
+         + `<stop offset="0" stop-color="${base}"/><stop offset="1" stop-color="#ffffff"/></linearGradient>`;
+  }
+})
 )};
 
 // S10/G36. The same move for a marker: mint an arrowhead into <defs> and point `marker-end` at it,
 // coloured by the shape's stroke. Markers attach to the stroked path tags. Everything else — the
 // non-colliding id, the untouched addresses, the paste rename — is shared with the gradient command.
-const _sl278 = function _cmdAddMarker(gestureDelta,nodeAt,attrVal,setProperty,attrTextLens,mintId,defsInsert){return(
-{
+const _sl278 = function _cmdAddMarker(defsCommand){return(
+defsCommand({
   id: "add-marker", label: "Add arrowhead", key: null,
-  plan(env) {
-    if (env.paths.length !== 1) return null;
-    const path = env.paths[0];
-    let n; try { n = nodeAt(env.src, path); } catch (e) { return null; }
-    const strokable = ["path", "line", "polyline", "polygon"];
-    if (!strokable.includes(n.tag)) return null;
-    const cur = attrVal(env.src, n.index, "stroke");
-    return gestureDelta.command("add-marker", (src) => {
-      const idx = nodeAt(src, path).index;
-      const id = mintId(src, "arrow");
-      const color = cur && !/^\s*url\(/.test(cur) && cur !== "none" ? cur : "#333333";
-      const mk = `<marker id="${id}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">`
-               + `<path d="M0,0 L10,5 L0,10 z" fill="${color}"/></marker>`;
-      const w = setProperty(src, idx, "marker-end", `url(#${id})`);
-      return defsInsert(attrTextLens(idx, w.name).put(w.value, src), mk);
-    }, { rebase: null, select: () => [path] });
+  tags: ["path", "line", "polyline", "polygon"],
+  sourceAttr: "stroke", targetAttr: "marker-end", prefix: "arrow",
+  markup(id, cur) {
+    const color = cur && !/^\s*url\(/.test(cur) && cur !== "none" ? cur : "#333333";
+    return `<marker id="${id}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">`
+         + `<path d="M0,0 L10,5 L0,10 z" fill="${color}"/></marker>`;
   }
-}
+})
 )};
 
 const _sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth,cmdSelect,cmdConvertSegment,cmdAddGradient,cmdAddMarker){return(
@@ -23589,11 +23613,6 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
                  attrs: Object.keys(n.attrs).map((k) => [k, n.attrs[k].value]) };
       } catch (e) { return null; }
     };
-    node.setAttr = (path, name, value) => {
-      const t = target.doc();
-      if (t === null) return null;
-      return writer.commit(nodeAt(t, path).index, name, value, null);
-    };
     // Set a paint property where it already lives: a `style="fill: …"` declaration wins over a `fill`
     // attribute, so writing the attribute would look like an edit and change nothing.
     node.setProperty = (path, prop, value) => {
@@ -23604,8 +23623,8 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       return writer.commit(idx, w.name, w.value, null);
     };
     // S6/G46. The typed field surface: what paint/stroke properties this element has and their current
-    // source values, and a setter that writes one back through `setProperty` — the same path
-    // `setAttr` uses, so a widget commit is byte-identical to it. A write that would not change the
+    // source values, and a setter that writes one back through `setProperty` — the same path the
+    // inspector and a drag use, so a widget commit is byte-identical to a raw attribute write. A write that would not change the
     // bytes is skipped (T1), which is what lets the panel re-render from the selection on every commit
     // without a colour picker reporting the same hex re-serialising `darkseagreen`.
     node.fields = (path) => {
@@ -23733,10 +23752,10 @@ export default function define(runtime, observer) {
   $def("sl03", "drawing", ["Generators","viewof drawing"], _sl03);
   // The inspector's height follows the selection, so it sits *below* the drawing: above it, every
   // change of selection would shift the picture under the pointer mid-gesture.
-  $def("sl02c", "inspector", ["htl","Inputs","invalidation","viewof drawing"], _sl02c);
+  $def("sl02c", "inspector", ["htl","Inputs","invalidation","svgFields","viewof drawing"], _sl02c);
   $def("sl271", "fieldPanel", ["htl","Inputs","invalidation","viewof drawing"], _sl271);
   $def("sl04", "howToDrive", ["md","ref"], _sl04);
-  $def("sl05", "putTable", ["Generators","viewof drawing","Inputs","invalidation"], _sl05);
+  $def("sl05", "putTable", ["putLog","edits","Inputs"], _sl05);
   $def("sl08", "useIt", ["md"], _sl08);
   $def("sl08f", "putLog", [], _sl08f);
   $def("sl08d", "edits", ["Generators","putLog","viewof drawing","viewof factory","invalidation"], _sl08d);
@@ -24017,7 +24036,7 @@ export default function define(runtime, observer) {
   $def("sl125z", "toolZoom", ["grabPointer"], _sl125z);
   $def("sl122b", "toolScope", ["pathOfIndex","scopedPath","shapeLookup","gestureDelta","commitDelta"], _sl122b);
   $def("sl121b", "toolMarquee", ["pathOfIndex","scopedPath","grabPointer","dragBox","gestureDelta","commitDelta"], _sl121b);
-  $def("sl122", "toolStructure", ["insertElement","insertPoint","deletePoint","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","deletePathPoint","gestureDelta","commitDelta"], _sl122);
+  $def("sl122", "toolStructure", ["insertElement","insertPoint","cmdDeleteVertex","nearestSegment","pointsHandles","parsePoints","attrVal","childrenLens","rebasePath","pathHandles","parsePath","pathSegments","nearestPathSegment","insertPathPoint","gestureDelta","commitDelta"], _sl122);
   $def("sl124", "toolTransform", ["opsLens","rotateAbout","scaleAbout","grabPointer","gestureDelta","previewDelta","commitDelta","revertDelta"], _sl124);
   $def("sl125a", "dragBox", [], _sl125a);
   $def("sl125b", "shapeSpec", ["dragBox"], _sl125b);
@@ -24053,10 +24072,11 @@ export default function define(runtime, observer) {
   $def("sl273", "toolAffordance", ["grabPointer","previewDelta","gestureDelta","revertDelta"], _sl273);
   $def("sl240", "cmdGroup", ["gestureDelta","groupPlan","groupElements","rebaseMoves"], _sl240);
   $def("sl241", "cmdUngroup", ["gestureDelta","ungroupBlockers","ungroupElements","childrenLens","rebaseMoves"], _sl241);
-  $def("sl242", "cmdDuplicate", ["gestureDelta","copyMarkup","offsetMarkup","pasteMarkup"], _sl242);
+  $def("sl301", "pasteInto", ["gestureDelta","offsetMarkup","pasteMarkup"], _sl301);
+  $def("sl242", "cmdDuplicate", ["copyMarkup","pasteInto"], _sl242);
   $def("sl243", "cmdCopy", ["gestureDelta","copyMarkup"], _sl243);
   $def("sl244", "cmdCut", ["gestureDelta","copyMarkup","deleteElement","rebasePath"], _sl244);
-  $def("sl245", "cmdPaste", ["gestureDelta","pasteMarkup","offsetMarkup"], _sl245);
+  $def("sl245", "cmdPaste", ["pasteInto"], _sl245);
   $def("sl246", "alignSpecs", [], _sl246);
   $def("sl247", "cmdAlign", ["moveDeltas"], _sl247);
   $def("sl248", "cmdDistribute", ["moveDeltas"], _sl248);
@@ -24067,8 +24087,9 @@ export default function define(runtime, observer) {
   $def("sl264", "cmdSelect", ["gestureDelta","nodeAt"], _sl264);
   $def("sl265", "pathConvert", ["pathSegments","replaceGroup","absoluteGroup"], _sl265);
   $def("sl266", "cmdConvertSegment", ["gestureDelta","attrVal","parsePath","printPath","pathSegments","pathHandles","attrTextLens","nodeAt","pathConvert"], _sl266);
-  $def("sl277", "cmdAddGradient", ["gestureDelta","nodeAt","attrVal","setProperty","attrTextLens","mintId","defsInsert"], _sl277);
-  $def("sl278", "cmdAddMarker", ["gestureDelta","nodeAt","attrVal","setProperty","attrTextLens","mintId","defsInsert"], _sl278);
+  $def("sl300", "defsCommand", ["gestureDelta","nodeAt","attrVal","setProperty","attrTextLens","mintId","defsInsert"], _sl300);
+  $def("sl277", "cmdAddGradient", ["defsCommand"], _sl277);
+  $def("sl278", "cmdAddMarker", ["defsCommand"], _sl278);
   $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth","cmdSelect","cmdConvertSegment","cmdAddGradient","cmdAddMarker"], _sl250);
   $def("sl272", "svgAffordances", ["gestureDelta","previewDelta","setProperty","nodeAt"], _sl272);
   $def("sl249", "commandLookup", [], _sl249);
