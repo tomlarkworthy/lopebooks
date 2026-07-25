@@ -2604,6 +2604,15 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
     }
     return -1;
   };
+  // notebook-kit (new.observablehq.com) names cells `viewof$x`/`mutable$x` where the legacy
+  // compiler uses `viewof x`/`mutable x`, and names the viewed notebook's import cells
+  // `cell 227` rather than `module 1`. The include:/layout: literals are source code, so they
+  // keep the legacy spelling on every platform — canonicalise runtime names at the boundary
+  // and try both spellings on every scope lookup.
+  const canonName = n => typeof n === 'string' ? n.replace(/^(viewof|mutable)\$/, '$1 ') : n;
+  const platformName = n => String(n).replace(/^(viewof|mutable) /, '$1$');
+  const scopeHas = (m, n) => m._scope.has(n) || m._scope.has(platformName(n));
+  const isImportVar = v => typeof v?._name === 'string' && (v._name.startsWith('module ') || v._inputs?.length === 1 && v._inputs[0]?._name === '@variable' && String(v._definition).includes('import('));
   return (rt, {invalidation, module = main, filter = () => true, include = null, columns = 12, showGrid = true, portrait = 640, layout = {}, persist = true, detachNodes = true} = {}) => {
     // hide imports and runtime plumbing regardless of mode
     const HIDDEN_NAMES = new Set([
@@ -2612,6 +2621,8 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
       'visibility'
     ]);
     const baseFilter = (name, variables) => {
+      if (variables?.some?.(isImportVar))
+        return false;
       for (const n of [
           name,
           variables?.[0]?._name
@@ -2633,7 +2644,7 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
           name,
           variables?.[0]?._name
         ]) {
-        if (typeof n === 'string' && includeState.includes(n))
+        if (typeof n === 'string' && includeState.includes(canonName(n)))
           return true;
       }
       return false;
@@ -2874,7 +2885,7 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
         scheduleSave();
       }, 350);
     };
-    const keyOf = variable => variable?._name ?? (variable?.pid != null ? 'pid:' + variable.pid : null);
+    const keyOf = variable => canonName(variable?._name) ?? (variable?.pid != null ? 'pid:' + variable.pid : null);
     const positionAtom = atom => {
       const pos = state.atoms[atom.dataset.sgKey];
       if (!pos)
@@ -3056,24 +3067,27 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
     };
     const candidateNames = () => {
       const seen = new Set(includeState ?? currentKeys());
-      const selfName = findSelf()?._name;
+      const selfName = canonName(findSelf()?._name);
       const out = [];
       try {
-        for (const [name, v] of module._scope) {
-          if (typeof name !== 'string' || !name)
+        for (const [rawName, v] of module._scope) {
+          if (typeof rawName !== 'string' || !rawName)
             continue;
+          const name = canonName(rawName);
           if (name.startsWith('module ') || HIDDEN_NAMES.has(name))
             continue;
           if (name.startsWith('initial ') || name.startsWith('mutable '))
             continue;
-          if (module._scope.has('viewof ' + name))
+          if (isImportVar(v))
+            continue;
+          if (scopeHas(module, 'viewof ' + name))
             continue;
           // derived viewof value
           if (seen.has(name) || name === selfName)
             continue;
           // skip import bindings/builtins — they resolve as identity aliases
           // (single input of the same name)
-          if (v?._inputs?.length === 1 && v._inputs[0]?._name === name)
+          if (v?._inputs?.length === 1 && v._inputs[0]?._name === rawName)
             continue;
           if (v?._inputs?.some(i => i?._name?.startsWith('module ')))
             continue;
@@ -3091,13 +3105,14 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
     const templateRoots = () => {
       const all = new Set();
       try {
-        for (const [name] of module._scope) {
-          if (typeof name !== 'string')
+        for (const [rawName] of module._scope) {
+          if (typeof rawName !== 'string')
             continue;
+          const name = canonName(rawName);
           const plain = name.replace(/^viewof /, '');
           if (!plain.startsWith('template_'))
             continue;
-          if (!name.startsWith('viewof ') && module._scope.has('viewof ' + name))
+          if (!name.startsWith('viewof ') && scopeHas(module, 'viewof ' + name))
             continue;
           // derived viewof value
           all.add(plain);
@@ -3110,19 +3125,20 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
     const instantiateTemplate = async rootName => {
       try {
         const base = rootName.replace(/^template_/, '');
-        const taken = n => module._scope.has(n) || module._scope.has('viewof ' + n);
+        const taken = n => scopeHas(module, n) || scopeHas(module, 'viewof ' + n);
         let i = 1;
         while (taken(base + i))
           i++;
         const instName = base + i;
         const groupVars = [];
-        for (const [name, v] of module._scope) {
-          if (typeof name !== 'string')
+        for (const [rawName, v] of module._scope) {
+          if (typeof rawName !== 'string')
             continue;
+          const name = canonName(rawName);
           const plain = name.replace(/^viewof /, '');
           if (plain !== rootName && !plain.startsWith(rootName + '_'))
             continue;
-          if (!name.startsWith('viewof ') && module._scope.has('viewof ' + name))
+          if (!name.startsWith('viewof ') && scopeHas(module, 'viewof ' + name))
             continue;
           // derived viewof value: compiled with its viewof cell
           groupVars.push(v);
@@ -3142,7 +3158,7 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
         // surface every instantiated group member (viewofs + plain cells),
         // renamed the same way — so a template drops a whole working widget
         for (const v of groupVars)
-          addCell(v._name.split(rootName).join(instName));
+          addCell(canonName(v._name).split(rootName).join(instName));
       } catch (e) {
         console.warn('grid-container: template instantiation failed', e);
       }
@@ -3169,7 +3185,7 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
       const head = document.createElement('div');
       head.className = 'sg-editor-header';
       const name = document.createElement('span');
-      name.textContent = variable?._name ?? '(anonymous)';
+      name.textContent = canonName(variable?._name) ?? '(anonymous)';
       const close = document.createElement('button');
       close.textContent = '\u2715';
       close.title = 'close editor';
@@ -3233,7 +3249,7 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
       grip.textContent = '\u283F';
       const label = document.createElement('span');
       label.className = 'sg-atom-title';
-      label.textContent = variable?._name ?? '(anonymous)';
+      label.textContent = canonName(variable?._name) ?? '(anonymous)';
       const removeBtn = document.createElement('button');
       removeBtn.className = 'sg-atom-remove';
       removeBtn.textContent = '\u2715';
@@ -3313,7 +3329,7 @@ const _79iuqn = function _gridContainer(main,sg_css,decompile,compile,cellEditor
         fulfilled: (value, name) => {
           atom.classList.remove('sg-running', 'sg-error');
           if (name)
-            label.textContent = name;
+            label.textContent = canonName(name);
           try {
             inner.fulfilled(value, name);
           } catch (e) {
