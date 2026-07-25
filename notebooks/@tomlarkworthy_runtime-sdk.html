@@ -2736,7 +2736,7 @@ const _nv232r = function _check_for_code_change(runtime_variables,codeChangeList
 const _ya86a1 = function _21(md){return(
 md`### observe(variable)
 
-This was monstrously difficult to develop. Installs a single dispatcher observer per variable holding an explicit listener list; each \`observe\` call adds a listener and returns a cancel that removes it, so attach/cancel can interleave in any order (views remount). A pre-existing observer (e.g. a bootloader Inspector) is kept as a permanent first listener. Delivery of \`["fulfilled", "rejected", "pending"]\` runs in attach order; for element values, a listener with \`detachNodes: true\` detaches the node from its current parent before adopting, so the last-attached view owns the node. When the observer attaches, if the variable is already fulfilled, the observer is signalled.
+This was monstrously difficult to develop. Taps a variable, intercepting all observer calls \`["fulfilled", "rejected", "pending"]\` whilst preserving the behaviour of the existing observer attached to the variable. If \`detachNodes\` is \`true\` and the existing observer hosts a DOM node, the additional variable "steals" it for it's DOM tree. When the observer attaches, if the variable is already fulfilled, the observer is signalled.
 
 Unobserved variables are marked as reachable and become active when observed.`
 )};
@@ -2750,240 +2750,240 @@ const _1hx65vf = function _no_observer(main)
     variable.delete();
     return symbol;
 };
-const _duwj4o = function _observe(Element,Text,trace_variable,$0,no_observer,queueMicrotask)
+const _18fhvl5 = function _observe(Element,Text,trace_variable,$0,no_observer,queueMicrotask)
 {
-    // Multiple views may observe one variable (a lopepage pane + an embedding widget).
-    // Views remount, so cancels arrive in any order. A single dispatcher observer per
-    // variable holds an explicit listener list: attach = push, cancel = splice. Delivery
-    // runs in attach order, so for element values the last-attached view adopts last and
-    // owns the node. (The previous design wrapped observer methods in place and each
-    // cancel restored the methods captured at ITS attach time — correct only for LIFO
-    // cancel order; any remount orphaned the surviving listener.)
-    const DISPATCH = '__observe_listeners__';
-    // cross realm support: no_observer is a Symbol compared by description
-    return function observe(v, observer, {invalidation, detachNodes = false} = {}) {
-        const observe_id = `${ v?._name || '<anon>' }@${ Date.now() }@${ Math.random().toString(16).slice(2) }`;
-        const snapshot = (extra = {}) => ({
-            t: Date.now(),
-            observe_id,
-            var_name: v?._name,
-            var_version: v?._version,
-            var_reachable: v?._reachable,
-            has_observer: v?._observer != null,
-            observer_has_node: !!observer?._node,
-            v_value_defined: v?._value !== undefined,
-            v_value_ctor: v?._value?.constructor?.name,
-            v_value_is_node: v?._value instanceof Element || v?._value instanceof Text || false,
-            v_promise: !!v?._promise,
-            listener_count: v?._observer?.[DISPATCH]?.length,
+  // Multiple views may observe one variable (a lopepage pane + an embedding widget).
+  // Views remount, so cancels arrive in any order. A single dispatcher observer per
+  // variable holds an explicit listener list: attach = push, cancel = splice. Delivery
+  // runs in attach order, so for element values the last-attached view adopts last and
+  // owns the node. (The previous design wrapped observer methods in place and each
+  // cancel restored the methods captured at ITS attach time — correct only for LIFO
+  // cancel order; any remount orphaned the surviving listener.)
+  const DISPATCH = '__observe_listeners__';
+  // cross realm support: no_observer is a Symbol compared by description
+  return function observe(v, observer, {invalidation, detachNodes = false} = {}) {
+    const observe_id = `${ v?._name || '<anon>' }@${ Date.now() }@${ Math.random().toString(16).slice(2) }`;
+    const snapshot = (extra = {}) => ({
+      t: Date.now(),
+      observe_id,
+      var_name: v?._name,
+      var_version: v?._version,
+      var_reachable: v?._reachable,
+      has_observer: v?._observer != null,
+      observer_has_node: !!observer?._node,
+      v_value_defined: v?._value !== undefined,
+      v_value_ctor: v?._value?.constructor?.name,
+      v_value_is_node: v?._value instanceof Element || v?._value instanceof Text || false,
+      v_promise: !!v?._promise,
+      listener_count: v?._observer?.[DISPATCH]?.length,
+      ...extra
+    });
+    const emit = (event, extra = {}) => {
+      if (v?._name !== trace_variable)
+        return;
+      try {
+        $0.value = $0.value.concat([snapshot({
+            event,
             ...extra
-        });
-        const emit = (event, extra = {}) => {
-            if (v?._name !== trace_variable)
-                return;
-            try {
-                $0.value = $0.value.concat([snapshot({
-                        event,
-                        ...extra
-                    })]);
-            } catch {
-            }
-        };
-        emit('observe:begin', { detachNodes });
-        const isNode = value => value instanceof Element || value instanceof Text;
-        // Detach an element value from wherever it currently lives so this listener's
-        // fulfilled can adopt it into its own node.
-        const stealFor = (l, value, reason) => {
-            const canSteal = l.detachNodes && isNode(value) && l.observer?._node && l.observer._node !== value.parentNode;
-            emit('observe:steal_check', {
-                reason,
-                canSteal,
-                value_ctor: value?.constructor?.name,
-                value_parent: value?.parentNode?.constructor?.name
-            });
-            if (canSteal) {
-                try {
-                    value.remove();
-                } catch {
-                }
-                emit('observe:steal_detached', { reason });
-            }
-        };
-        // --- ensure dispatcher installed ---
-        let dispatch = v._observer && v._observer[DISPATCH] ? v._observer : null;
-        if (!dispatch) {
-            const listeners = [];
-            const deliver = type => (...args) => {
-                emit(`observe:deliver:${ type }`, { arg0_ctor: args[0]?.constructor?.name });
-                for (const l of [...listeners]) {
-                    try {
-                        if (type === 'fulfilled') {
-                            stealFor(l, args[0], 'deliver');
-                            l.observer.fulfilled?.(args[0], v?._name);
-                        } else if (type === 'rejected')
-                            l.observer.rejected?.(args[0], v?._name);
-                        else
-                            l.observer.pending?.();
-                    } catch (e) {
-                        emit(`observe:deliver:${ type }:listener_error`, { message: String(e) });
-                    }
-                }
-            };
-            const previous = v._observer;
-            dispatch = {
-                [DISPATCH]: listeners,
-                // Preserve the `variable._observer._node` contract editors (divToVar),
-                // module-map, and observablehq.com key on. The pre-existing observer
-                // (e.g. the notebook Inspector) owns the canonical node; otherwise the
-                // last-attached listener that has one (the view that adopted the value).
-                get _node() {
-                    const base = listeners.find(l => l.base);
-                    if (base?.observer?._node != null)
-                        return base.observer._node;
-                    for (let i = listeners.length - 1; i >= 0; i--) {
-                        const n = listeners[i].observer?._node;
-                        if (n != null)
-                            return n;
-                    }
-                    return undefined;
-                },
-                __restore: () => {
-                    if (v._observer === dispatch)
-                        v._observer = previous;
-                },
-                pending: deliver('pending'),
-                fulfilled: deliver('fulfilled'),
-                rejected: deliver('rejected')
-            };
-            const hasExistingObserver = previous != null && previous?.description !== no_observer.description;
-            if (hasExistingObserver) {
-                // pre-existing real observer (e.g. bootloader Inspector) stays first, permanently
-                listeners.push({
-                    observer: previous,
-                    detachNodes: false,
-                    base: true
-                });
-                emit('observe:attach:base_listener_kept');
-            }
-            if (v && !v._reachable) {
-                v._reachable = true;
-                v._module._runtime._dirty.add(v);
-                v._module._runtime._updates.add(v);
-                emit('observe:attach:marked_reachable');
-            }
-            v._observer = dispatch;
-            emit('observe:attach:dispatcher_installed', { hasExistingObserver });
-        }
-        // --- attach this listener ---
-        const listeners = dispatch[DISPATCH];
-        const entry = {
-            observer,
-            detachNodes
-        };
-        listeners.push(entry);
-        emit('observe:attach:listener_added');
-        let cancelled = false;
-        const cancel = () => {
-            emit('observe:cancel_called');
-            if (cancelled)
-                return;
-            cancelled = true;
-            const i = listeners.indexOf(entry);
-            if (i >= 0)
-                listeners.splice(i, 1);
-            if (!listeners.some(l => !l.base)) {
-                // no external listeners left: hand the variable back
-                dispatch.__restore();
-                emit('observe:cancel:dispatcher_removed');
-            }
-        };
-        if (invalidation)
-            Promise.resolve(invalidation).then(() => {
-                emit('observe:invalidation_fired');
-                cancel();
-            });
-        // --- CATCH-UP REPLAY (BUG FIX) ---
-        // Snapshot version to avoid replaying stale results.
-        const versionAtAttach = v?._version;
-        emit('observe:catchup:scheduled', { versionAtAttach });
-        queueMicrotask(() => {
-            emit('observe:catchup:microtask_start', { cancelled });
-            if (cancelled)
-                return;
-            // mimic inspector: mark pending first
-            try {
-                observer.pending?.();
-                emit('observe:catchup:pending_sent');
-            } catch (e) {
-                emit('observe:catchup:pending_error', { message: String(e) });
-            }
-            // IMPORTANT: read CURRENT value at replay time
-            const valueNow = v?._value;
-            emit('observe:catchup:valueNow_snapshot', {
-                valueNow_defined: valueNow !== undefined,
-                valueNow_ctor: valueNow?.constructor?.name,
-                v_version_now: v?._version,
-                valueNow_outerHTML_prefix: v?._observer?._node?.outerHTML
-            });
-            if (valueNow !== undefined) {
-                if (v?._version !== versionAtAttach) {
-                    emit('observe:catchup:stale_skip_valueNow');
-                    return;
-                }
-                stealFor(entry, valueNow, 'catchup:valueNow');
-                try {
-                    observer.fulfilled?.(valueNow, v?._name);
-                    emit('observe:catchup:fulfilled_sent_valueNow');
-                } catch (e) {
-                    emit('observe:catchup:fulfilled_error_valueNow', { message: String(e) });
-                }
-                return;
-            }
-            // optional fallback: attach-time promise (or current promise)
-            const p = v?._promise;
-            if (!p || typeof p.then !== 'function') {
-                emit('observe:catchup:no_value_no_promise');
-                return;
-            }
-            emit('observe:catchup:await_promise');
-            Promise.resolve(p).then(value => {
-                emit('observe:catchup:promise_fulfilled', {
-                    value_defined: value !== undefined,
-                    value_ctor: value?.constructor?.name,
-                    v_version_now: v?._version
-                });
-                if (cancelled)
-                    return;
-                if (v?._version !== versionAtAttach) {
-                    emit('observe:catchup:stale_skip_promise');
-                    return;
-                }
-                if (value === undefined)
-                    return;
-                stealFor(entry, value, 'catchup:promise');
-                try {
-                    observer.fulfilled?.(value, v?._name);
-                    emit('observe:catchup:fulfilled_sent_promise');
-                } catch (e) {
-                    emit('observe:catchup:fulfilled_error_promise', { message: String(e) });
-                }
-            }, error => {
-                emit('observe:catchup:promise_rejected', { v_version_now: v?._version });
-                if (cancelled)
-                    return;
-                if (v?._version !== versionAtAttach)
-                    return;
-                try {
-                    observer.rejected?.(error, v?._name);
-                    emit('observe:catchup:rejected_sent_promise');
-                } catch (e) {
-                    emit('observe:catchup:rejected_error_promise', { message: String(e) });
-                }
-            });
-        });
-        emit('observe:end');
-        return cancel;
+          })]);
+      } catch {
+      }
     };
+    emit('observe:begin', { detachNodes });
+    const isNode = value => value instanceof Element || value instanceof Text;
+    // Detach an element value from wherever it currently lives so this listener's
+    // fulfilled can adopt it into its own node.
+    const stealFor = (l, value, reason) => {
+      const canSteal = l.detachNodes && isNode(value) && l.observer?._node && l.observer._node !== value.parentNode;
+      emit('observe:steal_check', {
+        reason,
+        canSteal,
+        value_ctor: value?.constructor?.name,
+        value_parent: value?.parentNode?.constructor?.name
+      });
+      if (canSteal) {
+        try {
+          value.remove();
+        } catch {
+        }
+        emit('observe:steal_detached', { reason });
+      }
+    };
+    // --- ensure dispatcher installed ---
+    let dispatch = v._observer && v._observer[DISPATCH] ? v._observer : null;
+    if (!dispatch) {
+      const listeners = [];
+      const deliver = type => (...args) => {
+        emit(`observe:deliver:${ type }`, { arg0_ctor: args[0]?.constructor?.name });
+        for (const l of [...listeners]) {
+          try {
+            if (type === 'fulfilled') {
+              stealFor(l, args[0], 'deliver');
+              l.observer.fulfilled?.(args[0], v?._name);
+            } else if (type === 'rejected')
+              l.observer.rejected?.(args[0], v?._name);
+            else
+              l.observer.pending?.();
+          } catch (e) {
+            emit(`observe:deliver:${ type }:listener_error`, { message: String(e) });
+          }
+        }
+      };
+      const previous = v._observer;
+      dispatch = {
+        [DISPATCH]: listeners,
+        // Preserve the `variable._observer._node` contract editors (divToVar),
+        // module-map, and observablehq.com key on. The pre-existing observer
+        // (e.g. the notebook Inspector) owns the canonical node; otherwise the
+        // last-attached listener that has one (the view that adopted the value).
+        get _node() {
+          const base = listeners.find(l => l.base);
+          if (base?.observer?._node != null)
+            return base.observer._node;
+          for (let i = listeners.length - 1; i >= 0; i--) {
+            const n = listeners[i].observer?._node;
+            if (n != null)
+              return n;
+          }
+          return undefined;
+        },
+        __restore: () => {
+          if (v._observer === dispatch)
+            v._observer = previous;
+        },
+        pending: deliver('pending'),
+        fulfilled: deliver('fulfilled'),
+        rejected: deliver('rejected')
+      };
+      const hasExistingObserver = previous != null && previous?.description !== no_observer.description;
+      if (hasExistingObserver) {
+        // pre-existing real observer (e.g. bootloader Inspector) stays first, permanently
+        listeners.push({
+          observer: previous,
+          detachNodes: false,
+          base: true
+        });
+        emit('observe:attach:base_listener_kept');
+      }
+      if (v && !v._reachable) {
+        v._reachable = true;
+        v._module._runtime._dirty.add(v);
+        v._module._runtime._updates.add(v);
+        emit('observe:attach:marked_reachable');
+      }
+      v._observer = dispatch;
+      emit('observe:attach:dispatcher_installed', { hasExistingObserver });
+    }
+    // --- attach this listener ---
+    const listeners = dispatch[DISPATCH];
+    const entry = {
+      observer,
+      detachNodes
+    };
+    listeners.push(entry);
+    emit('observe:attach:listener_added');
+    let cancelled = false;
+    const cancel = () => {
+      emit('observe:cancel_called');
+      if (cancelled)
+        return;
+      cancelled = true;
+      const i = listeners.indexOf(entry);
+      if (i >= 0)
+        listeners.splice(i, 1);
+      if (!listeners.some(l => !l.base)) {
+        // no external listeners left: hand the variable back
+        dispatch.__restore();
+        emit('observe:cancel:dispatcher_removed');
+      }
+    };
+    if (invalidation)
+      Promise.resolve(invalidation).then(() => {
+        emit('observe:invalidation_fired');
+        cancel();
+      });
+    // --- CATCH-UP REPLAY (BUG FIX) ---
+    // Snapshot version to avoid replaying stale results.
+    const versionAtAttach = v?._version;
+    emit('observe:catchup:scheduled', { versionAtAttach });
+    queueMicrotask(() => {
+      emit('observe:catchup:microtask_start', { cancelled });
+      if (cancelled)
+        return;
+      // mimic inspector: mark pending first
+      try {
+        observer.pending?.();
+        emit('observe:catchup:pending_sent');
+      } catch (e) {
+        emit('observe:catchup:pending_error', { message: String(e) });
+      }
+      // IMPORTANT: read CURRENT value at replay time
+      const valueNow = v?._value;
+      emit('observe:catchup:valueNow_snapshot', {
+        valueNow_defined: valueNow !== undefined,
+        valueNow_ctor: valueNow?.constructor?.name,
+        v_version_now: v?._version,
+        valueNow_outerHTML_prefix: v?._observer?._node?.outerHTML
+      });
+      if (valueNow !== undefined) {
+        if (v?._version !== versionAtAttach) {
+          emit('observe:catchup:stale_skip_valueNow');
+          return;
+        }
+        stealFor(entry, valueNow, 'catchup:valueNow');
+        try {
+          observer.fulfilled?.(valueNow, v?._name);
+          emit('observe:catchup:fulfilled_sent_valueNow');
+        } catch (e) {
+          emit('observe:catchup:fulfilled_error_valueNow', { message: String(e) });
+        }
+        return;
+      }
+      // optional fallback: attach-time promise (or current promise)
+      const p = v?._promise;
+      if (!p || typeof p.then !== 'function') {
+        emit('observe:catchup:no_value_no_promise');
+        return;
+      }
+      emit('observe:catchup:await_promise');
+      Promise.resolve(p).then(value => {
+        emit('observe:catchup:promise_fulfilled', {
+          value_defined: value !== undefined,
+          value_ctor: value?.constructor?.name,
+          v_version_now: v?._version
+        });
+        if (cancelled)
+          return;
+        if (v?._version !== versionAtAttach) {
+          emit('observe:catchup:stale_skip_promise');
+          return;
+        }
+        if (value === undefined)
+          return;
+        stealFor(entry, value, 'catchup:promise');
+        try {
+          observer.fulfilled?.(value, v?._name);
+          emit('observe:catchup:fulfilled_sent_promise');
+        } catch (e) {
+          emit('observe:catchup:fulfilled_error_promise', { message: String(e) });
+        }
+      }, error => {
+        emit('observe:catchup:promise_rejected', { v_version_now: v?._version });
+        if (cancelled)
+          return;
+        if (v?._version !== versionAtAttach)
+          return;
+        try {
+          observer.rejected?.(error, v?._name);
+          emit('observe:catchup:rejected_sent_promise');
+        } catch (e) {
+          emit('observe:catchup:rejected_error_promise', { message: String(e) });
+        }
+      });
+    });
+    emit('observe:end');
+    return cancel;
+  };
 };
 const _16ohhcn = function _observeOld(trace_variable,_,no_observer,isnode,toObject,queueMicrotask,getPromiseState)
 {
@@ -2994,7 +2994,7 @@ const _16ohhcn = function _observeOld(trace_variable,_,no_observer,isnode,toObje
             invalidation.then(onCancel);
         if (v?._name === trace_variable) {
             console.log('observe', trace_variable, v);
-            void 0;
+            debugger;
         }
         if (_.isEqual(v._observer, {}) || v._observer === no_observer) {
             // No existing observer, so we install one
@@ -3018,7 +3018,7 @@ const _16ohhcn = function _observeOld(trace_variable,_,no_observer,isnode,toObje
                 const old = v._observer[type];
                 v._observer[type] = (...args) => {
                     if (v?._name === trace_variable) {
-                        void 0;
+                        debugger;
                         console.log(trace_variable, type, ...args);
                     }
                     // The old is often a prototype, so we use Reflect to call it
@@ -3045,7 +3045,7 @@ const _16ohhcn = function _observeOld(trace_variable,_,no_observer,isnode,toObje
                 cancels.add(() => v._observer[type] = old);
             });
             if (v?._name === trace_variable) {
-                void 0;
+                debugger;
                 console.log(`checking`, trace_variable, v, toObject(v), v._value);
             }
         }
@@ -3067,7 +3067,7 @@ const _16ohhcn = function _observeOld(trace_variable,_,no_observer,isnode,toObje
             // either in pending or error state, we can check by racing a promise
             getPromiseState(v._promise).then(({state, error, value}) => {
                 if (v?._name === trace_variable) {
-                    void 0;
+                    debugger;
                 }
                 if (state == 'rejected') {
                     if (observer.rejected)
@@ -3137,11 +3137,22 @@ lookup a variable by name in a module, pass an array to lookup multiple`
 const _1l90etb = function _lookupVariable(){return(
 async function lookupVariable(name_or_names, module) {
     if (typeof name_or_names === 'string') {
-        let v, retries, name = name_or_names;
-        while (!module._scope.get(name) && retries++ < 1000) {
+        const name = name_or_names;
+        // new.observablehq (notebook-kit) spells viewof/mutable cells "viewof$x";
+        // legacy + lopecode use "viewof x". Accept either spelling at this boundary.
+        const candidates = [...new Set([
+            name,
+            name.replace(/^(viewof|mutable)\$/, '$1 '), // platform -> legacy
+            name.replace(/^(viewof|mutable) /, '$1$'),  // legacy -> platform
+        ])];
+        const get = () => {
+            for (const c of candidates) { const v = module._scope.get(c); if (v) return v; }
+        };
+        let retries = 0;
+        while (!get() && retries++ < 1000) {
             await new Promise(r => requestAnimationFrame(r));
         }
-        return module._scope.get(name);
+        return get();
     } else if (Array.isArray(name_or_names)) {
         return Promise.all(name_or_names.map(name => lookupVariable(name, module)));
     } else {
@@ -3173,23 +3184,22 @@ const _12s2v4c = function _getVariableByPersistentId(persistentIdToVariableRef,W
         }
     };
 };
-const _spmjyh = function _persistentId(contentHash,persistentIdToVariableRef,WeakRef){return(
-v => {
-    if (!v._observer)
-        throw new Error('Call on a variable');
-    if (!v.pid) {
-        v.pid = contentHash(v._name + v._definition.toString());
-        persistentIdToVariableRef.set(v.pid, new WeakRef(v));
-    }
-    return v.pid;
+const _xejgj8 = function _persistentId(contentHash,persistentIdToVariableRef,WeakRef){return(
+(v) => {
+  if (!v._module) throw new Error("Call on a variable");
+  if (!v.pid) {
+    v.pid = contentHash(v._name + v._definition.toString());
+    persistentIdToVariableRef.set(v.pid, new WeakRef(v));
+  }
+  return v.pid;
 }
 )};
-const _1jyou2n = async function _test_persistentId(lookupVariable,myModule,persistentId)
+const _1hb7tvq = async function _test_persistentId(lookupVariable,myModule,persistentId)
 {
-    const v = await lookupVariable('persistentId', myModule);
-    if (persistentId(v) !== '_4ie7s1')
-        throw 'persistentId changed';
-    return 'ok';
+  const v = await lookupVariable("persistentId", myModule);
+  const id = persistentId(v);
+  if (id !== "_o83sai") throw "persistentId changed";
+  return "ok";
 };
 const _1fxvgy1 = function _39(md){return(
 md`### obj_observer
@@ -3207,7 +3217,7 @@ Keep a named cell evaluated without a direct dataflow dependancy. Useful to keep
 const _12v8rf5 = function _keepalive(){return(
 (module, variable_name) => {
     if (variable_name === undefined)
-        void 0;
+        debugger;
     const name = `dynamic observe ${ variable_name }`;
     console.log(`keepalive: ${ name }`);
     if (module._scope.has(name))
@@ -3464,10 +3474,10 @@ md`### \`importShim\` polyfill
 
 Lopecode uses importShim which is not availible on Observablehq`
 )};
-const _12odeih = function _importShim() {
-    if (window.importShim)
-        return window.importShim;
-    return (url, options) => import(url);
+const _12odeih = function _importShim()
+{
+  if (window.importShim) return window.importShim;
+  return (url, options) => import(url);
 };
 const _1nrqtih = function _65(md){return(
 md`---`
@@ -3522,7 +3532,7 @@ export default function define(runtime, observer) {
   $def("_ya86a1", null, ["md"], _ya86a1);  
   $def("_tgfgv9", "trace_variable", [], _tgfgv9);  
   $def("_1hx65vf", "no_observer", ["main"], _1hx65vf);  
-  $def("_duwj4o", "observe", ["Element","Text","trace_variable","mutable trace_history","no_observer","queueMicrotask"], _duwj4o);  
+  $def("_18fhvl5", "observe", ["Element","Text","trace_variable","mutable trace_history","no_observer","queueMicrotask"], _18fhvl5);  
   $def("_16ohhcn", "observeOld", ["trace_variable","_","no_observer","isnode","toObject","queueMicrotask","getPromiseState"], _16ohhcn);  
   $def("_2kni3y", null, ["md"], _2kni3y);  
   $def("_1utnee9", "descendants", [], _1utnee9);  
@@ -3535,8 +3545,8 @@ export default function define(runtime, observer) {
   $def("_11hb1zq", null, ["md"], _11hb1zq);  
   $def("_kd8snz", "persistentIdToVariableRef", [], _kd8snz);  
   $def("_12s2v4c", "getVariableByPersistentId", ["persistentIdToVariableRef","WeakRef"], _12s2v4c);  
-  $def("_spmjyh", "persistentId", ["contentHash","persistentIdToVariableRef","WeakRef"], _spmjyh);  
-  $def("_1jyou2n", "test_persistentId", ["lookupVariable","myModule","persistentId"], _1jyou2n);  
+  $def("_xejgj8", "persistentId", ["contentHash","persistentIdToVariableRef","WeakRef"], _xejgj8);  
+  $def("_1hb7tvq", "test_persistentId", ["lookupVariable","myModule","persistentId"], _1hb7tvq);  
   $def("_1fxvgy1", null, ["md"], _1fxvgy1);  
   $def("_z6oz1f", "ojs_observer", ["myModule"], _z6oz1f);  
   $def("_cf0hco", null, ["md"], _cf0hco);  
