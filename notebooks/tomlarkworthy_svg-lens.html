@@ -15867,15 +15867,52 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
   return el;
 };
 
-// Type an exact value for an attribute the typed panel does not own — geometry, a transform, a custom
-// attribute. Paint and stroke belong to `fieldPanel` (the svgFields registry), so the inspector hides
-// any attribute a registry field already edits: fill has exactly one surface. It writes through
-// `setProperty` — the same style-aware commit `fieldPanel` and a drag use — so there is one write path,
-// not a second. Re-renders on `lens-select`, which the focus emits whenever it repaints.
+// §9.1: ONE selection editor (merged inspector + fieldPanel, 2026-07-26). One fieldset per selected
+// element carries every surface for that element: the typed paint/stroke registry fields (svgFields),
+// then the exact-value inputs for the attributes the registry does NOT own (geometry, transform, custom
+// attrs), then ref jumps and gradient stops. Both halves commit through the one style-aware write path —
+// paint via `drawing.setField`→`setProperty`, attributes via `drawing.setProperty` — so each value has
+// exactly one surface and one commit. Per-element (was: fieldPanel showed only the first), so a mixed
+// selection is no longer misleading. Re-renders on `lens-select`/`lens-put`; a throw is caught so it
+// can never break the synchronous `draw()` that dispatches those events.
 const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
 {
   const drawing = $0;
   const el = htl.html`<div style="margin:.5rem 0;min-height:2.2em;display:grid;gap:8px"></div>`;
+  const row = (label, control) => htl.html`<label style="display:flex;align-items:center;gap:8px;font:12px ui-monospace,monospace">
+    <span style="flex:0 0 96px;opacity:.7">${label}</span>${control}</label>`;
+  // Registry paint/stroke rows for one element — the enums an author asked for, one widget per `kind`,
+  // writing through `drawing.setField` (= `setProperty` → `commitDelta`, the one write path).
+  const paintRows = (path) => drawing.fields(path).map((f) => {
+    const commit = (value) => drawing.setField(path, f.prop, value);
+    if (f.kind === "enum") {
+      const opts = f.options.includes(f.value) && f.value !== "" ? f.options : [f.value || ""].concat(f.options);
+      const sel = htl.html`<select style="font:12px ui-monospace,monospace;padding:2px 4px"></select>`;
+      for (const o of opts) {
+        const op = document.createElement("option");
+        op.value = o; op.textContent = o === "" ? "(default)" : o;
+        if (o === f.value) op.selected = true;
+        sel.append(op);
+      }
+      sel.addEventListener("change", () => commit(sel.value));
+      return row(f.label, sel);
+    }
+    if (f.kind === "color") {
+      const txt = htl.html`<input type="text" value="${f.value}" placeholder="${f.dflt || "none"}" style="font:12px ui-monospace,monospace;width:120px">`;
+      const sw = htl.html`<input type="color" style="width:28px;height:22px;padding:0;border:none;background:none">`;
+      try { if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(f.value)) sw.value = f.value.length === 4
+        ? "#" + f.value.slice(1).split("").map((c) => c + c).join("") : f.value; } catch (e) {}
+      txt.addEventListener("change", () => commit(txt.value.trim()));
+      sw.addEventListener("change", () => { txt.value = sw.value; commit(sw.value); });
+      return row(f.label, htl.html`<span style="display:flex;gap:6px;align-items:center">${sw}${txt}</span>`);
+    }
+    const inp = htl.html`<input type="${f.kind === "number" ? "number" : "text"}" value="${f.value}" placeholder="${f.dflt || ""}" style="font:12px ui-monospace,monospace;width:120px">`;
+    if (f.min !== undefined) inp.min = f.min;
+    if (f.max !== undefined) inp.max = f.max;
+    if (f.step !== undefined) inp.step = f.step;
+    inp.addEventListener("change", () => commit(inp.value.trim()));
+    return row(f.label, inp);
+  });
   const render = () => {
     const paths = drawing.selectionPaths();
     el.textContent = "";
@@ -15883,12 +15920,16 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
       el.append(htl.html`<span style="font:12px/1.5 ui-monospace,monospace;opacity:.6">nothing selected</span>`);
       return;
     }
-    // One form per selected element: a multi-selection is several addresses, so it is several forms.
+    // One fieldset per selected element: a multi-selection is several addresses, so it is several editors.
     for (const path of paths) {
       const info = drawing.describe(path);
       if (!info) continue;
-      // Hide any attribute the field registry owns *for this element's tag* — paint lives in the panel
-      // for a shape, stop-colour/offset for a stop — so each value has exactly one surface (§9.1).
+      // Registry-owned paint/stroke for this element's tag (the typed section).
+      const paint = paintRows(path);
+      const paintLabel = info.tag === "stop" ? "stop"
+                       : /^(linear|radial)Gradient$/.test(info.tag) ? "gradient" : "paint & stroke";
+      // Hide any attribute the registry owns for this tag — paint has exactly one surface — and let the
+      // rest be typed exactly (geometry, transform, custom attrs).
       const owned = new Set(svgFields.forTag(info.tag).map((f) => f.prop));
       const fields = info.attrs.filter(([name]) => !owned.has(name)).map(([name, value]) => {
         const field = Inputs.text({ label: name, value, width: 220 });
@@ -15930,83 +15971,15 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
         add.onclick = async () => { drawing.select([g.gradient], "transform"); await drawing.command("add-stop"); };
         strip.append(add);
       }
-      el.append(htl.html`<fieldset style="border:1px solid #b9c4b4;border-radius:6px;padding:6px 10px 8px;margin:0">
+      el.append(htl.html`<fieldset style="border:1px solid #b9c4b4;border-radius:6px;padding:6px 10px 8px;margin:0;display:grid;gap:6px">
         <legend style="font:12px ui-monospace,monospace;padding:0 4px">&lt;${info.tag}&gt; ${path.join(".")}</legend>
-        ${Inputs.form(fields)}
+        ${paint.length ? htl.html`<div style="display:grid;gap:4px">
+          <span style="font:11px ui-monospace,monospace;opacity:.6">${paintLabel}</span>${paint}</div>` : ""}
+        ${fields.length ? Inputs.form(fields) : ""}
         ${jumps.length ? htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">${jumps}</div>` : ""}
         ${strip}
       </fieldset>`);
     }
-  };
-  render();
-  const on = () => render();
-  drawing.addEventListener("lens-select", on);
-  drawing.addEventListener("lens-put", on);
-  invalidation.then(() => {
-    drawing.removeEventListener("lens-select", on);
-    drawing.removeEventListener("lens-put", on);
-  });
-  return el;
-};
-
-// G46. The field panel: the enums an author asked for ("dotted lines and line caps") given somewhere
-// to live. It is a pure projection of `drawing.fields(path)` — the registry decides which fields exist
-// and reads their current values, this cell only picks a widget per `kind` and writes the change back
-// through `drawing.setField`, which is `setProperty` → `commitDelta`, the one write path. So a widget's
-// commit is byte-identical to a raw attribute write, adding a field is a line in the registry (no change here), and
-// a change applies to *every* selected element (the align commands' "one delta per claimed element",
-// G40). Colour gets both a native picker and a text box: the text preserves the author's own notation
-// (`darkseagreen` stays `darkseagreen`), the picker is the swatch. Re-renders on select and on commit.
-const _sl271 = function _fieldPanel(htl,Inputs,invalidation,$0)
-{
-  const drawing = $0;
-  const el = htl.html`<div style="margin:.5rem 0;display:grid;gap:4px"></div>`;
-  const commit = (paths, prop, value) => { for (const p of paths) drawing.setField(p, prop, value); };
-  const row = (label, control) => htl.html`<label style="display:flex;align-items:center;gap:8px;font:12px ui-monospace,monospace">
-    <span style="flex:0 0 96px;opacity:.7">${label}</span>${control}</label>`;
-  const render = () => {
-    const paths = drawing.selectionPaths();
-    el.textContent = "";
-    if (!paths.length) {
-      el.append(htl.html`<span style="font:12px/1.5 ui-monospace,monospace;opacity:.6">select a shape to edit its paint</span>`);
-      return;
-    }
-    const fields = drawing.fields(paths[0]);
-    const tag = (drawing.describe(paths[0]) || {}).tag || "";
-    const title = tag === "stop" ? "stop"
-                : /^(linear|radial)Gradient$/.test(tag) ? "gradient" : "paint & stroke";
-    const rows = fields.map((f) => {
-      if (f.kind === "enum") {
-        const opts = f.options.includes(f.value) && f.value !== "" ? f.options : [f.value || ""].concat(f.options);
-        const sel = htl.html`<select style="font:12px ui-monospace,monospace;padding:2px 4px"></select>`;
-        for (const o of opts) {
-          const op = document.createElement("option");
-          op.value = o; op.textContent = o === "" ? "(default)" : o;
-          if (o === f.value) op.selected = true;
-          sel.append(op);
-        }
-        sel.addEventListener("change", () => commit(paths, f.prop, sel.value));
-        return row(f.label, sel);
-      }
-      if (f.kind === "color") {
-        const txt = htl.html`<input type="text" value="${f.value}" placeholder="${f.dflt || "none"}" style="font:12px ui-monospace,monospace;width:120px">`;
-        const sw = htl.html`<input type="color" style="width:28px;height:22px;padding:0;border:none;background:none">`;
-        try { if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(f.value)) sw.value = f.value.length === 4
-          ? "#" + f.value.slice(1).split("").map((c) => c + c).join("") : f.value; } catch (e) {}
-        txt.addEventListener("change", () => commit(paths, f.prop, txt.value.trim()));
-        sw.addEventListener("change", () => { txt.value = sw.value; commit(paths, f.prop, sw.value); });
-        return row(f.label, htl.html`<span style="display:flex;gap:6px;align-items:center">${sw}${txt}</span>`);
-      }
-      const inp = htl.html`<input type="${f.kind === "number" ? "number" : "text"}" value="${f.value}" placeholder="${f.dflt || ""}" style="font:12px ui-monospace,monospace;width:120px">`;
-      if (f.min !== undefined) inp.min = f.min;
-      if (f.max !== undefined) inp.max = f.max;
-      if (f.step !== undefined) inp.step = f.step;
-      inp.addEventListener("change", () => commit(paths, f.prop, inp.value.trim()));
-      return row(f.label, inp);
-    });
-    el.append(htl.html`<fieldset style="border:1px solid #b9c4b4;border-radius:6px;padding:6px 10px 8px;margin:0;display:grid;gap:4px">
-      <legend style="font:12px ui-monospace,monospace;padding:0 4px">${title}${paths.length > 1 ? ` · ${paths.length} selected` : ""}</legend>
-      ${rows}</fieldset>`);
   };
   // `lens-select`/`lens-put` dispatch synchronously inside the drawing's own `draw()`; a listener that
   // throws would break that render, so the panel must never let one escape.
@@ -16030,14 +16003,13 @@ gridContainer(runtime, {
   module: svgLensModule,
   columns: 12,
   portrait: 640,
-  include: ["viewof drawing", "drawingCode", "toolbar", "inspector", "fieldPanel"],
+  include: ["viewof drawing", "drawingCode", "toolbar", "inspector"],
   layout: {
     atoms: {
       "viewof drawing": { x: 0, y: 0, w: 8, h: 4 },
       drawingCode: { x: 0, y: 4, w: 8, h: 4 },
       toolbar: { x: 8, y: 0, w: 4, h: 1 },
-      inspector: { x: 8, y: 1, w: 4, h: 3 },
-      fieldPanel: { x: 8, y: 4, w: 4, h: 4 }
+      inspector: { x: 8, y: 1, w: 4, h: 7 }
     }
   }
 })
@@ -25707,7 +25679,6 @@ export default function define(runtime, observer) {
   $def("sl03", "drawing", ["Generators","viewof drawing"], _sl03);
   $def("sl02b", "toolbar", ["htl","invalidation","viewof drawing"], _sl02b);
   $def("sl02c", "inspector", ["htl","Inputs","invalidation","svgFields","viewof drawing"], _sl02c);
-  $def("sl271", "fieldPanel", ["htl","Inputs","invalidation","viewof drawing"], _sl271);
   $def("sl306", "drawingCode", ["cellEditor","lookupVariable","svgLensModule"], _sl306);
 
   main.define("tests", ["module @tomlarkworthy/tests", "@variable"], (_, v) => v.import("tests", _));
@@ -25723,8 +25694,7 @@ export default function define(runtime, observer) {
   main.define("gridContainer", ["module @tomlarkworthy/grid-container", "@variable"], (_, v) => v.import("gridContainer", _));
   main.define("cellEditor", ["module @tomlarkworthy/editor-5", "@variable"], (_, v) => v.import("cellEditor", _));
   return main;
-}
-</script>
+}</script>
 
 <script id="@mbostock/safe-local-storage" 
   type="text/plain"
