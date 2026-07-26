@@ -15723,7 +15723,7 @@ const _sl02b = function _toolbar(htl,invalidation,$0)
 {
   const drawing = $0;                                    // viewof drawing — the editor node
   const TOOLS = [["select", "Select", "V"], ["rect", "Rect", "R"], ["ellipse", "Ellipse", "E"],
-                 ["line", "Line", "L"], ["pen", "Pen", "P"], ["scribble", "Scribble", "S"]];
+                 ["line", "Line", "L"], ["text", "Text", "T"], ["pen", "Pen", "P"], ["scribble", "Scribble", "S"]];
   const el = htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap;margin:.5rem 0"></div>`;
   const buttons = TOOLS.map(([id, label, key]) => {
     const b = htl.html`<button title="${label} (${key})" style="padding:4px 10px;border-radius:6px;border:1px solid #b9c4b4;cursor:pointer">${label}</button>`;
@@ -15924,6 +15924,18 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
     for (const path of paths) {
       const info = drawing.describe(path);
       if (!info) continue;
+      // G26. A text-bearing element gets an editable content field, written through the content lens
+      // (`setText`). Only tags whose content is a text run — a shape's empty inner is not text.
+      let textField = "";
+      if (["text", "tspan", "textPath", "title", "desc"].includes(info.tag) && drawing.textOf) {
+        const run = drawing.textOf(path);
+        if (run !== null && !/</.test(run)) {
+          const inp = htl.html`<input type="text" value="${run}" placeholder="(text)" style="font:12px ui-monospace,monospace;width:100%;box-sizing:border-box">`;
+          inp.addEventListener("change", () => drawing.setText(path, inp.value));
+          textField = htl.html`<label style="display:grid;gap:2px;font:12px ui-monospace,monospace">
+            <span style="opacity:.6">text</span>${inp}</label>`;
+        }
+      }
       // Registry-owned paint/stroke for this element's tag (the typed section).
       const paint = paintRows(path);
       const paintLabel = info.tag === "stop" ? "stop"
@@ -15973,6 +15985,7 @@ const _sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
       }
       el.append(htl.html`<fieldset style="border:1px solid #b9c4b4;border-radius:6px;padding:6px 10px 8px;margin:0;display:grid;gap:6px">
         <legend style="font:12px ui-monospace,monospace;padding:0 4px">&lt;${info.tag}&gt; ${path.join(".")}</legend>
+        ${textField}
         ${paint.length ? htl.html`<div style="display:grid;gap:4px">
           <span style="font:11px ui-monospace,monospace;opacity:.6">${paintLabel}</span>${paint}</div>` : ""}
         ${fields.length ? Inputs.form(fields) : ""}
@@ -18032,7 +18045,16 @@ const _sl270 = function _svgFields(attrVal,styleLens){return(
                           T("x2", "x2", { dflt: "1" }), T("y2", "y2", { dflt: "0" })].concat(gradientCommon);
   const radialGradient = [T("cx", "cx", { dflt: "0.5" }), T("cy", "cy", { dflt: "0.5" }), T("r", "r", { dflt: "0.5" }),
                           T("fx", "fx"), T("fy", "fy")].concat(gradientCommon);
-  const byTag = { stop, linearGradient, radialGradient };
+  // G26. A <text> paints like any shape (it keeps the full paint set) and adds the typography an author
+  // reaches for. font-size is a number; the rest are enums/text so a residue-bearing value survives.
+  const text = paint.concat([
+    N("Font size", "font-size", { min: 1, step: 1, dflt: "16" }),
+    E("Text anchor", "text-anchor", ["start", "middle", "end"]),
+    T("Font family", "font-family", { dflt: "" }),
+    E("Font weight", "font-weight", ["normal", "bold", "bolder", "lighter"]),
+    E("Font style", "font-style", ["normal", "italic", "oblique"])
+  ]);
+  const byTag = { stop, linearGradient, radialGradient, text };
   // Read a property the same way `setProperty` writes one: a `style` declaration wins over the
   // attribute, and an absent value reads as "" (the panel then shows the placeholder default).
   const read = (doc, idx, prop) => {
@@ -18097,6 +18119,22 @@ const _sl79 = function _childrenLens(lens,nodeAt,parseDoc){return(
 )
 )};
 
+// G26. Lens<SVG document text, an element's text run>. Where childrenLens views the *element* children,
+// this views the character content between the tags — what a <text> says. Domain: an element with no
+// element children, so the run is exactly innerStart..innerEnd (a <text> holding a <tspan> is out of
+// this lens's domain, as text content is out of childrenLens's). GetPut/PutGet/PutPut hold strictly:
+// the view is one contiguous slice and the put replaces exactly that slice.
+const _sl307 = function _textRunLens(lens,nodeAt){return(
+(path) => lens(
+  (s) => { const n = nodeAt(s, path); return s.slice(n.innerStart, n.innerEnd); },
+  (txt, s) => {
+    const n = nodeAt(s, path);
+    if (s.slice(n.innerStart, n.innerEnd) === txt) return s;   // skip rule: unchanged view, unchanged source
+    return s.slice(0, n.innerStart) + txt + s.slice(n.innerEnd);
+  }
+)
+)};
+
 // ---- commands: pure (document text, address, …) -> document text --------------------------------
 // Each one is a put, so the laws still cover it. Nothing here knows about the DOM or the pointer.
 
@@ -18132,6 +18170,12 @@ const _sl79c = function _reorderElement(childrenLens){return(
   kids.splice(Math.max(0, Math.min(kids.length, to)), 0, k);
   return l.put(kids, src);
 }
+)};
+
+// G26. Replace an element's text run — a put on textRunLens, so the laws cover it and it needs no
+// rebase (no element address moves when only the character content changes).
+const _sl308 = function _setTextRun(textRunLens){return(
+(src, path, txt) => textRunLens(path).put(txt, src)
 )};
 
 // ---- defs: minting an id and writing into <defs> (S10) -------------------------------------------
@@ -22474,6 +22518,74 @@ const _sl125 = function _toolDraw(shapeLookup,shapeSpec,shapeMarkup,dragBox,grab
 }
 )};
 
+// G26. The text tool: click to drop a <text> at the pointer and select it, so its content (through the
+// content lens) and its paint/typography are immediately editable in the panel. Gates on the active
+// tool, so it claims nothing in select mode; places on release like the shape tools.
+const _sl309 = function _toolText(grabPointer,gestureDelta,commitDelta){return(
+{
+  id: "text",
+  onPointerDown(ctx, e) {
+    if (ctx.tool() !== "text") return false;
+    const p = ctx.localPoint(ctx.node, e);
+    if (!p) return false;
+    e.preventDefault();
+    grabPointer(ctx.node, e);
+    ctx.state.textPlace = { x: p[0], y: p[1] };
+    return true;
+  },
+  async onPointerUp(ctx) {
+    const s = ctx.state.textPlace;
+    ctx.state.textPlace = null;
+    if (!s) return;
+    const r = (n) => Math.round(n * 10) / 10;
+    const style = ctx.options.shapeStyle || {};
+    const fs = style.fontSize === undefined ? 16 : style.fontSize;
+    const fill = style.textFill || "#000000";
+    const at = ctx.childCount([0]);
+    const rec = await ctx.addShape(`<text x="${r(s.x)}" y="${r(s.y)}" font-size="${fs}" fill="${fill}">text</text>`);
+    if (rec) await commitDelta(ctx, gestureDelta.select([[0, at]], "transform"));
+    ctx.setTool("select");
+  },
+  onCancel(ctx) { const had = !!ctx.state.textPlace; ctx.state.textPlace = null; return had; }
+}
+)};
+
+const _sl310 = function _test_place_text(forAll,arb,mulberry32,NUM_RUNS,insertElement,childrenLens,textRunLens,nodeAt)
+{
+  const rng = mulberry32(0x5EED0020);
+  const DOC = '<svg viewBox="0 0 10 10">\n  <!-- keep -->\n  <rect x="1"/>\n</svg>';
+  forAll(NUM_RUNS, rng, (r) => [arb.int(r, -99, 99), arb.int(r, -99, 99)], (x, y) => {
+    const doc = insertElement(DOC, [0], null, `<text x="${x}" y="${y}" font-size="16" fill="#000000">text</text>`);
+    const kids = childrenLens([0]).get(doc);
+    if (kids.length !== 2) throw new Error("place did not add exactly one element");
+    const path = [0, 1];
+    if (nodeAt(doc, path).tag !== "text") throw new Error("placed element is not <text>");
+    if (textRunLens(path).get(doc) !== "text") throw new Error("text run did not read back");
+    if (doc.indexOf("<!-- keep -->") === -1) throw new Error("residue lost");
+    return true;
+  }, "placing a <text> reads its run back");
+  return `✅ place-text: element is <text>, run reads back, residue kept (${NUM_RUNS} runs)`;
+};
+
+const _sl311 = function _test_edit_run(forAll,arb,mulberry32,NUM_RUNS,setTextRun,textRunLens)
+{
+  const rng = mulberry32(0x5EED0021);
+  const RUNS = ["hello", "a b c", "", "λ", "one\ntwo"];
+  const mk = (run) => `<svg>\n  <text x="1" y="2">${run}</text>\n  <rect/>\n</svg>`;
+  forAll(NUM_RUNS, rng, (r) => [arb.pick(r, RUNS), arb.pick(r, RUNS)], (a, b) => {
+    const doc = mk(a);
+    const path = [0, 0];
+    if (textRunLens(path).get(doc) !== a) throw new Error("run did not read back what was placed");
+    if (setTextRun(doc, path, textRunLens(path).get(doc)) !== doc) throw new Error("GetPut failed");
+    const doc2 = setTextRun(doc, path, b);
+    if (textRunLens(path).get(doc2) !== b) throw new Error("PutGet failed");
+    if (doc2.indexOf('<rect/>') === -1 || doc2.indexOf('x="1" y="2"') === -1)
+      throw new Error("surrounding source not preserved");
+    return true;
+  }, "setTextRun obeys GetPut/PutGet and preserves surroundings");
+  return `✅ edit-run: GetPut, PutGet, surroundings preserved (${NUM_RUNS} runs)`;
+};
+
 // Click to place anchors; click the first anchor to close, or double-click to finish open. The path
 // exists in the source from the first click, so there is no builder state that can diverge from it —
 // the only state the tool keeps is which path it is extending.
@@ -23502,10 +23614,11 @@ const _sl127h = function _toolHover(gestureDelta,previewDelta){return(
 }
 )};
 
-const _sl123 = function _svgTools(Inputs,toolAffordance,toolDraw,toolPen,toolScribble,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover){return(
+const _sl123 = function _svgTools(Inputs,toolAffordance,toolDraw,toolText,toolPen,toolScribble,toolTransform,toolVertex,toolMove,toolMarquee,toolScope,toolZoom,toolStructure,toolHover){return(
 // toolAffordance is first so a chip press is claimed before the handle/move tools — safe because it
 // gates on `dataset.aff` and falls through on anything else (the G22 empty-space discipline).
-Inputs.input([toolAffordance, toolDraw, toolPen, toolScribble, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover])
+// toolText sits with the creation tools (it gates on the active tool, so it claims only in text mode).
+Inputs.input([toolAffordance, toolDraw, toolText, toolPen, toolScribble, toolTransform, toolVertex, toolMove, toolMarquee, toolScope, toolZoom, toolStructure, toolHover])
 )};
 const _sl123v = (G, _) => G.input(_);
 
@@ -24476,7 +24589,7 @@ const _sl113s = function _lensState(){return(
 new Map()
 )};
 
-const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,svgFields,svgAffordances,commandLookup,copyMarkup,moveTargetOf,commitDelta,rebaseVertex,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox,gradientGizmo,attrTextLens)
+const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocus,svgTools,svgShapes,svgCommands,svgFields,svgAffordances,commandLookup,copyMarkup,moveTargetOf,commitDelta,rebaseVertex,invert,applyPoint,ctmMat,insertElement,deleteElement,reorderElement,rebasePath,childrenLens,zTarget,attrVal,effectiveAttr,translateLens,nodeAt,setProperty,refsOf,boxInRoot,hitTest,scopedPath,pathOfIndex,parseViewBox,printViewBox,gradientGizmo,attrTextLens,textRunLens,setTextRun)
 {
   // Which instance is projecting which node. Read by the facade below to route a tool's calls to the
   // node that is the cell's value now, rather than the one its gesture started on.
@@ -25122,6 +25235,14 @@ const _sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFoc
       const w = setProperty(t, idx, prop, v);
       return writer.commit(idx, w.name, w.value, null);
     };
+    // G26. The text run of an element (a <text>'s content), read from source and written through the
+    // content lens — one write path, undoable, no rebase (no address moves on a content change).
+    node.textOf = (path) => {
+      const t = target.doc();
+      if (t === null) return null;
+      try { return textRunLens(path).get(t); } catch (e) { return null; }
+    };
+    node.setText = (path, txt) => node.edit("setText", (src) => setTextRun(src, path, txt));
     node.refs = (path) => {
       const t = target.doc();
       if (t === null) return [];
@@ -25429,6 +25550,8 @@ export default function define(runtime, observer) {
   $def("sl119e", "test_scoped_path", ["forAll","arb","mulberry32","NUM_RUNS","scopedPath"], _sl119e);
   $def("sl113t", "test_shape_registry", ["forAll","arb","mulberry32","NUM_RUNS","scaleAbout","printOp","parseTransform","applyPoint","svgShapes","shapeLookup","attrTextLens"], _sl113t);
   $def("sl125t", "test_shape_creation", ["forAll","arb","mulberry32","NUM_RUNS","dragBox","shapeSpec","shapeMarkup","insertElement","childrenLens","attrVal","nodeAt"], _sl125t);
+  $def("sl310", "test_place_text", ["forAll","arb","mulberry32","NUM_RUNS","insertElement","childrenLens","textRunLens","nodeAt"], _sl310);
+  $def("sl311", "test_edit_run", ["forAll","arb","mulberry32","NUM_RUNS","setTextRun","textRunLens"], _sl311);
   $def("sl74t", "test_domain_boundary", ["outsideDomain","parseDoc","tokenize","childrenLens"], _sl74t);
   $def("sl31t", "test_units_and_style", ["forAll","arb","mulberry32","NUM_RUNS","lengthLens","parseLength","printLength","styleLens","parseStyle","setProperty"], _sl31t);
   $def("sl71t", "test_interpolation_slots", ["holeSpans","slotsOf","mergeInterpolated","literalSpan","literalLens"], _sl71t);
@@ -25530,9 +25653,11 @@ export default function define(runtime, observer) {
   $def("sl78", "cellAttrLens", ["compose","literalLens","attrTextLens"], _sl78);
   $def("sl290", "hStructural", ["md"], _sl290);
   $def("sl79", "childrenLens", ["lens","nodeAt","parseDoc"], _sl79);
+  $def("sl307", "textRunLens", ["lens","nodeAt"], _sl307);
   $def("sl79a", "insertElement", ["childrenLens"], _sl79a);
   $def("sl79b", "deleteElement", ["childrenLens"], _sl79b);
   $def("sl79c", "reorderElement", ["childrenLens"], _sl79c);
+  $def("sl308", "setTextRun", ["textRunLens"], _sl308);
   $def("sl275", "mintId", ["idsIn"], _sl275);
   $def("sl276", "defsInsert", ["nodeAt","insertElement"], _sl276);
   $def("sl79xa", "groupPlan", [], _sl79xa);
@@ -25616,6 +25741,7 @@ export default function define(runtime, observer) {
   $def("sl125c", "shapeMarkup", ["shapeSpec"], _sl125c);
   $def("sl125d", "penPath", [], _sl125d);
   $def("sl125", "toolDraw", ["shapeLookup","shapeSpec","shapeMarkup","dragBox","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl125);
+  $def("sl309", "toolText", ["grabPointer","gestureDelta","commitDelta"], _sl309);
   $def("sl126", "toolPen", ["penPath","attrVal","nodeAt","grabPointer","gestureDelta","previewDelta","commitDelta","pathHandles","pathOfIndex"], _sl126);
   $def("sl268", "fitCurve", [], _sl268);
   $def("sl269", "toolScribble", ["fitCurve","grabPointer","gestureDelta","previewDelta","commitDelta"], _sl269);
@@ -25641,7 +25767,7 @@ export default function define(runtime, observer) {
   $def("sl274", "frameBudget", ["withFixture","gestureCorpus","playGesture"], _sl274);
   $def("sl298", "hCommands", ["md"], _sl298);
   $def("sl127h", "toolHover", ["gestureDelta","previewDelta"], _sl127h);
-  $def("sl123", "viewof svgTools", ["Inputs","toolAffordance","toolDraw","toolPen","toolScribble","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl123);
+  $def("sl123", "viewof svgTools", ["Inputs","toolAffordance","toolDraw","toolText","toolPen","toolScribble","toolTransform","toolVertex","toolMove","toolMarquee","toolScope","toolZoom","toolStructure","toolHover"], _sl123);
   $def("sl273", "toolAffordance", ["grabPointer","previewDelta","gestureDelta","revertDelta"], _sl273);
   $def("sl240", "cmdGroup", ["gestureDelta","groupPlan","groupElements","rebaseMoves"], _sl240);
   $def("sl241", "cmdUngroup", ["gestureDelta","ungroupBlockers","ungroupElements","childrenLens","rebaseMoves"], _sl241);
@@ -25671,7 +25797,7 @@ export default function define(runtime, observer) {
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], _sl123v);
   $def("sl299", "hAssembly", ["md"], _sl299);
   $def("sl113s", "lensState", [], _sl113s);
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","svgFields","svgAffordances","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox","gradientGizmo","attrTextLens"], _sl114);
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","svgFields","svgAffordances","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox","gradientGizmo","attrTextLens","textRunLens","setTextRun"], _sl114);
 
   // The bench cells — their live nodes are shown by `workbench` (the snap-grid at the top); these
   // definitions render only their value-rows here in the appendix.
@@ -50899,7 +51025,7 @@ visualizer(runtime, { // get a runtime reference from @mootari/access-runtime
 const _bym618 = function _8(md){return(
 md`## Customizing the visual representation
 
-The \`inspector\` variable defines a factory of variable observers, matching the signature of Observable's [\`Inspector.into\`](https://github.com/observablehq/inspector#Inspector_into) method. The visualizer uses this factory to build listeners to the runtime's variables. By default it is the default observable inspector, which renders cells in the way you are familiar, however, you can change this to anything. In this notebook we also provide examples around the [minicell](https://observablehq.com/@tomlarkworthy/minicell), which renders just the variables's name, giving a minimap feel, but the possibilities are endless.`
+The \`inspector\` variable defines a factory of variable observers, matching the signature of Observable's [\`Inspector.into\`](https://github.com/observablehq/inspector#Inspector_into) method. The visualizer uses this factory to build listeners to the runtime's variables. By default it is the default observable inspector, which renders cells in the way you are familiar, however, you can change this to anything. For example, the [minicell](https://observablehq.com/@tomlarkworthy/minicell) inspector renders just each variable's name, giving a minimap feel — but the possibilities are endless.`
 )};
 const _1quu22m = function _9(md){return(
 md`---
@@ -51127,7 +51253,7 @@ const _1xdl683 = function _renderImportCell(navHref){return(
   return span;
 }
 )};
-const _17pe3vk = function _syncers(observe,inspectors,$0,liveCellMap,createImportCellHeader,renderImportCell,variablesForCell,visualizers,$1)
+const _bbb3dg = function _syncers(observe,inspectors,$0,liveCellMap,createImportCellHeader,renderImportCell,variablesForCell,visualizers,$1)
 {
   const syncers = this || new Map();
 
@@ -51163,7 +51289,14 @@ const _17pe3vk = function _syncers(observe,inspectors,$0,liveCellMap,createImpor
       root,
       remove: () => {
         observers.delete(v);
-        observer?._node?.remove?.();
+        const node = observer?._node;
+        if (node) {
+          // Detach the variable's live element value
+          const val = v?._value;
+          if (val && val.nodeType && val.parentNode === node)
+            node.removeChild(val);
+          node.remove();
+        }
         unobserve?.();
       }
     };
@@ -51341,7 +51474,7 @@ export default function define(runtime, observer) {
   $def("_zodkh8", "createImportCellHeader", [], _zodkh8);  
   $def("_526jo", "variablesForCell", [], _526jo);  
   $def("_1xdl683", "renderImportCell", ["navHref"], _1xdl683);  
-  $def("_17pe3vk", "syncers", ["observe","inspectors","viewof visualizersToDelete","liveCellMap","createImportCellHeader","renderImportCell","variablesForCell","visualizers","viewof visualizers"], _17pe3vk);  
+  $def("_bbb3dg", "syncers", ["observe","inspectors","viewof visualizersToDelete","liveCellMap","createImportCellHeader","renderImportCell","variablesForCell","visualizers","viewof visualizers"], _bbb3dg);  
   $def("_een5pq", null, ["md"], _een5pq);  
   $def("_1wiz55o", "backgroundJobs", ["keepalive","visualizerModule"], _1wiz55o);  
   $def("_1oonsyz", "viewof visualizerModule", ["thisModule"], _1oonsyz);  
@@ -51365,7 +51498,8 @@ export default function define(runtime, observer) {
   main.define("liveCellMap", ["module @tomlarkworthy/cell-map", "@variable"], (_, v) => v.import("liveCellMap", _));  
   main.define("navHref", ["module @tomlarkworthy/lopepage-urls", "@variable"], (_, v) => v.import("navHref", _));
   return main;
-}</script>
+}
+</script>
 
 <script id="d/57d79353bac56631" 
   type="text/plain"
