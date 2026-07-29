@@ -17622,9 +17622,13 @@ const sl113t = function _test_shape_registry(forAll,arb,mulberry32,NUM_RUNS,scal
   const inside = doc(`<rect x="1" y="2" width="3" height="4"/>`);
   if ((shapeLookup.forTag(svgShapes, "rect", inside, 1) || {}).mode !== "rect")
     throw new Error("the registry declined a rect it can read");
+  // G27: an <image> is x/y/width/height geometry, so it must route through the rect entry's handles.
+  const img = doc(`<image x="1" y="2" width="3" height="4" href="data:,"/>`);
+  if ((shapeLookup.forTag(svgShapes, "image", img, 1) || {}).mode !== "rect")
+    throw new Error("an <image> with x/y/width/height must get the rect geometry handles");
 
   return `✅ resize agreement (${NUM_RUNS} runs), ${SHAPES.length} entries write nothing when unmoved, `
-       + `${MOVES.length} drags land on target, ${OUTSIDE.length} unreadable elements declined`;
+       + `${MOVES.length} drags land on target, ${OUTSIDE.length} unreadable elements declined, <image> routes to rect`;
 };
 const sl125t = function _test_shape_creation(forAll,arb,mulberry32,NUM_RUNS,dragBox,shapeSpec,shapeMarkup,insertElement,childrenLens,attrVal,nodeAt)
 {
@@ -17891,6 +17895,49 @@ const sl303t = function _test_gradient_stops(svgFields,cmdStop,nodeAt)
   if (cmdStop("add").plan({ src: doc, paths: [[0, 1]] }) !== null)
     throw new Error("add-stop must decline on a non-gradient");
   return "✅ per-tag fields; add-stop midpoint+colour+selection; delete-stop >=2 guard";
+};
+const sl303u = function _test_defs_commands(cmdAddPattern,cmdClipMask,nodeAt)
+{
+  // G51 add-pattern: a single-shape command that mints a <pattern> in defs and points `fill` at it,
+  // and declines (T8) on anything but a single shape.
+  const rectDoc = '<svg>\n  <rect x="0" y="0" width="10" height="10" fill="#f00"/>\n</svg>';
+  const rp = [0, 0];
+  if (cmdAddPattern.plan({ src: rectDoc, paths: [] }) !== null)
+    throw new Error("add-pattern must decline with no selection");
+  if (cmdAddPattern.plan({ src: rectDoc, paths: [rp, rp] }) !== null)
+    throw new Error("add-pattern must decline on a multi-selection");
+  const pat = cmdAddPattern.plan({ src: rectDoc, paths: [rp] });
+  if (!pat) throw new Error("add-pattern declined on a single shape");
+  const withPat = pat.apply(rectDoc);
+  const pfill = nodeAt(withPat, rp).attrs.fill;
+  if (!pfill || !/^url\(#pat\d+\)$/.test(pfill.value))
+    throw new Error(`add-pattern did not point fill at the pattern (got ${pfill && pfill.value})`);
+  if (!/<pattern id="pat\d+"/.test(withPat)) throw new Error("add-pattern minted no <pattern> in defs");
+  if (pat.apply(rectDoc) !== withPat) throw new Error("add-pattern is not deterministic");
+
+  // G50 clip/mask: with a 2+ selection, move the topmost (highest source index) shape into a
+  // <clipPath>/<mask> in defs, point the rest at it via clip-path/mask=url(#id), delete the clipper.
+  const two = '<svg>\n  <rect x="0" y="0" width="10" height="10" fill="#00f"/>\n  <circle cx="5" cy="5" r="4"/>\n</svg>';
+  const rectP = [0, 0], circP = [0, 1];                 // circle is topmost (source index 1)
+  for (const kind of ["clip", "mask"]) {
+    const cmd = cmdClipMask(kind);
+    const attr = kind === "clip" ? "clip-path" : "mask";
+    const wrap = kind === "clip" ? "clipPath" : "mask";
+    if (cmd.plan({ src: two, paths: [rectP] }) !== null)
+      throw new Error(`${kind} must decline on a single selection`);
+    const plan = cmd.plan({ src: two, paths: [rectP, circP] });
+    if (!plan) throw new Error(`${kind} declined on a two-selection`);
+    const out = plan.apply(two);
+    const kids = nodeAt(out, [0]).children.filter((c) => c.tag !== "defs");
+    if (kids.length !== 1 || kids[0].tag !== "rect")
+      throw new Error(`${kind} did not consume the topmost clipper (left: ${kids.map((k) => k.tag).join(",")})`);
+    const a = nodeAt(out, rectP).attrs[attr];
+    if (!a || !/^url\(#\w+\d+\)$/.test(a.value))
+      throw new Error(`${kind} did not point the target at url(#…) via ${attr}`);
+    if (!new RegExp(`<${wrap} id="${kind}\\d+"`).test(out))
+      throw new Error(`${kind} minted no <${wrap}> in defs`);
+  }
+  return "✅ add-pattern mints a <pattern>+points fill (declines != 1); clip/mask consume topmost, ref the rest, decline < 2";
 };
 const sl304t = function _test_gradient_gizmo(gradientGizmo)
 {
@@ -25090,7 +25137,8 @@ export default function define(runtime, observer) {
   $def("sl31t", "test_units_and_style", ["forAll","arb","mulberry32","NUM_RUNS","lengthLens","parseLength","printLength","styleLens","parseStyle","setProperty"], sl31t);  
   $def("sl71t", "test_interpolation_slots", ["holeSpans","slotsOf","mergeInterpolated","literalSpan","literalLens"], sl71t);  
   $def("sl74u", "test_refs", ["refsOf","pathOfId"], sl74u);  
-  $def("sl303t", "test_gradient_stops", ["svgFields","cmdStop","nodeAt"], sl303t);  
+  $def("sl303t", "test_gradient_stops", ["svgFields","cmdStop","nodeAt"], sl303t);
+  $def("sl303u", "test_defs_commands", ["cmdAddPattern","cmdClipMask","nodeAt"], sl303u);
   $def("sl304t", "test_gradient_gizmo", ["gradientGizmo"], sl304t);  
   $def("sl127t", "test_snapRects", ["forAll","arb","mulberry32","NUM_RUNS","snapRects"], sl127t);  
   $def("sl119u", "test_topmost_selection", ["topmostPaths"], sl119u);  
