@@ -19978,7 +19978,7 @@ const sl113i = function _rxInset(){return(
 )};
 const sl113e = function _shapeRect(geomOf,numText,rxInset){return(
 {
-  mode: "rect", tags: ["rect"], writes: ["x", "y", "width", "height", "rx"], rotatable: true,
+  mode: "rect", tags: ["rect", "image"], writes: ["x", "y", "width", "height", "rx"], rotatable: true,   // G27: <image> shares rect geometry
   reads: (src, idx) => { geomOf.rect(src, idx); return true; },
   origin: (src, idx) => { const r = geomOf.rect(src, idx); return [r.x, r.y]; },
   move: (src, idx, x, y) => [{ name: "x", value: numText(x), dflt: "0" },
@@ -21435,9 +21435,14 @@ const sl122 = function _toolStructure(insertElement,insertPoint,cmdDeleteVertex,
     // `e.target` was the last place in the editor where "what did I click" had a second answer.
     const hit = key === undefined ? ((ctx.pick(e)[0] || {}).index ?? -1) : -1;
     const list = ctx.elems();
+    // A `fill="none"` outline is easy to miss with the default (6px) pick, which used to fall through to
+    // dropping a shape (bug 0). A generous pick catches the selected element's stroke so a double-click
+    // on its edge still inserts a vertex; the same list decides whether the canvas is genuinely empty.
+    const near = ctx.pick(e, { tolerance: 14 });
+    const onSel = sel && near.some((h) => h.index === focus.index);
     // Inserting means double-clicking the shape itself. A handle under the pointer is a delete
     // (above) or, for a control point, nothing at all — inserting there would be a guess.
-    if (sel && focus.mode === "points" && hit === focus.index) {
+    if (sel && focus.mode === "points" && (hit === focus.index || onSel)) {
       const el = list[focus.index];
       const p = ctx.localPoint(el, e);
       if (!p) return false;
@@ -21448,7 +21453,7 @@ const sl122 = function _toolStructure(insertElement,insertPoint,cmdDeleteVertex,
       return true;
     }
 
-    if (sel && focus.mode === "path" && hit === focus.index) {
+    if (sel && focus.mode === "path" && (hit === focus.index || onSel)) {
       const p = ctx.localPoint(list[focus.index], e);
       if (!p) return false;
       const segs = pathSegments(parsePath(ctx.attr(t, focus.index, "d")));
@@ -21461,7 +21466,9 @@ const sl122 = function _toolStructure(insertElement,insertPoint,cmdDeleteVertex,
       return true;
     }
 
-    if (hit < 0) {
+    // Drop a shape only on genuinely empty canvas — nothing painted and nothing near (T10 / partiality):
+    // a near-miss on a `fill="none"` outline is not an empty click, so it must not append a shape.
+    if (hit < 0 && !near.length) {
       const p = ctx.localPoint(ctx.node, e);
       if (!p) return false;
       const at = childrenLens([0]).get(t).length;       // appended, so nothing before it moves
@@ -23322,6 +23329,56 @@ defsCommand({
   }
 })
 )};
+const sl278b = function _cmdAddPattern(defsCommand){return(
+defsCommand({
+  // G51. A <pattern> is a defs entry like a gradient, so it is the same factory: mint one and point
+  // `fill` at it. The tile is an ordinary editable sub-tree (childrenLens), so editing it edits every
+  // shape the pattern fills.
+  id: "add-pattern", label: "Add pattern", key: null,
+  tags: ["rect", "circle", "ellipse", "polygon", "path", "line", "polyline", "text"],
+  sourceAttr: "fill", targetAttr: "fill", prefix: "pat",
+  markup(id, cur) {
+    const base = cur && !/^\s*url\(/.test(cur) && cur !== "none" ? cur : "#888888";
+    return `<pattern id="${id}" patternUnits="userSpaceOnUse" width="12" height="12">`
+         + `<rect width="12" height="12" fill="#ffffff"/>`
+         + `<circle cx="6" cy="6" r="3" fill="${base}"/></pattern>`;
+  }
+})
+)};
+const sl278c = function _cmdClipMask(gestureDelta,nodeAt,setProperty,attrTextLens,copyMarkup,defsInsert,deleteElement,mintId){return(
+(kind) => ({
+  // G50. Clip/mask with the topmost of a multi-selection: move that shape's markup into a <clipPath>/
+  // <mask> in defs, point the rest at it via url(#id), and remove the original (it is now the mask
+  // geometry, Inkscape's "clip"). All primitives are pure text edits; order matters — reference the
+  // targets first (attribute writes shift no paths), then defsInsert (appends, so earlier paths hold),
+  // then delete the clipper last.
+  id: kind, label: kind === "clip" ? "Clip with topmost" : "Mask with topmost", key: null,
+  plan(env) {
+    if (env.paths.length < 2) return null;
+    let top = env.paths[0], topIdx = -1;
+    for (const p of env.paths) {
+      let n; try { n = nodeAt(env.src, p); } catch (e) { return null; }
+      if (n.index > topIdx) { topIdx = n.index; top = p; }
+    }
+    const targets = env.paths.filter((p) => p !== top);
+    if (!targets.length) return null;
+    const attr = kind === "clip" ? "clip-path" : "mask";
+    const wrap = kind === "clip" ? "clipPath" : "mask";
+    return gestureDelta.command(kind, (src) => {
+      const cid = mintId(src, kind);
+      let out = src;
+      for (const p of targets) {
+        const idx = nodeAt(out, p).index;
+        const w = setProperty(out, idx, attr, `url(#${cid})`);
+        out = attrTextLens(idx, w.name).put(w.value, out);
+      }
+      const markup = copyMarkup(out, [top])[0];
+      out = defsInsert(out, `<${wrap} id="${cid}">${markup}</${wrap}>`);
+      return deleteElement(out, top);
+    }, { rebase: null, select: () => [] });
+  }
+})
+)};
 const sl302 = function _cmdStop(gestureDelta,nodeAt,insertElement,deleteElement){return(
 (kind) => ({
   id: kind === "add" ? "add-stop" : "delete-stop",
@@ -23411,7 +23468,7 @@ const sl304 = function _gradientGizmo(){return(
   };
 })()
 )};
-const sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth,cmdSelect,cmdConvertSegment,cmdAddGradient,cmdAddMarker,cmdStop){return(
+const sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmdCut,cmdPaste,cmdAlign,cmdDistribute,alignSpecs,cmdDeleteVertex,cmdClosePath,cmdToggleSmooth,cmdSelect,cmdConvertSegment,cmdAddGradient,cmdAddMarker,cmdAddPattern,cmdClipMask,cmdStop){return(
 [
   // A plain array, not an `Inputs.input`, for the same reason `svgShapes` is: pure code plans a command
   // and the laws exercise that headless, where there is no DOM to hold a view.
@@ -23421,7 +23478,7 @@ const sl250 = function _svgCommands(cmdGroup,cmdUngroup,cmdDuplicate,cmdCopy,cmd
            cmdDeleteVertex, cmdClosePath(true), cmdClosePath(false), cmdToggleSmooth])
   .concat(["all", "none", "same-fill", "same-tag"].map(cmdSelect))
   .concat(["L", "C", "Q"].map(cmdConvertSegment))
-  .concat([cmdAddGradient, cmdAddMarker, cmdStop("add"), cmdStop("delete")])
+  .concat([cmdAddGradient, cmdAddMarker, cmdAddPattern, cmdClipMask("clip"), cmdClipMask("mask"), cmdStop("add"), cmdStop("delete")])
 )};
 const sl272 = function _svgAffordances(gestureDelta,previewDelta,setProperty,nodeAt){return(
 (() => {
@@ -23451,6 +23508,21 @@ const sl272 = function _svgAffordances(gestureDelta,previewDelta,setProperty,nod
           await ctx.node.setField(p, "stroke", f);
         }
       }, title: "Swap fill and stroke" },
+
+    // G28 eyedropper. With two or more selected, the last (topmost) is the sample; its fill and stroke
+    // are matched onto the rest. Same read/write contract as swap-paint: `fieldOf` for the effective
+    // paint, `setField` for the one style-aware write path, sample captured before any commit remounts.
+    { id: "eyedropper", cursor: "pointer",
+      applies: (a) => a.paths.length >= 2,
+      glyph: (a) => ({ symbol: "⦿", fill: a.field("fill") || "#fff" }),
+      tap: async (ctx, a) => {
+        const src = a.paths[a.paths.length - 1];
+        const fill = a.fieldOf(src, "fill"), stroke = a.fieldOf(src, "stroke");
+        for (const p of a.paths.slice(0, -1)) {
+          if (fill != null) await ctx.node.setField(p, "fill", fill);
+          if (stroke != null) await ctx.node.setField(p, "stroke", stroke);
+        }
+      }, title: "Match paint from the last selected" },
 
     // G30 the canvas gesture: a grip whose horizontal drag is a stroke width in *user* units (screen
     // pixels ÷ the root's zoom, so it is zoom-invariant, T11). Fans out to the whole selection (G40),
@@ -23498,7 +23570,10 @@ const sl272 = function _svgAffordances(gestureDelta,previewDelta,setProperty,nod
       glyph: () => ({ symbol: "◑", fill: "#fff" }), title: "Add gradient" },
     { id: "add-marker", command: "add-marker", cursor: "pointer",
       applies: (a) => a.paths.length === 1,
-      glyph: () => ({ symbol: "➤", fill: "#fff" }), title: "Add arrowhead" }
+      glyph: () => ({ symbol: "➤", fill: "#fff" }), title: "Add arrowhead" },
+    { id: "add-pattern", command: "add-pattern", cursor: "pointer",       // G51
+      applies: (a) => a.paths.length === 1,
+      glyph: () => ({ symbol: "▦", fill: "#fff" }), title: "Add pattern" }
   ];
 })()
 )};
@@ -23957,6 +24032,20 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
       for (const t of tools) if (t.onDblClick && await t.onDblClick(liveCtx, e)) return;
     });
 
+    // G29. A swatch dragged from the palette drops its colour on whatever shape is under the pointer.
+    // pickAt hit-tests the same way a click would, so drop obeys T10 partiality: no target, no write.
+    const COLOR_MIME = "application/x-svg-lens-color";
+    node.addEventListener("dragover", (e) => {
+      if (e.dataTransfer && [...e.dataTransfer.types].includes(COLOR_MIME)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }
+    });
+    node.addEventListener("drop", async (e) => {
+      const color = e.dataTransfer && e.dataTransfer.getData(COLOR_MIME);
+      if (!color) return;
+      e.preventDefault();
+      const path = node.pickAt(e)[0];
+      if (path) await node.setField(path, e.altKey ? "stroke" : "fill", color);
+    });
+
     // The handles follow every put. A structural edit may move the selection's address, so the record
     // carries a rebase; refresh() drops the selection by itself if the path no longer resolves. The
     // writer knows nothing about selection — it just says what it did.
@@ -24176,6 +24265,42 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
       if (v === "" || v === cur) return null;                // no clear-to-default yet; no-op if unchanged (T1)
       const w = setProperty(t, idx, prop, v);
       return writer.commit(idx, w.name, w.value, null);
+    };
+    // Live, transient paint preview for the inspector's colour picker: write the property as an inline
+    // style (which beats attribute and CSS) straight onto the rendered element — no commit, no undo
+    // entry — so the drawing updates while you scrub the picker. A commit remounts and rebuilds from
+    // source, dropping the inline style; `clearPreview` drops it for a change that no-ops (T1), where no
+    // remount would.
+    const elForPath = (path) => {
+      const t = target.doc();
+      if (t === null) return null;
+      let idx;
+      try { idx = nodeAt(t, path).index; } catch (e) { return null; }
+      return target.elems()[idx] || null;
+    };
+    node.previewField = (path, prop, value) => {
+      const el = elForPath(path);
+      if (el && value != null && String(value).trim() !== "") el.style.setProperty(prop, String(value).trim());
+    };
+    node.clearPreview = (path, prop) => {
+      const el = elForPath(path);
+      if (el) el.style.removeProperty(prop);
+    };
+    // G49. The palette is a projection of the document, not stored state: the distinct colours already
+    // in the source (every fill / stroke / stop-color that is a plain colour, not a url() or none), in
+    // first-seen order. Read the style-aware way the fields do, so a `style="fill:…"` colour counts.
+    node.colors = () => {
+      const t = target.doc();
+      if (t === null) return [];
+      const out = [], seen = new Set();
+      const isColor = (v) => v && v !== "none" && !/^\s*url\(/.test(v) && v !== "transparent";
+      const list = target.elems();
+      for (let i = 1; i < list.length; i++)
+        for (const prop of ["fill", "stroke", "stop-color"]) {
+          let v; try { v = svgFields.read(t, i, prop); } catch (e) { continue; }
+          if (isColor(v) && !seen.has(v)) { seen.add(v); out.push(v); }
+        }
+      return out;
     };
     // G26. The text run of an element (a <text>'s content), read from source and written through the
     // content lens — one write path, undoable, no rebase (no address moves on a content change).
@@ -24494,6 +24619,19 @@ const sl02b = function _toolbar($0,htl,invalidation) {
             b
         ];
     });
+    // G27. Place an <image>: pick a local file, embed it as a data URI, append it. The href is then
+    // editable in the inspector like any attribute, and the element gets rect geometry handles.
+    const imgBtn = htl.html`<button title="Place an image" style="padding:4px 10px;border-radius:6px;border:1px solid #b9c4b4;cursor:pointer">🖼</button>`;
+    const filePick = htl.html`<input type="file" accept="image/*" style="display:none">`;
+    imgBtn.onclick = () => filePick.click();
+    filePick.onchange = () => {
+        const f = filePick.files && filePick.files[0];
+        if (!f) return;
+        const r = new FileReader();
+        r.onload = () => { drawing.addShape(`<image x="20" y="20" width="160" height="120" href="${ r.result }"/>`); filePick.value = ''; };
+        r.readAsDataURL(f);
+    };
+    el.appendChild(imgBtn); el.appendChild(filePick);
     const paint = tool => buttons.forEach(([id, b]) => {
         b.style.background = id === tool ? '#2F6BFF' : '#fff';
         b.style.color = id === tool ? '#fff' : '#243';
@@ -24700,8 +24838,13 @@ const sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
       const sw = htl.html`<input type="color" style="width:28px;height:22px;padding:0;border:none;background:none">`;
       try { if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(f.value)) sw.value = f.value.length === 4
         ? "#" + f.value.slice(1).split("").map((c) => c + c).join("") : f.value; } catch (e) {}
-      txt.addEventListener("change", () => commit(txt.value.trim()));
-      sw.addEventListener("change", () => { txt.value = sw.value; commit(sw.value); });
+      // Preview live on `input` (transient, no undo), commit once on `change`. A change that lands on
+      // the current value no-ops (T1), so clear the lingering preview since no remount will.
+      const done = (v) => { if (!commit(v)) drawing.clearPreview(path, f.prop); };
+      txt.addEventListener("input", () => drawing.previewField(path, f.prop, txt.value.trim()));
+      txt.addEventListener("change", () => done(txt.value.trim()));
+      sw.addEventListener("input", () => { txt.value = sw.value; drawing.previewField(path, f.prop, sw.value); });
+      sw.addEventListener("change", () => { txt.value = sw.value; done(sw.value); });
       return row(f.label, htl.html`<span style="display:flex;gap:6px;align-items:center">${sw}${txt}</span>`);
     }
     const inp = htl.html`<input type="${f.kind === "number" ? "number" : "text"}" value="${f.value}" placeholder="${f.dflt || ""}" style="font:12px ui-monospace,monospace;width:120px">`;
@@ -24790,6 +24933,22 @@ const sl02c = function _inspector(htl,Inputs,invalidation,svgFields,$0)
         ${jumps.length ? htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">${jumps}</div>` : ""}
         ${strip}
       </fieldset>`);
+    }
+    // G49. The document's palette — a projection of `node.colors()`, not stored state. Click a swatch to
+    // set the selection's fill through the one write path (`setField`); alt-click sets stroke.
+    const swatches = drawing.colors ? drawing.colors() : [];
+    if (swatches.length) {
+      const pal = htl.html`<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-top:2px">
+        <span style="font:11px ui-monospace,monospace;opacity:.6;flex:0 0 96px">palette</span></div>`;
+      for (const c of swatches) {
+        const sw = htl.html`<button draggable="true" title="${c} — click: fill · alt-click: stroke · drag onto a shape" style="width:20px;height:20px;border-radius:4px;border:1px solid #8a978a;background:${c};cursor:pointer;padding:0"></button>`;
+        sw.onclick = (e) => { const prop = e.altKey ? "stroke" : "fill"; for (const p of paths) drawing.setField(p, prop, c); };
+        // G29. Drag a swatch onto any shape (not just the selection); the drawing's drop handler reads
+        // this colour and sets the paint of the shape under the pointer.
+        sw.addEventListener("dragstart", (e) => e.dataTransfer.setData("application/x-svg-lens-color", c));
+        pal.append(sw);
+      }
+      el.append(pal);
     }
   };
   // `lens-select`/`lens-put` dispatch synchronously inside the drawing's own `draw()`; a listener that
@@ -25163,10 +25322,12 @@ export default function define(runtime, observer) {
   $def("sl266", "cmdConvertSegment", ["gestureDelta","attrVal","parsePath","printPath","pathSegments","pathHandles","attrTextLens","nodeAt","pathConvert"], sl266);  
   $def("sl300", "defsCommand", ["gestureDelta","nodeAt","attrVal","setProperty","attrTextLens","mintId","defsInsert"], sl300);  
   $def("sl277", "cmdAddGradient", ["defsCommand"], sl277);  
-  $def("sl278", "cmdAddMarker", ["defsCommand"], sl278);  
+  $def("sl278", "cmdAddMarker", ["defsCommand"], sl278);
+  $def("sl278b", "cmdAddPattern", ["defsCommand"], sl278b);
+  $def("sl278c", "cmdClipMask", ["gestureDelta","nodeAt","setProperty","attrTextLens","copyMarkup","defsInsert","deleteElement","mintId"], sl278c);
   $def("sl302", "cmdStop", ["gestureDelta","nodeAt","insertElement","deleteElement"], sl302);  
   $def("sl304", "gradientGizmo", [], sl304);  
-  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth","cmdSelect","cmdConvertSegment","cmdAddGradient","cmdAddMarker","cmdStop"], sl250);  
+  $def("sl250", "svgCommands", ["cmdGroup","cmdUngroup","cmdDuplicate","cmdCopy","cmdCut","cmdPaste","cmdAlign","cmdDistribute","alignSpecs","cmdDeleteVertex","cmdClosePath","cmdToggleSmooth","cmdSelect","cmdConvertSegment","cmdAddGradient","cmdAddMarker","cmdAddPattern","cmdClipMask","cmdStop"], sl250);  
   $def("sl272", "svgAffordances", ["gestureDelta","previewDelta","setProperty","nodeAt"], sl272);  
   $def("sl249", "commandLookup", [], sl249);  
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], sl123v);  
