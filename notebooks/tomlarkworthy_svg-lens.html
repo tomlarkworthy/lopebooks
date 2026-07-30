@@ -17824,6 +17824,32 @@ const sl71t = function _test_interpolation_slots(holeSpans,slotsOf,mergeInterpol
   if (!threw) throw new Error("an interpolation in element position must be refused");
   return "✅ slots classified, literals written, expressions preserved byte for byte and reported";
 };
+const sl71u = function _test_tagged_literal_span(literalSpan)
+{
+  // The `mutableSvg` tag makes the drawing an imported template — `svg`…`` — instead of the power API's
+  // `svgLens(svg`…`)`. literalSpan must locate the write-back region for both, and for whatever local
+  // name a consumer imported the tag under (rename-on-import), which is how the alias generalises.
+  const bodyOf = (defn, alias) => { const [a, b] = literalSpan(defn, alias); return defn.slice(a, b); };
+  const power = 'function _d(svgLens, svg){return( svgLens(svg`<svg width="10"/>`) )}';
+  if (bodyOf(power, "svgLens") !== '<svg width="10"/>')
+    throw new Error(`power-API span wrong: ${JSON.stringify(bodyOf(power, "svgLens"))}`);
+  const tag = 'function _d(svg){return( svg`<svg width="10"/>` )}';
+  if (bodyOf(tag, "svg") !== '<svg width="10"/>')
+    throw new Error(`tag-form span wrong: ${JSON.stringify(bodyOf(tag, "svg"))}`);
+  const renamed = 'function _d(draw){return( draw`<svg width="10"/>` )}';   // import {mutableSvg as draw}
+  if (bodyOf(renamed, "draw") !== '<svg width="10"/>')
+    throw new Error(`renamed-tag span wrong: ${JSON.stringify(bodyOf(renamed, "draw"))}`);
+  // An attribute-position hole is returned verbatim; an element-position one is refused in the tag form
+  // too — the same "indices would not line up" guard the power API has.
+  const holeAttr = 'function _d(svg){return( svg`<svg width="${w}"/>` )}';
+  if (bodyOf(holeAttr, "svg") !== '<svg width="${w}"/>')
+    throw new Error("tag form dropped an attribute-position hole");
+  let threw = false;
+  try { literalSpan('function _d(svg){return( svg`<svg>${shapes}</svg>` )}', "svg"); }
+  catch (e) { threw = /would not line up/.test(e.message); }
+  if (!threw) throw new Error("tag form must refuse an element-position interpolation");
+  return "✅ literalSpan resolves svgLens(svg`…`), svg`…` and a renamed tag`…`; element-position holes refused";
+};
 const sl74u = function _test_refs(refsOf,pathOfId)
 {
   const doc = [
@@ -19025,8 +19051,13 @@ const sl71 = function _literalSpan(acorn)
   };
   return (src, alias = null) => {
     const root = acorn.parseExpressionAt(src, 0, { ecmaVersion: "latest" });
+    // The alias is reached two ways: the power API wraps a builtin template, `svgLens(svg`…`)` (a
+    // CallExpression), and the imported `svg` tag is the template itself, `svg`…`` (a
+    // TaggedTemplateExpression whose quasi is the literal). Match either — the tag form's quasi is a
+    // TemplateLiteral child of `scope`, so the `find` below still locates it.
     const scope = alias
-      ? find(root, (n) => n.type === "CallExpression" && n.callee && n.callee.name === alias)
+      ? find(root, (n) => (n.type === "CallExpression" && n.callee && n.callee.name === alias)
+                       || (n.type === "TaggedTemplateExpression" && n.tag && n.tag.name === alias))
       : root;
     if (!scope) throw new Error(`no call to ${alias} in the definition`);
     const lit = find(scope.arguments || scope, (n) => n.type === "TemplateLiteral");
@@ -23693,7 +23724,7 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
     });
 
     const overlay = svgOverlay(node);
-    const target = svgTarget(node, { marker: svgLens, isOwn: overlay.isOwn });
+    const target = svgTarget(node, { marker: options.marker || svgLens, isOwn: overlay.isOwn });
     const writer = svgWriter(node, target);
     // Lazily, because `target.variable()` matches on `_value === node` and the runtime has not
     // assigned this cell's value yet — we are still inside the definition that produces it. Both are
@@ -24586,6 +24617,15 @@ const sl114 = function _svgLens(lensState,svgTarget,svgWriter,svgOverlay,svgFocu
     return node;
   };
 };
+const sl114b = function _mutableSvg(svgLens,htl){return(
+  // The editable-`md` move for SVG: a tag that builds the node with the *builtin* (`htl.svg`) and
+  // installs the editor. A consumer opts in per notebook with `import {mutableSvg as svg}`, and the
+  // rename-on-import shadows the builtin in that module only — no runtime fork. `marker: svg` (the
+  // named function expression refers to itself) makes write-back resolve the literal by whatever name
+  // the consumer imported it under. Nested/`map` uses where no host variable resolves fall back to the
+  // plain node the writer already returns.
+  function svg(strings, ...values) { return svgLens(htl.svg(strings, ...values), { marker: svg }); }
+)};
 const sl02 = function _drawing(svgLens,svg) {return (svgLens(svg`<svg viewBox="0 0 320 180" width="100%" style="max-height:420px;">
   <g transform="translate(86 95)">
     <animateTransform attributeName="transform" type="scale" additive="sum" values="1 1; 1 1; 0.71 1; 0 1; -0.71 1; -1 1; -0.71 1; 0 1; 0.71 1; 1 1" keyTimes="0;0.85;0.86875;0.8875;0.90625;0.925;0.94375;0.9625;0.98125;1" dur="4s" repeatCount="indefinite"/>
@@ -25135,7 +25175,8 @@ export default function define(runtime, observer) {
   $def("sl311", "test_edit_run", ["forAll","arb","mulberry32","NUM_RUNS","setTextRun","textRunLens"], sl311);  
   $def("sl74t", "test_domain_boundary", ["outsideDomain","parseDoc","tokenize","childrenLens"], sl74t);  
   $def("sl31t", "test_units_and_style", ["forAll","arb","mulberry32","NUM_RUNS","lengthLens","parseLength","printLength","styleLens","parseStyle","setProperty"], sl31t);  
-  $def("sl71t", "test_interpolation_slots", ["holeSpans","slotsOf","mergeInterpolated","literalSpan","literalLens"], sl71t);  
+  $def("sl71t", "test_interpolation_slots", ["holeSpans","slotsOf","mergeInterpolated","literalSpan","literalLens"], sl71t);
+  $def("sl71u", "test_tagged_literal_span", ["literalSpan"], sl71u);  
   $def("sl74u", "test_refs", ["refsOf","pathOfId"], sl74u);  
   $def("sl303t", "test_gradient_stops", ["svgFields","cmdStop","nodeAt"], sl303t);
   $def("sl303u", "test_defs_commands", ["cmdAddPattern","cmdClipMask","nodeAt"], sl303u);
@@ -25381,8 +25422,9 @@ export default function define(runtime, observer) {
   $def("sl123v", "svgTools", ["Generators","viewof svgTools"], sl123v);  
   $def("sl299", "hAssembly", ["md"], sl299);  
   $def("sl113s", "lensState", [], sl113s);  
-  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","svgFields","svgAffordances","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox","gradientGizmo","attrTextLens","textRunLens","setTextRun"], sl114);  
-  $def("sl02", "viewof drawing", ["svgLens","svg"], sl02);  
+  $def("sl114", "svgLens", ["lensState","svgTarget","svgWriter","svgOverlay","svgFocus","svgTools","svgShapes","svgCommands","svgFields","svgAffordances","commandLookup","copyMarkup","moveTargetOf","commitDelta","rebaseVertex","invert","applyPoint","ctmMat","insertElement","deleteElement","reorderElement","rebasePath","childrenLens","zTarget","attrVal","effectiveAttr","translateLens","nodeAt","setProperty","refsOf","boxInRoot","hitTest","scopedPath","pathOfIndex","parseViewBox","printViewBox","gradientGizmo","attrTextLens","textRunLens","setTextRun"], sl114);
+  $def("sl114b", "mutableSvg", ["svgLens","htl"], sl114b);
+  $def("sl02", "viewof drawing", ["svgLens","svg"], sl02);
   $def("sl03", "drawing", ["Generators","viewof drawing"], sl03);  
   $def("sl02b", "toolbar", ["viewof drawing","htl","invalidation"], sl02b);  
   $def("sl02c", "inspector", ["htl","Inputs","invalidation","svgFields","viewof drawing"], sl02c);  
