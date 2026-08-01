@@ -8137,6 +8137,73 @@ const _a2Anchors = function _a2Anchors(runtime,persistentId,getVariableByPersist
     try { return root.querySelector(":scope > " + path); } catch (e) { return null; }
   };
 
+  // The cell attribute is a lopepage convention; observablehq.com renders plain
+  // `.observablehq` divs. The variable knows its own display node either way.
+  const moduleNamed = (name) =>
+    (name && runtime.mains && runtime.mains.get ? runtime.mains.get(name) : null) || null;
+  const nodeForVariable = (moduleName, name, pane) => {
+    const mod = moduleNamed(moduleName);
+    let loose = null;
+    for (const v of runtime._variables) {
+      if (v._name !== name) continue;
+      const n = v._observer && v._observer._node;
+      if (!n || n.nodeType !== 1 || !n.isConnected) continue;
+      if (mod && v._module === mod) return n;
+      if (pane && pane.contains(n)) return n;
+      if (!loose) loose = n;
+    }
+    // A named module that does not have this cell is a miss, not an invitation to take
+    // some other module's cell of the same name.
+    return mod ? null : loose;
+  };
+
+  // Last rung: the words themselves. No cell, no pid, no attribute — re-find the quote in the
+  // page text the way a web annotator does, and take whatever cell it landed in.
+  const UNRENDERED = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TITLE: 1 };
+  const docTextNodes = () => {
+    const w = doc.createTreeWalker(doc.body, window.NodeFilter.SHOW_TEXT);
+    const out = [];
+    while (w.nextNode()) {
+      const n = w.currentNode, p = n.parentElement;
+      if (!p) continue;
+      // A lopecode notebook carries every module as a `<script type="text/plain">`: its text
+      // is in the DOM but not on the page, and it contains the annotation's own source, so
+      // including it makes every quote look ambiguous (measured: 3.4MB of text, all misses).
+      if (UNRENDERED[p.tagName]) continue;
+      // Our own boxes, and any code view: an open cell editor shows the annotation's own
+      // source, which would make its quote look ambiguous and lose the anchor.
+      if (p.closest && p.closest("[data-a2-root],[data-a2-layer],.cm-editor,[data-a2-editor]")) continue;
+      out.push(n);
+    }
+    return out;
+  };
+  // Document-wide, so ambiguity is a miss rather than a guess: context first, and the bare
+  // quote only when it occurs once on the whole page.
+  const quoteInDoc = (text, quote) => {
+    if (!quote || !quote.exact) return -1;
+    const want = (quote.prefix || "") + quote.exact + (quote.suffix || "");
+    const at = text.indexOf(want);
+    if (at !== -1) return text.indexOf(want, at + 1) === -1 ? at + (quote.prefix || "").length : -1;
+    const i = text.indexOf(quote.exact);
+    return i !== -1 && text.indexOf(quote.exact, i + 1) === -1 ? i : -1;
+  };
+  const cellForQuote = (quote) => {
+    const nodes = docTextNodes();
+    const at = quoteInDoc(nodes.map((n) => n.nodeValue).join(""), quote);
+    if (at === -1) return null;
+    let acc = 0;
+    for (const n of nodes) {
+      const len = n.nodeValue.length;
+      if (acc + len > at) return outermostCellDiv(n.parentElement);
+      acc += len;
+    }
+    return null;
+  };
+
+  // Where a page has no panes (observablehq.com, a bare notebook) the document itself is the
+  // scroll container, and boxes belong in page coordinates rather than clamped to the viewport.
+  const docScroller = () => doc.scrollingElement || doc.documentElement;
+
   // Structural locator: (module, pid|cell, region, path) -> live nodes. Every rung optional.
   // pid first — it survives a rename and is the only handle an unnamed cell has.
   const locate = (a) => {
@@ -8149,6 +8216,8 @@ const _a2Anchors = function _a2Anchors(runtime,persistentId,getVariableByPersist
       if (n && n.nodeType === 1 && n.isConnected) cellNode = n;
     }
     if (!cellNode && a.cell) cellNode = scope.querySelector('.observablehq[cell="' + cssq(a.cell) + '"]');
+    if (!cellNode && a.cell) cellNode = nodeForVariable(a.module, a.cell, pane);
+    if (!cellNode && a.quote) cellNode = cellForQuote(a.quote);
     let hostNode = cellNode;
     if (a.region === "after") {
       const sibs = [];
@@ -8172,7 +8241,8 @@ const _a2Anchors = function _a2Anchors(runtime,persistentId,getVariableByPersist
     // resolved to: without one the box is painted in viewport space and clamped to the
     // window instead of scrolling with its text.
     const node = hostNode || cellNode;
-    const pane2 = pane || (node && node.closest ? node.closest(PANE_SEL) : null);
+    const pane2 = pane || (node && node.closest ? node.closest(PANE_SEL) : null)
+      || (node ? docScroller() : null);
     return { pane: pane2, cellNode, hostNode, target, degraded };
   };
 
@@ -8468,7 +8538,7 @@ const _a2Anchors = function _a2Anchors(runtime,persistentId,getVariableByPersist
 
   const visible = (res) => {
     if (!res) return false;
-    if (res.pane) {
+    if (res.pane && res.pane !== docScroller()) {
       const p = res.pane.getBoundingClientRect();
       if (res.y < p.top || res.y > p.bottom || res.x < p.left || res.x > p.right) return false;
     }
@@ -8477,7 +8547,8 @@ const _a2Anchors = function _a2Anchors(runtime,persistentId,getVariableByPersist
 
   return { CELL_SEL, PANE_SEL, describeSelection, describePoint, resolve, visible,
            pathWithin, queryPath, cellHashOf, findQuote, rangeFromOffsets, locate,
-           hostOf, cellIdOf, varForNode, surfaces, registerSurface, pointSurfaces };
+           hostOf, cellIdOf, varForNode, surfaces, registerSurface, pointSurfaces,
+           nodeForVariable, cellForQuote, docScroller };
 };
 
 const _a2surface = function _a2surface(a2Anchors){return(
@@ -8561,12 +8632,25 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
   const DERIVED = ["id", "home", "cell", "varName"];
   const RECORD_RE = /^annotation_\w+$/;
 
+  const SELF_NAME = "@tomlarkworthy/annotate";
   const mains = () => (runtime.mains ? [...runtime.mains.entries()] : []);
+  // `runtime.mains` is a lopecode registry; observablehq.com has no module names at all, so
+  // a record living in this very notebook has to be recognised by identity. Without this the
+  // lookup falls through to the data module and every note reads as missing.
   const moduleNamed = (name) =>
-    (name && runtime.mains && runtime.mains.get ? runtime.mains.get(name) : null) || null;
+    (name && runtime.mains && runtime.mains.get ? runtime.mains.get(name) : null)
+    || (name === SELF_NAME ? self : null) || null;
   const nameOfModule = (mod) => {
     for (const [n, m] of mains()) if (m === mod) return n;
-    return mod === self ? "@tomlarkworthy/annotate" : DATA;
+    return mod === self ? SELF_NAME : DATA;
+  };
+  // Modules worth scanning for annotation cells: every main, plus this one and the data
+  // module (which are not in `mains` when there is no lopecode host).
+  const scanModules = () => {
+    const set = new window.Set(mains().map((e) => e[1]));
+    if (self) set.add(self);
+    if (fallback) set.add(fallback);
+    return [...set];
   };
 
   // The already-booted copy of a submodule, found through the import var that boots it.
@@ -8680,7 +8764,7 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
   // still found by name, and `readRecords(true)` forces the value.
   const cellsByName = () => {
     const out = new Map();
-    for (const [, mod] of mains()) {
+    for (const mod of scanModules()) {
       if (!mod._scope) continue;
       for (const [name, v] of mod._scope) {
         if (!RECORD_RE.test(name) || name.endsWith("_note") || v._type !== TYPE_NORMAL) continue;
@@ -8816,16 +8900,18 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
 
   // annotation_index is dead bookkeeping now that the graph is the index; clear it out of
   // any module that still carries one.
-  for (const [, mod] of mains()) if (lookup(mod, LEGACY_INDEX)) deleteCell(mod, LEGACY_INDEX);
+  for (const mod of scanModules()) if (lookup(mod, LEGACY_INDEX)) deleteCell(mod, LEGACY_INDEX);
 
   return store;
 };
 
-const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,invalidation,observe,Inspector,cellEditor,decompile,$1)
+const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,invalidation,observe,Inspector,cellEditor,decompile,$1,isOnObservableCom)
 {
   const doc = window.document;
   const view = $0;
   const A = a2Anchors;
+  // No lopecode host to save into: annotations placed here are runtime-only.
+  const readOnlyHost = () => { try { return !!isOnObservableCom(); } catch (e) { return false; } };
   const store = a2Store;
   const NS = "http://www.w3.org/2000/svg";
   const ACCENT = "var(--theme-foreground-focus, #0085ff)";
@@ -8889,8 +8975,14 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
     const lsvg = doc.createElementNS(NS, "svg");
     lsvg.style.cssText = "position:absolute; left:0; top:0; width:100%; height:100%; overflow:visible";
     el.appendChild(lsvg);
-    pane.appendChild(el);
-    L = { el, svg: lsvg, pane };
+    // A page with no panes scrolls as one document; the layer goes in the body at page
+    // coordinates so notes scroll with the text instead of being clamped to the viewport.
+    const isDoc = pane === A.docScroller();
+    if (isDoc) {
+      el.style.overflow = "visible"; // nothing to clip: the document is the scroll container
+      doc.body.appendChild(el);
+    } else pane.appendChild(el);
+    L = { el, svg: lsvg, pane, doc: isDoc };
     layers.set(pane, L);
     return L;
   };
@@ -8898,6 +8990,9 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
   // box hung past the content grows the pane's scrollable area (measured +380px).
   const sizeLayer = (L) => {
     if (!L.pane) return { w: window.innerWidth, h: window.innerHeight };
+    // The document layer stays 0x0 and only *measures* the page: sizing it to the document
+    // would make the layer itself part of what the document has to scroll.
+    if (L.doc) return { w: L.pane.clientWidth, h: L.pane.scrollHeight };
     const w = L.pane.clientWidth, h = L.pane.scrollHeight;
     if (L.w !== w) { L.el.style.width = w + "px"; L.w = w; }
     if (L.h !== h) { L.el.style.height = h + "px"; L.h = h; }
@@ -9084,6 +9179,16 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
       });
     }
     p.editorHost.innerHTML = "";
+    // observablehq.com has no save-in-place: cells minted at runtime are not part of the
+    // document, so an edit made here lives until reload. Say so rather than imply a save.
+    if (readOnlyHost()) {
+      const hint = doc.createElement("div");
+      hint.setAttribute("data-a2-readonly", id);
+      hint.textContent = "Runtime only here — paste this into a cell to keep it.";
+      hint.style.cssText = "padding:3px 7px; font:10px/1.4 system-ui, sans-serif; color:" + FAINT +
+        "; border-bottom:1px solid " + FAINT;
+      p.editorHost.appendChild(hint);
+    }
     p.editorHost.appendChild(ed);
     p.editorHost.style.display = "block";
     p.editor = ed;
@@ -9212,9 +9317,13 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
       // (variable_intersector: visible = !node).
       const L = layerFor(res.pane);
       const dim = sizeLayer(L);
-      // viewport -> layer-content coordinates
-      const pr = L.pane ? L.pane.getBoundingClientRect() : null;
-      const O = pr ? { x: L.pane.scrollLeft - pr.left, y: L.pane.scrollTop - pr.top } : { x: 0, y: 0 };
+      // viewport -> layer-content coordinates. The document layer measures its own origin
+      // instead: body margins and positioning vary by host page, the layer's own rect does not.
+      const pr = L.pane && !L.doc ? L.pane.getBoundingClientRect() : null;
+      const lr = L.doc ? L.el.getBoundingClientRect() : null;
+      const O = lr ? { x: -lr.left, y: -lr.top }
+        : pr ? { x: L.pane.scrollLeft - pr.left, y: L.pane.scrollTop - pr.top }
+        : { x: 0, y: 0 };
       const ax = res.x + O.x, ay = res.y + O.y;
       let p = parts.get(a.id);
       if (!p) { p = makeParts(a, L); parts.set(a.id, p); }
@@ -9801,7 +9910,7 @@ export default function define(runtime, observer) {
   $def("_a2docLayer", null, ["md"], _a2docLayer);
   $def("_a2layer", "a2Layer", ["viewof annotations", "annotationsEnabled", "a2Anchors", "a2Store", "invalidation",
                                "observe", "Inspector", "cellEditor", "decompile",
-                               "viewof annotationsEnabled"], _a2Layer);
+                               "viewof annotationsEnabled", "isOnObservableCom"], _a2Layer);
   $def("_a2docPlugins", null, ["md"], _a2docPlugins);
   $def("_a2menu", "a2MenuItem", ["plugins", "a2Layer", "invalidation"], _a2MenuItem);
   $def("_a2cmds", "a2Commands", ["plugins", "a2Layer", "invalidation"], _a2Commands);
@@ -9833,6 +9942,7 @@ export default function define(runtime, observer) {
   main.define("persistentId", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("persistentId", _));
   main.define("getVariableByPersistentId", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("getVariableByPersistentId", _));
   main.define("thisModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("thisModule", _));
+  main.define("isOnObservableCom", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("isOnObservableCom", _));
   main.define("module @tomlarkworthy/inspector", async () => runtime.module((await import("/@tomlarkworthy/inspector.js?v=4")).default));
   main.define("Inspector", ["module @tomlarkworthy/inspector", "@variable"], (_, v) => v.import("Inspector", _));
   main.define("module @tomlarkworthy/observablejs-toolchain", async () => runtime.module((await import("/@tomlarkworthy/observablejs-toolchain.js?v=4")).default));
