@@ -5497,7 +5497,7 @@ const _1itgjy2 = async function _calVideo(htl,calStream,invalidation) {
   });
   return v;
 };
-const _uxbtt2 = function _calRun(calRunning,CAL_FRAME,calRows,calMode,stimulusBus,calSource,calVideo,stimulusView,analyzeFrame) {return (async function* () {
+const _uxbtt2 = function _calRun(calRunning,CAL_FRAME,calRows,calMode,stimulusBus,calSource,calVideo,stimulusView,analyzeFrame,detectPool) {return (async function* () {
   if (!calRunning) {
     yield null;
     await new Promise(() => {}); // park until the toggle re-runs this cell
@@ -5526,7 +5526,10 @@ const _uxbtt2 = function _calRun(calRunning,CAL_FRAME,calRows,calMode,stimulusBu
   // costs plenty — each setTimeout(0) is clamped to ~4ms, and 13 of them per
   // frame dragged capture from 60fps to 18, which is exactly the temporal
   // resolution the latency estimate is made of.
-  const ROW_CHUNK = calMode === "orbit" ? Infinity : 20;
+  // With workers the detection is not on this thread at all, so there is
+  // nothing to yield to and chunking would only serialise the pool -- each
+  // chunk is one round trip that finishes before the next is dealt.
+  const ROW_CHUNK = calMode === "orbit" || detectPool ? Infinity : 20;
   const breathe = () => new Promise((r) => window.setTimeout(r, 0));
   // grid is a static scene: there is nothing to gain from detecting at display
   // rate, and the idle gap keeps the tab responsive and cool. Orbit runs flat
@@ -5593,7 +5596,9 @@ const _uxbtt2 = function _calRun(calRunning,CAL_FRAME,calRows,calMode,stimulusBu
       chunk: ROW_CHUNK,
       breathe,
       minMargin: 4,
-      minReadable: 4
+      minReadable: 4,
+      // same routine, rows dealt to the worker pool instead of run here
+      ...(detectPool ? { runRows: detectPool.runRows } : {})
     });
     if (calMode === "grid") {
       for (const [, a] of acc) a.w *= ACC_DECAY;
@@ -5812,19 +5817,28 @@ const _uio2e6 = function _analyzeFrame(runPipeline,scanLattice,clusterWindows,fu
   const maxFineRows = opts.maxFineRows ?? 260;
   const chunk = opts.chunk ?? Infinity;
   const breathe = opts.breathe ?? null;
+  // Where rows actually get processed. The default runs them here; a worker pool
+  // supplies its own and returns the same run records from another thread. This
+  // is an injection point rather than a second copy of the routine on purpose --
+  // a parallel analyzeFrame would be a fork of the passage below, and the two
+  // would drift.
+  const runRows =
+    opts.runRows ??
+    ((f, rows, o) => [runPipeline(f, { ...o, scanRows: rows })]);
   // everything not consumed here is forwarded to the pipeline, so detector
-  // options (generator, voteBin, minMargin, ...) reach it without this cell
-  // having to know about each one
+  // options (generator, minMargin, ...) reach it without this cell having to
+  // know about each one. runRows and breathe are functions and must NOT be
+  // forwarded -- they would be posted to a worker and fail to clone.
   const {
     coarseStride: _a, fineStride: _b, maxFineRows: _c, chunk: _d, breathe: _e,
-    maxBands: _f, scanRows: _g, ...forward
+    maxBands: _f, scanRows: _g, runRows: _h, ...forward
   } = opts;
   const pipeOpts = { minMargin: 4, minReadable: 4, ...forward };
   const merge = (a, b) =>
     !a ? b : {
       ...b,
       hits: a.hits.concat(b.hits),
-      windowList: a.windowList ?? b.windowList,
+      windowList: (a.windowList ?? []).concat(b.windowList ?? []),
       rawHits: a.rawHits + b.rawHits,
       rejectedByDecode: a.rejectedByDecode + b.rejectedByDecode,
       windows: a.windows + b.windows,
@@ -5838,9 +5852,11 @@ const _uio2e6 = function _analyzeFrame(runPipeline,scanLattice,clusterWindows,fu
   const sweep = async (list, acc, extra = {}) => {
     let run = acc;
     for (let i = 0; i < list.length; i += chunk) {
-      run = merge(run, runPipeline(frame, {
-        ...pipeOpts, ...extra, scanRows: list.slice(i, i + chunk)
-      }));
+      const parts = await runRows(frame, list.slice(i, i + chunk), {
+        ...pipeOpts,
+        ...extra
+      });
+      for (const part of parts) run = merge(run, part);
       if (breathe && i + chunk < list.length) await breathe();
     }
     return run;
@@ -6418,6 +6434,306 @@ const _a2pm83 = function _windowCandidates(crossRatio,crCurve,crDistance) {retur
   }
   return { cands, windows };
 });};
+const _15g2ti2 = function _detectKernelSource(SVD,LAYOUT,crCurve,carrierTemplate,codebook,minMargin,edgeThreshold,dpScratch,crossRatio,crDistance,xFromK,templateAtOffset,fitMobiusLS,dpAlignFast,windowCandidates,detectLandmarkRow,decodeLandmark,edges1Dsub,rowOf,runPipeline) {
+  // The worker script, built from the LIVE cells rather than a hand-written copy
+  // of them. Every function below is the same object this notebook calls on the
+  // main thread, serialised with toString(); every constant is the same value,
+  // serialised as JSON. So a worker cannot drift from the notebook: edit a cell
+  // and the next pool build picks the edit up. This is the only honest way to
+  // run notebook code off-thread — a transcribed kernel would be a second
+  // implementation to keep in step, and it would be wrong within a week.
+  //
+  // What makes it possible at all is that the detector is per-row pure: a scan
+  // row needs only its own pixels (decodeLandmark indexes hit.y * W and never
+  // leaves that row), so a worker can be handed a set of rows and nothing else.
+  const emit = (name, value) =>
+    typeof value === "function"
+      ? `const ${name} = ${value.toString()};`
+      : `const ${name} = ${JSON.stringify(value)};`;
+
+  const parts = [
+    // runPipeline times itself with window.performance; a worker has no window
+    "var window = self;",
+    // runPipeline's fallback row list, always overridden by the job's rows
+    "const scanRows = [];",
+    // svd-js's export, checked to be self-contained under toString()
+    emit("SVD", SVD),
+    emit("LAYOUT", LAYOUT),
+    emit("crCurve", crCurve),
+    emit("carrierTemplate", carrierTemplate),
+    emit("codebook", codebook),
+    emit("minMargin", minMargin),
+    emit("edgeThreshold", edgeThreshold),
+    // dpScratch is a set of reused buffers; its own ensure() allocates every one
+    // of them on first use, so the worker only needs the empty shell plus that
+    // method -- no buffer list to copy and get out of date
+    `const dpScratch = (function () { const s = { cells: 0, n: 0 }; s.ensure = ${dpScratch.ensure.toString()}; return s; })();`,
+    emit("crossRatio", crossRatio),
+    emit("crDistance", crDistance),
+    emit("xFromK", xFromK),
+    emit("templateAtOffset", templateAtOffset),
+    emit("fitMobiusLS", fitMobiusLS),
+    emit("dpAlignFast", dpAlignFast),
+    emit("windowCandidates", windowCandidates),
+    emit("detectLandmarkRow", detectLandmarkRow),
+    emit("decodeLandmark", decodeLandmark),
+    emit("edges1Dsub", edges1Dsub),
+    emit("rowOf", rowOf),
+    emit("runPipeline", runPipeline),
+    // The worker keeps a full-size frame buffer and writes only the rows of the
+    // job into it, so rowOf and decodeLandmark address pixels by absolute y
+    // exactly as they do on the main thread. Rows arrive packed and transferred,
+    // which is ~1.3KB per row moved rather than the whole 1.2MB frame.
+    `
+let FRAME = null;
+self.onmessage = (e) => {
+  const d = e.data;
+  if (d.type === "init") {
+    FRAME = { gray: new Uint8Array(d.w * d.h), w: d.w, h: d.h };
+    self.postMessage({ type: "ready" });
+    return;
+  }
+  const w = FRAME.w, ys = d.ys, px = d.px;
+  for (let i = 0; i < ys.length; i++)
+    FRAME.gray.set(px.subarray(i * w, (i + 1) * w), ys[i] * w);
+  let run = null, err = null;
+  try {
+    run = runPipeline(FRAME, Object.assign({}, d.opts, { scanRows: ys }));
+  } catch (ex) {
+    err = ex && ex.message ? ex.message : String(ex);
+  }
+  self.postMessage({ type: "done", id: d.id, run, err });
+};`
+  ];
+  return parts.join("\n");
+};
+const _rqclgc = function _poolSize(Inputs) {return (Inputs.range([0, 12], {
+  step: 1,
+  value: Math.min(8, Math.max(1, (navigator.hardwareConcurrency || 4) - 2)),
+  label: "detection workers (0 = main thread)"
+}));};
+const _1xat3lz = (G, _) => G.input(_);
+const _91k4wy = function _detectPool(poolSize,detectKernelSource,invalidation) {
+  // A fixed set of dedicated workers, handed row batches round robin. Nothing
+  // reactive crosses the boundary: a job is (rows, options) in and one run
+  // record out, which is why the same code can run on the main thread with the
+  // pool switched off (poolSize 0) and give byte-identical results.
+  if (!poolSize) return null;
+  const url = URL.createObjectURL(
+    new Blob([detectKernelSource], { type: "text/javascript" })
+  );
+  const ws = [];
+  for (let i = 0; i < poolSize; i++) {
+    const w = new Worker(url);
+    w.pending = new Map();
+    w.onmessage = (e) => {
+      const d = e.data;
+      // init acknowledgement carries no job id; every other reply does
+      if (d.type === "ready") { if (w.onReady) w.onReady(); return; }
+      const settle = w.pending.get(d.id);
+      if (settle) { w.pending.delete(d.id); settle(d); }
+    };
+    ws.push(w);
+  }
+  // rebuilt whenever poolSize changes, so the old pool has to go with it --
+  // otherwise the workers outlive their cell and leak a thread each
+  invalidation.then(() => {
+    for (const w of ws) w.terminate();
+    URL.revokeObjectURL(url);
+  });
+
+  let seq = 0;
+  let next = 0;
+  let dims = null;
+  const send = (w, msg, transfer) =>
+    new Promise((res) => {
+      const id = ++seq;
+      w.pending.set(id, res);
+      w.postMessage({ ...msg, id }, transfer || []);
+    });
+  // each worker keeps a full-size frame buffer so absolute y indexing works
+  // unchanged inside it; only a size change forces a reallocation
+  const ensure = async (frame) => {
+    if (dims && dims.w === frame.w && dims.h === frame.h) return;
+    dims = { w: frame.w, h: frame.h };
+    await Promise.all(
+      ws.map(
+        (w) =>
+          new Promise((res) => {
+            w.onReady = res;
+            w.postMessage({ type: "init", w: frame.w, h: frame.h });
+          })
+      )
+    );
+  };
+
+  return {
+    size: ws.length,
+    // Deal rows round robin rather than in contiguous blocks. Cost per row is
+    // wildly uneven -- a row crossing three marks is worth a hundred crossing
+    // blank screen -- so contiguous blocks would hand one worker every mark and
+    // leave the rest idle. Interleaving averages the marks out across the pool
+    // for free, with no work-stealing machinery.
+    runRows: async (frame, rows, opts) => {
+      await ensure(frame);
+      const buckets = ws.map(() => []);
+      rows.forEach((y, i) => buckets[(next + i) % ws.length].push(y));
+      next = (next + rows.length) % ws.length;
+      const jobs = [];
+      for (let i = 0; i < ws.length; i++) {
+        const ys = buckets[i];
+        if (!ys.length) continue;
+        // pack just this worker's rows; ~1.3KB each, transferred not copied
+        const px = new Uint8Array(ys.length * frame.w);
+        ys.forEach((y, k) =>
+          px.set(frame.gray.subarray(y * frame.w, (y + 1) * frame.w), k * frame.w)
+        );
+        jobs.push(send(ws[i], { type: "rows", ys, px, opts }, [px.buffer]));
+      }
+      const parts = await Promise.all(jobs);
+      const failed = parts.find((p) => p.err);
+      if (failed) throw new Error("detection worker: " + failed.err);
+      return parts.map((p) => p.run);
+    }
+  };
+};
+const _1qdzl86 = function _anonymous(md) {return (md`---
+## §8 Running it on more than one thread
+
+§3 said the detector's cost is ~25 µs per window that clears the cross-ratio gate. That number is the case for workers: it is arithmetic on a few dozen floats, there are thousands of them per frame, and **no two rows interact**. A scan row needs its own pixels and nothing else — \`decodeLandmark\` indexes \`hit.y * W\` and never leaves the row — so rows can be dealt out to a pool and the results concatenated. Fusion, which *is* cross-row, stays on the main thread where it costs nothing.
+
+The pool is deliberately dumb: a fixed set of dedicated workers, rows dealt **round robin**, one message per worker per pass. No work stealing, no queue, no shared memory. Round robin rather than contiguous blocks because per-row cost is wildly uneven — a row crossing three marks is worth a hundred crossing blank screen — and interleaving averages the marks across the pool for free. (Shared memory is not an option here anyway: \`SharedArrayBuffer\` needs cross-origin isolation, which a notebook opened from a file cannot have. Instead each job packs just its own rows, ~1.3 KB apiece, and *transfers* them.)
+
+The part worth stealing for other notebooks is **how the worker gets its code**. It is not transcribed. \`detectKernelSource\` walks the live cells and serialises them — functions through \`toString()\`, constants through \`JSON.stringify\` — so the worker runs the same \`detectLandmarkRow\`, the same \`windowCandidates\`, the same \`crCurve\` this page is running. Edit a cell and the next pool build picks the edit up. A hand-written kernel would be a second implementation of the detector, and it would be wrong within a week; this one cannot disagree with the notebook because it *is* the notebook. The only piece that needed checking was \`SVD\`, which comes from a package rather than a cell — its \`toString()\` turns out to be self-contained, which is verified rather than assumed.
+
+Two things make this safe to believe. \`analyzeFrame\` takes the row runner as an argument (\`opts.runRows\`) instead of having a parallel twin, so there is exactly one copy of the coarse-to-fine logic and the pool is just a different way of executing it. And the agreement check below re-runs the frame bank through both paths and compares fused landmark positions to four decimal places — a worker that drifts fails it.
+
+**Agreement is checked on every load; throughput is not.** They need opposite conditions. Agreement is a property of the output and holds whatever else the machine is doing, so it can be asserted at boot. A stopwatch cannot: at boot this page is still computing, and the contention does not fall on both arms equally — the main-thread arm competes with that work while the pool arm does not, so a benchmark taken then reports a *larger* speedup than the truth. Measured during boot the angled frame read 36×; measured on an idle page it is 5.8×. Hence the button, five runs, an untimed warm-up, and a **spread** column: if the fastest and slowest of the five disagree by much, the machine was busy and the row should not be quoted.`);};
+const _1gsq49k = async function _poolAgreement(testFrameBank,analyzeFrame,detectPool) {
+  // CORRECTNESS ONLY -- deliberately no timings here. This runs at boot, when
+  // the page is busy computing everything else, and a stopwatch read under that
+  // contention measures the boot, not the detector. Worse, it does not measure
+  // both arms equally: the serial arm competes with the boot work on this
+  // thread while the pool arm does not, so the ratio moves with how loaded the
+  // page happens to be. Throughput is measured on demand instead (poolBenchmark
+  // below), when the page is idle and the number means something.
+  //
+  // What IS sound to check at any moment is agreement. Landmark centres must
+  // match to 4dp -- not "close", identical: the workers execute the very same
+  // serialised cells, so a disagreement is a real defect (a constant that failed
+  // to serialise, a stale kernel, a lost row), never floating-point drift, and
+  // it is true regardless of what else the machine is doing.
+  const key = (f) => `${f.id}@${f.xc.toFixed(4)},${f.yc.toFixed(4)}`;
+  const rows = [];
+  for (const spec of testFrameBank) {
+    const serial = await analyzeFrame(spec.frame, {});
+    const parallel = detectPool
+      ? await analyzeFrame(spec.frame, { runRows: detectPool.runRows })
+      : null;
+    rows.push({
+      frame: spec.name,
+      marks: serial.fused.length,
+      poolMarks: parallel ? parallel.fused.length : null,
+      identical: parallel
+        ? serial.fused.map(key).sort().join("|") ===
+          parallel.fused.map(key).sort().join("|")
+        : null
+    });
+  }
+  return rows;
+};
+const _rqwdsc = function _poolReport(poolBenchmark,htl,detectPool,poolAgreement) {
+  const cell = "padding:2px 12px 2px 0";
+  const timing = poolBenchmark
+    ? new Map(poolBenchmark.map((b) => [b.frame, b]))
+    : null;
+  return htl.html`<table style="border-collapse:collapse;font:13px/1.5 system-ui,sans-serif">
+  <thead><tr style="text-align:left;border-bottom:1px solid currentColor">
+    <th style=${cell}>frame</th>
+    <th style=${cell}>marks</th>
+    <th style=${cell}>main thread</th>
+    <th style=${cell}>${detectPool ? detectPool.size + " workers" : "pool off"}</th>
+    <th style=${cell}>speedup</th>
+    <th style=${cell}>fps</th>
+    <th style=${cell}>spread</th>
+    <th style=${cell}>agrees</th>
+  </tr></thead>
+  <tbody>${poolAgreement.map((r) => {
+    const t = timing ? timing.get(r.frame) : null;
+    return htl.html`<tr>
+      <td style=${cell}>${r.frame}</td>
+      <td style=${cell}>${r.marks}${
+        r.poolMarks != null && r.poolMarks !== r.marks ? " / " + r.poolMarks : ""
+      }</td>
+      <td style=${cell}>${t ? Math.round(t.serial.med) + " ms" : "—"}</td>
+      <td style=${cell}>${t && t.parallel ? Math.round(t.parallel.med) + " ms" : "—"}</td>
+      <td style=${cell}>${t && t.speedup ? t.speedup + "×" : "—"}</td>
+      <td style=${cell}>${t ? t.fps : "—"}</td>
+      <td style=${cell};color:${t && t.spread > 25 ? "#d33" : "inherit"}>${
+        t ? t.spread + "%" : "—"
+      }</td>
+      <td style="${cell};color:${
+        r.identical == null ? "inherit" : r.identical ? "#28a745" : "#d33"
+      }">${r.identical == null ? "—" : r.identical ? "identical" : "DIFFERS"}</td>
+    </tr>`;
+  })}</tbody>
+  <caption style="caption-side:bottom;text-align:left;padding-top:6px;opacity:0.7">
+    ${timing
+      ? htl.html`Timings are the median of 5 runs after an untimed warm-up. <b>spread</b> is how much the five disagreed — above ~25% the machine was busy and the row is not worth quoting.`
+      : htl.html`Agreement is checked on every load; it does not depend on timing. Press <b>measure detection throughput</b> for the speed columns — benchmarking at boot would measure the boot, and would penalise the main-thread arm more than the pool.`}
+  </caption>
+</table>`;
+};
+const _1pno4rs = function _benchGo2(Inputs) {return (Inputs.button("measure detection throughput", {
+  description: "run when the page is idle — a benchmark taken during boot measures the boot"
+}));};
+const _1vdscoi = (G, _) => G.input(_);
+const _1kj72ix = async function _poolBenchmark(benchGo2,testFrameBank,analyzeFrame,detectPool) {
+  // On demand, not at boot. Inputs.button counts clicks and starts at 0, so
+  // nothing is measured until asked.
+  if (!benchGo2) return null;
+  const reps = 5;
+  // Median, and the spread is reported alongside it. Median rather than min
+  // because min is the most flattering statistic available and this comparison
+  // is not symmetric -- the main-thread arm loses time to anything else running
+  // on this thread, the pool arm does not, so picking the statistic picks the
+  // ratio. If min and median disagree much, the machine was busy and the run
+  // should be repeated rather than quietly reported.
+  const bench = async (fn) => {
+    await fn(); // untimed: first pool job allocates each worker's frame buffer
+    const ts = [];
+    for (let i = 0; i < reps; i++) {
+      const t0 = window.performance.now();
+      await fn();
+      ts.push(window.performance.now() - t0);
+    }
+    ts.sort((a, b) => a - b);
+    return { med: ts[reps >> 1], min: ts[0], max: ts[reps - 1] };
+  };
+  const rows = [];
+  for (const spec of testFrameBank) {
+    const serial = await bench(() => analyzeFrame(spec.frame, {}));
+    const parallel = detectPool
+      ? await bench(() => analyzeFrame(spec.frame, { runRows: detectPool.runRows }))
+      : null;
+    rows.push({
+      frame: spec.name,
+      serial,
+      parallel,
+      speedup: parallel ? +(serial.med / parallel.med).toFixed(2) : null,
+      fps: Math.round(1000 / (parallel ? parallel.med : serial.med)),
+      // how much the five runs disagreed with each other, as a fraction of the
+      // median: a noisy machine shows up here rather than in a wrong headline
+      spread: +(
+        Math.max(
+          (serial.max - serial.min) / serial.med,
+          parallel ? (parallel.max - parallel.min) / parallel.med : 0
+        ) * 100
+      ).toFixed(0)
+    });
+  }
+  return rows;
+};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -6509,7 +6825,7 @@ export default function define(runtime, observer) {
   $def("_1dh1pen", "calSource", ["Generators","viewof calSource"], _1dh1pen);  
   $def("_1i4d397", "calStream", ["calRunning","calSource","CAL_FRAME","invalidation"], _1i4d397);  
   $def("_1itgjy2", "calVideo", ["htl","calStream","invalidation"], _1itgjy2);  
-  $def("_uxbtt2", "calRun", ["calRunning","CAL_FRAME","calRows","calMode","stimulusBus","calSource","calVideo","stimulusView","analyzeFrame"], _uxbtt2);  
+  $def("_uxbtt2", "calRun", ["calRunning","CAL_FRAME","calRows","calMode","stimulusBus","calSource","calVideo","stimulusView","analyzeFrame","detectPool"], _uxbtt2);  
   $def("_9ey4fu", "fitHomography", [], _9ey4fu);  
   $def("_nnfn1b", "calHomography", ["calRun","stimulusBus","fitHomography"], _nnfn1b);  
   $def("_1gnnqz3", "calStats", ["calRun","md","stimulusBus","calHomography","htl"], _1gnnqz3);  
@@ -6526,7 +6842,18 @@ export default function define(runtime, observer) {
   $def("_tavtr3", "scanLattice", [], _tavtr3);  
   $def("_7u6ljb", "testFrameReport", ["htl","testFrameResults"], _7u6ljb);  
   $def("_1dpzurc", "clusterWindows", [], _1dpzurc);  
-  $def("_a2pm83", "windowCandidates", ["crossRatio","crCurve","crDistance"], _a2pm83);
+  $def("_a2pm83", "windowCandidates", ["crossRatio","crCurve","crDistance"], _a2pm83);  
+  main.define("SVD", ["module @tomlarkworthy/fast-1d-circular-barcode-matching", "@variable"], (_, v) => v.import("SVD", _));  
+  $def("_15g2ti2", "detectKernelSource", ["SVD","LAYOUT","crCurve","carrierTemplate","codebook","minMargin","edgeThreshold","dpScratch","crossRatio","crDistance","xFromK","templateAtOffset","fitMobiusLS","dpAlignFast","windowCandidates","detectLandmarkRow","decodeLandmark","edges1Dsub","rowOf","runPipeline"], _15g2ti2);  
+  $def("_rqclgc", "viewof poolSize", ["Inputs"], _rqclgc);  
+  $def("_1xat3lz", "poolSize", ["Generators","viewof poolSize"], _1xat3lz);  
+  $def("_91k4wy", "detectPool", ["poolSize","detectKernelSource","invalidation"], _91k4wy);  
+  $def("_1qdzl86", null, ["md"], _1qdzl86);  
+  $def("_1gsq49k", "poolAgreement", ["testFrameBank","analyzeFrame","detectPool"], _1gsq49k);  
+  $def("_rqwdsc", "poolReport", ["poolBenchmark","htl","detectPool","poolAgreement"], _rqwdsc);  
+  $def("_1pno4rs", "viewof benchGo2", ["Inputs"], _1pno4rs);  
+  $def("_1vdscoi", "benchGo2", ["Generators","viewof benchGo2"], _1vdscoi);  
+  $def("_1kj72ix", "poolBenchmark", ["benchGo2","testFrameBank","analyzeFrame","detectPool"], _1kj72ix);
   return main;
 }
 </script>
