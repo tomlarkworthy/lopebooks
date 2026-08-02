@@ -7958,7 +7958,7 @@ const _1epdu7f = function _hexRigScore() {return (function hexRigScore(res, trut
 });};
 const _q7egru = function _hexRigCases(Inputs) {return (Inputs.input([]));};
 const _cih7ns = (G, _) => G.input(_);
-const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCfg,analyzeFrameMan,analyzeFrameManAsync,detectPool,hexRigOpts,fitHexPose,hexRigLoo) {
+const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCfg,analyzeFrameMan,analyzeFrameManAsync,detectPool,hexRigOpts,fitHexPose,hexRigLoo,manScanRows) {
   // The calibration rig. Point the camera at the printed §11.4 sheet and it
   // does three things at once:
   //
@@ -8058,8 +8058,22 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     }
     ctx.drawImage(v, 0, 0, W, H);
     const px = ctx.getImageData(0, 0, W, H).data;
-    for (let i = 0, p = 0; i < gray.length; i++, p += 4)
-      gray[i] = (px[p] * 77 + px[p + 1] * 150 + px[p + 2] * 29) >> 8;
+    // Convert only the rows the scan is going to read. At stride 4 that is a
+    // quarter of the frame, and this is main-thread work sitting in the middle
+    // of the frame budget -- the same argument that moved the scan itself into
+    // workers. Two callers still need the whole frame: bothAxes reads it
+    // transposed, and a captured case gets replayed at other strides, so both
+    // ask for a full pass. Rows nobody converted keep whatever the previous
+    // frame left there, which is why neither of those may read this buffer
+    // without filling it first.
+    const grayRow = (y) => {
+      const b = y * W;
+      for (let x = 0, p = b * 4; x < W; x++, p += 4)
+        gray[b + x] = (px[p] * 77 + px[p + 1] * 150 + px[p + 2] * 29) >> 8;
+    };
+    const grayAll = () => { for (let y = 0; y < H; y++) grayRow(y); };
+    if (hexRigOpts.bothAxes) grayAll();
+    else for (const y of manScanRows({ w: W, h: H }, hexRigOpts)) grayRow(y);
     ctxOut.drawImage(work, 0, 0);
 
     const t = window.performance.now();
@@ -8136,6 +8150,9 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     if (manual || auto) {
       lastCap = t;
       n++;
+      // a case is replayed at other strides, so it needs the rows this frame's
+      // scan skipped
+      if (!hexRigOpts.bothAxes) grayAll();
       push({
         name: `hexcase-${session}-${String(n).padStart(2, "0")}`,
         w: W, h: H,
@@ -11210,13 +11227,18 @@ gating the scan to where a mark was last seen rather than at making the image
 smaller — downscaling is the intuitive lever and the measurements say it is the
 wrong one.
 
-The pool in §4.5 buys about 2.4x of that cost and no accuracy, and it leaves two
-leads of its own. Row cost is uneven enough that one worker routinely takes
-twice the median and sets the frame's latency on its own, which is an argument
-for handing out rows on demand rather than dealing them up front. And a
-temporal gate would cut the row count itself, which is the quantity the cost
-actually tracks — the two compose, because one makes rows cheaper to run and the
-other asks for fewer of them.`);};
+The pool in §4.5 buys about 2.4x of that cost and no accuracy. Handing chunks
+out on demand has since closed its first lead — the frame no longer waits on
+whichever worker drew a slow core. The second is still open: a **temporal gate**
+would cut the row count itself, which is the quantity the cost actually tracks.
+The two compose, because one makes rows cheaper to run and the other asks for
+fewer of them.
+
+A third lead is now visible from the same measurement. The main thread scans
+rows faster than any worker and spends the whole frame awaiting them, so it
+could be a consumer of the same queue. What stops that being free is that a
+chunk scanned here blocks the replies coming back, so the chunk size and the
+yield between them would have to be chosen rather than assumed.`);};
 const _10in6wk = function _manScanRows() {return (function manScanRows(frame, opts = {}) {
   // The scan lattice. One line, its own cell, because two things need it and
   // they must agree exactly: the serial pass walks it, and the worker pool
@@ -11589,7 +11611,7 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
     URL.revokeObjectURL(url);
   });
 
-  let seq = 0, next = 0, dims = null;
+  let seq = 0, dims = null;
   const send = (w, msg, transfer) =>
     new Promise((res) => {
       const id = ++seq;
@@ -11612,6 +11634,7 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
   const api = {
     size: ws.length,
     lastWorkerMs: [],
+    lastWorkerChunks: [],
     runRows: async (frame, ys, opts) => {
       if (dead) throw new Error("detection pool was torn down");
       await ensure(frame);
@@ -11624,37 +11647,55 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
       for (const [k, v] of Object.entries(opts ?? {}))
         if (typeof v !== "function") plain[k] = v;
 
-      // Deal rows round robin rather than in contiguous blocks. Cost per row
-      // is wildly uneven -- a row crossing three marks is worth a hundred
-      // crossing blank wall -- so contiguous blocks would hand one worker
-      // every mark and leave the rest idle. Interleaving averages the marks
-      // out across the pool for free, with no work-stealing machinery.
-      const buckets = ws.map(() => []);
-      ys.forEach((y, i) => buckets[(next + i) % ws.length].push(y));
-      next = (next + ys.length) % ws.length;
-      const jobs = [];
-      for (let i = 0; i < ws.length; i++) {
-        const rows = buckets[i];
-        if (!rows.length) continue;
-        // pack just this worker's rows; ~1KB each, transferred not copied
-        const px = new Uint8Array(rows.length * frame.w);
-        rows.forEach((y, k) =>
-          px.set(frame.gray.subarray(y * frame.w, (y + 1) * frame.w), k * frame.w)
-        );
-        jobs.push(send(ws[i], { type: "rows", ys: rows, px, opts: plain }, [px.buffer]));
+      // Hand chunks out on demand rather than dealing every row up front. The
+      // reason is not uneven rows -- interleaving already averages those out --
+      // it is uneven CORES. A phone and an Apple laptop both run a mix of
+      // performance and efficiency cores, and the browser is free to put a
+      // worker on either: six warm workers given identical work here split
+      // 8/8/8/30/30/31ms, a clean 4x in two groups. A static deal waits for the
+      // slowest of those every frame. A queue does not -- a worker on a fast
+      // core simply comes back for more, and nobody has to know which core they
+      // were given.
+      //
+      // Chunks are interleaved rather than contiguous so each still spans the
+      // image. The queue would absorb a chunk full of marks anyway, but rows
+      // differ in cost by ~100x and spreading them costs nothing.
+      const NC = Math.min(ys.length, ws.length * 3);
+      const chunks = [];
+      for (let c = 0; c < NC; c++) {
+        const rows = [];
+        for (let i = c; i < ys.length; i += NC) rows.push(ys[i]);
+        if (rows.length) chunks.push(rows);
       }
-      const parts = await Promise.all(jobs);
-      // Slowest worker vs wall clock: if they are close the split is doing its
-      // job and what remains is real work; if the wall clock is much larger the
-      // loss is in scheduling, transfer or the reply clone, not in the scan.
-      api.lastWorkerMs = parts.map((p) => +(p.ms ?? 0).toFixed(2));
-      const failed = parts.find((p) => p.err);
-      if (failed) throw new Error("detection worker: " + failed.err);
+      const out = [];
+      const ms = ws.map(() => 0), took = ws.map(() => 0);
+      let cursor = 0;
+      const consume = async (w, wi) => {
+        while (cursor < chunks.length) {
+          const rows = chunks[cursor++];
+          // pack just this chunk; ~1KB per row, transferred not copied
+          const px = new Uint8Array(rows.length * frame.w);
+          rows.forEach((y, k) =>
+            px.set(frame.gray.subarray(y * frame.w, (y + 1) * frame.w), k * frame.w)
+          );
+          const rep = await send(w, { type: "rows", ys: rows, px, opts: plain }, [px.buffer]);
+          if (rep.err) throw new Error("detection worker: " + rep.err);
+          ms[wi] += rep.ms ?? 0;
+          took[wi]++;
+          for (const r of rep.rows) out.push(r);
+        }
+      };
+      await Promise.all(ws.map(consume));
+      // Scan time per worker, and how many chunks each took. Unequal chunk
+      // counts are the queue doing its job, not a fault; equal times with
+      // unequal counts is what success looks like.
+      api.lastWorkerMs = ms.map((m) => +m.toFixed(2));
+      api.lastWorkerChunks = took;
       // Back into ascending y. clusterManRows is a forward scan over a
-      // y-ordered stream, so returning the pool's arrival order would build
-      // different clusters from the same hits -- the pool would not be wrong
-      // in any way that shows up as an error, only in the answer.
-      return parts.flatMap((p) => p.rows).sort((a, b) => a.y - b.y);
+      // y-ordered stream, so returning arrival order would build different
+      // clusters from the same hits -- the pool would not be wrong in any way
+      // that shows up as an error, only in the answer.
+      return out.sort((a, b) => a.y - b.y);
     }
   };
   return api;
@@ -11833,11 +11874,20 @@ build picks the edit up. A transcribed kernel would be a second implementation
 of the detector to keep in step with this one, and it would be wrong within a
 week.
 
-Two details that are not obvious and were not free:
+Three details that are not obvious and were not free:
 
-- **Rows are dealt round robin, not in blocks.** Cost per row is wildly uneven
-  — a row crossing three marks is worth a hundred crossing blank wall — so
-  contiguous blocks hand one worker every mark and leave the rest idle.
+- **Rows are interleaved, not blocked.** Cost per row is wildly uneven — a row
+  crossing three marks is worth a hundred crossing blank wall — so contiguous
+  blocks hand one worker every mark and leave the rest idle.
+- **Chunks are handed out on demand, not dealt up front.** Interleaving fixes
+  uneven rows; it cannot fix uneven *cores*. A phone and a laptop both run a
+  mix of performance and efficiency cores and the browser chooses: six warm
+  workers given identical work here came back 8, 8, 8, 30, 30, 31ms, a clean
+  4x in two groups. A static deal waits on the slow group every frame. A queue
+  does not — a worker on a fast core simply comes back for more, and nobody
+  needs to know which core they were given. \`detectPool.lastWorkerChunks\`
+  shows it happening: unequal counts with equal times is what success looks
+  like.
 - **The replies are sorted back into ascending y.** Clustering is a forward
   scan over a y-ordered stream, so arrival order would build different clusters
   out of identical hits. That is the failure mode this design has to fear: not
@@ -11856,10 +11906,25 @@ page is idle.
 
 Measured here, 6 workers, the two arms interleaved frame by frame so drift in
 machine load lands on both: **19ms → 8ms median over the 16 bank frames, 2.38x,
-worst frame 31ms → 12ms.** Not 6x, and the per-worker times say why — a typical
-job reads 3, 3, 3, 2, 3, 5ms, so one unlucky worker sets the frame's cost while
-the others wait. Round robin averages the marks out; it does not make the rows
-equal.
+worst frame 31ms → 12ms.** Not 6x, and the per-worker times said why — with the
+static deal a typical job read 3, 3, 3, 2, 3, 5ms, so one unlucky worker set the
+frame's cost while the others waited.
+
+The queue is what removes that tail, and it is worth being precise about how
+much: on a machine whose cores are all alike it buys little, 11.5ms → 9.8ms
+median with a run-to-run spread about a third of the difference. That is the
+honest reading, because the case it exists for is the one that machine cannot
+show. A pool split across performance and efficiency cores loses a factor of
+four on the slow half, and there the difference is not a tail, it is the frame.
+
+One more saving is on this thread rather than off it: the live loop converts
+only the rows the scan is going to read. At stride 4 that is a quarter of the
+frame, and the grayscale pass is main-thread work sitting in the middle of the
+budget — the same argument that moved the scan into workers, applied one step
+earlier. The rows nobody converted keep whatever the previous frame left there,
+so the two callers that need the whole image — the transposed pass, and a
+captured case, which gets replayed at other strides — ask for a full pass
+explicitly.
 
 The fallback is the same code. \`analyzeFrameManAsync\` without a \`runRows\` is
 \`analyzeFrameMan\` with an await in front, so setting the worker count to 0 is
@@ -11894,7 +11959,7 @@ export default function define(runtime, observer) {
   $def("_1epdu7f", "hexRigScore", [], _1epdu7f);  
   $def("_q7egru", "viewof hexRigCases", ["Inputs"], _q7egru);  
   $def("_cih7ns", "hexRigCases", ["Generators","viewof hexRigCases"], _cih7ns);  
-  $def("_1bfhbxi", "hexRig", ["hexRigView","viewof hexRigCases","liveOn","liveVideo","hexRigCfg","analyzeFrameMan","analyzeFrameManAsync","detectPool","hexRigOpts","fitHexPose","hexRigLoo"], _1bfhbxi);  
+  $def("_1bfhbxi", "hexRig", ["hexRigView","viewof hexRigCases","liveOn","liveVideo","hexRigCfg","analyzeFrameMan","analyzeFrameManAsync","detectPool","hexRigOpts","fitHexPose","hexRigLoo","manScanRows"], _1bfhbxi);  
   $def("_136sicf", "hexRigCasePanel", ["hexRigCases","htl"], _136sicf);  
   $def("_18kb3j3", "hexRigAutosave", ["viewof hexRigCases","htl","invalidation"], _18kb3j3);  
   $def("_js23sh", "hexTarget_md", ["md","tex"], _js23sh);  
