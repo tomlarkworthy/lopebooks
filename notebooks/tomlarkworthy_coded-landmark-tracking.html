@@ -7957,7 +7957,7 @@ const _1epdu7f = function _hexRigScore() {return (function hexRigScore(res, trut
 });};
 const _q7egru = function _hexRigCases(Inputs) {return (Inputs.input([]));};
 const _cih7ns = (G, _) => G.input(_);
-const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCfg,analyzeFrameMan,hexRigOpts,fitHexPose,hexRigLoo) {
+const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCfg,analyzeFrameMan,analyzeFrameManAsync,detectPool,hexRigOpts,fitHexPose,hexRigLoo) {
   // The calibration rig. Point the camera at the printed §11.4 sheet and it
   // does three things at once:
   //
@@ -8013,6 +8013,12 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
   // the granularity that actually collides: a second device, or a reload.
   const session = Math.floor(window.Date.now() / 1000).toString(36).slice(-4);
   const fps = [];
+  // Stage 1 goes to the pool when there is one. analyzeFrameManAsync with no
+  // runRows is analyzeFrameMan, so poolSize 0 is a real fallback and not a
+  // second code path -- poolAgreement holds the two to 4dp.
+  const poolOpts = detectPool
+    ? { ...hexRigOpts, runRows: detectPool.runRows }
+    : hexRigOpts;
   const COL = {
     read: "#2fe08a", located: "#ffd23f", missing: "#ff5c5c",
     misplaced: "#ff9f1c", off: "#d264ff"
@@ -8056,7 +8062,7 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     ctxOut.drawImage(work, 0, 0);
 
     const t = window.performance.now();
-    const res = analyzeFrameMan({ gray, w: W, h: H }, hexRigOpts);
+    const res = await analyzeFrameManAsync({ gray, w: W, h: H }, poolOpts);
     const pose = fitHexPose({ ...res, w: W, h: H });
     const dt = window.performance.now() - t;
     fps.push(dt);
@@ -8157,7 +8163,7 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     const med = fps.slice().sort((a, b) => a - b)[fps.length >> 1] ?? dt;
     const c = pose.ok ? pose.counts : null;
     view.hud.textContent =
-      `${W}x${H} ${med.toFixed(0)}ms  ` +
+      `${W}x${H} ${med.toFixed(0)}ms ${detectPool ? detectPool.size + "w" : "1t"}  ` +
       (pose.ok
         ? `read ${c.read} located ${c.located} missing ${c.missing} misplaced ${c.misplaced}` +
           (pose.offTarget.length ? ` off ${pose.offTarget.length}` : "") +
@@ -11424,6 +11430,300 @@ const _1m3an4z = function _mergeManAxes(unrotatePoint) {return (function mergeMa
     rowHits: rows.rowHits + rot.rowHits
   };
 });};
+const _13ae255 = function _detectKernelSource(manLayout,edges1Dsub,findInvolution,solveMan,manRowGroups,detectRowMan,scanRowsMan) {
+  // The worker script, built from the LIVE cells rather than a hand-written
+  // copy of them. Every function below is the same object this notebook calls
+  // on the main thread, serialised with toString(); every constant is the same
+  // value, serialised as a literal. So a worker cannot drift from the
+  // notebook: edit a cell and the next pool build picks the edit up. This is
+  // the only honest way to run notebook code off-thread -- a transcribed
+  // kernel would be a second implementation to keep in step, and it would be
+  // wrong within a week.
+  //
+  // What makes it possible at all is that stage 1 is per-row pure (see
+  // scanRowsMan), so a worker can be handed a set of rows and nothing else.
+  //
+  // The list below is the one thing here that IS hand-maintained, and in the
+  // previous incarnation of this pool it bit once: adding a precomputed table
+  // broke every worker with "Can't find variable" while the main thread stayed
+  // fine. A missing name fails loudly on the first job, which is the good case.
+  //
+  // The corollary: toString() carries the TEXT of a function, not its closure,
+  // so anything a detector function reaches for must be reachable BY NAME
+  // here. A lookup table hidden inside a closure would serialise to an
+  // unbound identifier.
+  const lit = (v) => {
+    if (ArrayBuffer.isView(v))
+      return `new ${v.constructor.name}([${Array.from(v).join(",")}])`;
+    if (Array.isArray(v)) return `[${v.map(lit).join(",")}]`;
+    if (typeof v === "number")
+      return Number.isFinite(v) ? String(v) : Number.isNaN(v) ? "NaN" : v > 0 ? "Infinity" : "-Infinity";
+    if (v && typeof v === "object")
+      return `({${Object.entries(v).map(([k, x]) => JSON.stringify(k) + ":" + lit(x)).join(",")}})`;
+    return JSON.stringify(v);
+  };
+  const emit = (name, value) =>
+    typeof value === "function"
+      ? `const ${name} = ${value.toString()};`
+      : `const ${name} = ${lit(value)};`;
+
+  return [
+    // a worker has no window; nothing in stage 1 needs one, but a stray
+    // performance.now() in a cell being edited should not take the pool down
+    "var window = self;",
+    emit("manLayout", manLayout),
+    emit("edges1Dsub", edges1Dsub),
+    emit("findInvolution", findInvolution),
+    emit("solveMan", solveMan),
+    emit("manRowGroups", manRowGroups),
+    emit("detectRowMan", detectRowMan),
+    emit("scanRowsMan", scanRowsMan),
+    // The worker keeps a full-size frame buffer and writes only the rows of
+    // the job into it, so every row is addressed by absolute y exactly as on
+    // the main thread. Rows arrive packed and transferred, which moves ~1KB
+    // per row rather than the whole frame.
+    `
+let FRAME = null;
+self.onmessage = (e) => {
+  const d = e.data;
+  if (d.type === "init") {
+    FRAME = { gray: new Uint8Array(d.w * d.h), w: d.w, h: d.h };
+    self.postMessage({ type: "ready" });
+    return;
+  }
+  const w = FRAME.w, ys = d.ys, px = d.px;
+  for (let i = 0; i < ys.length; i++)
+    FRAME.gray.set(px.subarray(i * w, (i + 1) * w), ys[i] * w);
+  let rows = null, err = null;
+  try {
+    rows = scanRowsMan(FRAME, ys, d.opts);
+  } catch (ex) {
+    err = ex && ex.message ? ex.message : String(ex);
+  }
+  self.postMessage({ type: "done", id: d.id, rows, err });
+};`
+  ].join("\n");
+};
+const _10l0bax = function _poolSize(Inputs) {return (Inputs.range([0, 12], {
+  step: 1,
+  value: Math.min(6, Math.max(0, (navigator.hardwareConcurrency || 4) - 2)),
+  label: "detection workers (0 = main thread)"
+}));};
+const _1xat3lz = (G, _) => G.input(_);
+const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
+  // A fixed set of dedicated workers, handed row batches. Nothing reactive
+  // crosses the boundary: a job is (rows, options) in and per-row hits out,
+  // which is why the same code runs on the main thread with the pool switched
+  // off (poolSize 0) and gives identical results rather than similar ones.
+  if (!poolSize) return null;
+  const url = URL.createObjectURL(
+    new Blob([detectKernelSource], { type: "text/javascript" })
+  );
+  const ws = [];
+  for (let i = 0; i < poolSize; i++) {
+    const w = new Worker(url);
+    w.pending = new Map();
+    w.onmessage = (e) => {
+      const d = e.data;
+      // the init acknowledgement carries no job id; every other reply does
+      if (d.type === "ready") { if (w.onReady) w.onReady(); return; }
+      const settle = w.pending.get(d.id);
+      if (settle) { w.pending.delete(d.id); settle(d); }
+    };
+    ws.push(w);
+  }
+  // Rebuilt whenever poolSize or the kernel changes, so the old pool has to go
+  // with it -- otherwise the workers outlive their cell and leak a thread each.
+  invalidation.then(() => {
+    for (const w of ws) w.terminate();
+    URL.revokeObjectURL(url);
+  });
+
+  let seq = 0, next = 0, dims = null;
+  const send = (w, msg, transfer) =>
+    new Promise((res) => {
+      const id = ++seq;
+      w.pending.set(id, res);
+      w.postMessage({ ...msg, id }, transfer || []);
+    });
+  // each worker keeps a full-size frame buffer so absolute y indexing works
+  // unchanged inside it; only a size change forces a reallocation
+  const ensure = async (frame) => {
+    if (dims && dims.w === frame.w && dims.h === frame.h) return;
+    dims = { w: frame.w, h: frame.h };
+    await Promise.all(
+      ws.map((w) => new Promise((res) => {
+        w.onReady = res;
+        w.postMessage({ type: "init", w: frame.w, h: frame.h });
+      }))
+    );
+  };
+
+  return {
+    size: ws.length,
+    runRows: async (frame, ys, opts) => {
+      await ensure(frame);
+      // opts crosses a structured clone, and the caller's opts is exactly the
+      // object carrying runRows -- a function, which is not cloneable. Drop
+      // every function rather than naming the one we know about: the next
+      // callback added to opts would otherwise throw DataCloneError from
+      // inside postMessage, a long way from whoever added it.
+      const plain = {};
+      for (const [k, v] of Object.entries(opts ?? {}))
+        if (typeof v !== "function") plain[k] = v;
+
+      // Deal rows round robin rather than in contiguous blocks. Cost per row
+      // is wildly uneven -- a row crossing three marks is worth a hundred
+      // crossing blank wall -- so contiguous blocks would hand one worker
+      // every mark and leave the rest idle. Interleaving averages the marks
+      // out across the pool for free, with no work-stealing machinery.
+      const buckets = ws.map(() => []);
+      ys.forEach((y, i) => buckets[(next + i) % ws.length].push(y));
+      next = (next + ys.length) % ws.length;
+      const jobs = [];
+      for (let i = 0; i < ws.length; i++) {
+        const rows = buckets[i];
+        if (!rows.length) continue;
+        // pack just this worker's rows; ~1KB each, transferred not copied
+        const px = new Uint8Array(rows.length * frame.w);
+        rows.forEach((y, k) =>
+          px.set(frame.gray.subarray(y * frame.w, (y + 1) * frame.w), k * frame.w)
+        );
+        jobs.push(send(ws[i], { type: "rows", ys: rows, px, opts: plain }, [px.buffer]));
+      }
+      const parts = await Promise.all(jobs);
+      const failed = parts.find((p) => p.err);
+      if (failed) throw new Error("detection worker: " + failed.err);
+      // Back into ascending y. clusterManRows is a forward scan over a
+      // y-ordered stream, so returning the pool's arrival order would build
+      // different clusters from the same hits -- the pool would not be wrong
+      // in any way that shows up as an error, only in the answer.
+      return parts.flatMap((p) => p.rows).sort((a, b) => a.y - b.y);
+    }
+  };
+};
+const _p4hc5x = function _analyzeFrameManAsync(rotateFrame,mergeManAxes,manScanRows,scanRowsMan,clusterManRows) {return (async function analyzeFrameManAsync(frame, opts = {}) {
+  // The same pipeline as analyzeFrameMan, with stage 1 allowed to happen
+  // somewhere else. Pass opts.runRows (detectPool.runRows) and the row scan
+  // goes to the worker pool; omit it and this is analyzeFrameMan with an
+  // await in front, which is what makes "pool off" a real fallback rather
+  // than a second code path.
+  //
+  // Stage 2 stays here. Clustering is where rows first see each other, and it
+  // is cheap -- the cost is in the edge finding and the cascade, both of which
+  // left the thread.
+  const t0 = window.performance.now();
+  if (opts.bothAxes) {
+    const single = { ...opts, bothAxes: false };
+    const rows = await analyzeFrameManAsync(frame, single);
+    const rot = await analyzeFrameManAsync(rotateFrame(frame, 1), single);
+    return { ...mergeManAxes(rows, rot, frame, opts), ms: window.performance.now() - t0 };
+  }
+  const ys = manScanRows(frame, opts);
+  const rowResults = opts.runRows
+    ? await opts.runRows(frame, ys, opts)
+    : scanRowsMan(frame, ys, opts);
+  const res = clusterManRows(rowResults, opts);
+  return { ...res, rowsTried: ys.length, ms: window.performance.now() - t0 };
+});};
+const _1hgoegm = async function _poolAgreement(detectPool,hexFrameBank,analyzeFrameMan,analyzeFrameManAsync) {
+  // CORRECTNESS ONLY -- deliberately no timings here. This runs at boot, when
+  // the page is busy computing everything else, and a stopwatch read under
+  // that contention measures the boot, not the detector. Worse, it does not
+  // measure both arms equally: the serial arm competes with the boot work on
+  // this thread while the pool arm does not, so the ratio would move with how
+  // loaded the page happens to be. Throughput is measured on demand instead
+  // (poolBenchmark), when the page is idle and the number means something.
+  //
+  // What IS sound to check at any moment is agreement. Landmark centres must
+  // match to 4dp -- not "close", identical: the workers execute the very same
+  // serialised cells, so a disagreement is a real defect (a constant that
+  // failed to serialise, a stale kernel, a lost row, rows delivered out of y
+  // order), never floating-point drift, and that is true regardless of what
+  // else the machine is doing.
+  if (!detectPool) return { pool: 0, note: "pool off — nothing to compare" };
+  const key = (f) => `${f.id}@${f.xc.toFixed(4)},${f.yc.toFixed(4)}`;
+  const rows = [];
+  for (const spec of hexFrameBank) {
+    const serial = analyzeFrameMan(spec.frame, {});
+    const parallel = await analyzeFrameManAsync(spec.frame, { runRows: detectPool.runRows });
+    rows.push({
+      frame: spec.name,
+      marks: serial.fused.length,
+      poolMarks: parallel.fused.length,
+      rowHits: serial.rowHits,
+      poolRowHits: parallel.rowHits,
+      identical:
+        serial.fused.map(key).sort().join("|") === parallel.fused.map(key).sort().join("|")
+    });
+  }
+  const bad = rows.filter((r) => !r.identical);
+  return {
+    pool: detectPool.size,
+    frames: rows.length,
+    allIdentical: bad.length === 0,
+    disagreements: bad,
+    rows
+  };
+};
+const _fp9av3 = function _poolBenchGo(Inputs) {return (Inputs.button("measure pool throughput", { label: "benchmark" }));};
+const _2jzm2c = (G, _) => G.input(_);
+const _1ptv9em = async function _poolBenchmark(poolBenchGo,detectPool,hexFrameBank,analyzeFrameMan,analyzeFrameManAsync) {
+  // On demand, not at boot. Inputs.button counts clicks and starts at 0, so
+  // nothing is measured until asked -- see poolAgreement for why a throughput
+  // number taken during boot would be a measurement of the boot.
+  if (!poolBenchGo) return null;
+  if (!detectPool) return { note: "pool off" };
+  const reps = 5;
+  // Median, with the spread reported next to it. Median rather than min
+  // because min is the most flattering statistic available and this
+  // comparison is not symmetric -- the main-thread arm loses time to anything
+  // else running on this thread, the pool arm does not, so picking the
+  // statistic picks the ratio. If min and median disagree much the machine was
+  // busy and the run should be repeated rather than quietly reported.
+  const bench = async (fn) => {
+    await fn(); // untimed: the first pool job allocates each worker's frame buffer
+    const ts = [];
+    for (let i = 0; i < reps; i++) {
+      const t0 = window.performance.now();
+      await fn();
+      ts.push(window.performance.now() - t0);
+    }
+    ts.sort((a, b) => a - b);
+    return { med: +ts[reps >> 1].toFixed(1), min: +ts[0].toFixed(1), max: +ts[reps - 1].toFixed(1) };
+  };
+  const rows = [];
+  for (const spec of hexFrameBank) {
+    const serial = await bench(async () => analyzeFrameMan(spec.frame, {}));
+    const parallel = await bench(() =>
+      analyzeFrameManAsync(spec.frame, { runRows: detectPool.runRows })
+    );
+    rows.push({
+      frame: spec.name,
+      px: spec.frame.w + "x" + spec.frame.h,
+      serialMs: serial.med,
+      poolMs: parallel.med,
+      speedup: +(serial.med / parallel.med).toFixed(2),
+      fps: Math.round(1000 / parallel.med),
+      // how much the five runs disagreed with each other, as a percentage of
+      // the median: a noisy machine shows up here rather than in a wrong
+      // headline number
+      spread: +(Math.max(
+        (serial.max - serial.min) / serial.med,
+        (parallel.max - parallel.min) / parallel.med
+      ) * 100).toFixed(0)
+    });
+  }
+  const med = (xs) => xs.slice().sort((a, b) => a - b)[xs.length >> 1];
+  return {
+    workers: detectPool.size,
+    serialMsMedian: med(rows.map((r) => r.serialMs)),
+    poolMsMedian: med(rows.map((r) => r.poolMs)),
+    speedupMedian: +med(rows.map((r) => r.speedup)).toFixed(2),
+    worstSpreadPct: Math.max(...rows.map((r) => r.spread)),
+    rows
+  };
+};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -11454,7 +11754,7 @@ export default function define(runtime, observer) {
   $def("_1epdu7f", "hexRigScore", [], _1epdu7f);  
   $def("_q7egru", "viewof hexRigCases", ["Inputs"], _q7egru);  
   $def("_cih7ns", "hexRigCases", ["Generators","viewof hexRigCases"], _cih7ns);  
-  $def("_1bfhbxi", "hexRig", ["hexRigView","viewof hexRigCases","liveOn","liveVideo","hexRigCfg","analyzeFrameMan","hexRigOpts","fitHexPose","hexRigLoo"], _1bfhbxi);  
+  $def("_1bfhbxi", "hexRig", ["hexRigView","viewof hexRigCases","liveOn","liveVideo","hexRigCfg","analyzeFrameMan","analyzeFrameManAsync","detectPool","hexRigOpts","fitHexPose","hexRigLoo"], _1bfhbxi);  
   $def("_136sicf", "hexRigCasePanel", ["hexRigCases","htl"], _136sicf);  
   $def("_18kb3j3", "hexRigAutosave", ["viewof hexRigCases","htl","invalidation"], _18kb3j3);  
   $def("_js23sh", "hexTarget_md", ["md","tex"], _js23sh);  
@@ -11519,7 +11819,16 @@ export default function define(runtime, observer) {
   $def("_10in6wk", "manScanRows", [], _10in6wk);  
   $def("_30gfrc", "scanRowsMan", ["edges1Dsub","detectRowMan"], _30gfrc);  
   $def("_ezke5v", "clusterManRows", ["manLayout","fitManPose"], _ezke5v);  
-  $def("_1m3an4z", "mergeManAxes", ["unrotatePoint"], _1m3an4z);
+  $def("_1m3an4z", "mergeManAxes", ["unrotatePoint"], _1m3an4z);  
+  $def("_13ae255", "detectKernelSource", ["manLayout","edges1Dsub","findInvolution","solveMan","manRowGroups","detectRowMan","scanRowsMan"], _13ae255);  
+  $def("_10l0bax", "viewof poolSize", ["Inputs"], _10l0bax);  
+  $def("_1xat3lz", "poolSize", ["Generators","viewof poolSize"], _1xat3lz);  
+  $def("_l7r79y", "detectPool", ["poolSize","detectKernelSource","invalidation"], _l7r79y);  
+  $def("_p4hc5x", "analyzeFrameManAsync", ["rotateFrame","mergeManAxes","manScanRows","scanRowsMan","clusterManRows"], _p4hc5x);  
+  $def("_1hgoegm", "poolAgreement", ["detectPool","hexFrameBank","analyzeFrameMan","analyzeFrameManAsync"], _1hgoegm);  
+  $def("_fp9av3", "viewof poolBenchGo", ["Inputs"], _fp9av3);  
+  $def("_2jzm2c", "poolBenchGo", ["Generators","viewof poolBenchGo"], _2jzm2c);  
+  $def("_1ptv9em", "poolBenchmark", ["poolBenchGo","detectPool","hexFrameBank","analyzeFrameMan","analyzeFrameManAsync"], _1ptv9em);
   return main;
 }
 </script>
