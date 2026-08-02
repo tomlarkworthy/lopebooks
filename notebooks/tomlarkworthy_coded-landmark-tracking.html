@@ -12109,18 +12109,24 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
   // passes measure both coordinates directly. Each keeps the coordinate it
   // measured and discards the one it guessed.
   //
-  // This is DELIBERATELY off by default: it is two full passes for one frame
-  // and the realtime detector cannot afford it. It is for the in-notebook
-  // demos and the calibration rig, where the frame rate does not matter and a
-  // stable centre does -- the rig's labels come from a homography through
-  // these centres, so a 6px error in y is 6px of error in the ground truth
-  // every later sweep is scored against.
+  // THIS IS AN ACCURACY AID, NOT A RECALL AID, and the distinction is the
+  // whole correctness of it. A mark seen by BOTH passes gets its x from the
+  // row scan and its y from the column scan, and is strictly better than
+  // either. A mark seen by only the COLUMN pass is a different animal: its y
+  // is measured but its x is the extrapolated coordinate, which is precisely
+  // the quantity this option exists to stop trusting. Admitting those as
+  // detections re-imports the error the option was built to remove.
   //
-  // The second pass also pays for itself twice: where both passes see a mark,
-  // their disagreement is an ERROR BAR measured against an independent set of
-  // measurements rather than a self-assessment. On the §11.1 test scene the
-  // worst disagreement was 5.2px against a true worst y error of 6.0px, so it
-  // is the right size to believe.
+  // Measured, on one static near-frontal frame with the target motionless:
+  // rows-only found 6 marks at worst leave-one-out 0.6px; adding a single
+  // column-only mark took the SAME pixels to 24.5px. A 7th detection that
+  // costs a 40x worse plane is not a 7th detection worth having, so
+  // column-only sightings are reported in `axisOnly` and left out of `fused`.
+  // They are still useful to a caller -- they say "something is there that the
+  // row scan missed" -- but they are not fixes.
+  //
+  // Every gate in this notebook was tuned and banked against the row scan.
+  // A column-only detection has passed none of them.
   //
   // rotateFrame is an exact index permutation -- no resampling, so the second
   // pass sees the same photons and not an interpolation of them.
@@ -12138,7 +12144,7 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
     };
     const cols = rot.fused.map(back);
     const used = new Set();
-    const fused = [], conflicts = [];
+    const fused = [], conflicts = [], axisOnly = [];
     let worstCross = 0, bothN = 0;
     for (const r of rows.fused) {
       // Same id, and close enough to be the same piece of paper. The tolerance
@@ -12174,11 +12180,14 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
         conflicts.push({ id: cols[i].id, x: +cols[i].xc.toFixed(1), y: +cols[i].yc.toFixed(1) });
         continue;
       }
-      fused.push({ ...cols[i], axis: "col" });
+      axisOnly.push({ ...cols[i], axis: "col" });
     }
     return {
       fused,
       unidentified: [...rows.unidentified, ...rot.unidentified.map(back)],
+      // seen by the column scan alone: real sightings, but carrying the
+      // extrapolated coordinate, so reported rather than fused
+      axisOnly,
       conflicts,
       bothAxes: bothN,
       worstCrossPx: +worstCross.toFixed(2),
