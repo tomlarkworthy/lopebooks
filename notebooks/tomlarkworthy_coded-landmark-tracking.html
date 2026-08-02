@@ -12106,19 +12106,50 @@ const _w574fm = function _manRowGroups(manLayout) {return (function manRowGroups
   //   gapFrac 0.3, offerWhole off  (was)  196 read, 0 wrong, median LOO 1.9px
   //   gapFrac 0.2, offerWhole off         210 read, 0 wrong  -- but see above
   //   gapFrac 0.2, offerWhole on   (now)  216 read, 0 wrong, median LOO 2.0px
-  // The pair costs roughly 1.7x the old segmentation (76ms against 45ms live,
-  // 26.5ms against 21.7ms headless). Pass offerWhole:false to buy that back
-  // where a false positive is cheaper than a dropped frame.
   //
   // offerWhole also makes duplicate ids possible, since one mark can lock in
   // both the split and the unsplit group; analyzeFrameMan dedupes by id.
+  //
+  // ---- groupCap: never OFFER a group bigger than one mark can be ----------
+  //
+  // The 2*(nT+1) bound above was used only to decide to SPLIT, and then
+  // offerWhole pushed the unsplit parent out anyway, at every level of the
+  // recursion. So the groups the layout says cannot be one mark were still
+  // handed to findInvolution -- and they are the expensive ones, because that
+  // fit is O(pair hypotheses * n^2). Over the 70-frame archive the over-cap
+  // parents are 19% of candidate groups and 72% of sum(n^2).
+  //
+  // Refusing to emit them is the single best change measured on this cascade,
+  // and it is NOT only a speed change (70 archived frames, plus 10 captured
+  // after the cap was written and never tuned against):
+  //
+  //   read 391/490 -> 412, wrong 6 -> 4, median 27.7ms -> 15.5, p90 47 -> 22.5
+  //   held-out read 58/70 -> 61, worst leave-one-out 0.91 -> 0.26 radii
+  //   rendered scenes 24 read / 5 wrong -> 37 / 0
+  //
+  // The reason accuracy IMPROVES is the interesting half. An over-cap group
+  // spans two or more marks; when it locks at all it lands at a foot between
+  // them carrying a decoded id belonging to neither, and that hit then poisons
+  // the cluster's id vote and the duplicate-id dedup downstream. Those locks
+  // looked like detections and were noise, which is why deleting 2055 of 7092
+  // locking groups RAISES the number of marks read.
+  //
+  // Slack 3 rather than maxEdges' 6 because 32..35 is a flat plateau on read
+  // and 33 is the cheapest of them; 30 (no slack) starts dropping real marks.
+  // Four cheaper structural tests were measured and all failed -- sign
+  // alternation keeps only 913 of 7092 locking groups, even parity 3722,
+  // mirror-sign consistency 1574 -- because edges1Dsub at thr=12 emits
+  // consecutive same-sign peaks freely and a real mark's group routinely
+  // carries clutter edges the involution simply does not use.
   const L = opts.layout ?? manLayout;
   const gapFrac = opts.gapFrac ?? 0.2;
   const maxEdges = opts.maxEdges ?? 2 * (L.nT + 1) + 6;
+  const groupCap = opts.groupCap ?? 2 * (L.nT + 1) + 3;
   const minEdges = opts.minEdges ?? 6;
   const minSpan = opts.minSpan ?? 14;
   const offerWhole = opts.offerWhole ?? true;
   const out = [];
+  const emit = (lo, hi) => { if (hi - lo + 1 <= groupCap) out.push([lo, hi]); };
   const split = (lo, hi, depth) => {
     const n = hi - lo + 1;
     if (n < minEdges) return;
@@ -12135,10 +12166,10 @@ const _w574fm = function _manRowGroups(manLayout) {return (function manRowGroups
       split(lo, worst, depth + 1);
       split(worst + 1, hi, depth + 1);
       // a mark straddling the cut would be lost, so also offer the whole run
-      if ((tooMany && !tooWide) || offerWhole) out.push([lo, hi]);
+      if ((tooMany && !tooWide) || offerWhole) emit(lo, hi);
       return;
     }
-    out.push([lo, hi]);
+    emit(lo, hi);
   };
   split(0, xs.length - 1, 0);
   return out;
@@ -14464,12 +14495,22 @@ const _15xffv4 = function _hexRigSynthCases(hexTarget,renderHexScene,analyzeFram
   // checked (hexRigSelfTest) and the sweep has something to chew on before
   // anyone has printed the sheet (hexRigSweep falls back to these).
   //
-  // One render pass, three consumers. The scenes are all near ⌀110-130 marks
-  // because that is where this cascade comes apart: bigger and it reads all
-  // seven, smaller and it reads none, and neither teaches anything.
+  // One render pass, three consumers. The scenes have to straddle the size
+  // where this cascade comes apart: bigger and it reads all seven, smaller and
+  // it reads none, and neither teaches anything. hexRigSelfTest's checks C and
+  // D need at least one ADMITTED case that reads fewer than seven, so if every
+  // scene here is solved outright the self-test cannot run and says so.
+  //
+  // THAT LINE MOVES WHEN THE DETECTOR IMPROVES. It was ⌀110-130; manRowGroups'
+  // groupCap took every one of those to 7/7, the partial-failure case
+  // disappeared, and the self-test failed — correctly, and for a good reason.
+  // The fix is a harder scene, never a softer bar: ⌀80-92 is where the cascade
+  // now sits astride the labelling bar. Expect to move it again.
   const T = hexTarget;
   const LOO_FRAC = 0.3;
   const CANDIDATES = [
+    { dPx: 80, blur: 1.1, yaw: 0, tilt: 25, seed: 9 },
+    { dPx: 92, blur: 0.9, yaw: 10, tilt: 30, seed: 11 },
     { dPx: 110, blur: 1.0, yaw: 10, tilt: 30, seed: 11 },
     { dPx: 120, blur: 1.0, yaw: 10, tilt: 30, seed: 11 },
     { dPx: 130, blur: 1.0, yaw: 10, tilt: 30, seed: 11 },
@@ -14927,10 +14968,11 @@ grades against what the rig believed at the time rather than against a fresh fit
 of the thing being measured.
 
 **Nothing here is filtered on whether the detector currently succeeds.** The
-worst frame reads three marks of seven, and two of the sixteen fit a plane from
-so few marks that there is nothing left over to check the fit with. Those are
-the most useful frames in the bank, and dropping them would be the one change
-that made this section a lie.`);};
+worst frame reads four marks of seven, and seven of the sixteen read fewer than
+six — and below six a homography has nothing left over to check itself with, so
+those frames get a pose with no way to tell whether it is right. Those are the
+most useful frames in the bank, and dropping them would be the one change that
+made this section a lie.`);};
 const _qcfx2y = function _hexFrames(testFrameFiles) {return (testFrameFiles.get("hexframes.json").json());};
 const _bw7jit = async function _hexFrameBank(hexFrames,testFrameFiles) {
   // Same decode as testFrameBank and manFrameBank, same luma weights, so a bank
