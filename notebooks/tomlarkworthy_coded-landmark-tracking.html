@@ -11898,28 +11898,32 @@ const _w574fm = function _manRowGroups(manLayout) {return (function manRowGroups
   // span are never separated, and then NEITHER locks, because the outer pair
   // straddles both. The hex calibration sheet is exactly that regime.
   //
-  // Measured over the 34-case archive of printed-sheet captures (§11.5),
-  // against 238 marks that should be read:
-  //   gapFrac 0.3, offerWhole off  (was)  186 read, 0 wrong, median LOO 1.9px
-  //   gapFrac 0.2, offerWhole off         198 read, 0 wrong, median LOO 1.8px
-  //   gapFrac 0.2, offerWhole ON   (now)  204 read, 0 wrong, median LOO 1.9px
-  // so the pair reads 18 more marks with no wrong reads and no loss of
-  // accuracy. 0.2 sits BELOW the 0.21 intra-mark bound and would sometimes cut
-  // a mark at its equator, which is what offerWhole is for.
+  // 0.2 sits BELOW the 0.21 intra-mark bound, so it WILL sometimes cut a mark
+  // at its equator. offerWhole is what makes that safe: it offers the unsplit
+  // run ALONGSIDE the halves, so a split that cuts a real mark does not delete
+  // it. A split is a guess at how many marks are present; offering both lets
+  // lattice support decide, which detectRowMan already does and which already
+  // happened for count-forced splits. The asymmetry is real -- a wrong split
+  // LOSES a mark, a wrong merge merely fails to lock and is discarded.
   //
-  // offerWhole offers the unsplit run ALONGSIDE the halves. A split is a guess
-  // about how many marks are in front of us, and when that guess is wrong the
-  // mark is simply gone from this row; offering both costs one more involution
-  // attempt and lets evidence decide, which is what already happened for
-  // count-forced splits and what detectRowMan already resolves by lattice
-  // support. The asymmetry is the point: a wrong split LOSES a mark, a wrong
-  // merge merely fails to lock and is discarded. It is worth little on its own
-  // (it measured -2 marks with gapFrac at 0.3, because at 0.3 few real marks
-  // are being cut) and is what makes the aggressive gapFrac safe -- paired, it
-  // pulls worst-case leave-one-out back from 17.2px to 11.3px.
+  // THE TWO ARE A PAIR AND MUST SHIP TOGETHER. 0.2 on its own is faster than
+  // the old 0.3 (33ms against 45ms, measured live on one frame) and reads 14
+  // more marks across the archive, which makes it look like the better buy --
+  // but on the rendered scene in manSceneTest it drops a mark at stride 4 and
+  // invents a SPURIOUS one at stride 6. That is the equator cut, and no frame
+  // rate is worth a false positive in a positioning system.
   //
-  // Rows are redundant -- many rows cross every mark -- which is why trading a
-  // little per-row precision for per-row recall comes out ahead.
+  // Measured over the 36-case archive of printed-sheet captures (§11.5),
+  // against 252 marks that should be read:
+  //   gapFrac 0.3, offerWhole off  (was)  196 read, 0 wrong, median LOO 1.9px
+  //   gapFrac 0.2, offerWhole off         210 read, 0 wrong  -- but see above
+  //   gapFrac 0.2, offerWhole on   (now)  216 read, 0 wrong, median LOO 2.0px
+  // The pair costs roughly 1.7x the old segmentation (76ms against 45ms live,
+  // 26.5ms against 21.7ms headless). Pass offerWhole:false to buy that back
+  // where a false positive is cheaper than a dropped frame.
+  //
+  // offerWhole also makes duplicate ids possible, since one mark can lock in
+  // both the split and the unsplit group; analyzeFrameMan dedupes by id.
   const L = opts.layout ?? manLayout;
   const gapFrac = opts.gapFrac ?? 0.2;
   const maxEdges = opts.maxEdges ?? 2 * (L.nT + 1) + 6;
@@ -12449,9 +12453,7 @@ opinion of itself. On this scene the worst disagreement was 5.5px against a
 true worst y error of 6.0px — the right size to believe. Compare
 [§11.5](#hexRig_md), where a fit's own residual claimed 1.39px while the labels
 it produced were 66px out.`);};
-const _9mkcus = function anonymous(manScene,analyzeFrameMan,rotateFrame,unrotatePoint
-) {
-
+const _9mkcus = function _manAxesTest(manScene,analyzeFrameMan,rotateFrame,unrotatePoint) {
   // Does scanning the other way actually buy anything? Measured against the
   // renderer's truth, which neither pass sees, on the same four-mark scene the
   // cascade regression uses.
@@ -12462,6 +12464,11 @@ const _9mkcus = function anonymous(manScene,analyzeFrameMan,rotateFrame,unrotate
   // pass that measured it should beat both. A wash would mean the anisotropy
   // is not the dominant error at this scale and the second pass is not worth
   // its 2x.
+  //
+  // It IS close to a wash on real frames -- see §11.5, where bothAxes never
+  // found an extra mark across the archive and its median leave-one-out was
+  // worse than rows only. This scene is clean enough to show the mechanism
+  // working; it is not evidence that the option earns its cost.
   const S = manScene;
   const opts = { stride: 4 };
   // Warm up before timing anything. Without this the first call carries the
@@ -12528,6 +12535,9 @@ const _9mkcus = function anonymous(manScene,analyzeFrameMan,rotateFrame,unrotate
     ["both-axes x is no worse than row-only x", eB.xMean <= eR.xMean + 1e-9],
     ["both-axes finds no fewer marks", eB.found >= eR.found],
     ["no id conflicts on a clean scene", both.conflicts.length === 0],
+    // One id is one piece of paper. offerWhole can lock a mark twice, so the
+    // dedupe in analyzeFrameMan is load-bearing and gets asserted here.
+    ["no duplicate ids", new Set(rows.fused.map((f) => f.id)).size === rows.fused.length],
     // The flag must be OFF unless asked for: every other consumer in this
     // notebook, and the realtime detector above all, calls analyzeFrameMan
     // without it and must be getting the single-pass result.
@@ -12536,7 +12546,6 @@ const _9mkcus = function anonymous(manScene,analyzeFrameMan,rotateFrame,unrotate
   for (const [what, ok] of checks) out.push(`${ok ? "ok  " : "FAIL"} ${what}`);
   out.push("", checks.every(([, ok]) => ok) ? "PASS" : "FAIL");
   return out.join("\n");
-
 };
 const _15441wy = function _markFamily(Inputs) {return (Inputs.radio(["man", "classic"], {
   label: "mark family",
