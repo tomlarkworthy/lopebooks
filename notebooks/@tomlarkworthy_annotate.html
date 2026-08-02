@@ -8662,7 +8662,10 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
   };
 
   let fallback = null;
-  for (let i = 0; i < 30 && !fallback; i++) {
+  // Only race the data module's boot when this document actually carries it; a host that
+  // never ships one (a blank notebook, observablehq.com) would otherwise stall 3s per boot.
+  const dataTries = window.document.getElementById(DATA) ? 30 : 1;
+  for (let i = 0; i < dataTries && !fallback; i++) {
     fallback = moduleNamed(DATA);
     if (!fallback) await new window.Promise((r) => window.setTimeout(r, 100));
   }
@@ -8812,6 +8815,19 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
     get: (id) => (store.all()).find((a) => a.id === id) || null,
     varOf: (a) => (a && a.varName) || "annotation_" + (a && a.id),
     noteVar: (a) => (a && a.cell ? lookup(homeOf(a), a.cell) : null),
+    // Is any of this note's document actually on the page? A module that is booted but not
+    // displayed has no observer nodes. This module is a main in the blank notebook, so
+    // without the test its own six documentation notes would paint over every notebook that
+    // boots it — as adrift, which is the wrong word: they are not lost, they are elsewhere.
+    onPage: (a) => {
+      const mods = [homeOf(a), moduleNamed(a && a.anchor && a.anchor.module)];
+      for (const v of runtime._variables) {
+        if (mods.indexOf(v._module) === -1) continue;
+        const n = v._observer && v._observer._node;
+        if (n && n.nodeType === 1 && n.isConnected) return true;
+      }
+      return false;
+    },
     setSource: (name, fullSource, a) => defineCompiled(homeOf(a || store.all().find((x) => x.cell === name)), name, fullSource),
     // Repair path: a record whose note cell is missing (deleted, or a legacy text-only
     // record) gets one minted from its text. Idempotent — the caller may retry.
@@ -9313,6 +9329,9 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
       const res = A.resolve(a.anchor);
       if (!res) continue;
       if (res.adrift) {
+        // A note whose document is not on this page is not adrift, it is elsewhere: skip it
+        // silently rather than stacking it in the corner of an unrelated notebook.
+        if (!store.onPage(a)) continue;
         adriftCount++;
         // several notes adrift on the page itself would stack exactly; cascade them
         if (res.rung === "page") res.y += 26 * adriftAtPage++;
