@@ -12097,41 +12097,46 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
 
   // ---- opts.bothAxes: scan the columns as well -------------------------
   //
-  // The centre estimate is anisotropic, and the asymmetry is structural, not
-  // noise. Along a scan row the centre column is the involution's fixed
-  // point: MEASURED, on every row that reads. Across rows the centre is
-  // wherever the d-space V-fit extrapolates |d| -> 0, which no row ever
-  // observes. §11.3 measured the gap on one photograph turned four ways:
-  // 23px of spread on the measured coordinate against 64px on the
-  // extrapolated one.
+  // The centre estimate is anisotropic. Along a scan row the centre column is
+  // the involution's fixed point: MEASURED, on every row that reads. Across
+  // rows the centre is wherever the d-space V-fit extrapolates |d| -> 0,
+  // which no row ever observes. §11.3 measured the gap on one photograph
+  // turned four ways: 23px of spread on the measured coordinate against 64px
+  // on the extrapolated one. Scanning the transposed frame turns that around,
+  // so between them the two passes measure both coordinates directly.
   //
-  // Scanning the transposed frame turns that around, so between them the two
-  // passes measure both coordinates directly. Each keeps the coordinate it
-  // measured and discards the one it guessed.
+  // OFF BY DEFAULT, AND THE MEASUREMENTS SAY IT SHOULD STAY THAT WAY. On 25
+  // real captures of the printed sheet (§11.5 archive) it never once found an
+  // extra mark, cost ~3x the time, and moved worst-case leave-one-out from a
+  // median 2.00px (rows only) to 2.70px. It is kept because it is the only
+  // independent check on the extrapolated coordinate, not because it is a
+  // better detector.
   //
-  // THIS IS AN ACCURACY AID, NOT A RECALL AID, and the distinction is the
-  // whole correctness of it. A mark seen by BOTH passes gets its x from the
-  // row scan and its y from the column scan, and is strictly better than
-  // either. A mark seen by only the COLUMN pass is a different animal: its y
-  // is measured but its x is the extrapolated coordinate, which is precisely
-  // the quantity this option exists to stop trusting. Admitting those as
-  // detections re-imports the error the option was built to remove.
+  // Two corrections the real frames forced, both of which the rendered scene
+  // in manAxesTest was too clean to expose:
   //
-  // Measured, on one static near-frontal frame with the target motionless:
-  // rows-only found 6 marks at worst leave-one-out 0.6px; adding a single
-  // column-only mark took the SAME pixels to 24.5px. A 7th detection that
-  // costs a 40x worse plane is not a 7th detection worth having, so
-  // column-only sightings are reported in `axisOnly` and left out of `fused`.
-  // They are still useful to a caller -- they say "something is there that the
-  // row scan missed" -- but they are not fixes.
+  // 1. A mark seen only by the COLUMN pass has a MEASURED y but an
+  //    EXTRAPOLATED x -- precisely the quantity this option exists to stop
+  //    trusting. Admitting those as detections re-imports the error the
+  //    option was built to remove: one such mark took a static frame from 6
+  //    marks at 0.6px leave-one-out to 7 at 24.5px. They go to `axisOnly`,
+  //    reported but not fused. Every gate here was tuned against the row
+  //    scan, and a column-only detection has passed none of them.
   //
-  // Every gate in this notebook was tuned and banked against the row scan.
-  // A column-only detection has passed none of them.
+  // 2. "The column pass measured y, so its y is better" is only true when the
+  //    column fit is itself sound. When the two passes disagree by a lot, one
+  //    of them is wrong and nothing local says which, so taking the column's
+  //    unconditionally is a coin flip on every frame -- it exploded two
+  //    captures to 22px. Past `maxCrossPx` we keep the row pass, because that
+  //    is the gated and banked one. Measured over the archive, the guard took
+  //    worst-case leave-one-out from 22.20px to 5.70px, which is better than
+  //    the 11.20px the row scan manages alone.
   //
   // rotateFrame is an exact index permutation -- no resampling, so the second
   // pass sees the same photons and not an interpolation of them.
   if (opts.bothAxes) {
     const single = { ...opts, bothAxes: false };
+    const maxCross = opts.maxCrossPx ?? 8;
     const t0 = window.performance.now();
     const rows = analyzeFrameMan(frame, single);
     const rot = analyzeFrameMan(rotateFrame(frame, 1), single);
@@ -12145,7 +12150,7 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
     const cols = rot.fused.map(back);
     const used = new Set();
     const fused = [], conflicts = [], axisOnly = [];
-    let worstCross = 0, bothN = 0;
+    let worstCross = 0, bothN = 0, crossRejected = 0;
     for (const r of rows.fused) {
       // Same id, and close enough to be the same piece of paper. The tolerance
       // is a fraction of the mark's own size so it travels with the working
@@ -12159,8 +12164,15 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
       }
       if (m < 0) { fused.push({ ...r, axis: "row" }); continue; }
       used.add(m);
-      bothN++;
       worstCross = Math.max(worstCross, bd);
+      if (bd > maxCross) {
+        // Disagreement too large to be the extrapolation error alone. Keep the
+        // row pass and say so, rather than silently picking the loser.
+        crossRejected++;
+        fused.push({ ...r, axis: "row", crossPx: +bd.toFixed(2), crossRejected: true });
+        continue;
+      }
+      bothN++;
       // x from the row pass, y from the column pass: each coordinate comes
       // from the pass that measured it rather than the one that extrapolated
       // it. Same for the two ellipse axes.
@@ -12190,6 +12202,7 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
       axisOnly,
       conflicts,
       bothAxes: bothN,
+      crossRejected,
       worstCrossPx: +worstCross.toFixed(2),
       axes: { rows, cols: rot },
       rowsTried: rows.rowsTried + rot.rowsTried,
