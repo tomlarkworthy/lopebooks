@@ -5999,7 +5999,18 @@ const _1emy5ow = function _liveView(htl,liveOn,liveVideo) {
   wrap.hud = hud;
   return wrap;
 };
-const _1tf4dro = async function* _liveRun(liveOn,liveStream,liveView,liveVideo,analyzeFrame,liveSolver,detectPool,markEllipse) {
+const _1tf4dro = async function* _liveRun(liveOn,liveStream,liveView,liveVideo,markFamily,analyzeFrameMan,analyzeFrame,liveSolver,detectPool,markEllipse) {
+  // The headline rig, for either mark family.
+  //
+  //   man     §11's cascade (analyzeFrameMan). 64 ids, and because every row
+  //           that crosses a mark locks geometry -- including the near-pole
+  //           rows -- the vertical extent is measured, so this arm reports a
+  //           TILT ANGLE. Main thread: the per-row cost is ~10x below §3's,
+  //           and the worker kernel only carries the classic detector.
+  //   classic §1's mark through analyzeFrame + the worker pool. No tilt angle;
+  //           see markEllipse for why that number is not available here.
+  //
+  // Existing printed sheets keep working -- that is what the toggle is for.
   if (!liveOn) {
     yield null;
     await new Promise(() => {}); // park until the toggle re-runs this cell
@@ -6038,60 +6049,98 @@ const _1tf4dro = async function* _liveRun(liveOn,liveStream,liveView,liveVideo,a
       gray[i] = (px[p] * 77 + px[p + 1] * 150 + px[p + 2] * 29) >> 8;
 
     const t = window.performance.now();
-    const { run, fused } = await analyzeFrame(
-      { gray, w: W, h: H, t, n },
-      {
-        coarseStride: 16,
-        fineStride: 6,
-        minMargin: 4,
-        minReadable: 4,
-        solver: liveSolver,
-        ...(detectPool ? { runRows: detectPool.runRows } : {})
+    // one shape for the overlay, whichever detector produced it:
+    // {id, x, y, a, b, s, tilt, rows}; id null = located but not identified
+    let shapes = [], rowHits = 0, engine = "";
+    if (markFamily === "man") {
+      // stride 4, not §3's 6: a man row costs a fraction of a classic row, and
+      // the extra rows are what carry small marks over fusion's two-vote bar --
+      // on the four-mark ground-truth scene (manSceneTest), stride 6 reads 3
+      // of 4 and stride 4 reads 4 of 4, for 4 -> 10 ms.
+      const res = analyzeFrameMan({ gray, w: W, h: H }, { stride: 4 });
+      rowHits = res.rowHits;
+      engine = "man · main thread";
+      for (const f of [
+        ...res.fused,
+        // A camera on an ordinary scene locks a lattice on ~40 rows a frame,
+        // so showing every unconfirmed cluster would bury the marks in
+        // dashes. Show only the ones whose SHAPE passed -- "there is a mark
+        // here, the payload did not read" is useful while aiming; "these
+        // edges happened to fit an involution" is not.
+        ...res.unidentified.filter((u) => u.posed)
+      ])
+        shapes.push({
+          id: f.id, x: f.xc, y: f.yc,
+          a: f.a, b: f.b, s: 0, tilt: f.tiltDeg,
+          rows: f.rows, fallback: f.a == null ? f.wHalf : null
+        });
+    } else {
+      const { run, fused } = await analyzeFrame(
+        { gray, w: W, h: H, t, n },
+        {
+          coarseStride: 16,
+          fineStride: 6,
+          minMargin: 4,
+          minReadable: 4,
+          solver: liveSolver,
+          ...(detectPool ? { runRows: detectPool.runRows } : {})
+        }
+      );
+      rowHits = run.hits.length;
+      engine = `classic · ${liveSolver} · ` + (detectPool ? `${detectPool.size} workers` : "main thread");
+      for (const f of fused) {
+        const el = markEllipse(f);
+        let fallback = null;
+        if (!el) {
+          const s = f.hits
+            .map((h) => Math.abs(h.rightX - h.leftX))
+            .filter((x) => isFinite(x) && x > 1)
+            .sort((a, b) => a - b);
+          fallback = s.length ? s[s.length >> 1] / 2 : 24;
+        }
+        shapes.push({
+          id: f.id, x: f.xc, y: f.yc,
+          a: el ? el.a : null, b: el ? el.b : null, s: el ? el.s : 0,
+          // classic marks get no tilt angle -- measured wrong by 10-25°
+          tilt: null,
+          rows: f.rows, fallback
+        });
       }
-    );
+    }
     const dt = window.performance.now() - t;
     fps.push(dt);
     if (fps.length > 20) fps.shift();
 
-    // fallback extent when the ellipse cannot be built (too few rows for the
-    // V-fit): half the median window width, which is what the rows measured
-    const radiusOf = (f) => {
-      if (f.apparentRadiusY) return f.apparentRadiusY;
-      const s = f.hits
-        .map((h) => Math.abs(h.rightX - h.leftX))
-        .filter((x) => isFinite(x) && x > 1)
-        .sort((a, b) => a - b);
-      return s.length ? s[s.length >> 1] / 2 : 24;
-    };
     const dias = [];
-    overlay.innerHTML = fused
-      .map((f) => {
-        const el = markEllipse(f);
-        const x = f.xc, y = f.yc;
-        const r = el ? el.major : radiusOf(f);
-        dias.push(2 * r);
+    overlay.innerHTML = shapes
+      .map((m) => {
+        const known = m.id != null;
+        const col = known ? "#2fe08a" : "#ffd23f";
+        const r = m.a != null ? Math.max(m.a, m.b) : m.fallback ?? 24;
+        if (known) dias.push(2 * r);
         const lab = Math.max(13, r * 0.5);
         let outline;
-        if (el) {
+        if (m.a != null) {
           // [[a, s·b],[0, b]] drawn as an SVG shear about the centre, so the
           // curve IS the fitted map of the unit circle rather than an
           // axis/rotation re-derivation of it. non-scaling-stroke keeps the
           // shear off the pen.
           outline =
-            `<g transform="translate(${x.toFixed(1)} ${y.toFixed(1)}) matrix(1 0 ${el.s.toFixed(4)} 1 0 0)">` +
-            `<ellipse cx="0" cy="0" rx="${el.a.toFixed(1)}" ry="${el.b.toFixed(1)}" fill="none" stroke="#2fe08a" stroke-width="3" vector-effect="non-scaling-stroke"/></g>`;
+            `<g transform="translate(${m.x.toFixed(1)} ${m.y.toFixed(1)}) matrix(1 0 ${(m.s ?? 0).toFixed(4)} 1 0 0)">` +
+            `<ellipse cx="0" cy="0" rx="${m.a.toFixed(1)}" ry="${m.b.toFixed(1)}" fill="none" stroke="${col}" stroke-width="3" ` +
+            `stroke-dasharray="${known ? "none" : "7 5"}" vector-effect="non-scaling-stroke"/></g>`;
         } else {
           // dashed = position only, geometry not resolved
-          outline = `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r.toFixed(1)}" fill="none" stroke="#2fe08a" stroke-width="2" stroke-dasharray="6 5"/>`;
+          outline = `<circle cx="${m.x.toFixed(1)}" cy="${m.y.toFixed(1)}" r="${r.toFixed(1)}" fill="none" stroke="${col}" stroke-width="2" stroke-dasharray="6 5"/>`;
         }
-        // No tilt angle is drawn. The outline tracks foreshortening, but the
-        // angle you would read off it is wrong by 10-25° against a simulator
-        // with the tilt set exactly -- see markEllipse for why.
+        const text = known
+          ? esc(m.id) + (m.tilt != null ? ` · ${m.tilt.toFixed(0)}°` : "")
+          : "?";
         return `<g>
 ${outline}
-<line x1="${(x - r * 0.3).toFixed(1)}" y1="${y.toFixed(1)}" x2="${(x + r * 0.3).toFixed(1)}" y2="${y.toFixed(1)}" stroke="#2fe08a" stroke-width="2"/>
-<line x1="${x.toFixed(1)}" y1="${(y - r * 0.3).toFixed(1)}" x2="${x.toFixed(1)}" y2="${(y + r * 0.3).toFixed(1)}" stroke="#2fe08a" stroke-width="2"/>
-<text x="${x.toFixed(1)}" y="${(y - r - 6).toFixed(1)}" font-family="ui-monospace,monospace" font-size="${lab.toFixed(0)}" font-weight="700" fill="#2fe08a" text-anchor="middle" paint-order="stroke" stroke="#000" stroke-width="4">${esc(f.id)}</text>
+<line x1="${(m.x - r * 0.3).toFixed(1)}" y1="${m.y.toFixed(1)}" x2="${(m.x + r * 0.3).toFixed(1)}" y2="${m.y.toFixed(1)}" stroke="${col}" stroke-width="2"/>
+<line x1="${m.x.toFixed(1)}" y1="${(m.y - r * 0.3).toFixed(1)}" x2="${m.x.toFixed(1)}" y2="${(m.y + r * 0.3).toFixed(1)}" stroke="${col}" stroke-width="2"/>
+<text x="${m.x.toFixed(1)}" y="${(m.y - r - 6).toFixed(1)}" font-family="ui-monospace,monospace" font-size="${lab.toFixed(0)}" font-weight="700" fill="${col}" text-anchor="middle" paint-order="stroke" stroke="#000" stroke-width="4">${text}</text>
 </g>`;
       })
       .join("");
@@ -6102,13 +6151,15 @@ ${outline}
     // is measurable right here — unlike a working distance, which depends on
     // the lens the reader happens to have.
     dias.sort((a, b) => a - b);
+    const named = shapes.filter((m) => m.id != null);
+    const anon = shapes.length - named.length;
     liveView.hud.textContent =
       `${W}x${H}  ${med.toFixed(0)} ms/frame (${(1000 / med).toFixed(0)} fps)  ` +
-      `${fused.length} mark${fused.length === 1 ? "" : "s"}` +
-      (fused.length ? "  ids " + fused.map((f) => f.id).join(",") : "") +
+      `${named.length} mark${named.length === 1 ? "" : "s"}` +
+      (anon ? ` +${anon} unread` : "") +
+      (named.length ? "  ids " + named.map((m) => m.id).join(",") : "") +
       (dias.length ? `  smallest ⌀${dias[0].toFixed(0)}px` : "") +
-      `  ${liveSolver}` +
-      (detectPool ? `  ${detectPool.size} workers` : "  main thread");
+      `  ${engine}`;
     n++;
     if (t - lastYield > 250) {
       lastYield = t;
@@ -6116,20 +6167,19 @@ ${outline}
         n,
         w: W,
         h: H,
+        family: markFamily,
         msMedian: +med.toFixed(1),
-        marks: fused.map((f) => {
-          const el = markEllipse(f);
-          return {
-            id: f.id,
-            x: +f.xc.toFixed(1),
-            y: +f.yc.toFixed(1),
-            rows: f.rows,
-            voteMargin: f.voteMargin,
-            major: el ? +el.major.toFixed(1) : null,
-            minor: el ? +el.minor.toFixed(1) : null
-          };
-        }),
-        rowHits: run.hits.length
+        marks: named.map((m) => ({
+          id: m.id,
+          x: +m.x.toFixed(1),
+          y: +m.y.toFixed(1),
+          rows: m.rows,
+          a: m.a == null ? null : +m.a.toFixed(1),
+          b: m.b == null ? null : +m.b.toFixed(1),
+          tiltDeg: m.tilt == null ? null : +m.tilt.toFixed(1)
+        })),
+        unread: anon,
+        rowHits
       };
     }
   }
@@ -6140,13 +6190,19 @@ const _bcrpkq = function _targetId(Inputs,usableIds) {return (Inputs.select(usab
   format: (id) => "id " + id
 }));};
 const _1tf3qak = (G, _) => G.input(_);
-const _kksuf6 = function _targetPanel(markSvgSource,targetId,markSheetSvg,usableIds,htl) {
+const _kksuf6 = function _targetPanel(markFamily,manMarkSvgSource,targetId,markSvgSource,markSheetSvg,usableIds,htl) {
   // Something to point the camera AT, without leaving the page: the selected
   // mark at screen size for a second device's camera, plus the two files worth
   // printing. Both links are data: URIs — a blob: URL is refused as a resource
   // by a page served from file://, and this notebook is meant to run from disk.
-  const mark = markSvgSource(targetId, { diameterMm: 60, label: false });
-  const sheet = markSheetSvg(usableIds, { diameterMm: 60 });
+  //
+  // Follows the family toggle, because a man mark and a classic mark share no
+  // ring layout: pointing the camera at the wrong one reads as nothing at all.
+  const man = markFamily === "man";
+  const mark = man
+    ? manMarkSvgSource(targetId, { diameterMm: 60, label: false })
+    : markSvgSource(targetId, { diameterMm: 60, label: false });
+  const sheet = man ? null : markSheetSvg(usableIds, { diameterMm: 60 });
   const uri = (svg) =>
     "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
   const box = htl.html`<div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap">
@@ -6160,10 +6216,12 @@ const _kksuf6 = function _targetPanel(markSvgSource,targetId,markSheetSvg,usable
       return d;
     })()}</div>
     <div style="font:13px/1.7 system-ui,sans-serif;min-width:16em">
-      <div><b>id ${targetId}</b> at screen size — point a phone at it.</div>
+      <div><b>${man ? "man" : "classic"} id ${targetId}</b> at screen size — point a phone at it.</div>
       <div style="margin-top:.5em">
-        <a download="mark-${targetId}.svg" href="${uri(mark)}">mark ${targetId} (60&thinsp;mm)</a><br>
-        <a download="mark-sheet.svg" href="${uri(sheet)}">all ${usableIds.length} marks, A4 sheet</a>
+        <a download="${man ? "man" : "mark"}-${targetId}.svg" href="${uri(mark)}">${man ? "man" : "mark"} ${targetId} (60&thinsp;mm)</a><br>
+        ${man
+          ? htl.html`<span style="color:var(--theme-foreground-muted,#888)">all 64 man ids, and the A4 sheet, are in §11.1</span>`
+          : htl.html`<a download="mark-sheet.svg" href="${uri(sheet)}">all ${usableIds.length} marks, A4 sheet</a>`}
       </div>
       <div style="margin-top:.6em;color:var(--theme-foreground-muted,#888)">
         Print the sheet as-is: the whole page is mid-gray on purpose. White paper
@@ -6178,25 +6236,32 @@ const _kksuf6 = function _targetPanel(markSvgSource,targetId,markSheetSvg,usable
 const _1031r80 = function _pose_md(md) {return (md`### §0.1 The outline is an ellipse, and what it does not tell you
 
 A circle photographed at an angle is an ellipse, so the overlay fits and draws one
-(\`markEllipse\`) rather than the circle it used to. Width comes from the rim
-half-widths the rows measured, height from fusion's V-fit slope, and a shear from
-the foot drifting sideways down the rows; together they are the linear map taking
-the unit circle to the mark's image. Below is the same overlay on a still frame.
+rather than the circle it used to. For the **classic** mark that is \`markEllipse\`:
+width comes from the rim half-widths the rows measured, height from fusion's V-fit
+slope, and a shear from the foot drifting sideways down the rows; together they
+are the linear map taking the unit circle to the mark's image. Below is the same
+overlay on a still frame.
 
-**It does not report a tilt angle, deliberately.** Checked against the simulator
-with the rotation set exactly, \`acos(minor/major)\` reads **23° on a mark that is
-dead frontal**, and stays 10–25° out to 40°. The cause is structural rather than a
-bad fit: only the middle of a mark yields rows at all — measured, \`|d|\` spans ±8
-of ±28, because chords near the poles cross too few rings — so the mark's *height*
-is always an extrapolation from its equator while its *width* is measured
+**The classic mark does not report a tilt angle, deliberately.** Checked against the
+simulator with the rotation set exactly, \`acos(minor/major)\` reads **23° on a mark
+that is dead frontal**, and stays 10–25° out to 40°. The cause is structural rather
+than a bad fit: only the middle of a mark yields rows at all — measured, \`|d|\` spans
+±8 of ±28, because chords near the poles cross too few rings — so the mark's
+*height* is always an extrapolation from its equator while its *width* is measured
 directly. Harvesting the pre-decode geometric windows instead does not rescue it;
 they stop being found before the poles too, and the height estimate then swings
 between 97 and 384 px on a 206 px mark. On top of that \`acos\` is at its most
 sensitive near frontal, where a 1% error in the axis ratio is ~8° of angle.
 
-So the outline is honest about extent and foreshortening, and silent about pose.
-Getting a real angle out needs rows nearer the poles — a detector gate that
-accepts short chords — which is a change to §3, not to the fit.`);};
+So for the classic family the outline is honest about extent and foreshortening,
+and silent about pose. The diagnosis named the fix — *rows nearer the poles* — and
+that is not a threshold to loosen, it is a property of the mark. §11 redesigns the
+rings so a chord anywhere across the mark still solves, and the **man** family does
+report a tilt angle for exactly that reason: with pole rows contributing, the
+height is measured rather than extrapolated. Measured there: 4.9 / 22.4 / 39.6 /
+60.1° against a true 0 / 20 / 40 / 60°. Small marks stay noisy — an 80 px-wide mark
+at 30° reads anywhere from 0 to 59° — so the angle is worth trusting on marks that
+fill a decent part of the frame, not on distant ones.`);};
 const _1dft8bc = async function _poseDemo(testFrameBank,htl,analyzeFrame,liveSolver,markEllipse) {
   // The outline the live demo draws, on a still frame, so it can be checked
   // without a camera in the loop.
@@ -10126,6 +10191,387 @@ const _1sh7vi3 = async function _liveVideo(htl,liveStream,invalidation) {
   });
   return v;
 };
+const _138kml = function _fitManPose(manLayout) {return (function fitManPose(geo, L = manLayout) {
+  // Pose from a cluster of geometry-locked rows. Each row measured its own
+  // chord offset |d| (in mark units) and its rim half-width (in pixels), so
+  // the mark's vertical extent is MEASURED rather than extrapolated from the
+  // equator -- which is the whole reason a tilt angle is available here and
+  // not for the §1 mark (see markEllipse).
+  //
+  // Returns the measurement AND a verdict on it; the caller decides. Two
+  // guards make the fit right, two make it admit when it is not looking at a
+  // mark -- pointed at an ordinary desk the cascade locks a lattice on ~40
+  // rows a frame, so "a fit exists" is not evidence.
+  //   1. Fit |d| = |y - yc| / Sv in d-space, NOT d^2. d^2 residuals grow with
+  //      d, so far rows dominate the fit and MAD trimming gets masked.
+  //   2. wHalf is an INDEPENDENT measurement of the same chord offset: with a
+  //      global horizontal scale Sh, a rim half-width implies its own d. A row
+  //      whose lattice d disagrees is a translated lattice lock -- two
+  //      measurements of one quantity, so disagreement identifies a bad row
+  //      with no threshold to tune.
+  //   3. aspect: a CIRCLE projects to a = b*cos(tilt), so a <= b is geometry,
+  //      not convention. The first version clamped a/b into acos's domain and
+  //      reported tilt 0 -- turning an impossibility into a confident answer.
+  //      Measured: real marks 0.51-1.10, desk clutter 1.13-11.3. This is the
+  //      gate that does the work.
+  //   4. cover: rows lock out to |d| ~ 0.77R, so a real mark's rows span
+  //      ~1.5b. A cluster huddled in a slice while the fit extrapolates a
+  //      large b has not measured that b. Measured: real marks 0.75-1.24, so
+  //      0.5 leaves margin; it is a backstop, not the primary gate.
+  if (!geo || geo.length < 5) return null;
+  let pts = geo;
+  const shs = geo
+    .filter((g) => g.sup >= 9 && g.d < L.R - 3)
+    .map((g) => g.wHalf / Math.sqrt(L.R * L.R - g.d * g.d))
+    .sort((x, z) => x - z);
+  if (shs.length >= 3) {
+    const sh = shs[shs.length >> 1];
+    const keep = geo.filter((g) => {
+      const q = L.R * L.R - (g.wHalf / sh) * (g.wHalf / sh);
+      return Math.abs(g.d - Math.sqrt(Math.max(0, q))) < 3;
+    });
+    if (keep.length >= 5) pts = keep;
+  }
+  const vFit = (list) => {
+    let best = null;
+    let yLo = Infinity, yHi = -Infinity;
+    for (const g of list) { if (g.y < yLo) yLo = g.y; if (g.y > yHi) yHi = g.y; }
+    for (let yc = yLo; yc <= yHi; yc += 1) {
+      let sz2 = 0, szd = 0;
+      for (const g of list) { const z = Math.abs(g.y - yc); sz2 += z * z; szd += z * g.d; }
+      if (sz2 < 1e-9) continue;
+      const gS = szd / sz2;
+      if (!(gS > 0)) continue;
+      let rss = 0;
+      for (const g of list) { const e = g.d - Math.abs(g.y - yc) * gS; rss += e * e; }
+      if (!best || rss < best.rss) best = { yc, gS, rss };
+    }
+    return best;
+  };
+  let fit = vFit(pts);
+  if (!fit) return null;
+  const resid = pts.map((g) => Math.abs(g.d - Math.abs(g.y - fit.yc) * fit.gS));
+  const mad = resid.slice().sort((x, z) => x - z)[resid.length >> 1] || 0.5;
+  const kept = pts.filter((g, i) => resid[i] <= 2.5 * mad);
+  if (kept.length >= 5) { pts = kept; fit = vFit(pts) ?? fit; }
+  const b = L.R / fit.gS;
+  const yc = fit.yc;
+  let yLo = Infinity, yHi = -Infinity;
+  for (const g of pts) { if (g.y < yLo) yLo = g.y; if (g.y > yHi) yHi = g.y; }
+  const cover = (yHi - yLo) / b;
+  const feet = pts.map((g) => g.foot).sort((x, z) => x - z);
+  const xc = feet[feet.length >> 1];
+  const ws = [];
+  for (const g of pts) {
+    const q = 1 - ((g.y - yc) / b) ** 2;
+    if (q > 0.15) ws.push(g.wHalf / Math.sqrt(q));
+  }
+  ws.sort((x, z) => x - z);
+  const a = ws.length >= 3 ? ws[ws.length >> 1] : null;
+  const aspect = a == null ? null : a / b;
+  const why =
+    a == null ? "no-width"
+      : aspect > (L.maxAspect ?? 1.2) ? "aspect"
+        : cover < (L.minCover ?? 0.5) ? "cover"
+          : null;
+  return {
+    xc, yc, a, b, cover, aspect,
+    tiltDeg: a == null ? null : (Math.acos(Math.min(1, aspect)) * 180) / Math.PI,
+    rows: pts.length,
+    plausible: why === null,
+    why
+  };
+});};
+const _w574fm = function _manRowGroups(manLayout) {return (function manRowGroups(xs, opts = {}) {
+  // Split one row's edge positions into candidate per-mark groups.
+  //
+  // findInvolution enumerates its outer pair from the outermost few edges of
+  // whatever it is given, so it can only ever lock ONE mark per call: with two
+  // marks in a row the outermost pair straddles both and no involution fits.
+  // A live frame has several marks, so the row must be segmented first.
+  //
+  // The segmentation is a property of the layout rather than a tuned constant.
+  // The widest gap INSIDE a mark is the dark disc, crossed only near the
+  // equator: 2*6 units of a 2*R span, so at most 0.21 of the mark's own span
+  // (largest at d=0, and the disc is not crossed at all past d=6). A gap
+  // wider than 0.30 of the span therefore separates marks, not rings. The
+  // edge-count cap is the same argument from the other side: a man mark can
+  // present at most 2*(nT+1) edges, so a group holding more than that plus
+  // slack is holding more than one thing.
+  const L = opts.layout ?? manLayout;
+  const gapFrac = opts.gapFrac ?? 0.3;
+  const maxEdges = opts.maxEdges ?? 2 * (L.nT + 1) + 6;
+  const minEdges = opts.minEdges ?? 6;
+  const minSpan = opts.minSpan ?? 14;
+  const out = [];
+  const split = (lo, hi, depth) => {
+    const n = hi - lo + 1;
+    if (n < minEdges) return;
+    const span = xs[hi] - xs[lo];
+    if (span < minSpan) return;
+    let worst = -1, worstGap = 0;
+    for (let i = lo; i < hi; i++) {
+      const g = xs[i + 1] - xs[i];
+      if (g > worstGap) { worstGap = g; worst = i; }
+    }
+    const tooWide = worstGap > gapFrac * span;
+    const tooMany = n > maxEdges;
+    if ((tooWide || tooMany) && worst >= lo && depth < 8) {
+      split(lo, worst, depth + 1);
+      split(worst + 1, hi, depth + 1);
+      // a mark straddling the cut would be lost, so also offer the whole run
+      // when the split was forced by count alone
+      if (tooMany && !tooWide) out.push([lo, hi]);
+      return;
+    }
+    out.push([lo, hi]);
+  };
+  split(0, xs.length - 1, 0);
+  return out;
+});};
+const _rvt6ru = function _detectRowMan(manLayout,manRowGroups,findInvolution,solveMan) {return (function detectRowMan(scanEdges, opts = {}) {
+  // One scan row, any number of man marks: segment, then run the §11 cascade
+  // per group. Overlapping locks are resolved by lattice support, so a group
+  // offered twice (the count-split fallback) cannot yield the mark twice.
+  const L = opts.layout ?? manLayout;
+  const n = scanEdges.length;
+  if (n < 6) return [];
+  const xs = new Float64Array(n), ss = new Int8Array(n);
+  for (let i = 0; i < n; i++) {
+    const e = scanEdges[i];
+    xs[i] = typeof e === "number" ? e : e.x;
+    ss[i] = typeof e === "number" ? 1 : e.s;
+  }
+  const groups = manRowGroups(xs, opts);
+  const hits = [];
+  for (const [lo, hi] of groups) {
+    const sub = [];
+    for (let i = lo; i <= hi; i++) sub.push({ x: xs[i], s: ss[i] });
+    const iv = findInvolution(sub, opts);
+    if (!iv) continue;
+    const r = solveMan(iv, L, opts);
+    if (!r.ok || r.sup < 5) continue;
+    const pOut = iv.up[iv.up.length - 1];
+    const wHalf = (iv.xs[pOut.f] - iv.xs[pOut.e]) / 2;
+    hits.push({
+      foot: iv.P, d: r.dHat, sup: r.sup, wHalf, id: r.id,
+      x0: iv.xs[0], x1: iv.xs[iv.xs.length - 1]
+    });
+  }
+  // strongest lattice support wins an overlap
+  hits.sort((a, b) => b.sup - a.sup);
+  const kept = [];
+  for (const h of hits)
+    if (!kept.some((k) => Math.abs(k.foot - h.foot) < 0.6 * Math.max(k.wHalf, h.wHalf)))
+      kept.push(h);
+  return kept;
+});};
+const _1jt47m8 = function _analyzeFrameMan(manLayout,edges1Dsub,detectRowMan,fitManPose) {return (function analyzeFrameMan(frame, opts = {}) {
+  // Whole frame, several man marks. Same shape as analyzeFrame so the live
+  // rig can dispatch on mark family, but there is no coarse/fine split: the
+  // §11 cascade locks geometry on ~all rows that cross a mark, so a single
+  // uniform lattice already puts many rows through every mark. Coarse-to-fine
+  // existed because §3's detector decoded only near the equator.
+  //
+  // Clustering is on the FOOT (the involution's fixed point = the mark's
+  // centre column for that row), not on decoded ids: geometry survives rows
+  // whose payload does not, so clustering on ids would discard the rows that
+  // make the pose fit work.
+  //
+  // A cluster is reported only if it survives BOTH an id vote and a plausible
+  // pose. The two are independent evidence -- the payload gate lives in
+  // solveMan's boundary checks, the shape gate in fitManPose's aspect/cover
+  // verdict -- so ordinary scene clutter, which produces plenty of one and
+  // almost none of the other, does not reach the caller as a mark.
+  const L = opts.layout ?? manLayout;
+  const stride = opts.stride ?? 6;
+  const thr = opts.edgeThreshold ?? 12;
+  const gray = frame.gray, w = frame.w, h = frame.h;
+  const t0 = window.performance.now();
+  const clusters = [];
+  let rowsTried = 0, rowHits = 0;
+  for (let y = Math.floor(stride / 2); y < h; y += stride) {
+    rowsTried++;
+    const se = edges1Dsub(gray.subarray(y * w, (y + 1) * w), thr);
+    for (const hit of detectRowMan(se, opts)) {
+      rowHits++;
+      let best = null, bestD = Infinity;
+      for (const c of clusters) {
+        if (y - c.lastY > 4 * stride) continue;
+        const dx = Math.abs(c.foot - hit.foot);
+        const tol = Math.max(10, 0.35 * Math.max(c.wHalf, hit.wHalf));
+        if (dx < tol && dx < bestD) { bestD = dx; best = c; }
+      }
+      if (!best) {
+        best = { rows: [], votes: new Map(), foot: hit.foot, wHalf: hit.wHalf, lastY: y };
+        clusters.push(best);
+      }
+      best.rows.push({ y, d: hit.d, sup: hit.sup, wHalf: hit.wHalf, foot: hit.foot });
+      if (hit.id != null) best.votes.set(hit.id, (best.votes.get(hit.id) ?? 0) + 1);
+      best.lastY = y;
+      best.foot = hit.foot;
+      best.wHalf = Math.max(best.wHalf, hit.wHalf);
+    }
+  }
+  const all = [];
+  for (const c of clusters) {
+    if (c.rows.length < 3) continue;
+    let id = null, bestN = 0, secondN = 0;
+    for (const [k, v] of c.votes) {
+      if (v > bestN) { secondN = bestN; bestN = v; id = k; }
+      else if (v > secondN) secondN = v;
+    }
+    if (!(bestN >= 2 && bestN >= 2 * secondN)) id = null;
+    const pose = fitManPose(c.rows, L);
+    const ys = c.rows.map((r) => r.y);
+    all.push({
+      id,
+      xc: pose ? pose.xc : c.rows.map((r) => r.foot).sort((a, b) => a - b)[c.rows.length >> 1],
+      yc: pose ? pose.yc : (Math.min(...ys) + Math.max(...ys)) / 2,
+      a: pose ? pose.a : null,
+      b: pose ? pose.b : null,
+      tiltDeg: pose && pose.plausible ? pose.tiltDeg : null,
+      cover: pose ? pose.cover : null,
+      aspect: pose ? pose.aspect : null,
+      posed: !!(pose && pose.plausible),
+      why: pose ? pose.why : "no-fit",
+      rows: c.rows.length,
+      voteMargin: bestN - secondN,
+      wHalf: c.wHalf
+    });
+  }
+  return {
+    fused: all.filter((f) => f.id != null && f.posed),
+    // located but not confirmed: kept separate so a caller can show them
+    // (useful when aiming the camera) without treating them as detections
+    unidentified: all.filter((f) => !(f.id != null && f.posed)),
+    rowsTried, rowHits, ms: window.performance.now() - t0
+  };
+});};
+const _15441wy = function _markFamily(Inputs) {return (Inputs.radio(["man", "classic"], {
+  label: "mark family",
+  value: "man",
+  format: (x) =>
+    x === "man" ? "man (§11) — 64 ids, reports tilt" : "classic (§1) — 14 ids"
+}));};
+const _gbwp1t = (G, _) => G.input(_);
+const _1xa2cta = function _manSceneTest(manLayout,renderManFrame,analyzeFrameMan) {
+  // Ground-truth regression for the whole-frame cascade: four man marks of
+  // different sizes and yaws composited into one 960x540 scene. Checks id,
+  // centre and tilt against what was rendered, so a change to the pose guards
+  // (aspect / cover) cannot quietly trade recall for a clean FP count.
+  const SCENE = [
+    { id: 45, W: 55, yaw: 0, x: 150, y: 140 },
+    { id: 9, W: 40, yaw: 30, x: 430, y: 130 },
+    { id: 62, W: 70, yaw: 50, x: 700, y: 300 },
+    { id: 21, W: 33, yaw: 15, x: 300, y: 400 }
+  ];
+  const W = 960, H = 540;
+  const gray = new Uint8Array(W * H).fill(128);
+  const truth = [];
+  for (const m of SCENE) {
+    const bits = [];
+    for (let i = manLayout.nBits - 1; i >= 0; i--) bits.push((m.id >> i) & 1);
+    const f = renderManFrame(bits, { W: m.W, yawDeg: m.yaw, blur: 1.0, noise: 3, seed: m.id });
+    for (let y = 0; y < f.h; y++) {
+      const ty = m.y + y;
+      if (ty < 0 || ty >= H) continue;
+      for (let x = 0; x < f.w; x++) {
+        const tx = m.x + x;
+        if (tx < 0 || tx >= W) continue;
+        gray[ty * W + tx] = f.gray[y * f.w + x];
+      }
+    }
+    truth.push({ ...m, xc: m.x + f.cx, yc: m.y + f.cy, aTrue: f.aTrue, bTrue: f.bTrue });
+  }
+  const lines = [];
+  for (const stride of [6, 4]) {
+    const res = analyzeFrameMan({ gray, w: W, h: H }, { stride });
+    let ok = 0;
+    const rows = truth.map((t) => {
+      const hit = res.fused.find((f) => Math.hypot(f.xc - t.xc, f.yc - t.yc) < 0.5 * t.bTrue);
+      if (hit && hit.id === t.id) ok++;
+      return hit
+        ? `#${t.id}${hit.id === t.id ? "" : `!=${hit.id}`} W${t.W} yaw${t.yaw}` +
+          ` -> tilt ${hit.tiltDeg.toFixed(0)} b ${hit.b.toFixed(0)}/${t.bTrue.toFixed(0)}` +
+          ` cov ${hit.cover.toFixed(2)} asp ${hit.aspect.toFixed(2)}`
+        : `#${t.id} W${t.W} yaw${t.yaw} -> MISSED`;
+    });
+    const wrong = res.fused.filter(
+      (f) => !truth.some((t) => Math.hypot(f.xc - t.xc, f.yc - t.yc) < 0.5 * t.bTrue)
+    );
+    lines.push(
+      `stride ${stride}: ${ok}/${truth.length} correct, ${wrong.length} spurious,` +
+      ` ${res.unidentified.filter((u) => u.posed).length} located-unread, ${res.ms.toFixed(0)}ms\n  ` +
+      rows.join("\n  ") +
+      (wrong.length ? "\n  SPURIOUS: " + wrong.map((f) => `#${f.id}@${f.xc | 0},${f.yc | 0}`).join(" ") : "")
+    );
+  }
+  return lines.join("\n");
+};
+const _1az419w = function _grabPanel(liveVideo) {
+  // Capture bench: grab the live camera frame and keep it, so real-world
+  // frames can be collected without a second device. A programmatic download
+  // is blocked on a file:// page, so saving is a click on a real link.
+  const shots = [];
+  const el = window.document.createElement("div");
+  el.style.cssText = "font:13px system-ui,sans-serif";
+  const bar = window.document.createElement("div");
+  bar.style.cssText = "display:flex;gap:10px;align-items:center;margin-bottom:8px";
+  const btn = window.document.createElement("button");
+  btn.textContent = "grab frame";
+  btn.style.cssText = "font:13px system-ui;padding:5px 12px";
+  const note = window.document.createElement("span");
+  note.style.cssText = "color:var(--theme-foreground-muted,#888)";
+  const strip = window.document.createElement("div");
+  strip.style.cssText = "display:flex;gap:10px;flex-wrap:wrap";
+  bar.append(btn, note);
+  el.append(bar, strip);
+
+  const grab = (url, w, h) => {
+    const n = shots.length + 1;
+    const name = `man-frame-${String(n).padStart(2, "0")}-${w}x${h}.png`;
+    shots.push({ name, url, w, h });
+    const card = window.document.createElement("div");
+    card.style.cssText = "width:150px";
+    const a = window.document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.title = "click to save";
+    const img = window.document.createElement("img");
+    img.src = url;
+    img.style.cssText = "width:150px;display:block;border:1px solid #4444";
+    a.appendChild(img);
+    const cap = window.document.createElement("div");
+    cap.style.cssText = "font:11px ui-monospace,monospace;padding-top:3px";
+    cap.textContent = name;
+    card.append(a, cap);
+    strip.appendChild(card);
+    note.textContent = `${shots.length} frame${shots.length === 1 ? "" : "s"} — click a thumbnail to save`;
+    el.value = shots;
+    el.dispatchEvent(new window.Event("input", { bubbles: true }));
+  };
+
+  // adopt the frame already grabbed by hand
+  if (window.__lastGrab) {
+    const im = new window.Image();
+    im.onload = () => grab(window.__lastGrab, im.naturalWidth, im.naturalHeight);
+    im.src = window.__lastGrab;
+  }
+
+  btn.onclick = () => {
+    const v = liveVideo;
+    if (!v || v.readyState < 2 || !v.videoWidth) { note.textContent = "no video"; return; }
+    const w = v.videoWidth, h = v.videoHeight;
+    const cv = window.document.createElement("canvas");
+    cv.width = w; cv.height = h;
+    cv.getContext("2d").drawImage(v, 0, 0, w, h);
+    grab(cv.toDataURL("image/png"), w, h);
+  };
+  el.value = shots;
+  return el;
+};
+const _qag4z6 = (G, _) => G.input(_);
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -10148,10 +10594,14 @@ export default function define(runtime, observer) {
   $def("_1v7uxcr", "viewof liveSolver", ["Inputs"], _1v7uxcr);  
   $def("_lsv1nput", "liveSolver", ["Generators","viewof liveSolver"], _lsv1nput);  
   $def("_1emy5ow", "liveView", ["htl","liveOn","liveVideo"], _1emy5ow);  
-  $def("_1tf4dro", "liveRun", ["liveOn","liveStream","liveView","liveVideo","analyzeFrame","liveSolver","detectPool","markEllipse"], _1tf4dro);  
+  $def("_1tf4dro", "liveRun", ["liveOn","liveStream","liveView","liveVideo","markFamily","analyzeFrameMan","analyzeFrame","liveSolver","detectPool","markEllipse"], _1tf4dro);  
+  $def("_15441wy", "viewof markFamily", ["Inputs"], _15441wy);  
+  $def("_gbwp1t", "markFamily", ["Generators","viewof markFamily"], _gbwp1t);  
   $def("_bcrpkq", "viewof targetId", ["Inputs","usableIds"], _bcrpkq);  
   $def("_1tf3qak", "targetId", ["Generators","viewof targetId"], _1tf3qak);  
-  $def("_kksuf6", "targetPanel", ["markSvgSource","targetId","markSheetSvg","usableIds","htl"], _kksuf6);  
+  $def("_kksuf6", "targetPanel", ["markFamily","manMarkSvgSource","targetId","markSvgSource","markSheetSvg","usableIds","htl"], _kksuf6);  
+  $def("_1az419w", "viewof grabPanel", ["liveVideo"], _1az419w);  
+  $def("_qag4z6", "grabPanel", ["Generators","viewof grabPanel"], _qag4z6);
   $def("_1031r80", "pose_md", ["md"], _1031r80);  
   $def("_1dft8bc", "poseDemo", ["testFrameBank","htl","analyzeFrame","liveSolver","markEllipse"], _1dft8bc);  
   $def("_1nlpgtu", "markEllipse", ["LAYOUT","xFromK"], _1nlpgtu);  
@@ -10299,9 +10749,15 @@ export default function define(runtime, observer) {
   $def("_19a2bc6", "manMarkSvgSource", ["manLayout","manColor"], _19a2bc6);  
   $def("_snxhn8", "manPrintPanel", ["manDemoCfg","manMarkSvgSource","manLayout","manColor","htl"], _snxhn8);  
   $def("_xdtu1n", "liveStream", ["liveOn","liveFacing","invalidation"], _xdtu1n);  
-  $def("_1sh7vi3", "liveVideo", ["htl","liveStream","invalidation"], _1sh7vi3);
+  $def("_1sh7vi3", "liveVideo", ["htl","liveStream","invalidation"], _1sh7vi3);  
+  $def("_138kml", "fitManPose", ["manLayout"], _138kml);  
+  $def("_w574fm", "manRowGroups", ["manLayout"], _w574fm);  
+  $def("_rvt6ru", "detectRowMan", ["manLayout","manRowGroups","findInvolution","solveMan"], _rvt6ru);  
+  $def("_1jt47m8", "analyzeFrameMan", ["manLayout","edges1Dsub","detectRowMan","fitManPose"], _1jt47m8);  
+  $def("_1xa2cta", "manSceneTest", ["manLayout","renderManFrame","analyzeFrameMan"], _1xa2cta);  
   return main;
-}</script>
+}
+</script>
 <script id="@tomlarkworthy/fast-1d-circular-barcode-matching/image.png" 
   type="text/plain"
   data-encoding="base64"
