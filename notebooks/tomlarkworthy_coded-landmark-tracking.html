@@ -10524,237 +10524,31 @@ One id means one piece of paper, so two clusters carrying the same id are
 resolved rather than both emitted: handing the plane fit two positions for one
 landmark gives the homography contradictory evidence about where that landmark
 is, which is the exact instability this detector exists to remove.`);};
-const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,edges1Dsub,detectRowMan,fitManPose) {return (function analyzeFrameMan(frame, opts = {}) {
-  // Whole frame, several man marks. Same shape as analyzeFrame so the live
-  // rig can dispatch on mark family, but there is no coarse/fine split: the
-  // §11 cascade locks geometry on ~all rows that cross a mark, so a single
-  // uniform lattice already puts many rows through every mark. Coarse-to-fine
-  // existed because §3's detector decoded only near the equator.
+const _1jt47m8 = function _analyzeFrameMan(rotateFrame,mergeManAxes,manScanRows,clusterManRows,scanRowsMan) {return (function analyzeFrameMan(frame, opts = {}) {
+  // Whole frame, several man marks, on this thread. Three stages:
   //
-  // Clustering is on the FOOT (the involution's fixed point = the mark's
-  // centre column for that row), not on decoded ids: geometry survives rows
-  // whose payload does not, so clustering on ids would discard the rows that
-  // make the pose fit work.
+  //   manScanRows    which rows to look at
+  //   scanRowsMan    rows -> per-row hits          (pure per row, parallelisable)
+  //   clusterManRows hits -> marks with poses      (rows talk to each other)
   //
-  // A cluster is reported only if it survives BOTH an id vote and a plausible
-  // pose. The two are independent evidence -- the payload gate lives in
-  // solveMan's boundary checks, the shape gate in fitManPose's verdict -- so
-  // ordinary scene clutter, which produces plenty of one and almost none of
-  // the other, does not reach the caller as a mark.
+  // There is no coarse/fine split: the §4.2 cascade locks geometry on ~all
+  // rows that cross a mark, so a single uniform lattice already puts many rows
+  // through every mark. Coarse-to-fine existed because the older detector
+  // decoded only near the equator.
   //
-  // The cluster rules are exposed as options ONLY so the calibration rig can
-  // sweep them (§11.5). Every default below is the value that was hardcoded
-  // here before, so an unparameterised call behaves exactly as it did; the
-  // pose gates live on the layout object and are overridden the same way, by
-  // passing a modified opts.layout.
-
-  // ---- opts.bothAxes: scan the columns as well -------------------------
-  //
-  // The centre estimate is anisotropic. Along a scan row the centre column is
-  // the involution's fixed point: MEASURED, on every row that reads. Across
-  // rows the centre is wherever the d-space V-fit extrapolates |d| -> 0,
-  // which no row ever observes. §11.3 measured the gap on one photograph
-  // turned four ways: 23px of spread on the measured coordinate against 64px
-  // on the extrapolated one. Scanning the transposed frame turns that around,
-  // so between them the two passes measure both coordinates directly.
-  //
-  // OFF BY DEFAULT, AND THE MEASUREMENTS SAY IT SHOULD STAY THAT WAY. On the
-  // real captures in the §11.5 archive it never once found an extra mark,
-  // cost ~3x the time, and its median leave-one-out is worse than rows only.
-  // It is kept because it is the only independent check on the extrapolated
-  // coordinate, not because it is a better detector.
-  //
-  // Two corrections the real frames forced, both of which the rendered scene
-  // in manAxesTest was too clean to expose:
-  //
-  // 1. A mark seen only by the COLUMN pass has a MEASURED y but an
-  //    EXTRAPOLATED x -- precisely the quantity this option exists to stop
-  //    trusting. Admitting those as detections re-imports the error the
-  //    option was built to remove: one such mark took a static frame from 6
-  //    marks at 0.6px leave-one-out to 7 at 24.5px. They go to `axisOnly`,
-  //    reported but not fused. Every gate here was tuned against the row
-  //    scan, and a column-only detection has passed none of them.
-  //
-  // 2. "The column pass measured y, so its y is better" is only true when the
-  //    column fit is itself sound. When the two passes disagree by a lot, one
-  //    of them is wrong and nothing local says which, so taking the column's
-  //    unconditionally is a coin flip on every frame -- it exploded two
-  //    captures to 22px. Past `maxCrossPx` we keep the row pass, because that
-  //    is the gated and banked one. Measured over the archive, the guard took
-  //    worst-case leave-one-out from 22.20px to 5.70px, which is better than
-  //    the 11.20px the row scan manages alone.
-  //
-  // rotateFrame is an exact index permutation -- no resampling, so the second
-  // pass sees the same photons and not an interpolation of them.
+  // The split into stages is what analyzeFrameManAsync uses to put stage 1 on
+  // a worker pool; this entry point stays synchronous so every test, sweep and
+  // report that calls it keeps working unchanged.
+  const t0 = window.performance.now();
   if (opts.bothAxes) {
     const single = { ...opts, bothAxes: false };
-    const maxCross = opts.maxCrossPx ?? 8;
-    const t0 = window.performance.now();
     const rows = analyzeFrameMan(frame, single);
     const rot = analyzeFrameMan(rotateFrame(frame, 1), single);
-    // Map the rotated pass back into frame coordinates. The ellipse axes swap
-    // with the frame: what that pass measured along ITS scan is the extent in
-    // image y.
-    const back = (f) => {
-      const p = unrotatePoint(f.xc, f.yc, 1, frame.w, frame.h);
-      return { ...f, xc: p.x, yc: p.y, a: f.b, b: f.a };
-    };
-    const cols = rot.fused.map(back);
-    const used = new Set();
-    const fused = [], conflicts = [], axisOnly = [];
-    let worstCross = 0, bothN = 0, crossRejected = 0;
-    for (const r of rows.fused) {
-      // Same id, and close enough to be the same piece of paper. The tolerance
-      // is a fraction of the mark's own size so it travels with the working
-      // distance instead of being a pixel count that only suits one.
-      const size = r.a ?? r.wHalf ?? 24;
-      let m = -1, bd = Infinity;
-      for (let i = 0; i < cols.length; i++) {
-        if (used.has(i) || cols[i].id !== r.id) continue;
-        const d = Math.hypot(cols[i].xc - r.xc, cols[i].yc - r.yc);
-        if (d < 0.8 * size && d < bd) { bd = d; m = i; }
-      }
-      if (m < 0) { fused.push({ ...r, axis: "row" }); continue; }
-      used.add(m);
-      worstCross = Math.max(worstCross, bd);
-      if (bd > maxCross) {
-        // Disagreement too large to be the extrapolation error alone. Keep the
-        // row pass and say so, rather than silently picking the loser.
-        crossRejected++;
-        fused.push({ ...r, axis: "row", crossPx: +bd.toFixed(2), crossRejected: true });
-        continue;
-      }
-      bothN++;
-      // x from the row pass, y from the column pass: each coordinate comes
-      // from the pass that measured it rather than the one that extrapolated
-      // it. Same for the two ellipse axes.
-      fused.push({
-        ...r, xc: r.xc, yc: cols[m].yc, a: r.a, b: cols[m].b ?? r.b,
-        axis: "both", crossPx: +bd.toFixed(2)
-      });
-    }
-    const rowIds = new Set(rows.fused.map((f) => f.id));
-    for (let i = 0; i < cols.length; i++) {
-      if (used.has(i)) continue;
-      if (rowIds.has(cols[i].id)) {
-        // Both passes claim this id, too far apart to be the same mark. One of
-        // them is wrong and there is nothing here that says which, so keep the
-        // row pass -- that is what ships -- and report the disagreement rather
-        // than emitting a duplicate id for fitHexPose to trip over.
-        conflicts.push({ id: cols[i].id, x: +cols[i].xc.toFixed(1), y: +cols[i].yc.toFixed(1) });
-        continue;
-      }
-      axisOnly.push({ ...cols[i], axis: "col" });
-    }
-    return {
-      fused,
-      unidentified: [...rows.unidentified, ...rot.unidentified.map(back)],
-      // seen by the column scan alone: real sightings, but carrying the
-      // extrapolated coordinate, so reported rather than fused
-      axisOnly,
-      conflicts,
-      bothAxes: bothN,
-      crossRejected,
-      worstCrossPx: +worstCross.toFixed(2),
-      axes: { rows, cols: rot },
-      rowsTried: rows.rowsTried + rot.rowsTried,
-      rowHits: rows.rowHits + rot.rowHits,
-      ms: window.performance.now() - t0
-    };
+    return { ...mergeManAxes(rows, rot, frame, opts), ms: window.performance.now() - t0 };
   }
-
-  const L = opts.layout ?? manLayout;
-  const stride = opts.stride ?? 6;
-  const thr = opts.edgeThreshold ?? 12;
-  const minRows = opts.minRows ?? 3;      // rows before a cluster is a candidate
-  const minVotes = opts.minVotes ?? 2;    // rows that must agree on the id
-  const voteRatio = opts.voteRatio ?? 2;  // winner must beat runner-up by this
-  const gray = frame.gray, w = frame.w, h = frame.h;
-  const t0 = window.performance.now();
-  const clusters = [];
-  let rowsTried = 0, rowHits = 0;
-  for (let y = Math.floor(stride / 2); y < h; y += stride) {
-    rowsTried++;
-    const se = edges1Dsub(gray.subarray(y * w, (y + 1) * w), thr);
-    for (const hit of detectRowMan(se, opts)) {
-      rowHits++;
-      let best = null, bestD = Infinity;
-      for (const c of clusters) {
-        if (y - c.lastY > 4 * stride) continue;
-        const dx = Math.abs(c.foot - hit.foot);
-        const tol = Math.max(10, 0.35 * Math.max(c.wHalf, hit.wHalf));
-        if (dx < tol && dx < bestD) { bestD = dx; best = c; }
-      }
-      if (!best) {
-        best = { rows: [], votes: new Map(), foot: hit.foot, wHalf: hit.wHalf, lastY: y };
-        clusters.push(best);
-      }
-      best.rows.push({ y, d: hit.d, sup: hit.sup, wHalf: hit.wHalf, foot: hit.foot });
-      if (hit.id != null) best.votes.set(hit.id, (best.votes.get(hit.id) ?? 0) + 1);
-      best.lastY = y;
-      best.foot = hit.foot;
-      best.wHalf = Math.max(best.wHalf, hit.wHalf);
-    }
-  }
-  const all = [];
-  for (const c of clusters) {
-    if (c.rows.length < minRows) continue;
-    let id = null, bestN = 0, secondN = 0;
-    for (const [k, v] of c.votes) {
-      if (v > bestN) { secondN = bestN; bestN = v; id = k; }
-      else if (v > secondN) secondN = v;
-    }
-    if (!(bestN >= minVotes && bestN >= voteRatio * secondN)) id = null;
-    const pose = fitManPose(c.rows, L);
-    const ys = c.rows.map((r) => r.y);
-    all.push({
-      id,
-      xc: pose ? pose.xc : c.rows.map((r) => r.foot).sort((a, b) => a - b)[c.rows.length >> 1],
-      yc: pose ? pose.yc : (Math.min(...ys) + Math.max(...ys)) / 2,
-      a: pose ? pose.a : null,
-      b: pose ? pose.b : null,
-      tiltDeg: pose && pose.plausible ? pose.tiltDeg : null,
-      cover: pose ? pose.cover : null,
-      aspect: pose ? pose.aspect : null,
-      axisRatio: pose ? pose.axisRatio : null,
-      posed: !!(pose && pose.plausible),
-      why: pose ? pose.why : "no-fit",
-      rows: c.rows.length,
-      voteMargin: bestN - secondN,
-      wHalf: c.wHalf
-    });
-  }
-
-  // One id is one piece of paper. Two clusters carrying it means either a
-  // mark was locked twice at slightly different feet -- which manRowGroups'
-  // offerWhole makes possible, since it deliberately offers a split AND the
-  // unsplit run -- or one of them is clutter that voted the same payload.
-  // Either way, handing fitHexPose two points for a single landmark gives the
-  // homography contradictory evidence about where that landmark is, which is
-  // exactly the instability this detector is supposed to remove. Keep the
-  // better-evidenced cluster (most rows, then vote margin, then coverage) and
-  // demote the other rather than letting the fit arbitrate.
-  const confirmed = all.filter((f) => f.id != null && f.posed);
-  const rejected = all.filter((f) => !(f.id != null && f.posed));
-  const byId = new Map();
-  for (const f of confirmed) {
-    const prev = byId.get(f.id);
-    if (!prev) { byId.set(f.id, f); continue; }
-    const wins =
-      f.rows !== prev.rows ? f.rows > prev.rows
-      : f.voteMargin !== prev.voteMargin ? f.voteMargin > prev.voteMargin
-      : (f.cover ?? 0) > (prev.cover ?? 0);
-    byId.set(f.id, wins ? f : prev);
-    rejected.push({ ...(wins ? prev : f), why: "duplicate-id" });
-  }
-
-  return {
-    fused: [...byId.values()],
-    // located but not confirmed: kept separate so a caller can show them
-    // (useful when aiming the camera) without treating them as detections
-    unidentified: rejected,
-    rowsTried, rowHits, ms: window.performance.now() - t0
-  };
+  const ys = manScanRows(frame, opts);
+  const res = clusterManRows(scanRowsMan(frame, ys, opts), opts);
+  return { ...res, rowsTried: ys.length, ms: window.performance.now() - t0 };
 });};
 const _138kml = function _fitManPose(manLayout) {return (function fitManPose(geo, L = manLayout) {
   // Pose from a cluster of geometry-locked rows. Each row measured its own
@@ -11388,6 +11182,248 @@ busy background costs 1.7x the time for no change in accuracy. That points at
 gating the scan to where a mark was last seen rather than at making the image
 smaller — downscaling is the intuitive lever and the measurements say it is the
 wrong one.`);};
+const _10in6wk = function _manScanRows() {return (function manScanRows(frame, opts = {}) {
+  // The scan lattice. One line, its own cell, because two things need it and
+  // they must agree exactly: the serial pass walks it, and the worker pool
+  // deals it out. If they disagreed the pool would silently scan a different
+  // set of rows and every comparison between them would be meaningless.
+  const stride = opts.stride ?? 6;
+  const ys = [];
+  for (let y = Math.floor(stride / 2); y < frame.h; y += stride) ys.push(y);
+  return ys;
+});};
+const _30gfrc = function _scanRowsMan(edges1Dsub,detectRowMan) {return (function scanRowsMan(frame, ys, opts = {}) {
+  // Stage 1 of three, and the only expensive one: per row, find the edges and
+  // run the §4.2 cascade over them.
+  //
+  // Pure per row. A row needs its own pixels and nothing else -- no
+  // accumulator, no neighbouring row, no state carried between iterations.
+  // That is not a convenience, it is the whole reason the detector can be
+  // moved off the main thread at all, and it is why the seam is cut here
+  // rather than anywhere else in the pipeline. Stage 2 (clustering) is where
+  // rows first talk to each other, so stage 2 is where parallelism stops.
+  const thr = opts.edgeThreshold ?? 12;
+  const gray = frame.gray, w = frame.w;
+  const out = [];
+  for (let i = 0; i < ys.length; i++) {
+    const y = ys[i];
+    const se = edges1Dsub(gray.subarray(y * w, (y + 1) * w), thr);
+    out.push({ y, hits: detectRowMan(se, opts) });
+  }
+  return out;
+});};
+const _ezke5v = function _clusterManRows(manLayout,fitManPose) {return (function clusterManRows(rowResults, opts = {}) {
+  // Stage 2: rows into marks. Lifted verbatim out of analyzeFrameMan when the
+  // pipeline was split for the worker pool -- there is still exactly one copy
+  // of these rules, which is the only reason serial and pooled runs can be
+  // required to agree to 4dp.
+  //
+  // Clustering is on the FOOT (the involution's fixed point = the mark's
+  // centre column for that row), not on decoded ids: geometry survives rows
+  // whose payload does not, so clustering on ids would discard the rows that
+  // make the pose fit work.
+  //
+  // A cluster is reported only if it survives BOTH an id vote and a plausible
+  // pose. The two are independent evidence -- the payload gate lives in
+  // solveMan's boundary checks, the shape gate in fitManPose's verdict -- so
+  // ordinary scene clutter, which produces plenty of one and almost none of
+  // the other, does not reach the caller as a mark.
+  //
+  // The cluster rules are exposed as options ONLY so the calibration rig can
+  // sweep them (§3.3). Every default below is the value that was hardcoded
+  // here before, so an unparameterised call behaves exactly as it did.
+  //
+  // rowResults must arrive in ascending y: the neighbour test below is a
+  // forward scan over a y-ordered stream, so a shuffled input would build
+  // different clusters. The pool restores the order before calling this.
+  const L = opts.layout ?? manLayout;
+  const stride = opts.stride ?? 6;
+  const minRows = opts.minRows ?? 3;      // rows before a cluster is a candidate
+  const minVotes = opts.minVotes ?? 2;    // rows that must agree on the id
+  const voteRatio = opts.voteRatio ?? 2;  // winner must beat runner-up by this
+  const clusters = [];
+  let rowHits = 0;
+  for (const row of rowResults) {
+    const y = row.y;
+    for (const hit of row.hits) {
+      rowHits++;
+      let best = null, bestD = Infinity;
+      for (const c of clusters) {
+        if (y - c.lastY > 4 * stride) continue;
+        const dx = Math.abs(c.foot - hit.foot);
+        const tol = Math.max(10, 0.35 * Math.max(c.wHalf, hit.wHalf));
+        if (dx < tol && dx < bestD) { bestD = dx; best = c; }
+      }
+      if (!best) {
+        best = { rows: [], votes: new Map(), foot: hit.foot, wHalf: hit.wHalf, lastY: y };
+        clusters.push(best);
+      }
+      best.rows.push({ y, d: hit.d, sup: hit.sup, wHalf: hit.wHalf, foot: hit.foot });
+      if (hit.id != null) best.votes.set(hit.id, (best.votes.get(hit.id) ?? 0) + 1);
+      best.lastY = y;
+      best.foot = hit.foot;
+      best.wHalf = Math.max(best.wHalf, hit.wHalf);
+    }
+  }
+  const all = [];
+  for (const c of clusters) {
+    if (c.rows.length < minRows) continue;
+    let id = null, bestN = 0, secondN = 0;
+    for (const [k, v] of c.votes) {
+      if (v > bestN) { secondN = bestN; bestN = v; id = k; }
+      else if (v > secondN) secondN = v;
+    }
+    if (!(bestN >= minVotes && bestN >= voteRatio * secondN)) id = null;
+    const pose = fitManPose(c.rows, L);
+    const ys = c.rows.map((r) => r.y);
+    all.push({
+      id,
+      xc: pose ? pose.xc : c.rows.map((r) => r.foot).sort((a, b) => a - b)[c.rows.length >> 1],
+      yc: pose ? pose.yc : (Math.min(...ys) + Math.max(...ys)) / 2,
+      a: pose ? pose.a : null,
+      b: pose ? pose.b : null,
+      tiltDeg: pose && pose.plausible ? pose.tiltDeg : null,
+      cover: pose ? pose.cover : null,
+      aspect: pose ? pose.aspect : null,
+      axisRatio: pose ? pose.axisRatio : null,
+      posed: !!(pose && pose.plausible),
+      why: pose ? pose.why : "no-fit",
+      rows: c.rows.length,
+      voteMargin: bestN - secondN,
+      wHalf: c.wHalf
+    });
+  }
+
+  // One id is one piece of paper. Two clusters carrying it means either a
+  // mark was locked twice at slightly different feet -- which manRowGroups'
+  // offerWhole makes possible, since it deliberately offers a split AND the
+  // unsplit run -- or one of them is clutter that voted the same payload.
+  // Either way, handing fitHexPose two points for a single landmark gives the
+  // homography contradictory evidence about where that landmark is, which is
+  // exactly the instability this detector is supposed to remove. Keep the
+  // better-evidenced cluster (most rows, then vote margin, then coverage) and
+  // demote the other rather than letting the fit arbitrate.
+  const confirmed = all.filter((f) => f.id != null && f.posed);
+  const rejected = all.filter((f) => !(f.id != null && f.posed));
+  const byId = new Map();
+  for (const f of confirmed) {
+    const prev = byId.get(f.id);
+    if (!prev) { byId.set(f.id, f); continue; }
+    const wins =
+      f.rows !== prev.rows ? f.rows > prev.rows
+      : f.voteMargin !== prev.voteMargin ? f.voteMargin > prev.voteMargin
+      : (f.cover ?? 0) > (prev.cover ?? 0);
+    byId.set(f.id, wins ? f : prev);
+    rejected.push({ ...(wins ? prev : f), why: "duplicate-id" });
+  }
+
+  return {
+    fused: [...byId.values()],
+    // located but not confirmed: kept separate so a caller can show them
+    // (useful when aiming the camera) without treating them as detections
+    unidentified: rejected,
+    rowHits
+  };
+});};
+const _1m3an4z = function _mergeManAxes(unrotatePoint) {return (function mergeManAxes(rows, rot, frame, opts = {}) {
+  // The opts.bothAxes merge, lifted out of analyzeFrameMan so the serial and
+  // pooled entry points share one copy of it rather than two that drift.
+  //
+  // The centre estimate is anisotropic. Along a scan row the centre column is
+  // the involution's fixed point: MEASURED, on every row that reads. Across
+  // rows the centre is wherever the d-space V-fit extrapolates |d| -> 0,
+  // which no row ever observes. §4.3 measured the gap on one photograph
+  // turned four ways: 23px of spread on the measured coordinate against 64px
+  // on the extrapolated one. Scanning the transposed frame turns that around,
+  // so between them the two passes measure both coordinates directly.
+  //
+  // Two corrections the real frames forced, both of which the rendered scene
+  // in manAxesTest was too clean to expose:
+  //
+  // 1. A mark seen only by the COLUMN pass has a MEASURED y but an
+  //    EXTRAPOLATED x -- precisely the quantity this option exists to stop
+  //    trusting. Admitting those as detections re-imports the error the
+  //    option was built to remove: one such mark took a static frame from 6
+  //    marks at 0.6px leave-one-out to 7 at 24.5px. They go to `axisOnly`,
+  //    reported but not fused.
+  //
+  // 2. "The column pass measured y, so its y is better" is only true when the
+  //    column fit is itself sound. When the two passes disagree by a lot, one
+  //    of them is wrong and nothing local says which, so taking the column's
+  //    unconditionally is a coin flip on every frame -- it exploded two
+  //    captures to 22px. Past `maxCrossPx` we keep the row pass, because that
+  //    is the gated and banked one. Measured over the archive, the guard took
+  //    worst-case leave-one-out from 22.20px to 5.70px, better than the
+  //    11.20px the row scan manages alone.
+  const maxCross = opts.maxCrossPx ?? 8;
+  // Map the rotated pass back into frame coordinates. The ellipse axes swap
+  // with the frame: what that pass measured along ITS scan is the extent in
+  // image y.
+  const back = (f) => {
+    const p = unrotatePoint(f.xc, f.yc, 1, frame.w, frame.h);
+    return { ...f, xc: p.x, yc: p.y, a: f.b, b: f.a };
+  };
+  const cols = rot.fused.map(back);
+  const used = new Set();
+  const fused = [], conflicts = [], axisOnly = [];
+  let worstCross = 0, bothN = 0, crossRejected = 0;
+  for (const r of rows.fused) {
+    // Same id, and close enough to be the same piece of paper. The tolerance
+    // is a fraction of the mark's own size so it travels with the working
+    // distance instead of being a pixel count that only suits one.
+    const size = r.a ?? r.wHalf ?? 24;
+    let m = -1, bd = Infinity;
+    for (let i = 0; i < cols.length; i++) {
+      if (used.has(i) || cols[i].id !== r.id) continue;
+      const d = Math.hypot(cols[i].xc - r.xc, cols[i].yc - r.yc);
+      if (d < 0.8 * size && d < bd) { bd = d; m = i; }
+    }
+    if (m < 0) { fused.push({ ...r, axis: "row" }); continue; }
+    used.add(m);
+    worstCross = Math.max(worstCross, bd);
+    if (bd > maxCross) {
+      // Disagreement too large to be the extrapolation error alone. Keep the
+      // row pass and say so, rather than silently picking the loser.
+      crossRejected++;
+      fused.push({ ...r, axis: "row", crossPx: +bd.toFixed(2), crossRejected: true });
+      continue;
+    }
+    bothN++;
+    // x from the row pass, y from the column pass: each coordinate comes from
+    // the pass that measured it rather than the one that extrapolated it.
+    fused.push({
+      ...r, xc: r.xc, yc: cols[m].yc, a: r.a, b: cols[m].b ?? r.b,
+      axis: "both", crossPx: +bd.toFixed(2)
+    });
+  }
+  const rowIds = new Set(rows.fused.map((f) => f.id));
+  for (let i = 0; i < cols.length; i++) {
+    if (used.has(i)) continue;
+    if (rowIds.has(cols[i].id)) {
+      // Both passes claim this id, too far apart to be the same mark. One of
+      // them is wrong and nothing here says which, so keep the row pass --
+      // that is what ships -- and report the disagreement rather than emitting
+      // a duplicate id for fitHexPose to trip over.
+      conflicts.push({ id: cols[i].id, x: +cols[i].xc.toFixed(1), y: +cols[i].yc.toFixed(1) });
+      continue;
+    }
+    axisOnly.push({ ...cols[i], axis: "col" });
+  }
+  return {
+    fused,
+    unidentified: [...rows.unidentified, ...rot.unidentified.map(back)],
+    // seen by the column scan alone: real sightings, but carrying the
+    // extrapolated coordinate, so reported rather than fused
+    axisOnly,
+    conflicts,
+    bothAxes: bothN,
+    crossRejected,
+    worstCrossPx: +worstCross.toFixed(2),
+    axes: { rows, cols: rot },
+    rowsTried: rows.rowsTried + rot.rowsTried,
+    rowHits: rows.rowHits + rot.rowHits
+  };
+});};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -11467,7 +11503,7 @@ export default function define(runtime, observer) {
   $def("_rvt6ru", "detectRowMan", ["manLayout","manRowGroups","findInvolution","solveMan"], _rvt6ru);  
   $def("_1mnpthu", "detectFrameMan", ["manLayout","edges1Dsub","findInvolution","solveMan"], _1mnpthu);  
   $def("_4liiby", "cascade_md", ["md"], _4liiby);  
-  $def("_1jt47m8", "analyzeFrameMan", ["rotateFrame","unrotatePoint","manLayout","edges1Dsub","detectRowMan","fitManPose"], _1jt47m8);  
+  $def("_1jt47m8", "analyzeFrameMan", ["rotateFrame","mergeManAxes","manScanRows","clusterManRows","scanRowsMan"], _1jt47m8);  
   $def("_138kml", "fitManPose", ["manLayout"], _138kml);  
   $def("_1xa2cta", "manSceneTest", ["manScene","analyzeFrameMan"], _1xa2cta);  
   $def("_11vsmkp", "axes_md", ["md"], _11vsmkp);  
@@ -11479,7 +11515,11 @@ export default function define(runtime, observer) {
   $def("_nb5x", "plane_md", ["md"], _nb5x);  
   $def("_9ey4fu", "fitHomography", [], _9ey4fu);  
   $def("_1qa5emd", "fitHexPose", ["hexTarget","fitHomography"], _1qa5emd);  
-  $def("_nb6x", "next_md", ["md"], _nb6x);
+  $def("_nb6x", "next_md", ["md"], _nb6x);  
+  $def("_10in6wk", "manScanRows", [], _10in6wk);  
+  $def("_30gfrc", "scanRowsMan", ["edges1Dsub","detectRowMan"], _30gfrc);  
+  $def("_ezke5v", "clusterManRows", ["manLayout","fitManPose"], _ezke5v);  
+  $def("_1m3an4z", "mergeManAxes", ["unrotatePoint"], _1m3an4z);
   return main;
 }
 </script>
