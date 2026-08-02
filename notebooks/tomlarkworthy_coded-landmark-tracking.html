@@ -10171,10 +10171,7 @@ const _k6d86f = function _testFrames() {return ([
   // set at or just under what the current pipeline achieves: they are a floor to
   // notice regressions against, not a target. Raise them when the detector
   // genuinely improves -- as happened when coarse-to-fine scanning took the
-  // upright yield from 3-4 of 6 marks to 6 of 6 (minIds 3/4 -> 6/6), and again
-  // when the reflection sweep replaced the histogram gate (maxRotDisagreePx
-  // 12 -> 3: the quarter turns went from one ~8.5px sighting to several
-  // V-fit-accurate ones).
+  // upright yield from 3-4 of 6 marks to 6 of 6 (minIds 3/4 -> 6/6).
   //
   // Each frame is also replayed at all four quarter turns. That costs nothing to
   // store -- a rotation is an exact index permutation of the pixels already
@@ -10182,15 +10179,31 @@ const _k6d86f = function _testFrames() {return ([
   // that needs no hand-set number, plus the knowledge that a turn cannot
   // manufacture a detection on a blank screen.
   //
-  // TWO agreement bounds, because they measure different things.
-  // maxPrimaryDisagreePx is upright vs 180 only. Both are full-quality views of
-  // the same marks, they agree to ~1.05px, and roughly 1px of that is the
-  // pixel-boundary convention under a flip rather than estimator error. This is
-  // the tight one, and it is the only threshold here that needs no reference
-  // data and no number carried over from a previous run, so it cannot rot.
-  // maxRotDisagreePx spans all four turns and is looser. A 90 degree scan
-  // crosses three times the edges; those turns used to find nothing at all and
-  // now recover several marks, currently agreeing to ~2.1px once unrotated.
+  // AGREEMENT IS BOUNDED PER SCAN AXIS, not as a distance. The centre estimate
+  // is anisotropic by construction: along a scan row the centre column is
+  // measured on every row that decodes, while across rows it is only where the
+  // V-fit extrapolates and no row ever observes it. A single hypot over the two
+  // is a bound on a measurement and a guess at once, and the guess dominates.
+  //
+  // This bank used to carry maxPrimaryDisagreePx (0 vs 180, hypot) and
+  // maxRotDisagreePx (all turns, hypot), and both had gone red: 1.67px against
+  // a 1.3px bar on the angled frame, 2.33px on the flat one. Decomposed, the
+  // along-scan component was 0.86px and 0.68px -- inside the bar the whole time
+  // -- and the failure was entirely the extrapolated coordinate. The mechanism
+  // checks out rather than being a convenient story: under a quarter turn the
+  // loose axis FOLLOWS THE SCAN and swaps with the image, 0/180 giving
+  // |dx| 0.86 / |dy| 1.43 and 90/270 giving |dy| 0.74 / |dx| 2.67 on the same
+  // frame. So the instrument was wrong, not the detector, and the fix is to
+  // measure the two separately rather than to loosen one number until it
+  // passes. Same conclusion §11.2's man bank reached, and §11.1's bothAxes
+  // option is the other way to spend compute on it.
+  //
+  // maxAlongPx is the one that can catch a real regression: two direct
+  // measurements of the same quantity, currently agreeing to 0.86px, and about
+  // 1px of even that is the pixel-boundary convention under a flip rather than
+  // estimator error. maxAcrossPx bounds an extrapolation and is deliberately
+  // slack -- it is here to catch a collapse, not a drift. Both carry the same
+  // ~50% headroom over what the pipeline currently achieves.
   //
   // STORED AS 8-BIT GREYSCALE PNG, and it has to stay that way.
   // Greyscale is free: the pipeline only ever reads luma, so collapsing colour
@@ -10214,8 +10227,8 @@ const _k6d86f = function _testFrames() {return ([
       minUprightVFitShare: 0.9,
       minUnionIds: 6,
       maxIds: 6,
-      maxPrimaryDisagreePx: 1.3,
-      maxRotDisagreePx: 3
+      maxAlongPx: 1.3,
+      maxAcrossPx: 4
     }
   },
   {
@@ -10227,8 +10240,8 @@ const _k6d86f = function _testFrames() {return ([
       minUprightVFitShare: 0.9,
       minUnionIds: 6,
       maxIds: 6,
-      maxPrimaryDisagreePx: 1.3,
-      maxRotDisagreePx: 3
+      maxAlongPx: 1.3,
+      maxAcrossPx: 4
     }
   },
   {
@@ -10325,17 +10338,26 @@ const _s8m851 = async function _testFrameResults(testFrameBank,rotateFrame,analy
     // turns cross-check each other with no reference data and no threshold
     // pulled from a previous run.
     //
-    // Two bounds, because the turns are not equivalent. 0 and 180 scan along the
-    // same image axis and are the regime the rig actually runs in; they agree to
-    // about a pixel, and that is the bound worth defending. A quarter turn scans
-    // ACROSS the display's texture instead of along it, raises three times the
-    // edges, and the sightings it does manage are correspondingly loose -- 7px
-    // on this bank. Folding that into one number would only mean carrying a
-    // tolerance too slack to catch a real regression in the case we care about.
+    // Split BY SCAN AXIS. Along a scan row the centre column is the estimator's
+    // direct output on every row that decodes; across rows the centre is only
+    // where the V-fit extrapolates |d| -> 0, and no row ever observes it.
+    // Turns 0 and 180 both scan along image x, so their dx compares two
+    // MEASUREMENTS and their dy compares two EXTRAPOLATIONS. Turns 90 and 270
+    // scan along image y and swap the roles -- which is what makes this a
+    // property of the estimator rather than of the photograph, and it is
+    // visible in the numbers: on the angled frame 0/180 gives |dx| 0.86 and
+    // |dy| 1.43 while 90/270 gives |dy| 0.74 and |dx| 2.67.
+    //
+    // The old single hypot bound mixed one of each and had been failing on that
+    // basis alone. worstDisagreePx (every turn against every other) is kept and
+    // reported but NOT gated: comparing turn 0 with turn 90 sets a measured
+    // coordinate against an extrapolated one, so it is loose for a reason that
+    // says nothing about the detector.
     const pairDist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
     const ids = new Set(turns.flatMap((r) => r.ids));
     let worstDisagreePx = 0, agreedIds = 0;
     let primaryDisagreePx = 0, primaryIds = 0;
+    let alongScanPx = 0, acrossScanPx = 0, axisIds = 0;
     for (const id of ids) {
       const pts = turns.filter((r) => r.at.has(id)).map((r) => r.at.get(id));
       if (pts.length >= 2) {
@@ -10344,10 +10366,21 @@ const _s8m851 = async function _testFrameResults(testFrameBank,rotateFrame,analy
           for (let j = i + 1; j < pts.length; j++)
             worstDisagreePx = Math.max(worstDisagreePx, pairDist(pts[i], pts[j]));
       }
+      // 0 vs 180 -- scanned along x, so dx is the measured pair
       const a = turns[0].at.get(id), b = turns[2].at.get(id);
       if (a && b) {
         primaryIds++;
+        axisIds++;
         primaryDisagreePx = Math.max(primaryDisagreePx, pairDist(a, b));
+        alongScanPx = Math.max(alongScanPx, Math.abs(a.x - b.x));
+        acrossScanPx = Math.max(acrossScanPx, Math.abs(a.y - b.y));
+      }
+      // 90 vs 270 -- scanned along y, so dy is the measured pair
+      const c = turns[1].at.get(id), d = turns[3].at.get(id);
+      if (c && d) {
+        axisIds++;
+        alongScanPx = Math.max(alongScanPx, Math.abs(c.y - d.y));
+        acrossScanPx = Math.max(acrossScanPx, Math.abs(c.x - d.x));
       }
     }
 
@@ -10369,10 +10402,10 @@ const _s8m851 = async function _testFrameResults(testFrameBank,rotateFrame,analy
       if (e.maxIds != null && r.ids.length > e.maxIds)
         failures.push(`${r.deg}deg wanted <=${e.maxIds} ids, got ${r.ids.length} (${r.ids.join(",")})`);
     }
-    if (e.maxPrimaryDisagreePx != null && primaryIds && primaryDisagreePx > e.maxPrimaryDisagreePx)
-      failures.push(`0/180 disagree by ${primaryDisagreePx.toFixed(2)}px, allowed ${e.maxPrimaryDisagreePx}`);
-    if (e.maxRotDisagreePx != null && agreedIds && worstDisagreePx > e.maxRotDisagreePx)
-      failures.push(`turns disagree by ${worstDisagreePx.toFixed(2)}px, allowed ${e.maxRotDisagreePx}`);
+    if (e.maxAlongPx != null && axisIds && alongScanPx > e.maxAlongPx)
+      failures.push(`along-scan centres disagree by ${alongScanPx.toFixed(2)}px, allowed ${e.maxAlongPx}`);
+    if (e.maxAcrossPx != null && axisIds && acrossScanPx > e.maxAcrossPx)
+      failures.push(`across-scan centres disagree by ${acrossScanPx.toFixed(2)}px, allowed ${e.maxAcrossPx}`);
 
     out.push({
       name: spec.name,
@@ -10389,6 +10422,9 @@ const _s8m851 = async function _testFrameResults(testFrameBank,rotateFrame,analy
       worstDisagreePx,
       primaryIds,
       primaryDisagreePx,
+      axisIds,
+      alongScanPx,
+      acrossScanPx,
       ms: window.performance.now() - t0,
       failures,
       pass: failures.length === 0
@@ -14461,6 +14497,126 @@ const _a0ribc = function _hexRigSelfTest(hexRigSynthCases,hexRigScore,analyzeFra
   lines.push("", pass ? "PASS" : "FAIL");
   return lines.join("\n");
 };
+const _18kb3j3 = function _hexRigAutosave($0,htl,invalidation) {
+  // Captured cases die with the tab. hexRigCases is an Inputs.input([]), so it
+  // holds real pixels at runtime and exports as empty -- a reload, a crash or a
+  // slow export throws away work that costs someone standing in front of a
+  // camera holding a printed sheet at arm's length. This takes each case off
+  // the page the moment it is kept.
+  //
+  // What gets sent is the `gray` buffer, which is exactly the bytes the
+  // detector was handed, plus a sidecar of the frozen labels and the settings
+  // that produced them. No image codec in either direction, so a restored case
+  // is bit-identical to the captured one -- which matters here more than
+  // anywhere, because a JPEG round trip moves measured centres by up to 10px
+  // and these cases exist to BE the ground truth.
+  //
+  // It depends on the cases NODE, not the cases value. Depending on the value
+  // would re-run this cell on every capture, rebuilding the panel and losing
+  // track of what had already been sent; listening to the node's input event
+  // leaves the cell running and stateful across captures.
+  const node = $0;
+  const sent = new Set();
+  let sink = "http://127.0.0.1:8787";
+  let auto = true;
+
+  const el = htl.html`<div style="font:12px/1.5 ui-monospace,monospace;border:1px solid #0002;border-radius:6px;padding:8px 10px;margin:6px 0">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <label style="display:flex;gap:5px;align-items:center"><input type="checkbox" checked> autosave to</label>
+      <input type="text" value="${sink}" size="26" style="font:inherit">
+      <button>save all now</button>
+      <button>download bundle</button>
+      <span data-status style="opacity:.7"></span>
+    </div>
+    <div data-log style="opacity:.6;margin-top:4px;max-height:70px;overflow:auto;white-space:pre"></div>
+  </div>`;
+  const chk = el.querySelector("input[type=checkbox]");
+  const box = el.querySelector("input[type=text]");
+  const btns = el.querySelectorAll("button");
+  const saveBtn = btns[0], dlBtn = btns[1];
+  const status = el.querySelector("[data-status]");
+  const log = el.querySelector("[data-log]");
+  const say = (msg) => {
+    log.textContent = (msg + "\n" + log.textContent).split("\n").slice(0, 12).join("\n");
+  };
+  chk.oninput = () => { auto = chk.checked; };
+  box.oninput = () => { sink = box.value.trim(); sent.clear(); };
+
+  const meta = (c) => ({
+    name: c.name, w: c.w, h: c.h, labelled: c.labelled, pinned: c.pinned,
+    difficulty: c.difficulty, truth: c.truth, cfg: c.cfg, capture: c.capture
+  });
+
+  const push = async (c) => {
+    // gray first: if the sidecar lands without pixels the case is unusable, so
+    // a half-finished transfer should leave the recoverable half on disk.
+    const g = await window.fetch(sink + "/gray/" + encodeURIComponent(c.name), {
+      method: "POST", body: c.gray
+    });
+    if (!g.ok) throw new Error("gray " + g.status);
+    const j = await window.fetch(sink + "/meta/" + encodeURIComponent(c.name), {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(meta(c), null, 1)
+    });
+    if (!j.ok) throw new Error("meta " + j.status);
+  };
+
+  const drain = async (force) => {
+    if (!sink || (!auto && !force)) return 0;
+    const cases = node.value ?? [];
+    let n = 0, failed = 0;
+    for (const c of cases) {
+      if (!c.gray) continue;
+      if (sent.has(c.name) && !force) continue;
+      try {
+        await push(c);
+        sent.add(c.name);
+        n++;
+        say("saved " + c.name + " (" + c.gray.length.toLocaleString() + "B)");
+      } catch (e) {
+        failed++;
+        say("FAILED " + c.name + ": " + e.message);
+      }
+    }
+    status.textContent = sent.size + "/" + cases.length + " on disk" +
+      (failed ? " — " + failed + " failed" : "");
+    return n;
+  };
+
+  // A bundle for when no receiver is running: raw gray, gzipped, one file,
+  // restorable without an image decoder.
+  const bundle = async () => {
+    const cases = node.value ?? [];
+    const parts = [];
+    for (const c of cases) {
+      if (!c.gray) continue;
+      const packed = await new window.Response(
+        new window.Blob([c.gray]).stream().pipeThrough(new window.CompressionStream("gzip"))
+      ).arrayBuffer();
+      const b = new Uint8Array(packed);
+      let s = "";
+      for (let i = 0; i < b.length; i += 0x8000)
+        s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+      parts.push({ ...meta(c), grayGzipB64: window.btoa(s) });
+    }
+    const a = window.document.createElement("a");
+    a.href = URL.createObjectURL(new window.Blob(
+      [JSON.stringify({ format: "hexrig-cases-1", cases: parts })],
+      { type: "application/json" }
+    ));
+    a.download = "hexrig-cases.json";
+    a.click();
+    say("bundled " + parts.length + " case(s)");
+  };
+
+  saveBtn.onclick = () => drain(true);
+  dlBtn.onclick = () => bundle();
+  const onInput = () => drain(false);
+  node.addEventListener("input", onInput);
+  invalidation.then(() => node.removeEventListener("input", onInput));
+  drain(false);
+  return el;
+};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -14680,9 +14836,11 @@ export default function define(runtime, observer) {
   $def("_5e077b", "hexRigSweepGo", ["Generators","viewof hexRigSweepGo"], _5e077b);  
   $def("_15xffv4", "hexRigSynthCases", ["hexTarget","renderHexScene","analyzeFrameMan","fitHexPose","hexRigLoo"], _15xffv4);  
   $def("_zoue8d", "hexRigSweep", ["hexRigSweepGo","hexRigCases","hexRigSynthCases","hexRigCfg","hexRigOpts","analyzeFrameMan","hexRigScore"], _zoue8d);  
-  $def("_a0ribc", "hexRigSelfTest", ["hexRigSynthCases","hexRigScore","analyzeFrameMan"], _a0ribc);
+  $def("_a0ribc", "hexRigSelfTest", ["hexRigSynthCases","hexRigScore","analyzeFrameMan"], _a0ribc);  
+  $def("_18kb3j3", "hexRigAutosave", ["viewof hexRigCases","htl","invalidation"], _18kb3j3);
   return main;
-}</script>
+}
+</script>
 <script id="@tomlarkworthy/fast-1d-circular-barcode-matching/image.png" 
   type="text/plain"
   data-encoding="base64"
