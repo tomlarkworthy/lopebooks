@@ -12133,12 +12133,11 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
   // on the extrapolated one. Scanning the transposed frame turns that around,
   // so between them the two passes measure both coordinates directly.
   //
-  // OFF BY DEFAULT, AND THE MEASUREMENTS SAY IT SHOULD STAY THAT WAY. On 25
-  // real captures of the printed sheet (§11.5 archive) it never once found an
-  // extra mark, cost ~3x the time, and moved worst-case leave-one-out from a
-  // median 2.00px (rows only) to 2.70px. It is kept because it is the only
-  // independent check on the extrapolated coordinate, not because it is a
-  // better detector.
+  // OFF BY DEFAULT, AND THE MEASUREMENTS SAY IT SHOULD STAY THAT WAY. On the
+  // real captures in the §11.5 archive it never once found an extra mark,
+  // cost ~3x the time, and its median leave-one-out is worse than rows only.
+  // It is kept because it is the only independent check on the extrapolated
+  // coordinate, not because it is a better detector.
   //
   // Two corrections the real frames forced, both of which the rendered scene
   // in manAxesTest was too clean to expose:
@@ -12300,11 +12299,35 @@ const _1jt47m8 = function _analyzeFrameMan(rotateFrame,unrotatePoint,manLayout,e
       wHalf: c.wHalf
     });
   }
+
+  // One id is one piece of paper. Two clusters carrying it means either a
+  // mark was locked twice at slightly different feet -- which manRowGroups'
+  // offerWhole makes possible, since it deliberately offers a split AND the
+  // unsplit run -- or one of them is clutter that voted the same payload.
+  // Either way, handing fitHexPose two points for a single landmark gives the
+  // homography contradictory evidence about where that landmark is, which is
+  // exactly the instability this detector is supposed to remove. Keep the
+  // better-evidenced cluster (most rows, then vote margin, then coverage) and
+  // demote the other rather than letting the fit arbitrate.
+  const confirmed = all.filter((f) => f.id != null && f.posed);
+  const rejected = all.filter((f) => !(f.id != null && f.posed));
+  const byId = new Map();
+  for (const f of confirmed) {
+    const prev = byId.get(f.id);
+    if (!prev) { byId.set(f.id, f); continue; }
+    const wins =
+      f.rows !== prev.rows ? f.rows > prev.rows
+      : f.voteMargin !== prev.voteMargin ? f.voteMargin > prev.voteMargin
+      : (f.cover ?? 0) > (prev.cover ?? 0);
+    byId.set(f.id, wins ? f : prev);
+    rejected.push({ ...(wins ? prev : f), why: "duplicate-id" });
+  }
+
   return {
-    fused: all.filter((f) => f.id != null && f.posed),
+    fused: [...byId.values()],
     // located but not confirmed: kept separate so a caller can show them
     // (useful when aiming the camera) without treating them as detections
-    unidentified: all.filter((f) => !(f.id != null && f.posed)),
+    unidentified: rejected,
     rowsTried, rowHits, ms: window.performance.now() - t0
   };
 });};
@@ -12426,7 +12449,9 @@ opinion of itself. On this scene the worst disagreement was 5.5px against a
 true worst y error of 6.0px — the right size to believe. Compare
 [§11.5](#hexRig_md), where a fit's own residual claimed 1.39px while the labels
 it produced were 66px out.`);};
-const _9mkcus = function _manAxesTest(manScene,analyzeFrameMan,rotateFrame,unrotatePoint) {
+const _9mkcus = function anonymous(manScene,analyzeFrameMan,rotateFrame,unrotatePoint
+) {
+
   // Does scanning the other way actually buy anything? Measured against the
   // renderer's truth, which neither pass sees, on the same four-mark scene the
   // cascade regression uses.
@@ -12492,7 +12517,13 @@ const _9mkcus = function _manAxesTest(manScene,analyzeFrameMan,rotateFrame,unrot
   // The claim being tested, stated as pass/fail rather than left to the reader.
   const checks = [
     ["row scan is better in x than in y", eR.yMean > eR.xMean],
-    ["column scan is better in y than in x", eC.xMean > eC.yMean],
+    // NOT "the column pass beats itself on its own scan axis". On a clean
+    // render both of its errors are sub-pixel and which one wins is noise:
+    // this passed on 1.01 vs 0.96 and flipped to 0.75 vs 0.97 the moment
+    // segmentation improved the extrapolated coordinate. The load-bearing
+    // claim is that the column pass measures y better than the ROW pass
+    // does -- that is the asymmetry bothAxes exploits -- and it holds by ~3x.
+    ["column scan measures y better than the row scan does", eC.yMean < eR.yMean],
     ["both-axes y beats row-only y", eB.yMean <= eR.yMean],
     ["both-axes x is no worse than row-only x", eB.xMean <= eR.xMean + 1e-9],
     ["both-axes finds no fewer marks", eB.found >= eR.found],
@@ -12505,6 +12536,7 @@ const _9mkcus = function _manAxesTest(manScene,analyzeFrameMan,rotateFrame,unrot
   for (const [what, ok] of checks) out.push(`${ok ? "ok  " : "FAIL"} ${what}`);
   out.push("", checks.every(([, ok]) => ok) ? "PASS" : "FAIL");
   return out.join("\n");
+
 };
 const _15441wy = function _markFamily(Inputs) {return (Inputs.radio(["man", "classic"], {
   label: "mark family",
