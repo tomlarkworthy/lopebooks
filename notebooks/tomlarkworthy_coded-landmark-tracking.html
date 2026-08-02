@@ -7694,13 +7694,61 @@ const _1tf4dro = async function* _liveRun(liveOn,liveStream,liveView,liveVideo,m
   const cap = window.document.createElement("canvas");
   let W = 0, H = 0, ctx = null, gray = null;
   let n = 0, lastYield = 0;
+  let waitStart = 0, playTries = 0, lastPlay = 0;
   const fps = [];
   const esc = (s) => String(s).replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp;"));
 
   while (true) {
     await new Promise((r) => window.requestAnimationFrame(r));
     const v = liveVideo;
-    if (!v || v.readyState < 2 || !v.videoWidth) continue;
+    if (!v || v.readyState < 2 || !v.videoWidth) {
+      // A phone can grant permission and still never deliver a frame. The old
+      // `continue` spun here silently -- a grey box, an empty HUD, and no way
+      // to tell which of the three possible failures it was. So: report what
+      // the element is actually doing, and retry play() from HERE, where the
+      // video is mounted. liveVideo sets srcObject while the element is still
+      // detached; mobile Safari evaluates autoplay at that moment and does not
+      // re-evaluate on insertion, so the element can sit paused forever.
+      const now = window.performance.now();
+      if (!waitStart) waitStart = now;
+      if (v && v.paused && now - lastPlay > 700) {
+        lastPlay = now;
+        playTries++;
+        try {
+          await v.play();
+        } catch (e) {}
+      }
+      // Past a few silent retries the only thing left is a user gesture, which
+      // a phone can supply and a render loop cannot.
+      if (playTries >= 3 && !liveView.onclick) {
+        liveView.style.cursor = "pointer";
+        liveView.onclick = () => {
+          try {
+            v.play();
+          } catch (e) {}
+        };
+      }
+      const tr =
+        liveStream && liveStream.getVideoTracks ? liveStream.getVideoTracks()[0] : null;
+      const st = tr && tr.getSettings ? tr.getSettings() : null;
+      liveView.hud.textContent =
+        `waiting for video ${((now - waitStart) / 1000).toFixed(1)}s` +
+        ` · readyState ${v ? v.readyState : "-"}` +
+        (v ? (v.paused ? " · PAUSED" : " · playing") : "") +
+        (playTries ? ` · ${playTries} play retries` : "") +
+        (tr
+          ? ` · track ${tr.readyState}${tr.muted ? " MUTED" : ""}` +
+            (st && st.width ? ` ${st.width}x${st.height}` : "")
+          : " · no video track") +
+        (playTries >= 3 ? " · tap the box to start" : "");
+      continue;
+    }
+    if (waitStart) {
+      waitStart = 0;
+      playTries = 0;
+      liveView.onclick = null;
+      liveView.style.cursor = "";
+    }
     // Cap the working resolution rather than using whatever the camera gives:
     // detection cost is per row and per window, so a 1920 capture costs triple
     // a 960 one for marks that are already far above the pixel floor.
