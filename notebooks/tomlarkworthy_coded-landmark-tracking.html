@@ -7845,6 +7845,188 @@ const _1di846o = function _hexRigView(htl) {
   clear.onclick = () => { el.wantClear = true; };
   return el;
 };
+const _lumcap0 = function _lumaCapture() {return (function makeLumaCapture() {
+  // Getting the luma out of a camera, by the cheapest route the browser
+  // actually offers rather than the one everyone writes.
+  //
+  // The obvious pipeline -- drawImage into a 2D canvas, getImageData, weighted
+  // sum to gray -- costs 5.1 + 17.7 + 1.7 ms on a mid-range Android at
+  // 960x1280. The 17.7 is a GPU-to-CPU readback of 4.9MB of RGBA. But a camera
+  // does not produce RGBA: it produces I420 or NV12, whose FIRST PLANE IS THE
+  // LUMA. WebCodecs will hand that over directly for 1.4ms. The whole detour
+  // exists to reconstruct something the hardware already had.
+  //
+  // Everything here is capability-detected and falls back to the old path, so
+  // a browser without WebCodecs, a camera that reports RGBA, or a frame the
+  // caller wants at a different size all still work -- more slowly, and
+  // saying so through `path`.
+  const LUMA_FIRST = /^(I420|I422|I444|NV12|NV21)/;  // formats whose plane 0 is Y
+  let W = 0, H = 0;
+  let cvs = null, ctx = null;      // fallback surface
+  let raw = null, packed = null;   // fast-path buffers
+  let lut = null;
+  let gray = null;
+  let full = false;
+
+  const size = (w, h) => {
+    if (w === W && h === H) return;
+    W = w; H = h;
+    gray = new Uint8Array(W * H);
+    raw = null; packed = null; cvs = null; ctx = null;
+  };
+
+  const fallbackSurface = () => {
+    if (ctx) return;
+    cvs = window.document.createElement("canvas");
+    cvs.width = W; cvs.height = H;
+    // willReadFrequently asks for a CPU-backed surface. It makes the readback
+    // less catastrophic and the drawImage worse; on this path we do both, so
+    // it is still the right side of that trade.
+    ctx = cvs.getContext("2d", { willReadFrequently: true });
+  };
+
+  // BT.601 limited range (16-235) to full range. The old path derived luma
+  // from RGB that the decoder had ALREADY expanded to full range, so without
+  // this the two paths differ by a scale and an offset -- edge magnitudes
+  // shrink by 219/255 and every tuned threshold, and every archived case,
+  // quietly means something else. One table lookup per pixel is cheaper than
+  // the three multiplies the old conversion cost, so correctness here is free.
+  const buildLut = () => {
+    lut = new Uint8Array(256);
+    for (let v = 0; v < 256; v++) {
+      const x = Math.round(((v - 16) * 255) / 219);
+      lut[v] = x < 0 ? 0 : x > 255 ? 255 : x;
+    }
+  };
+
+  const api = {
+    path: "unknown",
+    format: null,
+    fullRange: null,
+    why: "",
+    ms: 0,
+
+    // Fill `gray` for this frame. `rows` is only consulted on the fallback
+    // path, where converting the whole frame costs real time and the scan
+    // needs a quarter of it; the fast path always has every row and says so
+    // through `full`, which is what lets bothAxes and case capture skip their
+    // extra pass entirely.
+    grab: async (video, w, h, rows) => {
+      size(w, h);
+      const t0 = window.performance.now();
+      full = false;
+
+      // The fast path cannot resize -- copyTo crops, it does not scale -- so a
+      // caller asking for anything but the camera's own dimensions gets the
+      // slow one. Worth stating rather than silently degrading.
+      const native = video.videoWidth === W && video.videoHeight === H;
+      if (typeof window.VideoFrame === "function" && native && api.path !== "getimagedata-forced") {
+        let frame = null;
+        try {
+          frame = new window.VideoFrame(video);
+          const fmt = frame.format || "";
+          if (!LUMA_FIRST.test(fmt)) {
+            api.why = `format ${fmt} has no luma plane`;
+            frame.close();
+          } else {
+            const need = frame.allocationSize();
+            if (!raw || raw.length < need) raw = new Uint8Array(need);
+            const layout = await frame.copyTo(raw);
+            const cs = frame.colorSpace;
+            const fr = cs && cs.fullRange;
+            frame.close();
+            frame = null;
+            const { offset, stride } = layout[0];
+            // Plane 0 may be padded to a hardware-friendly stride, and often
+            // is not. Only repack when it actually differs.
+            let y;
+            if (stride === W) {
+              y = raw.subarray(offset, offset + W * H);
+            } else {
+              if (!packed || packed.length !== W * H) packed = new Uint8Array(W * H);
+              for (let r = 0; r < H; r++)
+                packed.set(raw.subarray(offset + r * stride, offset + r * stride + W), r * W);
+              y = packed;
+            }
+            if (fr === false) {
+              if (!lut) buildLut();
+              for (let i = 0, n = W * H; i < n; i++) gray[i] = lut[y[i]];
+            } else {
+              gray.set(y);
+            }
+            api.path = "videoframe";
+            api.format = fmt;
+            api.fullRange = fr == null ? null : !!fr;
+            api.why = "";
+            full = true;
+            api.ms = window.performance.now() - t0;
+            return { gray, full, path: api.path };
+          }
+        } catch (e) {
+          if (frame) try { frame.close(); } catch (e2) {}
+          api.why = "VideoFrame: " + (e && e.message ? e.message : String(e));
+        }
+      } else if (!native) {
+        api.why = `frame requested at ${W}x${H}, camera is ${video.videoWidth}x${video.videoHeight}`;
+      } else if (typeof window.VideoFrame !== "function") {
+        api.why = "no WebCodecs";
+      }
+
+      fallbackSurface();
+      ctx.drawImage(video, 0, 0, W, H);
+      const px = ctx.getImageData(0, 0, W, H).data;
+      api._px = px;
+      const row = (yy) => {
+        const b = yy * W;
+        for (let x = 0, p = b * 4; x < W; x++, p += 4)
+          gray[b + x] = (px[p] * 77 + px[p + 1] * 150 + px[p + 2] * 29) >> 8;
+      };
+      if (rows) { for (const yy of rows) row(yy); }
+      else { for (let yy = 0; yy < H; yy++) row(yy); full = true; }
+      api._row = row;
+      api.path = "getimagedata";
+      api.format = "RGBA";
+      api.ms = window.performance.now() - t0;
+      return { gray, full, path: api.path };
+    },
+
+    // Fallback only: convert the rows grab() was allowed to skip. A no-op on
+    // the fast path, which is the point -- callers stop having to know which
+    // path they are on.
+    ensureFull: () => {
+      if (full) return gray;
+      for (let yy = 0; yy < H; yy++) api._row(yy);
+      full = true;
+      return gray;
+    },
+
+    // Do the two paths agree? Same bar as poolAgreement: run both on ONE
+    // frame and report the difference rather than assert a number nobody
+    // measured. They cannot be identical -- the RGB path has been through
+    // YUV->RGB->luma with rounding at each step -- so this reports the
+    // distribution and lets the reader judge.
+    compare: async (video, w, h) => {
+      const a = await api.grab(video, w, h);
+      if (a.path !== "videoframe") return { note: "fast path unavailable: " + api.why };
+      const fast = gray.slice();
+      const was = api.path;
+      api.path = "getimagedata-forced";
+      await api.grab(video, w, h);
+      api.path = was;
+      let max = 0, sum = 0;
+      const n = w * h;
+      for (let i = 0; i < n; i++) {
+        const d = Math.abs(fast[i] - gray[i]);
+        if (d > max) max = d;
+        sum += d;
+      }
+      gray.set(fast);
+      full = true;
+      return { format: api.format, fullRange: api.fullRange, maxDiff: max, meanDiff: +(sum / n).toFixed(3), px: n };
+    }
+  };
+  return api;
+});};
 const _1lt19nm = function _hexRigOpts(hexRigCfg,manLayout) {
   // One options object, used by BOTH the live loop and the offline sweep.
   // Sharing it is the point: a knob the sweep can move but the live view
@@ -7958,7 +8140,7 @@ const _1epdu7f = function _hexRigScore() {return (function hexRigScore(res, trut
 });};
 const _q7egru = function _hexRigCases(Inputs) {return (Inputs.input([]));};
 const _cih7ns = (G, _) => G.input(_);
-const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCfg,analyzeFrameMan,analyzeFrameManAsync,detectPool,hexRigOpts,fitHexPose,hexRigLoo,manScanRows) {
+const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCfg,analyzeFrameMan,analyzeFrameManAsync,detectPool,hexRigOpts,fitHexPose,hexRigLoo,manScanRows,lumaCapture) {
   // The calibration rig. Point the camera at the printed §11.4 sheet and it
   // does three things at once:
   //
@@ -8011,9 +8193,12 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     }
   }
 
+  // No willReadFrequently: nothing reads this canvas back per frame any more,
+  // so it stays a GPU surface and drawImage stays ~0.1ms.
   const ctxOut = view.cap.getContext("2d");
-  const work = window.document.createElement("canvas");
-  let W = 0, H = 0, ctx = null, gray = null;
+  const luma = lumaCapture();
+  view.luma = luma;
+  let W = 0, H = 0, gray = null;
   let lastCap = -1e9, lastYield = 0, n = 0, kept = 0;
   // The counter restarts at 0 in every tab, so a bare hexcase-NN silently
   // OVERWROTE earlier captures on the receiver -- four frames were lost that
@@ -8089,15 +8274,17 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     const th = Math.round((v.videoHeight * tw) / v.videoWidth);
     if (tw !== W || th !== H) {
       W = tw; H = th;
-      work.width = W; work.height = H;
       view.cap.width = W; view.cap.height = H;
-      ctx = work.getContext("2d", { willReadFrequently: true });
-      gray = new Uint8Array(W * H);
       view.overlay.setAttribute("viewBox", `0 0 ${W} ${H}`);
     }
+    // Capture and luma in one step when the browser allows it. `cap` is now
+    // the whole cost of getting a gray buffer; on the fast path `gray` is
+    // nothing, because there is no conversion left to do.
     const tCap = window.performance.now();
-    ctx.drawImage(v, 0, 0, W, H);
-    const px = ctx.getImageData(0, 0, W, H).data;
+    const grabbed = await luma.grab(
+      v, W, H, hexRigOpts.bothAxes ? null : manScanRows({ w: W, h: H }, hexRigOpts)
+    );
+    gray = grabbed.gray;
     stage("cap", tCap);
     const tGray = window.performance.now();
     // Convert only the rows the scan is going to read. At stride 4 that is a
@@ -8108,16 +8295,12 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     // ask for a full pass. Rows nobody converted keep whatever the previous
     // frame left there, which is why neither of those may read this buffer
     // without filling it first.
-    const grayRow = (y) => {
-      const b = y * W;
-      for (let x = 0, p = b * 4; x < W; x++, p += 4)
-        gray[b + x] = (px[p] * 77 + px[p + 1] * 150 + px[p + 2] * 29) >> 8;
-    };
-    const grayAll = () => { for (let y = 0; y < H; y++) grayRow(y); };
-    if (hexRigOpts.bothAxes) grayAll();
-    else for (const y of manScanRows({ w: W, h: H }, hexRigOpts)) grayRow(y);
+    const grayAll = () => luma.ensureFull();
     stage("gray", tGray);
-    ctxOut.drawImage(work, 0, 0);
+    // Straight from the video to the visible canvas: 0.1ms, because it never
+    // leaves the GPU. The old path drew the CPU-side copy here, which is only
+    // necessary if you already paid to bring the pixels down.
+    ctxOut.drawImage(v, 0, 0, W, H);
 
     const t = window.performance.now();
     const res = await analyzeFrameManAsync({ gray, w: W, h: H }, poolOpts);
@@ -8219,7 +8402,9 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
         w: W, h: H,
         // a copy: the loop reuses this buffer every frame
         gray: gray.slice(),
-        url: work.toDataURL("image/png"),
+        // the visible canvas holds exactly the analysed frame -- the overlay is
+        // a sibling SVG, so nothing drawn on top can contaminate a stored case
+        url: view.cap.toDataURL("image/png"),
         labelled,
         pinned: manual,
         difficulty,
@@ -8258,7 +8443,8 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     // marks under the panel, so below ~560px say the same things shorter.
     const narrow = (view.overlay.clientWidth || W) < 560;
     view.hud.textContent = narrow
-      ? `${W}×${H} ${whole.toFixed(0)}ms [${budget}] ${detectPool ? detectPool.size + "w" : "1t"}  ` +
+      ? `${W}×${H} ${whole.toFixed(0)}ms [${budget}] ${detectPool ? detectPool.size + "w" : "1t"}` +
+        `${luma.path === "videoframe" ? " vf" : " gid"}  ` +
         (pose.ok
           ? `${c.read}r ${c.located}l ${c.missing}m ${c.misplaced}x` +
             (pose.offTarget.length ? ` ${pose.offTarget.length}?` : "") +
@@ -8269,7 +8455,8 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
       : `${W}x${H} ${whole.toFixed(0)}ms frame (cap ${stageMed("cap").toFixed(1)}` +
         ` gray ${stageMed("gray").toFixed(1)} scan ${stageMed("scan").toFixed(1)}` +
         ` fit ${stageMed("fit").toFixed(1)} draw ${stageMed("draw").toFixed(1)})` +
-        ` ${detectPool ? detectPool.size + "w" : "1t"}  ` +
+        ` ${detectPool ? detectPool.size + "w" : "1t"}` +
+        ` ${luma.path === "videoframe" ? "luma " + luma.format : "rgba readback" + (luma.why ? " (" + luma.why + ")" : "")}  ` +
       (pose.ok
         ? `read ${c.read} located ${c.located} missing ${c.missing} misplaced ${c.misplaced}` +
           (pose.offTarget.length ? ` off ${pose.offTarget.length}` : "") +
@@ -12209,13 +12396,14 @@ export default function define(runtime, observer) {
   $def("_1sh7vi3", "liveVideo", ["htl","liveStream","invalidation"], _1sh7vi3);  
   $def("_ktbd9n", "viewof hexRigCfg", ["Inputs"], _ktbd9n);  
   $def("_1pvjep3", "hexRigCfg", ["Generators","viewof hexRigCfg"], _1pvjep3);  
-  $def("_1di846o", "hexRigView", ["htl"], _1di846o);  
+  $def("_1di846o", "hexRigView", ["htl"], _1di846o);
+  $def("_lumcap0", "lumaCapture", [], _lumcap0);  
   $def("_1lt19nm", "hexRigOpts", ["hexRigCfg","manLayout"], _1lt19nm);  
   $def("_gwo9xk", "hexRigLoo", ["hexTarget","fitHomography"], _gwo9xk);  
   $def("_1epdu7f", "hexRigScore", [], _1epdu7f);  
   $def("_q7egru", "viewof hexRigCases", ["Inputs"], _q7egru);  
   $def("_cih7ns", "hexRigCases", ["Generators","viewof hexRigCases"], _cih7ns);  
-  $def("_1bfhbxi", "hexRig", ["hexRigView","viewof hexRigCases","liveOn","liveVideo","hexRigCfg","analyzeFrameMan","analyzeFrameManAsync","detectPool","hexRigOpts","fitHexPose","hexRigLoo","manScanRows"], _1bfhbxi);  
+  $def("_1bfhbxi", "hexRig", ["hexRigView","viewof hexRigCases","liveOn","liveVideo","hexRigCfg","analyzeFrameMan","analyzeFrameManAsync","detectPool","hexRigOpts","fitHexPose","hexRigLoo","manScanRows","lumaCapture"], _1bfhbxi);  
   $def("_136sicf", "hexRigCasePanel", ["hexRigCases","htl"], _136sicf);  
   $def("_18kb3j3", "hexRigAutosave", ["viewof hexRigCases","htl","invalidation"], _18kb3j3);  
   $def("_js23sh", "hexTarget_md", ["md","tex"], _js23sh);  
