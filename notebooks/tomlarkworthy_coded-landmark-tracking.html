@@ -6312,7 +6312,7 @@ answer.</p></div></div><div><div class="cell-editor" style="display: flex;
     border-radius:6px;overflow:hidden"><canvas style="display:block;width:100%;height:auto;background:#151515"></canvas><svg viewBox="0 0 960 540" preserveAspectRatio="none" style="position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none"></svg><div style="position:absolute;left:0;bottom:0;right:0;padding:4px 8px;
     background:rgba(0,0,0,0.6);color:#dfe;font:12px/1.5 ui-monospace,monospace">camera off — turn it on in §0</div></div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0">
     <button style="font:13px system-ui;padding:5px 12px">keep this frame</button><button style="font:13px system-ui;padding:5px 12px">clear cases</button><label style="font:13px system-ui;display:flex;gap:5px;align-items:center">
-    <input type="checkbox" checked=""> auto-collect hard cases</label><span style="color:var(--theme-foreground-muted,#888);font:12px ui-monospace,monospace"></span></div></div></div><div><div class="cell-editor" style="display: flex;
+    <input type="checkbox"> auto-collect hard cases</label><span style="color:var(--theme-foreground-muted,#888);font:12px ui-monospace,monospace"></span></div></div></div><div><div class="cell-editor" style="display: flex;
            flex-direction: column;
            background: var(--theme-background-alt);">
     <style>
@@ -7732,13 +7732,17 @@ const _1ncd6hs = (G, _) => G.input(_);
 const _xdtu1n = async function _liveStream(liveOn,liveFacing,invalidation) {
   if (!liveOn) return null;
   try {
-    // Ask for more than we will use: the detector needs ~2 image pixels per
-    // template unit, and asking for 1280 rather than the default 640 is the
-    // single cheapest thing that widens the usable working distance.
+    // The detector needs ~2 image pixels per template unit, so 1280 rather than
+    // the default 640 is the single cheapest thing that widens the usable
+    // working distance. `max` as well as `ideal`, because a phone camera
+    // offered a free hand will hand back 1920 or more, and the zero-copy
+    // capture path in §5.1 needs the working width to EQUAL the camera width
+    // (VideoFrame.copyTo crops, it cannot scale). Overshoot here costs ~20ms a
+    // frame there.
     const s = await window.navigator.mediaDevices.getUserMedia({
       video: {
-        width: { ideal: 1280 },
-        height: { ideal: 960 },
+        width: { ideal: 1280, max: 1280 },
+        height: { ideal: 960, max: 1280 },
         facingMode: liveFacing
       }
     });
@@ -7797,24 +7801,19 @@ const _ktbd9n = function _hexRigCfg(Inputs) {return (Inputs.form({
   minCover: Inputs.range([0, 0.9], { step: 0.05, value: 0.3, label: "min cover" }),
   maxASpread: Inputs.range([0.05, 1.5], { step: 0.05, value: 0.35, label: "max width spread" }),
   gapFrac: Inputs.range([0.15, 0.6], { step: 0.05, value: 0.3, label: "row split gap frac" }),
-  maxWidth: Inputs.range([480, 1280], { step: 160, value: 960, label: "working width (px)" }),
+  // Defaults to the TOP of its range on purpose. Lowering it does not just cost
+  // resolution: the working width has to equal the camera's own width for the
+  // zero-copy capture path (§5.1) to engage, so any value under the camera
+  // resolution buys a smaller image at the price of a ~20ms/frame RGBA readback
+  // -- a net loss on a phone. Cost tracks locked rows, not pixels (§5).
+  maxWidth: Inputs.range([480, 1280], { step: 160, value: 1280, label: "working width (px)" }),
   // The odd one out: not a threshold to tune but a second scan of the same
   // frame, down the columns instead of across the rows (§11.1). It halves the
   // frame rate and it is off by default for that reason, but the rig is where
   // it earns its keep -- the labels it stores are a homography through these
   // centres, and the row scan MEASURES a centre's x while only extrapolating
   // its y. Turn it on before collecting cases you intend to trust.
-  bothAxes: Inputs.toggle({ label: "scan both axes", value: false }),
-  // Also not a threshold: whether this thread takes chunks from the pool's
-  // queue alongside the workers. Measured 2% on a 14-core laptop and parked as
-  // noise -- but a profile on a phone shows the main thread idle 38% of the
-  // frame while all six workers are saturated, which is the case the laptop
-  // could not produce -- and where, measured, it is 13.8% SLOWER (45.3ms vs
-  // 39.8ms, interleaved on one frame, 8 cores 6 workers). An idle main thread
-  // is not a spare core: it was idle because it was WAITING, and scanning on
-  // it takes a core away from a worker while blocking the replies those
-  // workers are trying to deliver. Off by default on the strength of that.
-  mainShare: Inputs.toggle({ label: "main thread scans too", value: false })
+  bothAxes: Inputs.toggle({ label: "scan both axes", value: false })
 }));};
 const _1pvjep3 = (G, _) => G.input(_);
 const _1di846o = function _hexRigView(htl) {
@@ -8097,7 +8096,6 @@ const _1lt19nm = function _hexRigOpts(hexRigCfg,manLayout) {
     voteRatio: c.voteRatio,
     gapFrac: c.gapFrac,
     bothAxes: c.bothAxes,
-    mainShare: c.mainShare,
     layout: {
       ...manLayout,
       minAxisRatio: c.minAxisRatio,
@@ -8280,7 +8278,6 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     o.total = +Object.values(o).reduce((a, b) => a + b, 0).toFixed(2);
     o.workerMs = detectPool ? detectPool.lastWorkerMs : null;
     o.workerChunks = detectPool ? detectPool.lastWorkerChunks : null;
-    o.mainChunks = detectPool ? detectPool.lastMainChunks : null;
     o.px = W * H;
     return o;
   };
@@ -11621,24 +11618,64 @@ would cut the row count itself, which is the quantity the cost actually tracks.
 The two compose, because one makes rows cheaper to run and the other asks for
 fewer of them.
 
-A third lead came from the same measurement and has since been **tried and
-parked**. The main thread scans rows faster than any worker and spends the whole
-frame awaiting them, so it can consume the same queue: \`runRows\` takes
-\`mainShare\`, and this thread takes a chunk, yields, and takes another. The
-yield has to be a real task — worker replies arrive as message events, so
-awaiting a promise drains microtasks and lets no reply land at all — which is
-why it goes through a \`MessageChannel\` rather than \`setTimeout\`, whose 4ms
-clamp after five nested calls is most of a chunk.
+A third lead came from the same measurement, was tried, and has been
+**removed**. The main thread scans rows faster than any worker and spends the
+whole frame awaiting them, so it could consume the same queue. A sampling
+profile taken over the DevTools protocol on the phone itself made that look
+obvious: the main thread sits **idle 37.9%** of every frame while all six
+workers saturate.
 
-It is exactly correct and barely faster. Marks match the pool arm to 4dp on
-every bank frame, and the median frame moves 2-5% on a 14-core laptop, inside
-the run-to-run spread. The reason is visible in the chunk counts: this thread
-takes 2 to 5 of the 18 chunks, because it yields between each one while a worker
-loops straight into the next, and on a machine with eight idle cores the workers
-were never the constraint. It stays **off by default** and appears as a third
-arm in the §4.5 benchmark, because the machine where it should pay — few cores,
-workers genuinely contended — is the one this laptop cannot imitate. Press the
-button on a phone and it will answer for itself.`);};
+Measured on one stored frame, arms interleaved and both warmed, it was **13.8%
+slower** — 39.8ms against 45.3ms, on 8 cores with 6 workers. It was idle because
+it was *waiting*. Scanning on it takes a core away from a worker and blocks the
+replies those workers are trying to deliver, so it loses twice. An idle main
+thread is not a spare core; idle percentages measure blocking, and only an A/B
+measures spare capacity. The code is gone rather than left behind a flag,
+because a flag would have preserved the wrong intuition along with it.
+
+### §5.1 &nbsp; Capture, and how it had to be tuned
+
+On a phone, **getting the pixels cost more than looking at them**, and that went
+unnoticed for a long time because the frame timer started after the capture. The
+original path is the obvious one: \`drawImage\` the video into a 2D canvas,
+\`getImageData\`, weighted-sum RGB to gray. On a mid-range Android at 960×1280
+that is 5.1 + 17.7 + 1.7 = **24ms**, against 10-26ms for the detector it feeds.
+
+But a camera does not produce RGBA. It produces **I420**, and plane 0 of an I420
+frame *is* the luma — the exact buffer the detector wants, already computed by
+the decoder. \`new VideoFrame(video).copyTo(buf)\` hands it over in **1.4ms**,
+and the visible canvas takes the video directly on the GPU for 0.1ms instead of
+receiving a CPU-side copy. Capture went ~22ms → ~1.5ms, and gray → 0.
+
+Four things had to be right, and each is a way this can quietly regress:
+
+- **Colour range.** I420 luma is BT.601 *limited* range (16-235); the old path
+  derived luma from RGB the decoder had already expanded to full range.
+  Uncorrected, every edge magnitude shrinks by 0.86 and every tuned threshold
+  and every archived case silently means something else. Measured against the
+  old path on a lit frame: raw Y differs by a mean of **11.5 levels**,
+  LUT-corrected by **0.34**. The correction is a 256-entry lookup, cheaper than
+  the three multiplies it replaces.
+- **Expand lazily.** Converting all 1.2M pixels showed up in the next profile as
+  its own cost, larger than the copy it followed. The scan reads a quarter of
+  the rows, so only a quarter of the rows are expanded; anything wanting the
+  whole frame asks for it (\`ensureFull\`).
+- **\`copyTo\` cannot scale — it crops.** So the fast path requires the working
+  width to equal the camera's own width. A \`maxWidth\` below the camera
+  resolution silently drops back to the 22ms path. The camera is therefore
+  requested at \`max: 1280\` and the working width defaults to 1280, so the two
+  agree by construction. **If capture time jumps back to ~20ms, check this
+  first.**
+- **Stride may be padded.** Plane 0 can be wider than the image; the
+  \`PlaneLayout\` returned by \`copyTo\` carries the real stride, and rows are
+  repacked only when it differs from the width.
+
+None of this is assumed to exist. WebCodecs, the pixel format and the frame size
+are all capability-checked and the old path stays as a real fallback, which is
+also what makes the two comparable — \`lumaCapture.compare()\` runs both on the
+same live frame and reports the mean and max difference. The HUD says which path
+is live (\`vf\` or \`gid\`) and, when it is the slow one, why: a 20ms difference
+should never have to be guessed at.`);};
 const _10in6wk = function _manScanRows() {return (function manScanRows(frame, opts = {}) {
   // The scan lattice. One line, its own cell, because two things need it and
   // they must agree exactly: the serial pass walks it, and the worker pool
@@ -12032,7 +12069,7 @@ const _10l0bax = function _poolSize(Inputs) {return (Inputs.range([0, 12], {
   label: "detection workers (0 = main thread)"
 }));};
 const _1xat3lz = (G, _) => G.input(_);
-const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation,scanRowsMan) {
+const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
   // A fixed set of dedicated workers, handed row batches. Nothing reactive
   // crosses the boundary: a job is (rows, options) in and per-row hits out,
   // which is why the same code runs on the main thread with the pool switched
@@ -12079,16 +12116,6 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation,sc
     URL.revokeObjectURL(url);
   });
 
-  // A macrotask yield, not setTimeout(0). Worker replies arrive as message
-  // TASKS: awaiting a promise only drains microtasks, so a main-thread
-  // consumer that yields with `await null` never lets a single reply land.
-  // setTimeout would work but is clamped to 4ms once five of them nest, which
-  // is most of a chunk. One channel for the pool's lifetime.
-  const chan = new MessageChannel();
-  let yielders = [];
-  chan.port1.onmessage = () => { const ys = yielders; yielders = []; for (const r of ys) r(); };
-  const yieldTask = () => new Promise((r) => { yielders.push(r); chan.port2.postMessage(0); });
-
   let seq = 0;
   const send = (w, msg, transfer) =>
     new Promise((res) => {
@@ -12101,8 +12128,6 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation,sc
     size: ws.length,
     lastWorkerMs: [],
     lastWorkerChunks: [],
-    lastMainMs: 0,
-    lastMainChunks: 0,
     runRows: async (frame, ys, opts) => {
       if (dead) throw new Error("detection pool was torn down");
       // opts crosses a structured clone, and the caller's opts is exactly the
@@ -12152,34 +12177,18 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation,sc
           for (const r of rep.rows) out.push(r);
         }
       };
-      // The main thread is a consumer too, when asked. It scans faster than any
-      // worker and does nothing at all while they run -- but it is also the
-      // only thread that can hand out the next chunk, so a long sync scan here
-      // starves them. Hence: one chunk, then yield, and never before every
-      // worker has been given its first chunk (the loop below starts after one
-      // yield, by which point all the postMessages are out).
-      let mainMs = 0, mainChunks = 0;
-      const consumeMain = async () => {
-        await yieldTask();
-        while (cursor < chunks.length) {
-          const rows = chunks[cursor++];
-          const t = window.performance.now();
-          for (const r of scanRowsMan(frame, rows, opts)) out.push(r);
-          mainMs += window.performance.now() - t;
-          mainChunks++;
-          await yieldTask();
-        }
-      };
-      const consumers = ws.map(consume);
-      if (opts.mainShare && scanRowsMan) consumers.push(consumeMain());
-      await Promise.all(consumers);
+      // Workers only. Letting the main thread take chunks too was tried and
+      // measured 13.8% SLOWER on a phone (39.8ms -> 45.3ms, 8 cores, 6
+      // workers), because it takes a core away from a worker AND blocks the
+      // replies those workers are trying to deliver. The 38% idle main thread
+      // that suggested the idea was idle from WAITING, not from having nothing
+      // to run on.
+      await Promise.all(ws.map(consume));
       // Scan time per worker, and how many chunks each took. Unequal chunk
       // counts are the queue doing its job, not a fault; equal times with
       // unequal counts is what success looks like.
       api.lastWorkerMs = ms.map((m) => +m.toFixed(2));
       api.lastWorkerChunks = took;
-      api.lastMainMs = +mainMs.toFixed(2);
-      api.lastMainChunks = mainChunks;
       // Back into ascending y. clusterManRows is a forward scan over a
       // y-ordered stream, so returning arrival order would build different
       // clusters from the same hits -- the pool would not be wrong in any way
@@ -12285,30 +12294,19 @@ const _1ptv9em = async function _poolBenchmark(poolBenchGo,detectPool,hexFrameBa
     const parallel = await bench(() =>
       analyzeFrameManAsync(spec.frame, { runRows: detectPool.runRows })
     );
-    // Third arm: the same queue with this thread taking chunks too. Worth
-    // measuring rather than assuming -- the main thread scans faster than any
-    // worker, but it is also the only one that can hand out the next chunk,
-    // so it can pay for its own contribution twice over.
-    const shared = await bench(() =>
-      analyzeFrameManAsync(spec.frame, { runRows: detectPool.runRows, mainShare: true })
-    );
     rows.push({
       frame: spec.name,
       px: spec.frame.w + "x" + spec.frame.h,
       serialMs: serial.med,
       poolMs: parallel.med,
-      sharedMs: shared.med,
-      mainChunks: detectPool.lastMainChunks,
       speedup: +(serial.med / parallel.med).toFixed(2),
-      sharedSpeedup: +(serial.med / shared.med).toFixed(2),
       fps: Math.round(1000 / parallel.med),
       // how much the five runs disagreed with each other, as a percentage of
       // the median: a noisy machine shows up here rather than in a wrong
       // headline number
       spread: +(Math.max(
         (serial.max - serial.min) / serial.med,
-        (parallel.max - parallel.min) / parallel.med,
-        (shared.max - shared.min) / shared.med
+        (parallel.max - parallel.min) / parallel.med
       ) * 100).toFixed(0)
     });
   }
@@ -12317,9 +12315,7 @@ const _1ptv9em = async function _poolBenchmark(poolBenchGo,detectPool,hexFrameBa
     workers: detectPool.size,
     serialMsMedian: med(rows.map((r) => r.serialMs)),
     poolMsMedian: med(rows.map((r) => r.poolMs)),
-    sharedMsMedian: med(rows.map((r) => r.sharedMs)),
     speedupMedian: +med(rows.map((r) => r.speedup)).toFixed(2),
-    sharedSpeedupMedian: +med(rows.map((r) => r.sharedSpeedup)).toFixed(2),
     worstSpreadPct: Math.max(...rows.map((r) => r.spread)),
     rows
   };
@@ -12347,14 +12343,6 @@ const _704z68 = function _poolReport(detectPool,poolAgreement,poolBenchmark,md) 
       ` ${poolBenchmark.serialMsMedian}ms serial → ${poolBenchmark.poolMsMedian}ms pooled` +
       ` (${poolBenchmark.speedupMedian}x, ${Math.round(1000 / poolBenchmark.poolMsMedian)} fps)`
     );
-    if (poolBenchmark.sharedMsMedian != null)
-      L.push(
-        `with this thread taking chunks too: ${poolBenchmark.sharedMsMedian}ms` +
-        ` (${poolBenchmark.sharedSpeedupMedian}x) — ` +
-        (poolBenchmark.sharedMsMedian < poolBenchmark.poolMsMedian * 0.95
-          ? "worth having"
-          : "not worth having on this machine; it pays for its own chunks by delaying the queue")
-      );
     if (poolBenchmark.worstSpreadPct > 40)
       L.push(
         `run-to-run spread reached ${poolBenchmark.worstSpreadPct}% — the machine was busy,` +
@@ -12539,7 +12527,7 @@ export default function define(runtime, observer) {
   $def("_13ae255", "detectKernelSource", ["manLayout","edges1Dsub","findInvolution","solveMan","manRowGroups","detectRowMan","scanRowsMan"], _13ae255);  
   $def("_10l0bax", "viewof poolSize", ["Inputs"], _10l0bax);  
   $def("_1xat3lz", "poolSize", ["Generators","viewof poolSize"], _1xat3lz);  
-  $def("_l7r79y", "detectPool", ["poolSize","detectKernelSource","invalidation","scanRowsMan"], _l7r79y);
+  $def("_l7r79y", "detectPool", ["poolSize","detectKernelSource","invalidation"], _l7r79y);
   $def("_p4hc5x", "analyzeFrameManAsync", ["rotateFrame","mergeManAxes","manScanRows","scanRowsMan","clusterManRows"], _p4hc5x);  
   $def("_1hgoegm", "poolAgreement", ["detectPool","hexFrameBank","analyzeFrameMan","analyzeFrameManAsync"], _1hgoegm);  
   $def("_fp9av3", "viewof poolBenchGo", ["Inputs"], _fp9av3);  
