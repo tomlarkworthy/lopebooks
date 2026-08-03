@@ -8245,11 +8245,6 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
   const luma = lumaCapture();
   view.luma = luma;
   let W = 0, H = 0, gray = null;
-  // focal length, measured on well-conditioned frames and reused on the rest
-  let lockedF = null;
-  const fSamples = [];
-  view.focal = () => ({ lockedF, samples: fSamples.slice() });
-  view.recalibrateFocal = () => { lockedF = null; fSamples.length = 0; };
   let lastCap = -1e9, lastYield = 0, n = 0, kept = 0;
   // The counter restarts at 0 in every tab, so a bare hexcase-NN silently
   // OVERWROTE earlier captures on the receiver -- four frames were lost that
@@ -8357,19 +8352,11 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     const res = await analyzeFrameManAsync({ gray, w: W, h: H }, poolOpts);
     stage("scan", t);
     const tFit = window.performance.now();
-    // A camera has ONE focal length. Estimating it per frame from a
-    // near-frontal view is what made distance swing 4x between frames while
-    // the in-plane scale held to 2%. So: take it from frames whose two
-    // estimates agree, keep the median of a few, and hand it back on every
-    // frame after that. Median rather than first, because one lucky
-    // well-conditioned frame is still one sample.
-    const pose = fitHexPose({ ...res, w: W, h: H }, lockedF ? { focalPx: lockedF } : {});
-    if (pose.focalOk && pose.selfFocalPx) {
-      fSamples.push(pose.selfFocalPx);
-      if (fSamples.length > 9) fSamples.shift();
-      if (fSamples.length >= 3)
-        lockedF = fSamples.slice().sort((a, b) => a - b)[fSamples.length >> 1];
-    }
+    // Every frame is judged on its own evidence. Carrying a focal length (or
+    // anything else) forward from an earlier frame belongs in a notebook about
+    // exploiting similar frames under geometric constraints, not in the one
+    // that defines what a single frame can establish.
+    const pose = fitHexPose({ ...res, w: W, h: H });
     stage("fit", tFit);
     const dt = window.performance.now() - t;
     fps.push(dt);
@@ -8526,10 +8513,7 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
           `  rms ${pose.rmsResidualPx}px` +
           (loo ? ` loo ${loo.worstPx}px` : "") +
           `  ${pose.mmPerPx}mm/px` +
-          (pose.pose
-            ? `  ${pose.pose.distanceMm}mm  tilt ${pose.pose.tiltDeg}°` +
-              (pose.pose.focalSource === "locked" ? `  f${Math.round(lockedF)} locked` : `  f${pose.pose.focalPx}`)
-            : `  (${pose.poseWhy})`)
+          (pose.pose ? `  ${pose.pose.distanceMm}mm  tilt ${pose.pose.tiltDeg}°` : `  (${pose.poseWhy})`)
         : `no plane — ${res.fused.length} read, need 4 target marks`) +
       `  cases ${kept}/${MAX}`;
     view.note.textContent = labelled
@@ -11552,16 +11536,11 @@ const _1qa5emd = function _fitHexPose(hexTarget,fitHomography) {return (function
   const spread = cands.length === 2 ? Math.abs(Math.sqrt(f2a) - Math.sqrt(f2b)) : null;
   const maxSpreadFrac = opts.maxFSpreadFrac ?? 0.25;
   const selfOk = selfF != null && spread != null && spread <= maxSpreadFrac * selfF;
-  // A camera's focal length does not change between frames. Given one, the
-  // decomposition is well posed even where self-calibration is not, so a
-  // caller that has measured f on a well-tilted view can hand it back and get
-  // a stable distance out of a frontal one.
-  const lockedF = Number.isFinite(opts.focalPx) && opts.focalPx > 1 ? opts.focalPx : null;
-  const f = lockedF ?? (selfOk ? selfF : null);
+  const f = selfOk ? selfF : null;
   const centrePx = fit.map(0, 0);
   const mmPerPx = T.radiusMm / radiusAt(T.marks[0]);
   let pose = null;
-  if (f && (lockedF || cands.length === 2)) {
+  if (f && cands.length === 2) {
     const Ki = (v) => [v[0] / f, v[1] / f, v[2]];
     const k1 = Ki(h1), k2 = Ki(h2), k3 = Ki(h3);
     const n1 = Math.hypot(k1[0], k1[1], k1[2]);
@@ -11586,12 +11565,7 @@ const _1qa5emd = function _fitHexPose(hexTarget,fitHomography) {return (function
         // how far the two f estimates disagreed -- the honest conditioning
         // number for everything above, and now the thing that decides whether
         // any of it is reported at all
-        fSpread: spread == null ? null : +spread.toFixed(1),
-        // was f measured from THIS frame, or handed in from a better one?
-        focalSource: lockedF ? "locked" : "self",
-        // self-calibration's own opinion, kept even when f is locked, so a
-        // caller can see the two diverge rather than trust one silently
-        selfFocalPx: selfF == null ? null : +selfF.toFixed(1)
+        fSpread: spread == null ? null : +spread.toFixed(1)
       };
     }
   }
@@ -11611,16 +11585,8 @@ const _1qa5emd = function _fitHexPose(hexTarget,fitHomography) {return (function
       : fit.affine ? "affine (3 marks)"
       : !cands.length ? "no valid f"
       : selfF && spread != null && !selfOk
-        ? `f ill-conditioned (±${Math.round((spread / selfF) * 100)}% — tilt the sheet, or lock a focal length)`
+        ? `f ill-conditioned (±${Math.round((spread / selfF) * 100)}% — tilt the sheet)`
         : "near-frontal: f ill-conditioned",
-    // exposed so a caller can lock it once the geometry is good enough to
-    // trust, and keep using it when it is not
-    focalPx: pose ? pose.focalPx : null,
-    // THIS frame's own estimate, never the locked one -- a caller accumulating
-    // samples must not be fed back the value it handed in, or the average
-    // freezes on its first guess
-    selfFocalPx: selfF == null ? null : +selfF.toFixed(1),
-    focalOk: selfOk,
     counts, marks,
     offTarget: offTarget.map((f) => ({ id: f.id, x: Math.round(f.xc), y: Math.round(f.yc) }))
   };
@@ -11678,25 +11644,9 @@ const _10in6wk = function _manScanRows() {return (function manScanRows(frame, op
   // they must agree exactly: the serial pass walks it, and the worker pool
   // deals it out. If they disagreed the pool would silently scan a different
   // set of rows and every comparison between them would be meaningless.
-  // opts.bands narrows the lattice to rows a previous frame says are worth
-  // looking at -- [y0,y1] pairs, inclusive. The lattice itself is unchanged:
-  // a gated row is a row the ungated scan would also have taken, at the same
-  // y, so a gated frame's hits are a SUBSET of the ungated frame's rather than
-  // a different measurement. That is what makes the gate safe to compare
-  // against, and it is why the filter lives here instead of in the caller --
-  // the serial pass and the pool deal must agree on the row set exactly.
   const stride = opts.stride ?? 6;
-  const bands = opts.bands;
   const ys = [];
-  for (let y = Math.floor(stride / 2); y < frame.h; y += stride) {
-    if (bands) {
-      let inside = false;
-      for (let i = 0; i < bands.length; i++)
-        if (y >= bands[i][0] && y <= bands[i][1]) { inside = true; break; }
-      if (!inside) continue;
-    }
-    ys.push(y);
-  }
+  for (let y = Math.floor(stride / 2); y < frame.h; y += stride) ys.push(y);
   return ys;
 });};
 const _30gfrc = function _scanRowsMan(edges1Dsub,detectRowMan) {return (function scanRowsMan(frame, ys, opts = {}) {
