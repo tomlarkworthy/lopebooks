@@ -7736,7 +7736,7 @@ const _xdtu1n = async function _liveStream(liveOn,liveFacing,invalidation) {
     // the default 640 is the single cheapest thing that widens the usable
     // working distance. `max` as well as `ideal`, because a phone camera
     // offered a free hand will hand back 1920 or more, and the zero-copy
-    // capture path in §5.1 needs the working width to EQUAL the camera width
+    // capture path in §5.2 needs the working width to EQUAL the camera width
     // (VideoFrame.copyTo crops, it cannot scale). Overshoot here costs ~20ms a
     // frame there.
     const s = await window.navigator.mediaDevices.getUserMedia({
@@ -7803,7 +7803,7 @@ const _ktbd9n = function _hexRigCfg(Inputs) {return (Inputs.form({
   gapFrac: Inputs.range([0.15, 0.6], { step: 0.05, value: 0.3, label: "row split gap frac" }),
   // Defaults to the TOP of its range on purpose. Lowering it does not just cost
   // resolution: the working width has to equal the camera's own width for the
-  // zero-copy capture path (§5.1) to engage, so any value under the camera
+  // zero-copy capture path (§5.2) to engage, so any value under the camera
   // resolution buys a smaller image at the price of a ~20ms/frame RGBA readback
   // -- a net loss on a phone. Cost tracks locked rows, not pixels (§5).
   maxWidth: Inputs.range([480, 1280], { step: 160, value: 1280, label: "working width (px)" }),
@@ -11633,7 +11633,38 @@ thread is not a spare core; idle percentages measure blocking, and only an A/B
 measures spare capacity. The code is gone rather than left behind a flag,
 because a flag would have preserved the wrong intuition along with it.
 
-### §5.1 &nbsp; Capture, and how it had to be tuned
+### §5.1 &nbsp; Why it used to start slow
+
+The rig was reliably terrible for its first second and then fine, which is the
+kind of thing that gets explained away as the camera settling. It was 8.4x, and
+it was not the camera.
+
+Timing every job from the very first on a fresh pool, and recording each
+worker's *own* reported time next to wall clock, splits it in two — because
+from outside, a job waiting in a queue and a job running interpreted look
+exactly the same:
+
+| jobs | wall | workers reported | |
+|---|---|---|---|
+| 1-17 | 28-47ms | 7-10ms | 25ms of **queueing** |
+| 18 | 7.2ms | | \`poolAgreement\` resolved |
+| 18-80 | falling | 7.0 → 4.0ms | **cold code**, tiering up |
+
+The first half was self-inflicted. \`poolAgreement\` is the boot-time
+correctness check, and it pushes all 16 bank frames through the very workers
+the live loop needs, so live frames queued behind it. It now **defers while the
+camera is running**: queueing 25.4ms → 0.4ms, first ten frames 33.4ms → 7.9ms,
+converged at job 4 instead of job 41. Turn the camera off and the check runs.
+
+The second half is real and has no cheap fix. The kernel is these cells put
+through \`toString()\` and rebuilt with \`new Function()\` inside each worker,
+so nothing of the main thread's JIT state crosses over and six workers each
+tier up alone. A synthetic warm-up was tried and did nothing — it was 375x too
+small, and sized to work it costs the same second of worker time the deferred
+check was already spending. Ahead-of-time compilation is the only thing that
+removes it outright.
+
+### §5.2 &nbsp; Capture, and how it had to be tuned
 
 On a phone, **getting the pixels cost more than looking at them**, and that went
 unnoticed for a long time because the frame timer started after the capture. The
@@ -12196,6 +12227,13 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
       return out.sort((a, b) => a.y - b.y);
     }
   };
+
+  // A cheap synthetic warm-up was tried here and did nothing: 256 rows of a
+  // 96px pattern is 4k inner-loop iterations per worker, against the ~1.5M it
+  // takes for the workers' reported time to fall 8.2ms -> 4.6ms. 375x short.
+  // Sized to actually tier the code it costs about a second of worker time --
+  // which is what poolAgreement already spends. There is no cheap warm-up:
+  // either the workers do real work or they stay interpreted.
   return api;
 };
 const _p4hc5x = function _analyzeFrameManAsync(rotateFrame,mergeManAxes,manScanRows,scanRowsMan,clusterManRows) {return (async function analyzeFrameManAsync(frame, opts = {}) {
@@ -12222,7 +12260,7 @@ const _p4hc5x = function _analyzeFrameManAsync(rotateFrame,mergeManAxes,manScanR
   const res = clusterManRows(rowResults, opts);
   return { ...res, rowsTried: ys.length, ms: window.performance.now() - t0 };
 });};
-const _1hgoegm = async function _poolAgreement(detectPool,hexFrameBank,analyzeFrameMan,analyzeFrameManAsync) {
+const _1hgoegm = async function _poolAgreement(liveOn,detectPool,hexFrameBank,analyzeFrameMan,analyzeFrameManAsync) {
   // CORRECTNESS ONLY -- deliberately no timings here. This runs at boot, when
   // the page is busy computing everything else, and a stopwatch read under
   // that contention measures the boot, not the detector. Worse, it does not
@@ -12238,6 +12276,16 @@ const _1hgoegm = async function _poolAgreement(detectPool,hexFrameBank,analyzeFr
   // order), never floating-point drift, and that is true regardless of what
   // else the machine is doing.
   if (!detectPool) return { pool: 0, note: "pool off — nothing to compare" };
+  // NOT while the camera is running. This pushes all 16 bank frames through
+  // the very workers the live loop needs, and the live loop's frames queue
+  // behind it: measured on a fresh pool, the first 17 frames took 28-47ms
+  // wall while the workers reported only 7-10ms of actual work -- 25ms of
+  // pure waiting, ending the instant this cell resolved. That is most of the
+  // "starts slow, then gets fast" the rig is known for, and on a phone it
+  // lasts proportionally longer. Turn the camera off and the check runs.
+  if (liveOn)
+    return { pool: detectPool.size, deferred: true,
+      note: "deferred while the camera is live — it would queue ahead of the live frames. Turn the camera off to run it." };
   const key = (f) => `${f.id}@${f.xc.toFixed(4)},${f.yc.toFixed(4)}`;
   const rows = [];
   for (const spec of hexFrameBank) {
@@ -12327,6 +12375,7 @@ const _704z68 = function _poolReport(detectPool,poolAgreement,poolBenchmark,md) 
       ? `${detectPool.size} worker(s) on ${navigator.hardwareConcurrency || "?"} logical cores`
       : "pool off — stage 1 runs on this thread"
   );
+  if (poolAgreement && poolAgreement.deferred) L.push("agreement: " + poolAgreement.note);
   if (poolAgreement && poolAgreement.rows) {
     L.push(
       poolAgreement.allIdentical
@@ -12529,7 +12578,7 @@ export default function define(runtime, observer) {
   $def("_1xat3lz", "poolSize", ["Generators","viewof poolSize"], _1xat3lz);  
   $def("_l7r79y", "detectPool", ["poolSize","detectKernelSource","invalidation"], _l7r79y);
   $def("_p4hc5x", "analyzeFrameManAsync", ["rotateFrame","mergeManAxes","manScanRows","scanRowsMan","clusterManRows"], _p4hc5x);  
-  $def("_1hgoegm", "poolAgreement", ["detectPool","hexFrameBank","analyzeFrameMan","analyzeFrameManAsync"], _1hgoegm);  
+  $def("_1hgoegm", "poolAgreement", ["liveOn","detectPool","hexFrameBank","analyzeFrameMan","analyzeFrameManAsync"], _1hgoegm);
   $def("_fp9av3", "viewof poolBenchGo", ["Inputs"], _fp9av3);  
   $def("_2jzm2c", "poolBenchGo", ["Generators","viewof poolBenchGo"], _2jzm2c);  
   $def("_1ptv9em", "poolBenchmark", ["poolBenchGo","detectPool","hexFrameBank","analyzeFrameMan","analyzeFrameManAsync"], _1ptv9em);  
