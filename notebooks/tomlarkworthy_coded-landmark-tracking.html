@@ -8021,6 +8021,38 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
   // the granularity that actually collides: a second device, or a reload.
   const session = Math.floor(window.Date.now() / 1000).toString(36).slice(-4);
   const fps = [];
+  // Where the frame actually goes. The headline number used to start AFTER the
+  // capture and the luma conversion, so two pieces of main-thread work in the
+  // middle of the budget -- a full-frame getImageData and a per-pixel loop over
+  // a quarter of it -- were invisible in it. On a laptop that is a rounding
+  // error and on a phone it is not, which is precisely the machine the number
+  // was being read on. Same 20-frame window as fps, medians not means: one
+  // stalled frame should not move a stage's number.
+  const STAGES = ["cap", "gray", "scan", "fit", "draw"];
+  const hist = {};
+  for (const s of STAGES) hist[s] = [];
+  const stage = (name, t0) => {
+    const h = hist[name];
+    h.push(window.performance.now() - t0);
+    if (h.length > 20) h.shift();
+  };
+  const stageMed = (name) => {
+    const h = hist[name];
+    if (!h.length) return 0;
+    return h.slice().sort((a, b) => a - b)[h.length >> 1];
+  };
+  // Read from the console or over CDP while the camera runs -- the HUD has room
+  // for a summary, not for the evidence.
+  view.stages = () => {
+    const o = {};
+    for (const s of STAGES) o[s] = +stageMed(s).toFixed(2);
+    o.total = +Object.values(o).reduce((a, b) => a + b, 0).toFixed(2);
+    o.workerMs = detectPool ? detectPool.lastWorkerMs : null;
+    o.workerChunks = detectPool ? detectPool.lastWorkerChunks : null;
+    o.mainChunks = detectPool ? detectPool.lastMainChunks : null;
+    o.px = W * H;
+    return o;
+  };
   // Stage 1 goes to the pool when there is one. analyzeFrameManAsync with no
   // runRows is analyzeFrameMan, so poolSize 0 is a real fallback and not a
   // second code path -- poolAgreement holds the two to 4dp.
@@ -8063,8 +8095,11 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
       gray = new Uint8Array(W * H);
       view.overlay.setAttribute("viewBox", `0 0 ${W} ${H}`);
     }
+    const tCap = window.performance.now();
     ctx.drawImage(v, 0, 0, W, H);
     const px = ctx.getImageData(0, 0, W, H).data;
+    stage("cap", tCap);
+    const tGray = window.performance.now();
     // Convert only the rows the scan is going to read. At stride 4 that is a
     // quarter of the frame, and this is main-thread work sitting in the middle
     // of the frame budget -- the same argument that moved the scan itself into
@@ -8081,11 +8116,15 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     const grayAll = () => { for (let y = 0; y < H; y++) grayRow(y); };
     if (hexRigOpts.bothAxes) grayAll();
     else for (const y of manScanRows({ w: W, h: H }, hexRigOpts)) grayRow(y);
+    stage("gray", tGray);
     ctxOut.drawImage(work, 0, 0);
 
     const t = window.performance.now();
     const res = await analyzeFrameManAsync({ gray, w: W, h: H }, poolOpts);
+    stage("scan", t);
+    const tFit = window.performance.now();
     const pose = fitHexPose({ ...res, w: W, h: H });
+    stage("fit", tFit);
     const dt = window.performance.now() - t;
     fps.push(dt);
     if (fps.length > 20) fps.shift();
@@ -8096,6 +8135,7 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     // arrives as barely one. Every WIDTH and TYPE SIZE below is multiplied by
     // this so it stays constant on screen; positions and radii are not, because
     // those are the measurement.
+    const tDraw = window.performance.now();
     const k = W / (view.overlay.clientWidth || W);
     const sw = (n) => +(n * k).toFixed(2);
     const parts = [];
@@ -8152,6 +8192,7 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
       }
     }
     view.overlay.innerHTML = parts.join("");
+    stage("draw", tDraw);
 
     // ---- collect ----
     const loo = pose.ok ? hexRigLoo(res) : null;
@@ -8208,12 +8249,16 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
     }
 
     const med = fps.slice().sort((a, b) => a - b)[fps.length >> 1] ?? dt;
+    // cap+gray+scan+fit+draw, not just scan+fit. The difference between this
+    // and `med` is exactly the work the old headline number did not count.
+    const whole = STAGES.reduce((a, s) => a + stageMed(s), 0);
+    const budget = STAGES.map((s) => s[0] + stageMed(s).toFixed(0)).join(" ");
     const c = pose.ok ? pose.counts : null;
     // On a phone the long form wraps to three lines and buries the bottom two
     // marks under the panel, so below ~560px say the same things shorter.
     const narrow = (view.overlay.clientWidth || W) < 560;
     view.hud.textContent = narrow
-      ? `${W}×${H} ${med.toFixed(0)}ms ${detectPool ? detectPool.size + "w" : "1t"}  ` +
+      ? `${W}×${H} ${whole.toFixed(0)}ms [${budget}] ${detectPool ? detectPool.size + "w" : "1t"}  ` +
         (pose.ok
           ? `${c.read}r ${c.located}l ${c.missing}m ${c.misplaced}x` +
             (pose.offTarget.length ? ` ${pose.offTarget.length}?` : "") +
@@ -8221,7 +8266,10 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
             (pose.pose ? `  ${pose.pose.distanceMm}mm ${Math.round(pose.pose.tiltDeg)}°` : ` (${pose.poseWhy})`)
           : `no plane, ${res.fused.length} read`) +
         `  ${kept}/${MAX}`
-      : `${W}x${H} ${med.toFixed(0)}ms ${detectPool ? detectPool.size + "w" : "1t"}  ` +
+      : `${W}x${H} ${whole.toFixed(0)}ms frame (cap ${stageMed("cap").toFixed(1)}` +
+        ` gray ${stageMed("gray").toFixed(1)} scan ${stageMed("scan").toFixed(1)}` +
+        ` fit ${stageMed("fit").toFixed(1)} draw ${stageMed("draw").toFixed(1)})` +
+        ` ${detectPool ? detectPool.size + "w" : "1t"}  ` +
       (pose.ok
         ? `read ${c.read} located ${c.located} missing ${c.missing} misplaced ${c.misplaced}` +
           (pose.offTarget.length ? ` off ${pose.offTarget.length}` : "") +
@@ -8247,6 +8295,8 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
       yield {
         w: W, h: H,
         msMedian: +med.toFixed(1),
+        // the whole frame, stage by stage -- watchable from the pairing channel
+        stages: view.stages(),
         counts: pose.ok ? pose.counts : null,
         offTarget: pose.ok ? pose.offTarget.length : 0,
         rmsPx: pose.ok ? pose.rmsResidualPx : null,
