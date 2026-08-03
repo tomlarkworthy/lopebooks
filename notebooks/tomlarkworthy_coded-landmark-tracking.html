@@ -7867,6 +7867,7 @@ const _lumcap0 = function _lumaCapture() {return (function makeLumaCapture() {
   let lut = null;
   let gray = null;
   let full = false;
+  let src = null;                  // fast path: the luma plane grab() read from
 
   const size = (w, h) => {
     if (w === W && h === H) return;
@@ -7949,16 +7950,31 @@ const _lumcap0 = function _lumaCapture() {return (function makeLumaCapture() {
               y = packed;
             }
             if (fr === false) {
+              // The expansion is a per-pixel loop, and a profile on a phone put
+              // it at 4.5ms/frame -- the whole remaining cost of capture, and
+              // more than the copy it follows. The scan reads a quarter of the
+              // rows at stride 4, so expand a quarter of the rows. Same trick
+              // the RGB path always used, for the same reason.
               if (!lut) buildLut();
-              for (let i = 0, n = W * H; i < n; i++) gray[i] = lut[y[i]];
+              src = y;
+              if (rows) {
+                for (const yy of rows) {
+                  const b = yy * W;
+                  for (let x = 0; x < W; x++) gray[b + x] = lut[y[b + x]];
+                }
+              } else {
+                for (let i = 0, n = W * H; i < n; i++) gray[i] = lut[y[i]];
+                full = true;
+              }
             } else {
+              // a bulk copy, not a loop -- cheap enough to always do whole
               gray.set(y);
+              full = true;
             }
             api.path = "videoframe";
             api.format = fmt;
             api.fullRange = fr == null ? null : !!fr;
             api.why = "";
-            full = true;
             api.ms = window.performance.now() - t0;
             return { gray, full, path: api.path };
           }
@@ -7995,7 +8011,11 @@ const _lumcap0 = function _lumaCapture() {return (function makeLumaCapture() {
     // path they are on.
     ensureFull: () => {
       if (full) return gray;
-      for (let yy = 0; yy < H; yy++) api._row(yy);
+      if (api.path === "videoframe") {
+        for (let i = 0, n = W * H; i < n; i++) gray[i] = lut[src[i]];
+      } else {
+        for (let yy = 0; yy < H; yy++) api._row(yy);
+      }
       full = true;
       return gray;
     },
