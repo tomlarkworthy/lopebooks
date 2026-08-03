@@ -11317,11 +11317,24 @@ would cut the row count itself, which is the quantity the cost actually tracks.
 The two compose, because one makes rows cheaper to run and the other asks for
 fewer of them.
 
-A third lead is now visible from the same measurement. The main thread scans
-rows faster than any worker and spends the whole frame awaiting them, so it
-could be a consumer of the same queue. What stops that being free is that a
-chunk scanned here blocks the replies coming back, so the chunk size and the
-yield between them would have to be chosen rather than assumed.`);};
+A third lead came from the same measurement and has since been **tried and
+parked**. The main thread scans rows faster than any worker and spends the whole
+frame awaiting them, so it can consume the same queue: \`runRows\` takes
+\`mainShare\`, and this thread takes a chunk, yields, and takes another. The
+yield has to be a real task — worker replies arrive as message events, so
+awaiting a promise drains microtasks and lets no reply land at all — which is
+why it goes through a \`MessageChannel\` rather than \`setTimeout\`, whose 4ms
+clamp after five nested calls is most of a chunk.
+
+It is exactly correct and barely faster. Marks match the pool arm to 4dp on
+every bank frame, and the median frame moves 2-5% on a 14-core laptop, inside
+the run-to-run spread. The reason is visible in the chunk counts: this thread
+takes 2 to 5 of the 18 chunks, because it yields between each one while a worker
+loops straight into the next, and on a machine with eight idle cores the workers
+were never the constraint. It stays **off by default** and appears as a third
+arm in the §4.5 benchmark, because the machine where it should pay — few cores,
+workers genuinely contended — is the one this laptop cannot imitate. Press the
+button on a phone and it will answer for itself.`);};
 const _10in6wk = function _manScanRows() {return (function manScanRows(frame, opts = {}) {
   // The scan lattice. One line, its own cell, because two things need it and
   // they must agree exactly: the serial pass walks it, and the worker pool
@@ -11715,7 +11728,7 @@ const _10l0bax = function _poolSize(Inputs) {return (Inputs.range([0, 12], {
   label: "detection workers (0 = main thread)"
 }));};
 const _1xat3lz = (G, _) => G.input(_);
-const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
+const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation,scanRowsMan) {
   // A fixed set of dedicated workers, handed row batches. Nothing reactive
   // crosses the boundary: a job is (rows, options) in and per-row hits out,
   // which is why the same code runs on the main thread with the pool switched
@@ -11762,6 +11775,16 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
     URL.revokeObjectURL(url);
   });
 
+  // A macrotask yield, not setTimeout(0). Worker replies arrive as message
+  // TASKS: awaiting a promise only drains microtasks, so a main-thread
+  // consumer that yields with `await null` never lets a single reply land.
+  // setTimeout would work but is clamped to 4ms once five of them nest, which
+  // is most of a chunk. One channel for the pool's lifetime.
+  const chan = new MessageChannel();
+  let yielders = [];
+  chan.port1.onmessage = () => { const ys = yielders; yielders = []; for (const r of ys) r(); };
+  const yieldTask = () => new Promise((r) => { yielders.push(r); chan.port2.postMessage(0); });
+
   let seq = 0;
   const send = (w, msg, transfer) =>
     new Promise((res) => {
@@ -11774,6 +11797,8 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
     size: ws.length,
     lastWorkerMs: [],
     lastWorkerChunks: [],
+    lastMainMs: 0,
+    lastMainChunks: 0,
     runRows: async (frame, ys, opts) => {
       if (dead) throw new Error("detection pool was torn down");
       // opts crosses a structured clone, and the caller's opts is exactly the
@@ -11823,12 +11848,34 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
           for (const r of rep.rows) out.push(r);
         }
       };
-      await Promise.all(ws.map(consume));
+      // The main thread is a consumer too, when asked. It scans faster than any
+      // worker and does nothing at all while they run -- but it is also the
+      // only thread that can hand out the next chunk, so a long sync scan here
+      // starves them. Hence: one chunk, then yield, and never before every
+      // worker has been given its first chunk (the loop below starts after one
+      // yield, by which point all the postMessages are out).
+      let mainMs = 0, mainChunks = 0;
+      const consumeMain = async () => {
+        await yieldTask();
+        while (cursor < chunks.length) {
+          const rows = chunks[cursor++];
+          const t = window.performance.now();
+          for (const r of scanRowsMan(frame, rows, opts)) out.push(r);
+          mainMs += window.performance.now() - t;
+          mainChunks++;
+          await yieldTask();
+        }
+      };
+      const consumers = ws.map(consume);
+      if (opts.mainShare && scanRowsMan) consumers.push(consumeMain());
+      await Promise.all(consumers);
       // Scan time per worker, and how many chunks each took. Unequal chunk
       // counts are the queue doing its job, not a fault; equal times with
       // unequal counts is what success looks like.
       api.lastWorkerMs = ms.map((m) => +m.toFixed(2));
       api.lastWorkerChunks = took;
+      api.lastMainMs = +mainMs.toFixed(2);
+      api.lastMainChunks = mainChunks;
       // Back into ascending y. clusterManRows is a forward scan over a
       // y-ordered stream, so returning arrival order would build different
       // clusters from the same hits -- the pool would not be wrong in any way
@@ -11934,19 +11981,30 @@ const _1ptv9em = async function _poolBenchmark(poolBenchGo,detectPool,hexFrameBa
     const parallel = await bench(() =>
       analyzeFrameManAsync(spec.frame, { runRows: detectPool.runRows })
     );
+    // Third arm: the same queue with this thread taking chunks too. Worth
+    // measuring rather than assuming -- the main thread scans faster than any
+    // worker, but it is also the only one that can hand out the next chunk,
+    // so it can pay for its own contribution twice over.
+    const shared = await bench(() =>
+      analyzeFrameManAsync(spec.frame, { runRows: detectPool.runRows, mainShare: true })
+    );
     rows.push({
       frame: spec.name,
       px: spec.frame.w + "x" + spec.frame.h,
       serialMs: serial.med,
       poolMs: parallel.med,
+      sharedMs: shared.med,
+      mainChunks: detectPool.lastMainChunks,
       speedup: +(serial.med / parallel.med).toFixed(2),
+      sharedSpeedup: +(serial.med / shared.med).toFixed(2),
       fps: Math.round(1000 / parallel.med),
       // how much the five runs disagreed with each other, as a percentage of
       // the median: a noisy machine shows up here rather than in a wrong
       // headline number
       spread: +(Math.max(
         (serial.max - serial.min) / serial.med,
-        (parallel.max - parallel.min) / parallel.med
+        (parallel.max - parallel.min) / parallel.med,
+        (shared.max - shared.min) / shared.med
       ) * 100).toFixed(0)
     });
   }
@@ -11955,7 +12013,9 @@ const _1ptv9em = async function _poolBenchmark(poolBenchGo,detectPool,hexFrameBa
     workers: detectPool.size,
     serialMsMedian: med(rows.map((r) => r.serialMs)),
     poolMsMedian: med(rows.map((r) => r.poolMs)),
+    sharedMsMedian: med(rows.map((r) => r.sharedMs)),
     speedupMedian: +med(rows.map((r) => r.speedup)).toFixed(2),
+    sharedSpeedupMedian: +med(rows.map((r) => r.sharedSpeedup)).toFixed(2),
     worstSpreadPct: Math.max(...rows.map((r) => r.spread)),
     rows
   };
@@ -11983,6 +12043,14 @@ const _704z68 = function _poolReport(detectPool,poolAgreement,poolBenchmark,md) 
       ` ${poolBenchmark.serialMsMedian}ms serial → ${poolBenchmark.poolMsMedian}ms pooled` +
       ` (${poolBenchmark.speedupMedian}x, ${Math.round(1000 / poolBenchmark.poolMsMedian)} fps)`
     );
+    if (poolBenchmark.sharedMsMedian != null)
+      L.push(
+        `with this thread taking chunks too: ${poolBenchmark.sharedMsMedian}ms` +
+        ` (${poolBenchmark.sharedSpeedupMedian}x) — ` +
+        (poolBenchmark.sharedMsMedian < poolBenchmark.poolMsMedian * 0.95
+          ? "worth having"
+          : "not worth having on this machine; it pays for its own chunks by delaying the queue")
+      );
     if (poolBenchmark.worstSpreadPct > 40)
       L.push(
         `run-to-run spread reached ${poolBenchmark.worstSpreadPct}% — the machine was busy,` +
@@ -12166,7 +12234,7 @@ export default function define(runtime, observer) {
   $def("_13ae255", "detectKernelSource", ["manLayout","edges1Dsub","findInvolution","solveMan","manRowGroups","detectRowMan","scanRowsMan"], _13ae255);  
   $def("_10l0bax", "viewof poolSize", ["Inputs"], _10l0bax);  
   $def("_1xat3lz", "poolSize", ["Generators","viewof poolSize"], _1xat3lz);  
-  $def("_l7r79y", "detectPool", ["poolSize","detectKernelSource","invalidation"], _l7r79y);  
+  $def("_l7r79y", "detectPool", ["poolSize","detectKernelSource","invalidation","scanRowsMan"], _l7r79y);
   $def("_p4hc5x", "analyzeFrameManAsync", ["rotateFrame","mergeManAxes","manScanRows","scanRowsMan","clusterManRows"], _p4hc5x);  
   $def("_1hgoegm", "poolAgreement", ["detectPool","hexFrameBank","analyzeFrameMan","analyzeFrameManAsync"], _1hgoegm);  
   $def("_fp9av3", "viewof poolBenchGo", ["Inputs"], _fp9av3);  
