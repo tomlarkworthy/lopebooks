@@ -10765,11 +10765,49 @@ observes. Measured on one photograph turned four ways: 23px of spread on the
 measured coordinate against 64px on the extrapolated one.
 
 Scanning the transposed frame turns that around, so between them the two passes
-measure both coordinates directly. It is **off by default**, and the
-measurements say it should stay that way: over the real archive it never once
-found an extra mark, cost about 3x the time, and its median leave-one-out is
-worse than rows alone. It is kept because it is the only independent check on
-the extrapolated coordinate, not because it is a better detector.`);};
+measure both coordinates directly.
+
+For a long time the measurements said the option was not worth having: over the
+archive it never once found an extra mark and its median leave-one-out was
+slightly worse than rows alone. **That verdict was an artefact of the archive.**
+Every frame in it was held still. Motion blur is directional, and a smear along
+${""}x destroys exactly the ring flanks a row crosses while leaving the arcs a
+column crosses intact — so the frames where an orthogonal scan is worth
+everything were the frames nobody had captured yet. Five arrived at once: the
+row pass read **0** on all five and the column pass read 6 or 7 with a
+leave-one-out of 1.6–2.7px.
+
+It still read nothing, because the merge threw the answer away. A column-only
+*sighting* inside a row-anchored frame is suspect — it carries an extrapolated
+${""}x into a set of row-measured marks, and mixing provenance inside one
+homography is what once took a static frame from 0.6px to 24.5px. A column-only
+*frame* is not that animal at all: it is this detector with the image turned
+ninety degrees, extrapolating ${""}x exactly as a rows-only frame extrapolates
+${""}y, which is what ships on every frame. The old rule could not tell the two
+apart, so a complete detection was filed under \`axisOnly\` and the frame
+reported nothing.
+
+Two other things the archive settled, both against the argument that sounded
+better:
+
+- **Gate the two disagreements separately, at the same fraction of the mark.**
+  The asymmetry says ${""}dy should be the looser bound, since it is the row
+  pass extrapolating ${""}y and is expected to be large. Sweeping them
+  independently, equal fractions won and loosening ${""}dy lost: at 0.25 a
+  single admitted fusion takes worst-case leave-one-out from 21px to 134px.
+  What the gate actually asks is whether both passes found the *same object*,
+  and that question has no preferred axis.
+- **On a disagreement, keep the row pass** — not "whichever pass covered the
+  mark better", which is the rule that sounds principled and measures worse
+  (median 3.3 → 3.9px, worst 21 → 134px). The row pass is the one every gate,
+  sweep and banked case here was tuned against, and that is a real asymmetry.
+
+Over 156 archived cases, against the same detector scanning rows alone:
+**851 → 889 marks, 149 → 155 frames posed, 5 dead frames → 0, worst-case
+leave-one-out 23.9px → 21.3px**, median 3.1 → 3.3px, and no frame made worse by
+more than 2px. It costs a second pass. It is still off by default, because that
+second pass is the frame budget on a phone — but it is no longer off because it
+does not work.`);};
 const _zghole = function _rotateFrame() {return (function rotateFrame(frame, turns) {
   // Quarter turns only, done as an index permutation rather than through a
   // canvas: no resampling, so a rotated frame carries exactly the original
@@ -11419,7 +11457,23 @@ const _1m3an4z = function _mergeManAxes(unrotatePoint) {return (function mergeMa
   //    is the gated and banked one. Measured over the archive, the guard took
   //    worst-case leave-one-out from 22.20px to 5.70px, better than the
   //    11.20px the row scan manages alone.
+  // The cross-check tolerance travels with the mark, like the matching radius
+  // below. A mark 70px across can disagree by 10px between passes purely
+  // through extrapolation; one 25px across cannot. A fixed pixel count only
+  // ever suits one working distance.
   const maxCross = opts.maxCrossPx ?? 8;
+  const crossFrac = opts.maxCrossFrac ?? 0.15;
+  // Gate each disagreement separately, both as the same fraction of the mark.
+  // The asymmetry argument said dy should be the looser of the two -- it is the
+  // row pass extrapolating y, measured in §4.3 at 64px of spread against 23px
+  // for a measured coordinate, so a large dy is expected rather than damning.
+  // The archive disagreed: sweeping the two independently, equal fractions won
+  // and loosening dy lost. At 0.25 a single bad fusion takes worst-case
+  // leave-one-out from 21px to 134px. What the gate is really asking is "did
+  // both passes find the SAME object", and that question has no preferred axis.
+  const crossYFrac = opts.maxCrossYFrac ?? 0.15;
+  // Four points fit a homography, so four is where a frame becomes usable.
+  const minSet = opts.minAxisSet ?? 4;
   // Map the rotated pass back into frame coordinates. The ellipse axes swap
   // with the frame: what that pass measured along ITS scan is the extent in
   // image y.
@@ -11445,11 +11499,35 @@ const _1m3an4z = function _mergeManAxes(unrotatePoint) {return (function mergeMa
     if (m < 0) { fused.push({ ...r, axis: "row" }); continue; }
     used.add(m);
     worstCross = Math.max(worstCross, bd);
-    if (bd > maxCross) {
-      // Disagreement too large to be the extrapolation error alone. Keep the
-      // row pass and say so, rather than silently picking the loser.
+
+    // Which disagreement indicts whom. The row pass MEASURED x and
+    // extrapolated y; the column pass measured y and extrapolated x. So
+    // dx is the column's extrapolation error and dy is the row's --
+    // each is evidence about the coordinate that pass is about to have
+    // TAKEN AWAY from it, not about the one it contributes.
+    //
+    // The old gate was on hypot(dx, dy), which is mostly dy on exactly the
+    // frames this option exists for: a big dy IS the row pass extrapolating y
+    // badly, and rejecting the fusion there throws away the fix at the moment
+    // it is worth most. Gate on dx alone. A column pass that also puts the
+    // mark in the right place along x is a column pass that found this mark
+    // rather than something else, and that is the only thing worth checking.
+    const dx = Math.abs(cols[m].xc - r.xc);
+    const dy = Math.abs(cols[m].yc - r.yc);
+    if (dx > Math.max(maxCross, crossFrac * size) || dy > crossYFrac * size) {
+      // The two passes are looking at different things. Keep the row pass.
+      //
+      // Deciding this by evidence instead -- whichever pass covered the mark
+      // better -- reads as the more principled rule and measures worse: over
+      // the archive it took median leave-one-out from 3.3px to 3.9px and
+      // worst-case from 21px to 134px. "Keep the row pass" is not a position
+      // in the code, it is the pass that every gate, sweep and banked case in
+      // this notebook was tuned against, and that is a real asymmetry between
+      // them.
       crossRejected++;
-      fused.push({ ...r, axis: "row", crossPx: +bd.toFixed(2), crossRejected: true });
+      fused.push({ ...r, axis: "row",
+        crossPx: +bd.toFixed(2), dxPx: +dx.toFixed(2), dyPx: +dy.toFixed(2),
+        crossRejected: true });
       continue;
     }
     bothN++;
@@ -11457,10 +11535,12 @@ const _1m3an4z = function _mergeManAxes(unrotatePoint) {return (function mergeMa
     // the pass that measured it rather than the one that extrapolated it.
     fused.push({
       ...r, xc: r.xc, yc: cols[m].yc, a: r.a, b: cols[m].b ?? r.b,
-      axis: "both", crossPx: +bd.toFixed(2)
+      axis: "both", crossPx: +bd.toFixed(2),
+      dxPx: +dx.toFixed(2), dyPx: +dy.toFixed(2)
     });
   }
   const rowIds = new Set(rows.fused.map((f) => f.id));
+  const leftover = [];
   for (let i = 0; i < cols.length; i++) {
     if (used.has(i)) continue;
     if (rowIds.has(cols[i].id)) {
@@ -11471,15 +11551,40 @@ const _1m3an4z = function _mergeManAxes(unrotatePoint) {return (function mergeMa
       conflicts.push({ id: cols[i].id, x: +cols[i].xc.toFixed(1), y: +cols[i].yc.toFixed(1) });
       continue;
     }
-    axisOnly.push({ ...cols[i], axis: "col" });
+    leftover.push({ ...cols[i], axis: "col" });
   }
+
+  // TOLERATING A DEAD AXIS.
+  //
+  // A column-only SIGHTING inside a row-anchored frame is suspect, and that is
+  // what sends `leftover` to axisOnly: it carries an extrapolated x into a set
+  // of row-measured marks, and mixing provenance inside one homography is what
+  // took a static frame from 0.6px to 24.5px leave-one-out.
+  //
+  // A column-only FRAME is a different animal, and the old rule could not tell
+  // them apart. It is this detector with the image turned ninety degrees: it
+  // extrapolates x exactly as a rows-only frame extrapolates y, which is a
+  // thing we ship on every frame. Nothing about it is mixed.
+  //
+  // That distinction is not academic. Motion blur is directional, and a smear
+  // along x destroys precisely the ring flanks a row crosses while leaving the
+  // arcs a column crosses intact. On five such captures the row pass read 0
+  // and the column pass read 6 or 7 with a leave-one-out of 1.6-2.7px -- and
+  // the old rule filed all of it under axisOnly and reported nothing.
+  const colSet = [...cols].map((c) => ({ ...c, axis: "col" }));
+  const rowFallback = fused.length < minSet && colSet.length > fused.length;
+  const out = rowFallback ? colSet : fused;
   return {
-    fused,
+    fused: out,
     unidentified: [...rows.unidentified, ...rot.unidentified.map(back)],
-    // seen by the column scan alone: real sightings, but carrying the
-    // extrapolated coordinate, so reported rather than fused
-    axisOnly,
+    // seen by one scan alone: real sightings, but carrying the extrapolated
+    // coordinate into a set measured the other way, so reported not fused
+    axisOnly: rowFallback ? rows.fused.filter((r) => !colSet.some((c) => c.id === r.id))
+        .map((r) => ({ ...r, axis: "row" }))
+      : leftover,
     conflicts,
+    // which axis carried the frame: "col" means the row pass could not
+    axisUsed: rowFallback ? "col" : bothN ? "both" : "row",
     bothAxes: bothN,
     crossRejected,
     worstCrossPx: +worstCross.toFixed(2),
