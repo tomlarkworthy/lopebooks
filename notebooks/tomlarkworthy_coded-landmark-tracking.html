@@ -8000,8 +8000,15 @@ const _1bfhbxi = async function* _hexRig(hexRigView,$0,liveOn,liveVideo,hexRigCf
 
   if (!liveOn) {
     view.hud.textContent = "camera off — turn it on in §0";
-    yield null;
-    await new Promise(() => {}); // park; the toggle re-runs this cell
+    // Idle, but never on a promise that cannot settle. The runtime ends a
+    // generator by calling return() on it, which lands at the next yield; a
+    // cell parked on `new Promise(() => {})` has no next yield, so the
+    // termination never completes and the whole update chain stops behind it
+    // — not this cell alone. Ticking keeps the cell endable.
+    while (true) {
+      yield null;
+      await new Promise((r) => window.setTimeout(r, 250));
+    }
   }
 
   const ctxOut = view.cap.getContext("2d");
@@ -11537,11 +11544,14 @@ const _13ae255 = function _detectKernelSource(manLayout,edges1Dsub,findInvolutio
 let FRAME = null;
 self.onmessage = (e) => {
   const d = e.data;
-  if (d.type === "init") {
+  // The buffer is sized from the job, not from a separate init handshake. A
+  // handshake needs a reply to pair with a request, and pairing it by a single
+  // resolver slot loses one whenever two are in flight — which bothAxes makes
+  // routine, since it alternates 960x720 and 720x960 every frame. A dropped
+  // resolver is a promise that never settles, and one of those stops the whole
+  // runtime, not just this pool.
+  if (!FRAME || FRAME.w !== d.w || FRAME.h !== d.h)
     FRAME = { gray: new Uint8Array(d.w * d.h), w: d.w, h: d.h };
-    self.postMessage({ type: "ready" });
-    return;
-  }
   const w = FRAME.w, ys = d.ys, px = d.px;
   for (let i = 0; i < ys.length; i++)
     FRAME.gray.set(px.subarray(i * w, (i + 1) * w), ys[i] * w);
@@ -11578,8 +11588,6 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
     w.pending = new Map();
     w.onmessage = (e) => {
       const d = e.data;
-      // the init acknowledgement carries no job id; every other reply does
-      if (d.type === "ready") { if (w.onReady) w.onReady(); return; }
       const settle = w.pending.get(d.id);
       if (settle) { w.pending.delete(d.id); settle(d); }
     };
@@ -11611,25 +11619,13 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
     URL.revokeObjectURL(url);
   });
 
-  let seq = 0, dims = null;
+  let seq = 0;
   const send = (w, msg, transfer) =>
     new Promise((res) => {
       const id = ++seq;
       w.pending.set(id, res);
       w.postMessage({ ...msg, id }, transfer || []);
     });
-  // each worker keeps a full-size frame buffer so absolute y indexing works
-  // unchanged inside it; only a size change forces a reallocation
-  const ensure = async (frame) => {
-    if (dims && dims.w === frame.w && dims.h === frame.h) return;
-    dims = { w: frame.w, h: frame.h };
-    await Promise.all(
-      ws.map((w) => new Promise((res) => {
-        w.onReady = res;
-        w.postMessage({ type: "init", w: frame.w, h: frame.h });
-      }))
-    );
-  };
 
   const api = {
     size: ws.length,
@@ -11637,7 +11633,6 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
     lastWorkerChunks: [],
     runRows: async (frame, ys, opts) => {
       if (dead) throw new Error("detection pool was torn down");
-      await ensure(frame);
       // opts crosses a structured clone, and the caller's opts is exactly the
       // object carrying runRows -- a function, which is not cloneable. Drop
       // every function rather than naming the one we know about: the next
@@ -11678,7 +11673,7 @@ const _l7r79y = function _detectPool(poolSize,detectKernelSource,invalidation) {
           rows.forEach((y, k) =>
             px.set(frame.gray.subarray(y * frame.w, (y + 1) * frame.w), k * frame.w)
           );
-          const rep = await send(w, { type: "rows", ys: rows, px, opts: plain }, [px.buffer]);
+          const rep = await send(w, { type: "rows", w: frame.w, h: frame.h, ys: rows, px, opts: plain }, [px.buffer]);
           if (rep.err) throw new Error("detection worker: " + rep.err);
           ms[wi] += rep.ms ?? 0;
           took[wi]++;
