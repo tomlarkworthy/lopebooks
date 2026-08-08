@@ -14132,7 +14132,47 @@ name => lp2_watchedModules && lp2_watchedModules.get ? lp2_watchedModules.get(na
 const _j3eb9x = function _lp2_paneRegistry(){return(
 new Map()
 )};
-const _193se86 = function _lp2_getPane(lp2_scrollToCell,lp2_paneRegistry,lp2_moduleByName,visualizer,runtime,lp2_installAnchor){return(
+const _1dorm7b = function _lp2_bootDormant(runtime,importShim)
+{
+  // `modules()` only lists modules the runtime already holds, so a module nobody booted is
+  // invisible to lp2_moduleByName and its pane sits on "loading …" for ever — nothing was going to
+  // resolve it, the click was the request. Boot it here instead. Two cases, one code path:
+  // a block in this file (dormant: not a bootconf main, not imported by anything) resolves through
+  // contentSync in ~10ms, and a name with no block goes out to Observable in ~1s. Only a name that
+  // is neither is a real miss.
+  const tried = new Map();
+  return moduleName => {
+    if (tried.has(moduleName))
+      return tried.get(moduleName);
+    // A file attachment is also a text/plain script, so require the module mime before believing a
+    // block; anything else falls through to the network, which is where a new module comes from.
+    const block = document.getElementById(moduleName);
+    if (block && block.getAttribute('data-mime') !== 'application/javascript') {
+      tried.set(moduleName, null);
+      return null;
+    }
+    const p = importShim(`/${ moduleName }.js?v=4`).then(m => {
+      const mod = runtime.module(m.default);
+      // Registering as a main is what makes `modules()` name it, and keeps bootconf's mains a
+      // superset of the layout: a tab that was opened survives the next save.
+      if (runtime.mains && runtime.mains.set)
+        runtime.mains.set(moduleName, mod);
+      return mod;
+    }).catch(e => {
+      console.warn('lopepage-2: could not boot', moduleName, e);
+      // Downgrade the memo to a plain miss, and say so on the placeholder now: a failed import
+      // resolves nothing, so no reactive edge fires and no render is coming to correct the text.
+      tried.set(moduleName, null);
+      for (const el of document.querySelectorAll('.lp2-pane'))
+        if (el.dataset.module === moduleName && /^loading /.test(el.textContent))
+          el.textContent = 'no module ' + moduleName;
+      return null;
+    });
+    tried.set(moduleName, p);
+    return p;
+  };
+};
+const _193se86 = function _lp2_getPane(lp2_scrollToCell,lp2_paneRegistry,lp2_moduleByName,lp2_bootDormant,visualizer,runtime,lp2_installAnchor){return(
 (moduleName, deepLinkCell) => {
     const applyDeepLink = entry => {
       if (deepLinkCell && !entry.transient && entry.deepLink !== deepLinkCell) {
@@ -14159,7 +14199,8 @@ const _193se86 = function _lp2_getPane(lp2_scrollToCell,lp2_paneRegistry,lp2_mod
       // Module not in the (incrementally-populated) map yet. Return a transient placeholder
       // WITHOUT caching, so a later render retries once the module resolves. Caching here would
       // freeze the pane on "not found" forever (panes are immortal).
-      el.textContent = 'loading ' + moduleName + '\u2026';
+      const dormant = lp2_bootDormant(moduleName);
+      el.textContent = dormant === null ? 'no module ' + moduleName : 'loading ' + moduleName + '\u2026';
       el.style.cssText += ';display:flex;align-items:center;justify-content:center;color:var(--theme-foreground-faint);font:12px var(--monospace,monospace)';
       return {
         el,
@@ -14456,23 +14497,36 @@ const _1r0c4er = function _lp2_ops()
     move
   };
 };
-const _sx484g = function _lp2_dragOut(){return(
-(moduleName, dataTransfer) => {
-  const res = window.lopecode.contentSync(moduleName);
-  const text = res && res.bytes ? new TextDecoder().decode(res.bytes) : '';
-  const mime = res && res.mime || 'application/javascript';
-  const fname = moduleName.replace(/^@/, '').replace(/\//g, '_') + '.js';
-  dataTransfer.setData('text/plain', text);
-  dataTransfer.setData('application/javascript', text);
-  dataTransfer.setData('DownloadURL', mime + ':' + fname + ':data:' + mime + ';base64,' + btoa(unescape(encodeURIComponent(text))));
-  dataTransfer.effectAllowed = 'copy';
-  return {
-    fname,
-    len: text.length,
-    mime
+const _sx484g = function _lp2_dragOut(exportModuleJS)
+{
+  // dragstart's setData is synchronous but exportModuleJS is async, so the tab's
+  // pointerdown primes a live-runtime source into the cache ahead of the drag;
+  // dragstart falls back to the boot-time script block if the prime hasn't landed.
+  const cache = new Map();
+  const dragOut = (moduleName, dataTransfer) => {
+    let text = cache.get(moduleName);
+    if (!text) {
+      const res = window.lopecode.contentSync(moduleName);
+      text = res && res.bytes ? new TextDecoder().decode(res.bytes) : '';
+    }
+    const mime = 'application/javascript';
+    const fname = moduleName.replace(/^@/, '').replace(/\//g, '_') + '.js';
+    dataTransfer.setData('text/plain', text);
+    dataTransfer.setData('application/javascript', text);
+    dataTransfer.setData('DownloadURL', mime + ':' + fname + ':data:' + mime + ';base64,' + btoa(unescape(encodeURIComponent(text))));
+    dataTransfer.effectAllowed = 'copy';
+    return {
+      fname,
+      len: text.length,
+      mime,
+      live: cache.has(moduleName)
+    };
   };
-}
-)};
+  dragOut.prime = moduleName => {
+    exportModuleJS(moduleName).then(r => cache.set(moduleName, r.source)).catch(() => {});
+  };
+  return dragOut;
+};
 const _1194mfy = function _lp2_view(lp2_host,lp2Model,lp2_installAnchor,lp2_anchor,$0,Event,lp2_getPane,lp2_dragOut,lp2_ops,linkTo,lp2_paneRegistry,lp2_renderNode,lp2_burger,lp2_add_module)
 {
   const host = lp2_host;
@@ -14790,7 +14844,7 @@ const _1y1ubko = function _lp2_page(apply_theme,lp2_host,commandPaletteStyles,co
   root.appendChild(commandPaletteOverlay);
   return root;
 };
-const _9clfn3 = function _lp2_background_jobs(commandPaletteKeybinding,cc_chat,change_listener,commit_history,replay_git,auto_attach,lp2_watchModules,lp2_menu_sync,lp2_menu_defaults,lp2_menu_clear_history)
+const _9clfn3 = function _lp2_background_jobs(commandPaletteKeybinding,cc_chat,change_listener,commit_history,replay_git,auto_attach,lp2_watchModules,lp2_menu_sync,lp2_menu_defaults,lp2_menu_clear_history,lp2_import_sync,lp2_import_drop)
 {
   // hold references so these orthogonal features' main-loop cells instantiate
   commandPaletteKeybinding;
@@ -14813,7 +14867,11 @@ const _9clfn3 = function _lp2_background_jobs(commandPaletteKeybinding,cc_chat,c
   // registers the built-in menu items (download, fork)
   lp2_menu_clear_history;
   // registers the per-notebook history wipe menu item
-  return 'background jobs: command-palette, claude-code-pairing, local-change-history, editor-5, module-watcher, burger-menu';
+  lp2_import_sync;
+  // keeps the import dialog's probe set current from the plugin registry
+  lp2_import_drop;
+  // captures OS file drops for the import wizards
+  return 'background jobs: command-palette, claude-code-pairing, local-change-history, editor-5, module-watcher, burger-menu, import-wizards';
 };
 const _1yumqn = function _lp2_append_to_body(lp2_view,lp2_syncFromUrl,lp2_syncToUrl,lp2_page)
 {
@@ -14835,7 +14893,7 @@ const _1yumqn = function _lp2_append_to_body(lp2_view,lp2_syncFromUrl,lp2_syncTo
 const _z83rug = function _29(currentModules){return(
 currentModules
 )};
-const _1s8yfis = function _lp2_renderTab(location){return(
+const _1s8yfis = function _lp2_renderTab(location,navigate){return(
 (node, i, ctx) => {
     const leaf = node.tabs[i];
     const active = node.active || 0;
@@ -14855,6 +14913,13 @@ const _1s8yfis = function _lp2_renderTab(location){return(
       ctx.commit(ctx.getRoot());
     };
     tab.draggable = true;
+    // regenerate this module's source from the live runtime before a drag can start
+    tab.addEventListener('pointerdown', () => {
+      try {
+        ctx.dragOut.prime && ctx.dragOut.prime(leaf.module);
+      } catch (_) {
+      }
+    });
     tab.addEventListener('dragstart', ev => {
       window.__lp2_drag = { module: leaf.module };
       try {
@@ -14888,13 +14953,9 @@ const _1s8yfis = function _lp2_renderTab(location){return(
     close.addEventListener('mousedown', ev => ev.stopPropagation());
     close.addEventListener('click', ev => {
       ev.stopPropagation();
-      // route through the URL intent system: close=<module>. Write via the
-      // History API + a synthetic hashchange rather than `location.hash =`,
-      // which is a silent no-op in blob: forks (fragment navigation is dropped
-      // on the opaque origin); pushState/replaceState still work there.
-      const target = ctx.linkTo({ close: leaf.module }, { baseURI: location.href });
-      window.history.pushState(null, '', target);
-      window.dispatchEvent(new window.HashChangeEvent('hashchange'));
+      // route through the URL intent system: close=<module>. `navigate` rather than
+      // `location.hash =`, which is a silent no-op in blob: forks.
+      navigate(ctx.linkTo({ close: leaf.module }, { baseURI: location.href }));
     });
     tab.appendChild(close);
     return tab;
@@ -15562,7 +15623,7 @@ const _1mz2n05 = function _lp2_menu_clear_history(lp2_registerMenuItem,lch_git,l
   invalidation.then(dispose);
   return 'menu: clear-history';
 };
-const _1af1qr1 = function _lp2_add_module(createModule,runtime,realize,location,linkTo,invalidation)
+const _1af1qr1 = function _lp2_add_module(createModule,runtime,realize,location,linkTo,navigate,invalidation)
 {
   const button = document.createElement('button');
   button.className = 'lp2-add-module';
@@ -15648,7 +15709,7 @@ const _1af1qr1 = function _lp2_add_module(createModule,runtime,realize,location,
     const [fn] = await realize([src], runtime);
     mod.variable({}).define('intro', ['md'], fn);
     close();
-    location.hash = linkTo({ open: name }, { baseURI: location.href });
+    navigate(linkTo({ open: name }, { baseURI: location.href }));
   };
   button.addEventListener('click', ev => {
     ev.stopPropagation();
@@ -15682,6 +15743,254 @@ const _1af1qr1 = function _lp2_add_module(createModule,runtime,realize,location,
     close
   };
 };
+const _1imw0doc = function _lp2_doc_import(md){return(
+md`### Import wizards
+
+Dropping OS files on the page opens an import dialog. The wizards are plugins: the [\`@tomlarkworthy/plugin-registry\`](https://observablehq.com/@tomlarkworthy/plugin-registry) set named \`"import_plugins"\` holds **probe** functions \`(payload) => candidates\`, called once at drop with \`{files, text, types}\` (files are readable, so a probe can sniff content). Each candidate is \`{id, label, detail?, render}\`. lopepage-2 owns the modal frame and the candidate picker; on pick the body swaps to the plugin's own element from \`render({payload, close})\` — the plugin supplies its own confirm affordance and calls \`close()\` when finished. Durability after an import is the plugin's concern (e.g. prompt a save, or leave it as a live-runtime edit).
+
+\`lp2_import_host\` is build-once; \`lp2_import_sync\` pushes the live probe set through a stable setter so registering a plugin never tears down an open dialog. \`lp2_import_drop\` captures page-level \`dragover\`/\`drop\` for OS file drags and for module-typed string drags — a tab dragged from **another notebook window** arrives as strings (\`application/x-lp2-leaf\` with the module name, \`application/javascript\` with the source; \`DownloadURL\` only becomes a file when dropped on the OS), and the payload carries them as \`leaf\`/\`js\`/\`downloadURL\`. Internal same-window tab drags (\`window.__lp2_drag\`) are untouched. Reference wizards live in the \`import_wizards.html\` notebook (\`import-wizard-js\`, \`import-wizard-file\`, \`import-wizard-notebook\`).`
+)};
+const _1imw1 = function _lp2_importWizards(plugins){return(
+plugins.get("import_plugins")
+)};
+const _1imw2 = function _lp2_import_host(invalidation)
+{
+  let probes = [];
+  let overlay = null;
+  let body = null;
+  const close = () => {
+    if (overlay) {
+      overlay.remove();
+      overlay = null;
+      body = null;
+      document.removeEventListener('keydown', onKey);
+    }
+  };
+  const onKey = ev => {
+    if (ev.key === 'Escape')
+      close();
+  };
+  const fmtSize = n => n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+  const summarize = payload => {
+    const files = payload.files || [];
+    if (files.length === 1)
+      return files[0].name + ' (' + fmtSize(files[0].size) + ')';
+    if (files.length > 1)
+      return files.length + ' files';
+    if (payload.leaf)
+      return payload.leaf;
+    return payload.text ? 'text' : 'drop';
+  };
+  const open = async payload => {
+    close();
+    overlay = document.createElement('div');
+    Object.assign(overlay.style, {
+      position: 'fixed',
+      inset: '0',
+      zIndex: 1200,
+      background: 'rgba(0,0,0,.35)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center'
+    });
+    const dialog = document.createElement('div');
+    dialog.className = 'lp2-import-dialog';
+    Object.assign(dialog.style, {
+      background: 'var(--theme-background-a, #fff)',
+      color: 'var(--theme-foreground)',
+      border: '1px solid var(--theme-foreground-fainter)',
+      borderRadius: '6px',
+      boxShadow: '0 8px 32px rgba(0,0,0,.25)',
+      minWidth: '340px',
+      maxWidth: 'min(560px, 90vw)',
+      maxHeight: '80vh',
+      overflow: 'auto',
+      font: '13px var(--sans-serif, sans-serif)'
+    });
+    const header = document.createElement('div');
+    Object.assign(header.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      padding: '10px 12px',
+      borderBottom: '1px solid var(--theme-foreground-fainter)'
+    });
+    const title = document.createElement('div');
+    title.textContent = 'Import ' + summarize(payload);
+    Object.assign(title.style, {
+      flex: '1',
+      fontWeight: '600',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    });
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '\xD7';
+    closeBtn.title = 'Cancel';
+    Object.assign(closeBtn.style, {
+      border: 'none',
+      background: 'transparent',
+      cursor: 'pointer',
+      color: 'var(--theme-foreground-faint)',
+      font: '16px var(--sans-serif, sans-serif)',
+      lineHeight: '1',
+      padding: '2px 4px'
+    });
+    closeBtn.onclick = close;
+    header.append(title, closeBtn);
+    body = document.createElement('div');
+    Object.assign(body.style, { padding: '12px' });
+    body.textContent = 'Looking for importers…';
+    dialog.append(header, body);
+    overlay.appendChild(dialog);
+    overlay.addEventListener('mousedown', ev => {
+      if (ev.target === overlay)
+        close();
+    });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+    const myOverlay = overlay;
+    const candidates = [];
+    for (const probe of probes) {
+      try {
+        const r = await probe(payload);
+        if (Array.isArray(r))
+          candidates.push(...r);
+      } catch (e) {
+        console.warn('[lp2 import] probe failed:', e);
+      }
+    }
+    if (overlay !== myOverlay)
+      return;
+    if (!candidates.length) {
+      body.textContent = 'No importer handles this drop.';
+      return;
+    }
+    const list = document.createElement('div');
+    Object.assign(list.style, {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '6px'
+    });
+    for (const cand of candidates) {
+      const btn = document.createElement('button');
+      Object.assign(btn.style, {
+        textAlign: 'left',
+        padding: '8px 10px',
+        border: '1px solid var(--theme-foreground-fainter)',
+        borderRadius: '4px',
+        background: 'transparent',
+        color: 'var(--theme-foreground)',
+        cursor: 'pointer',
+        font: '13px var(--sans-serif, sans-serif)'
+      });
+      const label = document.createElement('div');
+      label.textContent = cand.label;
+      label.style.fontWeight = '600';
+      btn.appendChild(label);
+      if (cand.detail) {
+        const detail = document.createElement('div');
+        detail.textContent = cand.detail;
+        Object.assign(detail.style, {
+          color: 'var(--theme-foreground-faint)',
+          fontSize: '11px',
+          marginTop: '2px'
+        });
+        btn.appendChild(detail);
+      }
+      btn.onclick = async () => {
+        body.textContent = '…';
+        try {
+          const el = await cand.render({ payload, close });
+          if (overlay === myOverlay && body)
+            body.replaceChildren(el);
+        } catch (e) {
+          console.error('[lp2 import] wizard render failed:', e);
+          if (overlay === myOverlay && body)
+            body.textContent = 'Wizard failed: ' + (e && e.message || e);
+        }
+      };
+      list.appendChild(btn);
+    }
+    body.replaceChildren(list);
+  };
+  invalidation.then(close);
+  return {
+    open,
+    close,
+    setProbes: arr => {
+      probes = arr || [];
+    }
+  };
+};
+const _1imw3 = function _lp2_import_sync(lp2_import_host,lp2_importWizards)
+{
+  // stable setter keeps the host build-once: a plugin registering mid-dialog
+  // must not tear the dialog down
+  lp2_import_host.setProbes(lp2_importWizards);
+  return 'import probes: ' + lp2_importWizards.length;
+};
+const _1imw4 = function _lp2_import_drop(lp2_page,lp2_import_host,invalidation)
+{
+  const page = lp2_page;
+  const STYLE_ID = 'lp2-import-style';
+  document.getElementById(STYLE_ID)?.remove();
+  const s = document.createElement('style');
+  s.id = STYLE_ID;
+  s.textContent = `#lopepage-2.lp2-import-target { outline: 2px dashed var(--theme-foreground-focus, currentColor); outline-offset: -3px; }`;
+  document.head.appendChild(s);
+  // OS file drags, plus module-typed string drags from another notebook window
+  // (a cross-window tab drag delivers strings — DownloadURL only becomes a real
+  // file when dropped on the OS). Internal same-window tab drags set
+  // window.__lp2_drag and are left to the dock zones. Bare text/plain
+  // selections are deliberately not accepted.
+  const hasType = (e, t) => [...e.dataTransfer?.types || []].some(x => x.toLowerCase() === t);
+  const isImportDrag = e => !window.__lp2_drag && (hasType(e, 'files') || hasType(e, 'application/x-lp2-leaf') || hasType(e, 'application/javascript') || hasType(e, 'downloadurl'));
+  const onDragOver = e => {
+    if (!isImportDrag(e))
+      return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    page.classList.add('lp2-import-target');
+  };
+  const onDragLeave = e => {
+    if (!page.contains(e.relatedTarget))
+      page.classList.remove('lp2-import-target');
+  };
+  const onDrop = e => {
+    if (!isImportDrag(e))
+      return;
+    e.preventDefault();
+    page.classList.remove('lp2-import-target');
+    const gd = t => {
+      try {
+        return e.dataTransfer.getData(t) || null;
+      } catch (_) {
+        return null;
+      }
+    };
+    const payload = {
+      files: [...e.dataTransfer.files],
+      text: gd('text/plain'),
+      js: gd('application/javascript'),
+      leaf: gd('application/x-lp2-leaf'),
+      downloadURL: gd('DownloadURL'),
+      types: [...e.dataTransfer.types]
+    };
+    lp2_import_host.open(payload).catch(err => console.error('[lp2 import] open failed:', err));
+  };
+  page.addEventListener('dragover', onDragOver);
+  page.addEventListener('dragleave', onDragLeave);
+  page.addEventListener('drop', onDrop);
+  invalidation.then(() => {
+    page.removeEventListener('dragover', onDragOver);
+    page.removeEventListener('dragleave', onDragLeave);
+    page.removeEventListener('drop', onDrop);
+    page.classList.remove('lp2-import-target');
+    document.getElementById(STYLE_ID)?.remove();
+  });
+  return 'import drop capture installed';
+};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -15709,7 +16018,8 @@ export default function define(runtime, observer) {
   $def("_14hgn59", "lp2_doc_panes", ["md"], _14hgn59);  
   $def("_r14r4j", "lp2_moduleByName", ["lp2_watchedModules"], _r14r4j);  
   $def("_j3eb9x", "lp2_paneRegistry", [], _j3eb9x);  
-  $def("_193se86", "lp2_getPane", ["lp2_scrollToCell","lp2_paneRegistry","lp2_moduleByName","visualizer","runtime","lp2_installAnchor"], _193se86);  
+  $def("_1dorm7b", "lp2_bootDormant", ["runtime","importShim"], _1dorm7b);  
+  $def("_193se86", "lp2_getPane", ["lp2_scrollToCell","lp2_paneRegistry","lp2_moduleByName","lp2_bootDormant","visualizer","runtime","lp2_installAnchor"], _193se86);  
   $def("_88b5go", "lp2_doc_scroll", ["md"], _88b5go);  
   $def("_78h40x", "lp2_anchor", ["persistentId"], _78h40x);  
   $def("_d4xe91", "lp2_installAnchor", ["lp2_anchor","ResizeObserver"], _d4xe91);  
@@ -15717,7 +16027,7 @@ export default function define(runtime, observer) {
   $def("_1fxe40f", "lp2_host", [], _1fxe40f);  
   $def("_inou6n", "lp2_renderNode", ["lp2_renderStack","lp2_renderSplit"], _inou6n);  
   $def("_1r0c4er", "lp2_ops", [], _1r0c4er);  
-  $def("_sx484g", "lp2_dragOut", [], _sx484g);  
+  $def("_sx484g", "lp2_dragOut", ["exportModuleJS"], _sx484g);
   $def("_1194mfy", "lp2_view", ["lp2_host","lp2Model","lp2_installAnchor","lp2_anchor","viewof lp2Model","Event","lp2_getPane","lp2_dragOut","lp2_ops","linkTo","lp2_paneRegistry","lp2_renderNode","lp2_burger","lp2_add_module"], _1194mfy);  
   $def("_1bytrbx", "lp2_probe", ["lp2_view","lp2_paneRegistry"], _1bytrbx);  
   $def("_orvfgz", "lp2_doc_hash", ["md"], _orvfgz);  
@@ -15727,10 +16037,10 @@ export default function define(runtime, observer) {
   $def("_1rf2mk0", "lp2_syncToUrl", ["lp2Model","lp2_serializeDSL","lp2_parseDSL","location","lp2_setHash"], _1rf2mk0);  
   $def("_6e8yep", "lp2_doc_mount", ["md"], _6e8yep);  
   $def("_1y1ubko", "lp2_page", ["apply_theme","lp2_host","commandPaletteStyles","commandPaletteOverlay"], _1y1ubko);  
-  $def("_9clfn3", "lp2_background_jobs", ["commandPaletteKeybinding","cc_chat","change_listener","commit_history","replay_git","auto_attach","lp2_watchModules","lp2_menu_sync","lp2_menu_defaults","lp2_menu_clear_history"], _9clfn3);  
+  $def("_9clfn3", "lp2_background_jobs", ["commandPaletteKeybinding","cc_chat","change_listener","commit_history","replay_git","auto_attach","lp2_watchModules","lp2_menu_sync","lp2_menu_defaults","lp2_menu_clear_history","lp2_import_sync","lp2_import_drop"], _9clfn3);
   $def("_1yumqn", "lp2_append_to_body", ["lp2_view","lp2_syncFromUrl","lp2_syncToUrl","lp2_page"], _1yumqn);  
   $def("_z83rug", null, ["currentModules"], _z83rug);  
-  $def("_1s8yfis", "lp2_renderTab", ["location"], _1s8yfis);  
+  $def("_1s8yfis", "lp2_renderTab", ["location","navigate"], _1s8yfis);  
   $def("_13y25bb", "lp2_dropZone", [], _13y25bb);  
   $def("_b408jx", "lp2_splitter", [], _b408jx);  
   $def("_nj1uts", "lp2_renderStack", ["lp2_renderTab","lp2_dropZone"], _nj1uts);  
@@ -15746,9 +16056,15 @@ export default function define(runtime, observer) {
   $def("_1gv42y9", "lp2_menu_sync", ["lp2_burger","Element","lp2MenuItems"], _1gv42y9);  
   $def("_1vx778a", "lp2_menu_defaults", ["viewof attachContextManu","lp2_registerMenuItem","disk_svg","downloadAnchor","forkAnchor","Event","invalidation"], _1vx778a);  
   $def("_1mz2n05", "lp2_menu_clear_history", ["lp2_registerMenuItem","lch_git","lch_fs","lch_config","invalidation"], _1mz2n05);  
-  $def("_1af1qr1", "lp2_add_module", ["createModule","runtime","realize","location","linkTo","invalidation"], _1af1qr1);  
+  $def("_1af1qr1", "lp2_add_module", ["createModule","runtime","realize","location","linkTo","navigate","invalidation"], _1af1qr1);
+  $def("_1imw0doc", "lp2_doc_import", ["md"], _1imw0doc);
+  $def("_1imw1", "lp2_importWizards", ["plugins"], _1imw1);
+  $def("_1imw2", "lp2_import_host", ["invalidation"], _1imw2);
+  $def("_1imw3", "lp2_import_sync", ["lp2_import_host","lp2_importWizards"], _1imw3);
+  $def("_1imw4", "lp2_import_drop", ["lp2_page","lp2_import_host","invalidation"], _1imw4);
   main.define("plugins", ["module @tomlarkworthy/plugin-registry", "@variable"], (_, v) => v.import("plugins", _));  
   main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));  
+  main.define("importShim", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("importShim", _));  
   main.define("main", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("main", _));  
   main.define("persistentId", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("persistentId", _));  
   main.define("createModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("createModule", _));  
@@ -15768,12 +16084,14 @@ export default function define(runtime, observer) {
   main.define("lch_git", ["module @tomlarkworthy/local-change-history", "@variable"], (_, v) => v.import("git", "lch_git", _));  
   main.define("lch_fs", ["module @tomlarkworthy/local-change-history", "@variable"], (_, v) => v.import("fs", "lch_fs", _));  
   main.define("linkTo", ["module @tomlarkworthy/lopepage-urls", "@variable"], (_, v) => v.import("linkTo", _));  
+  main.define("navigate", ["module @tomlarkworthy/lopepage-urls", "@variable"], (_, v) => v.import("navigate", _));  
   main.define("auto_attach", ["module @tomlarkworthy/editor-5", "@variable"], (_, v) => v.import("auto_attach", _));  
   main.define("viewof attachContextManu", ["module @tomlarkworthy/editor-5", "@variable"], (_, v) => v.import("viewof attachContextManu", _));  
   main.define("attachContextManu", ["module @tomlarkworthy/editor-5", "@variable"], (_, v) => v.import("attachContextManu", _));  
   main.define("disk_svg", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("disk_svg", _));  
   main.define("downloadAnchor", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("downloadAnchor", _));  
   main.define("forkAnchor", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("forkAnchor", _));
+  main.define("exportModuleJS", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("exportModuleJS", _));
   return main;
 }</script>
 <script id="@tomlarkworthy/markdown-wiki/js-toolchain-notebook-kit-2-cells.md" 
@@ -27313,80 +27631,64 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _13upker = function _1(md){return(
+const _tku1if = function _1(md){return(
 md`# Command Palette
 
-Plugin-driven command palette. Press **Cmd+K** (Mac) or **Ctrl+K** to open.
+Plugin-driven command palette. Press **Cmd+K** (Mac) or **Ctrl+K** to open, or pick **Command palette** from the lopepage-2 burger menu (registered on the shared \`"lp2-menu"\` plugin bus).
 
 \`\`\`js
 import {commandPaletteOverlay, commandPaletteStyles, commandPaletteKeybinding} from "@tomlarkworthy/command-palette"
 \`\`\`
 
-## Registering a plugin
+## Registering a command provider
 
-A plugin is a function \`(query: string) => Command[]\` where \`Command = {label, href, hint?, module?, badge?, snippet?, score?}\`. Plugins run on every keystroke; results are merged and sorted by \`score\` (descending).
+A provider is a function \`(query: string) => Command[]\` where \`Command = {label, href?, action?, hint?, module?, badge?, snippet?, score?}\`. Providers run on every keystroke; results are merged and sorted by \`score\` (descending). A command with an \`action\` runs it instead of navigating — that is how a notebook exposes a *verb* (arm a tool, toggle a layer) rather than a destination.
+
+Providers register on the shared [\`@tomlarkworthy/plugin-registry\`](https://observablehq.com/@tomlarkworthy/plugin-registry) set named \`"lopecode_commands"\` — no import of this notebook needed, so any notebook can extend the palette:
 
 \`\`\`js
-import {viewof commands as commandsView} from "@tomlarkworthy/command-palette"
+import {plugins} from "@tomlarkworthy/plugin-registry"
 {
-  const myPlugin = (q) => [{label: "Hello " + q, href: "#" + q, score: 100}];
-  const unregister = commandsView.addCommand(myPlugin);
-  invalidation.then(unregister);
+  const provider = (q) => [{label: "Hello " + q, href: "#" + q, score: 100}];
+  plugins.add("lopecode_commands", provider, {invalidation});
 }
 \`\`\`
 
-## Built-in plugins
+## Built-in providers
 
 - **Module finder** — type a module name to open it.
 - **Cell search** — type to find cells across all loaded modules.`
 )};
-const _1eng7wy = function _commands(Inputs,Event)
-{
-    const input = Inputs.input([]);
-    input.addCommand = function (plugin) {
-        input.value.push(plugin);
-        input.dispatchEvent(new Event('input'));
-        return () => {
-            const i = input.value.indexOf(plugin);
-            if (i >= 0) {
-                input.value.splice(i, 1);
-                input.dispatchEvent(new Event('input'));
-            }
-        };
-    };
-    return input;
-};
-const _7bve6u = (G, _) => G.input(_);
-const _bpk8h7 = function _searchIndex(liveCellMap,modules){return(
+const _yavx6b = function _searchIndex(liveCellMap,modules){return(
 (() => {
-    const index = [];
-    for (const [mod, cells] of liveCellMap.entries()) {
-        const moduleName = modules?.get(mod)?.name ?? '<unknown>';
-        for (const cell of cells) {
-            if (!cell.name && cell.type !== 'import')
-                continue;
-            let source = null;
-            try {
-                const v = cell.variables?.[0];
-                if (v?._definition)
-                    source = v._definition.toString();
-            } catch (e) {
-            }
-            index.push({
-                module: moduleName,
-                name: cell.name ?? null,
-                type: cell.type ?? 'simple',
-                source
-            });
-        }
+  const index = [];
+  for (const [mod, cells] of liveCellMap.entries()) {
+    const moduleName = modules?.get(mod)?.name ?? '<unknown>';
+    for (const cell of cells) {
+      if (!cell.name && cell.type !== 'import')
+        continue;
+      let source = null;
+      try {
+        const v = cell.variables?.[0];
+        if (v?._definition)
+          source = v._definition.toString();
+      } catch (e) {
+      }
+      index.push({
+        module: moduleName,
+        name: cell.name ?? null,
+        type: cell.type ?? 'simple',
+        source
+      });
     }
-    return index;
+  }
+  return index;
 })()
 )};
-const _1ptnr90 = function _commandPaletteStyles(theme_assets,htl)
+const _rmjyys = function _commandPaletteStyles(theme_assets,htl)
 {
-    theme_assets;
-    return htl.html`<style>
+  theme_assets;
+  return htl.html`<style>
 .command-palette-overlay {
   position: fixed;
   inset: 0;
@@ -27508,15 +27810,15 @@ const _1ptnr90 = function _commandPaletteStyles(theme_assets,htl)
 }
 </style>`;
 };
-const _fomuvm = function _commandPaletteOverlay($0,Node,invalidation)
+const _1q8grv4 = function _commandPaletteOverlay(Node,navigate,invalidation)
 {
-    const $commands = $0;
-    let selectedIdx = 0;
-    let results = [];
-    const overlay = document.createElement('div');
-    overlay.className = 'command-palette-overlay';
-    overlay.hidden = true;
-    overlay.innerHTML = `<div class="command-palette-box">
+  let selectedIdx = 0;
+  let results = [];
+  let providers = [];
+  const overlay = document.createElement('div');
+  overlay.className = 'command-palette-overlay';
+  overlay.hidden = true;
+  overlay.innerHTML = `<div class="command-palette-box">
       <input class="command-palette-input" placeholder="Type a command..." autocomplete="off" />
       <div class="command-palette-results"></div>
       <div class="command-palette-hint">
@@ -27525,147 +27827,163 @@ const _fomuvm = function _commandPaletteOverlay($0,Node,invalidation)
         <span><kbd>Esc</kbd> close</span>
       </div>
     </div>`;
-    const input = overlay.querySelector('.command-palette-input');
-    const resultsContainer = overlay.querySelector('.command-palette-results');
-    function search(query) {
-        if (!query || query.length < 1)
-            return [];
-        const plugins = $commands.value || [];
-        let all = [];
-        for (const plugin of plugins) {
-            try {
-                const out = plugin(query);
-                if (Array.isArray(out))
-                    all = all.concat(out);
-            } catch (e) {
-                console.error('[command-palette] plugin error:', e);
-            }
-        }
-        all.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-        return all.slice(0, 50);
+  const input = overlay.querySelector('.command-palette-input');
+  const resultsContainer = overlay.querySelector('.command-palette-results');
+  function search(query) {
+    if (!query || query.length < 1)
+      return [];
+    let all = [];
+    for (const provider of providers) {
+      try {
+        const out = provider(query);
+        if (Array.isArray(out))
+          all = all.concat(out);
+      } catch (e) {
+        console.error('[command-palette] provider error:', e);
+      }
     }
-    function render() {
-        resultsContainer.innerHTML = '';
-        if (results.length === 0 && input.value.length > 0) {
-            resultsContainer.innerHTML = '<div class="command-palette-empty">No results found</div>';
-            return;
+    all.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    return all.slice(0, 50);
+  }
+  // A command either navigates (href) or runs (action). Providers that do something to the
+  // page rather than move within it need the latter.
+  function activate(r) {
+    if (!r)
+      return;
+    close();
+    if (typeof r.action === 'function')
+      r.action();
+    else
+      navigate(r.href || '#');
+  }
+  function render() {
+    resultsContainer.innerHTML = '';
+    if (results.length === 0 && input.value.length > 0) {
+      resultsContainer.innerHTML = '<div class="command-palette-empty">No results found</div>';
+      return;
+    }
+    results.forEach((r, i) => {
+      const row = document.createElement('a');
+      row.className = 'command-palette-result' + (i === selectedIdx ? ' selected' : '');
+      row.href = r.href || '#';
+      if (typeof r.action === 'function')
+        row.dataset.commandAction = '';
+      row.style.textDecoration = 'none';
+      row.style.color = 'inherit';
+      if (r.module) {
+        const modSpan = document.createElement('span');
+        modSpan.className = 'command-palette-module';
+        modSpan.textContent = r.module;
+        row.appendChild(modSpan);
+      }
+      const labelSpan = document.createElement('span');
+      labelSpan.className = 'command-palette-label';
+      labelSpan.textContent = r.label ?? '';
+      row.appendChild(labelSpan);
+      if (r.badge) {
+        const badgeSpan = document.createElement('span');
+        badgeSpan.className = 'command-palette-badge';
+        badgeSpan.textContent = r.badge;
+        row.appendChild(badgeSpan);
+      }
+      if (r.hint) {
+        const hintSpan = document.createElement('span');
+        hintSpan.className = 'command-palette-hint-right';
+        hintSpan.textContent = r.hint;
+        row.appendChild(hintSpan);
+      }
+      row.addEventListener('click', e => {
+        e.preventDefault();
+        activate(r);
+      });
+      resultsContainer.appendChild(row);
+      if (r.snippet) {
+        const snippet = document.createElement('div');
+        snippet.className = 'command-palette-snippet';
+        if (i === selectedIdx)
+          snippet.style.background = '#eef4ff';
+        if (typeof r.snippet === 'string') {
+          snippet.textContent = r.snippet;
+        } else if (r.snippet instanceof Node) {
+          snippet.appendChild(r.snippet);
         }
-        results.forEach((r, i) => {
-            const row = document.createElement('a');
-            row.className = 'command-palette-result' + (i === selectedIdx ? ' selected' : '');
-            row.href = r.href || '#';
-            row.style.textDecoration = 'none';
-            row.style.color = 'inherit';
-            if (r.module) {
-                const modSpan = document.createElement('span');
-                modSpan.className = 'command-palette-module';
-                modSpan.textContent = r.module;
-                row.appendChild(modSpan);
-            }
-            const labelSpan = document.createElement('span');
-            labelSpan.className = 'command-palette-label';
-            labelSpan.textContent = r.label ?? '';
-            row.appendChild(labelSpan);
-            if (r.badge) {
-                const badgeSpan = document.createElement('span');
-                badgeSpan.className = 'command-palette-badge';
-                badgeSpan.textContent = r.badge;
-                row.appendChild(badgeSpan);
-            }
-            if (r.hint) {
-                const hintSpan = document.createElement('span');
-                hintSpan.className = 'command-palette-hint-right';
-                hintSpan.textContent = r.hint;
-                row.appendChild(hintSpan);
-            }
-            row.addEventListener('click', e => {
-                e.preventDefault();
-                close();
-                window.location.href = row.href;
-            });
-            resultsContainer.appendChild(row);
-            if (r.snippet) {
-                const snippet = document.createElement('div');
-                snippet.className = 'command-palette-snippet';
-                if (i === selectedIdx)
-                    snippet.style.background = '#eef4ff';
-                if (typeof r.snippet === 'string') {
-                    snippet.textContent = r.snippet;
-                } else if (r.snippet instanceof Node) {
-                    snippet.appendChild(r.snippet);
-                }
-                snippet.addEventListener('click', e => {
-                    e.preventDefault();
-                    close();
-                    window.location.href = row.href;
-                });
-                resultsContainer.appendChild(snippet);
-            }
+        snippet.addEventListener('click', e => {
+          e.preventDefault();
+          activate(r);
         });
-    }
-    function open() {
-        overlay.hidden = false;
-        input.value = '';
-        results = [];
-        selectedIdx = 0;
-        render();
-        requestAnimationFrame(() => input.focus());
-    }
-    function close() {
-        overlay.hidden = true;
-        input.blur();
-    }
-    function navigateToSelected() {
-        if (results[selectedIdx]) {
-            const r = results[selectedIdx];
-            close();
-            window.location.href = r.href || '#';
-        }
-    }
-    input.addEventListener('input', () => {
-        results = search(input.value);
-        selectedIdx = 0;
-        render();
+        resultsContainer.appendChild(snippet);
+      }
     });
-    input.addEventListener('keydown', e => {
-        if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            selectedIdx = Math.min(selectedIdx + 1, results.length - 1);
-            render();
-            const sel = resultsContainer.querySelector('.selected');
-            if (sel)
-                sel.scrollIntoView({ block: 'nearest' });
-        } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            selectedIdx = Math.max(selectedIdx - 1, 0);
-            render();
-            const sel = resultsContainer.querySelector('.selected');
-            if (sel)
-                sel.scrollIntoView({ block: 'nearest' });
-        } else if (e.key === 'Enter') {
-            e.preventDefault();
-            navigateToSelected();
-        } else if (e.key === 'Escape') {
-            e.preventDefault();
-            close();
-        }
-    });
-    overlay.addEventListener('click', e => {
-        if (e.target === overlay)
-            close();
-    });
-    invalidation.then(() => overlay.remove());
-    overlay._openPalette = open;
-    overlay._closePalette = close;
-    overlay._isOpen = () => !overlay.hidden;
-    return overlay;
+  }
+  function open() {
+    overlay.hidden = false;
+    input.value = '';
+    results = [];
+    selectedIdx = 0;
+    render();
+    requestAnimationFrame(() => input.focus());
+  }
+  function close() {
+    overlay.hidden = true;
+    input.blur();
+  }
+  function navigateToSelected() {
+    activate(results[selectedIdx]);
+  }
+  input.addEventListener('input', () => {
+    results = search(input.value);
+    selectedIdx = 0;
+    render();
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      selectedIdx = Math.min(selectedIdx + 1, results.length - 1);
+      render();
+      const sel = resultsContainer.querySelector('.selected');
+      if (sel)
+        sel.scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      selectedIdx = Math.max(selectedIdx - 1, 0);
+      render();
+      const sel = resultsContainer.querySelector('.selected');
+      if (sel)
+        sel.scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      navigateToSelected();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+    }
+  });
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay)
+      close();
+  });
+  invalidation.then(() => overlay.remove());
+  overlay._openPalette = open;
+  overlay._closePalette = close;
+  overlay._isOpen = () => !overlay.hidden;
+  // Stable setter fed by command_provider_sync; re-searches live if the palette is open.
+  overlay._setProviders = arr => {
+    providers = arr || [];
+    if (!overlay.hidden) {
+      results = search(input.value);
+      selectedIdx = 0;
+      render();
+    }
+  };
+  return overlay;
 };
-const _mqy6k9 = function _commandPaletteKeybinding(cellSearchPlugin,moduleFinderPlugin,commandPaletteOverlay,invalidation)
+const _1vuj6tn = function _commandPaletteKeybinding(cellSearchPlugin,moduleFinderPlugin,command_provider_sync,commandPaletteOverlay,invalidation)
 {
   cellSearchPlugin;
   moduleFinderPlugin;
-  const handler = (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+  command_provider_sync;
+  const handler = e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
       e.preventDefault();
       e.stopPropagation();
       if (commandPaletteOverlay._isOpen()) {
@@ -27675,24 +27993,23 @@ const _mqy6k9 = function _commandPaletteKeybinding(cellSearchPlugin,moduleFinder
       }
     }
   };
-  document.addEventListener("keydown", handler, true);
-  invalidation.then(() =>
-    document.removeEventListener("keydown", handler, true)
-  );
+  document.addEventListener('keydown', handler, true);
+  invalidation.then(() => document.removeEventListener('keydown', handler, true));
   return null;
 };
-const _k261kj = function _cellSearchPlugin(searchIndex,linkTo,$0,invalidation)
+const _104tbig = function _cellSearchPlugin(searchIndex,linkTo,plugins,invalidation)
 {
-  const plugin = (query) => {
-    if (!query || query.length < 1) return [];
+  const plugin = query => {
+    if (!query || query.length < 1)
+      return [];
     const q = query.toLowerCase();
     const out = [];
     for (const entry of searchIndex) {
       let score = 0;
       let nameMatch = false;
       let sourceMatch = false;
-      const name = String(entry.name ?? "").toLowerCase();
-      const mod = String(entry.module ?? "").toLowerCase();
+      const name = String(entry.name ?? '').toLowerCase();
+      const mod = String(entry.module ?? '').toLowerCase();
       if (name.length && name.startsWith(q)) {
         score += 150;
         nameMatch = true;
@@ -27707,50 +28024,42 @@ const _k261kj = function _cellSearchPlugin(searchIndex,linkTo,$0,invalidation)
         score += 10;
         sourceMatch = true;
       }
-      if (score === 0) continue;
-      const nameStr = String(entry.name ?? "");
-      const modStr = String(entry.module ?? "");
-      const href = linkTo(nameStr ? modStr + "#" + nameStr : modStr);
+      if (score === 0)
+        continue;
+      const nameStr = String(entry.name ?? '');
+      const modStr = String(entry.module ?? '');
+      const href = linkTo(nameStr ? modStr + '#' + nameStr : modStr);
       let snippet = null;
       if (entry.source) {
         const src = String(entry.source);
         const idx = src.toLowerCase().indexOf(q);
         const frag = document.createDocumentFragment();
         if (idx >= 0) {
-          const start = Math.max(
-            0,
-            src.lastIndexOf("\n", Math.max(0, idx - 40)) + 1
-          );
-          const endNL = src.indexOf("\n", idx + query.length + 40);
-          const lineEnd =
-            endNL < 0 ? Math.min(src.length, idx + query.length + 80) : endNL;
+          const start = Math.max(0, src.lastIndexOf('\n', Math.max(0, idx - 40)) + 1);
+          const endNL = src.indexOf('\n', idx + query.length + 40);
+          const lineEnd = endNL < 0 ? Math.min(src.length, idx + query.length + 80) : endNL;
           const before = src.slice(start, idx);
           const match = src.slice(idx, idx + query.length);
           const after = src.slice(idx + query.length, lineEnd);
           if (start > 0)
-            frag.appendChild(document.createTextNode("\u2026" + before));
-          else frag.appendChild(document.createTextNode(before));
-          const mark = document.createElement("mark");
+            frag.appendChild(document.createTextNode('\u2026' + before));
+          else
+            frag.appendChild(document.createTextNode(before));
+          const mark = document.createElement('mark');
           mark.textContent = match;
           frag.appendChild(mark);
-          frag.appendChild(
-            document.createTextNode(
-              after + (lineEnd < src.length ? "\u2026" : "")
-            )
-          );
+          frag.appendChild(document.createTextNode(after + (lineEnd < src.length ? '\u2026' : '')));
         } else {
-          const firstLine = src.slice(0, src.indexOf("\n", 0));
-          frag.appendChild(
-            document.createTextNode((firstLine || src).slice(0, 120))
-          );
+          const firstLine = src.slice(0, src.indexOf('\n', 0));
+          frag.appendChild(document.createTextNode((firstLine || src).slice(0, 120)));
         }
         snippet = frag;
       }
       out.push({
-        label: nameStr || "(anonymous)",
+        label: nameStr || '(anonymous)',
         module: modStr,
-        badge: entry.type && entry.type !== "simple" ? entry.type : null,
-        hint: sourceMatch && !nameMatch ? "source" : null,
+        badge: entry.type && entry.type !== 'simple' ? entry.type : null,
+        hint: sourceMatch && !nameMatch ? 'source' : null,
         snippet,
         href,
         score
@@ -27758,37 +28067,69 @@ const _k261kj = function _cellSearchPlugin(searchIndex,linkTo,$0,invalidation)
     }
     return out;
   };
-  const unregister = $0.addCommand(plugin);
-  invalidation.then(unregister);
-  return "cell-search plugin registered";
+  plugins.add('lopecode_commands', plugin, { invalidation });
+  return 'cell-search plugin registered';
 };
-const _lq3msy = function _moduleFinderPlugin(modules,linkTo,$0,invalidation)
+const _1opf5e1 = function _moduleFinderPlugin(currentModules,linkTo,plugins,invalidation)
 {
-  const plugin = (query) => {
-    if (!query || query.length < 1) return [];
+  // Use the REACTIVE module set (module-map currentModules), not cell-map's one-shot `modules` snapshot,
+  // so modules created live (e.g. by robocoop-4) are immediately findable. This cell recomputes whenever
+  // currentModules changes; the old plugin is unregistered via invalidation before the new one registers.
+  const plugin = query => {
+    if (!query || query.length < 1)
+      return [];
     const q = query.toLowerCase();
     const out = [];
-    for (const [, info] of modules.entries()) {
-      const name = info?.name ?? "";
-      if (!name) continue;
+    for (const [, info] of currentModules.entries()) {
+      const name = info?.name ?? '';
+      if (!name)
+        continue;
       const lower = name.toLowerCase();
       let score = 0;
-      if (lower === q) score = 1000;
-      else if (lower.startsWith(q)) score = 800;
-      else if (lower.includes(q)) score = 600;
-      if (score === 0) continue;
+      if (lower === q)
+        score = 1000;
+      else if (lower.startsWith(q))
+        score = 800;
+      else if (lower.includes(q))
+        score = 600;
+      if (score === 0)
+        continue;
       out.push({
         label: name,
         href: linkTo(name),
-        hint: "open module",
+        hint: 'open module',
         score
       });
     }
     return out;
   };
-  const unregister = $0.addCommand(plugin);
-  invalidation.then(unregister);
-  return "module-finder plugin registered";
+  plugins.add('lopecode_commands', plugin, { invalidation });
+  return 'module-finder plugin registered';
+};
+const _1seh1ei = function _cp_menu_register(plugins,commandPaletteOverlay,invalidation)
+{
+  // Surface the palette in the lopepage-2 burger menu so it's discoverable without knowing the
+  // Cmd/Ctrl+K shortcut. Registers straight onto the shared plugin-registry "lp2-menu" set — no
+  // import of lopepage-2; a notebook opts in by adding both modules to its bootconf mains.
+  const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent || '');
+  plugins.add('lp2-menu', {
+    id: 'command-palette',
+    order: 3,
+    label: 'Command palette  ' + (isMac ? '\u2318K' : 'Ctrl+K'),
+    svg: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="7" cy="7" r="4.2"/><path d="M10.2 10.2 14 14"/></svg>',
+    action: () => commandPaletteOverlay._openPalette()
+  }, { invalidation });
+  return 'registered: command-palette menu item';
+};
+const _7c6wp9 = function _commandProviders(plugins){return(
+plugins.get('lopecode_commands')
+)};
+const _13y9cxb = function _command_provider_sync(commandPaletteOverlay,commandProviders)
+{
+  // Push the current provider set (from the "lopecode_commands" bus) into the stable overlay,
+  // so the overlay is built once yet always searches the live set. Recomputes on every add/remove.
+  commandPaletteOverlay._setProviders(commandProviders);
+  return `command providers: ${ commandProviders.length }`;
 };
 
 export default function define(runtime, observer) {
@@ -27800,20 +28141,26 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/cell-map", async () => runtime.module((await import("/@tomlarkworthy/cell-map.js?v=4")).default));  
   main.define("module @tomlarkworthy/lopepage-urls", async () => runtime.module((await import("/@tomlarkworthy/lopepage-urls.js?v=4")).default));  
   main.define("module @tomlarkworthy/themes", async () => runtime.module((await import("/@tomlarkworthy/themes.js?v=4")).default));  
-  $def("_13upker", null, ["md"], _13upker);  
-  $def("_1eng7wy", "viewof commands", ["Inputs","Event"], _1eng7wy);  
-  $def("_7bve6u", "commands", ["Generators","viewof commands"], _7bve6u);  
-  $def("_bpk8h7", "searchIndex", ["liveCellMap","modules"], _bpk8h7);  
-  $def("_1ptnr90", "commandPaletteStyles", ["theme_assets","htl"], _1ptnr90);  
-  $def("_fomuvm", "commandPaletteOverlay", ["viewof commands","Node","invalidation"], _fomuvm);  
-  $def("_mqy6k9", "commandPaletteKeybinding", ["cellSearchPlugin","moduleFinderPlugin","commandPaletteOverlay","invalidation"], _mqy6k9);  
-  $def("_k261kj", "cellSearchPlugin", ["searchIndex","linkTo","viewof commands","invalidation"], _k261kj);  
-  $def("_lq3msy", "moduleFinderPlugin", ["modules","linkTo","viewof commands","invalidation"], _lq3msy);  
+  main.define("module @tomlarkworthy/module-map", async () => runtime.module((await import("/@tomlarkworthy/module-map.js?v=4")).default));  
+  main.define("module @tomlarkworthy/plugin-registry", async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));  
+  $def("_tku1if", null, ["md"], _tku1if);  
+  $def("_yavx6b", "searchIndex", ["liveCellMap","modules"], _yavx6b);  
+  $def("_rmjyys", "commandPaletteStyles", ["theme_assets","htl"], _rmjyys);  
+  $def("_1q8grv4", "commandPaletteOverlay", ["Node","navigate","invalidation"], _1q8grv4);  
+  $def("_1vuj6tn", "commandPaletteKeybinding", ["cellSearchPlugin","moduleFinderPlugin","command_provider_sync","commandPaletteOverlay","invalidation"], _1vuj6tn);  
+  $def("_104tbig", "cellSearchPlugin", ["searchIndex","linkTo","plugins","invalidation"], _104tbig);  
+  $def("_1opf5e1", "moduleFinderPlugin", ["currentModules","linkTo","plugins","invalidation"], _1opf5e1);  
   main.define("viewof liveCellMap", ["module @tomlarkworthy/cell-map", "@variable"], (_, v) => v.import("viewof liveCellMap", _));  
   main.define("liveCellMap", ["module @tomlarkworthy/cell-map", "@variable"], (_, v) => v.import("liveCellMap", _));  
   main.define("modules", ["module @tomlarkworthy/cell-map", "@variable"], (_, v) => v.import("modules", _));  
   main.define("linkTo", ["module @tomlarkworthy/lopepage-urls", "@variable"], (_, v) => v.import("linkTo", _));  
-  main.define("theme_assets", ["module @tomlarkworthy/themes", "@variable"], (_, v) => v.import("theme_assets", _));
+  main.define("navigate", ["module @tomlarkworthy/lopepage-urls", "@variable"], (_, v) => v.import("navigate", _));  
+  main.define("theme_assets", ["module @tomlarkworthy/themes", "@variable"], (_, v) => v.import("theme_assets", _));  
+  main.define("currentModules", ["module @tomlarkworthy/module-map", "@variable"], (_, v) => v.import("currentModules", _));  
+  main.define("plugins", ["module @tomlarkworthy/plugin-registry", "@variable"], (_, v) => v.import("plugins", _));  
+  $def("_1seh1ei", "cp_menu_register", ["plugins","commandPaletteOverlay","invalidation"], _1seh1ei);  
+  $def("_7c6wp9", "commandProviders", ["plugins"], _7c6wp9);  
+  $def("_13y9cxb", "command_provider_sync", ["commandPaletteOverlay","commandProviders"], _13y9cxb);
   return main;
 }</script>
 <script id="@tomlarkworthy/dataflow-templating/dataflow_templating%401.svg" 
@@ -40095,6 +40442,28 @@ function navHref(
   return `#${finalOp}=${cell ? `${module}#${cell}` : module}`;
 }
 )};
+const _1nav0gx = function _26(md){return(
+md`## navigate
+
+Follow a link built by \`linkTo\`/\`navHref\`. Assigning to \`location.hash\` looks equivalent and is,
+until the page is a fork: a notebook opened from exporter-3's **Fork** lives on \`blob:null\`, an
+opaque origin where fragment navigation is silently dropped, so the intent is lost and nothing
+happens. The History API works there, but fires no \`hashchange\` of its own, so this announces the
+change itself. Write hash intents through here rather than through \`location\`.`
+)};
+const _1nav1ht = function _navigate(){return(
+function navigate(href) {
+  const target = String(href ?? "");
+  // Not a fragment (an Observable path, an absolute URL): a real navigation, which works anywhere.
+  if (!target.startsWith("#")) {
+    window.location.href = target || "#";
+    return false;
+  }
+  window.history.pushState(null, "", target);
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  return true;
+}
+)};
 const _1b41ote = function _25(md){return(
 md`## Add linkTo`
 )};
@@ -40396,7 +40765,9 @@ export default function define(runtime, observer) {
   $def("_1c5mz8f", null, ["md"], _1c5mz8f);  
   $def("_pguvk3", null, ["navHref","htl"], _pguvk3);  
   $def("_1buu6oo", "navHref", [], _1buu6oo);  
-  $def("_1b41ote", null, ["md"], _1b41ote);  
+  $def("_1nav0gx", null, ["md"], _1nav0gx);
+  $def("_1nav1ht", "navigate", [], _1nav1ht);
+  $def("_1b41ote", null, ["md"], _1b41ote);
   $def("_1xjzq9r", "isOnObservableCom", ["location"], _1xjzq9r);  
   $def("_gxaxgb", "links", [], _gxaxgb);  
   $def("_17e89y0", "targets", [], _17e89y0);  
