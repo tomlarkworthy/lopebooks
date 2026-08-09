@@ -28184,7 +28184,7 @@ md`# Dataflow Templating
 const _1edhe6y = function _2(md){return(
 md`\`\`\`js
 
-import {cloneDataflow, thisModule, lookupVariable} from '@tomlarkworthy/dataflow-templating'
+import {instantiateDataflow, cloneViaSandbox, cloneDataflow, thisModule, lookupVariable} from '@tomlarkworthy/dataflow-templating'
 \`\`\``
 )};
 const _190zbgd = function _3(md){return(
@@ -28471,6 +28471,75 @@ md`## Releasing Resources
 
 \`cloneDataflow\` creates non-visible reactive variables. These will accumulate over time unless you call the returned disposal function. You can use the [dataflow debugger](https://observablehq.com/@tomlarkworthy/debugger) to help identify leaks as it is able to plot a variables in the runtime, even those not visible in the notebook.`
 )};
+const _dtv2a = function _dtv2a(md){return(
+md`## Instancing into a sandbox Runtime
+
+\`cloneDataflow\` defines its clones into the module it copied from, so every instance is a variable in the page's own runtime. Measured on [@tomlarkworthy/editor-5](https://observablehq.com/@tomlarkworthy/editor-5) on 2026-08-09, at rest with 132 cell shells and 3 open panels:
+
+\`\`\`
+runtime._variables      3107
+  "dynamic " clones      862   (28%)
+editorModule._scope     1031
+\`\`\`
+
+Opening one more panel added 21 variables, and fired 21 code-change events at 7 listeners.
+
+This is not a CPU problem. The \`check_for_code_change\` pass costs 0.33ms with those clones present against 0.19ms without, and it is debounced. The problem is that a clone is indistinguishable from a real cell, so seven unrelated modules carry a hand-rolled \`dynamic \` name filter to hide them: \`exporter-3\` (without it clones are serialised into the export), \`local-change-history\`, \`cell-map\`, \`lopepage\`, \`lopepage-2\`, and \`module-map\`/\`modules.js\` which catch only the narrower \`dynamic observe \`. Two of those are correctness guards, not cosmetics.
+
+\`instantiateDataflow\` builds the instance in a second \`Runtime\` instead. Nothing to filter, and nothing in the origin module's scope: the same page with every editor on the sandbox reports 2291 primary variables, 7 clones, and a module scope of 215.`
+)};
+const _dtv2b = function _dtv2b(md){return(
+md`### API
+
+\`\`\`js
+// One factory per page. It creates its sandbox Runtime lazily and shares it across instances.
+instantiateDataflow = instantiateDataflowFactory(runtime.constructor, {
+  builtins: {}            // builtins for the sandbox Runtime; default is none
+})
+
+instance = instantiateDataflow(
+  template,                // Variable[] — the same argument cloneDataflow takes
+  {
+    params: {},            // {name: value}, injected; shadows a template variable of that name
+    observers: (name) => ({fulfilled, rejected, pending}), // as cloneDataflow's observerFactory
+    watch: onCodeChange    // (cb) => unsub; without it the instance ignores later source edits
+  }
+)
+
+instance.value("widget")           // promise of a cell's value
+instance.observe("widget", obs)    // attach an observer afterwards; returns a detach function
+instance.variables                 // Map<name, Variable> — the instance body
+instance.captures                  // names bridged in from the origin module
+instance.diagnostics               // [{code, name}] — warn/mixed-modules, warn/shadowed
+instance.dispose()                 // true the first time, false after
+\`\`\`
+
+\`instantiateDataflow.stats()\` reports \`{sandboxRuntime, bridges, modules}\`, and \`instantiateDataflow.destroy()\` disposes the sandbox Runtime and every bridge.
+
+\`params\` is what \`cloneDataflow\` has no answer for. A parameter is defined in the instance module ahead of the body, so a template variable of the same name is simply not created and every downstream variable reads the injected value.`
+)};
+const _dtv2c = function _dtv2c(md){return(
+md`### What crosses the boundary
+
+An input a template variable reads but does not itself define — \`Inputs\`, \`htl\`, a shared \`time\` range — is a **capture**. Each one becomes a single variable in the origin module, named \`dynamic bridge <name> <uid>\`, whose observer republishes into the sandbox as an async generator. Bridges are keyed by \`(module, name)\`, shared by every instance and refcounted, so they do not scale with instance count: editor-5 with 135 editors holds **36** bridges, against the 862 clone variables \`cloneDataflow\` produced. Break-even is 6 instances.
+
+\`invalidation\`, \`visibility\` and \`@variable\` are never bridged. They are symbols the runtime resolves per-variable, so the sandbox mints its own.
+
+**The bridge is one-way.** A template that writes back to a captured \`mutable\` works under \`cloneDataflow\` and does not work here. That is the one known behavioural regression, and it is why \`cloneDataflow\` remains exported and supported.`
+)};
+const _dtv2d = function _dtv2d(md){return(
+md`### Migrating a call site
+
+\`cloneViaSandbox\` has \`cloneDataflow\`'s signature and returns the same disposal function, so a call site moves by one identifier:
+
+\`\`\`js
+dispose = cloneViaSandbox(template, observerFactory)
+\`\`\`
+
+Corpus-wide there are four \`cloneDataflow\` consumers: \`@tomlarkworthy/editor-5\`, \`@tomlarkworthy/robocoop-2\`, \`@tomlarkworthy/robocoop-3\` and \`@tomlarkworthy/parametric-svg\`. Only editor-5 is migrated, on 2026-08-09 — all 135 editors built on the sandbox from boot, the page exported, and the export re-booted with zero console errors. The other three are untested, and none of them has been checked against the \`mutable\` write-back above.
+
+Disposal is not simply "delete what was created". Deleting a variable that still has outputs does **not** free its scope entry — \`variable.js\` substitutes a fresh implicit variable so the references stay wired — so \`dispose()\` deletes in reverse dependency order and then sweeps whatever survived out of the module scope.`
+)};
 const _jw42sg = function _46(md){return(
 md`---`
 )};
@@ -28512,6 +28581,238 @@ function cloneDataflow(variables, observerFactory = () => ({})) {
     clones.clear();
     unobserve();
   };
+}
+)};
+const _dtv2h = function _dtv2h(md){return(
+md`## instantiateDataflow`
+)};
+const _dtv2f = function _instantiateDataflowFactory(){
+// instantiateDataflow — cloneDataflow, but the instance lives in a sandbox Runtime.
+//
+// cloneDataflow defines its clones into the module it copied from, so every instance is a variable
+// in the primary runtime. Seven unrelated modules carry a `dynamic ` name filter to keep those out
+// of the exporter, the change history, the cell map and three cell lists. This instantiates into a
+// separate Runtime instead, so there is nothing to filter.
+//
+// Import-free on purpose: `make-cells.mjs` lifts this file into notebook cells verbatim, so the
+// Runtime constructor arrives as a factory argument rather than an import.
+
+const SENTINELS = new Set(["invalidation", "visibility", "@variable"]);
+
+const sanitize = (s) => String(s).replace(/[^\w$]/g, "_");
+
+// A one-way live edge from a variable in the primary runtime into the sandbox. One per
+// (module, name), shared by every instance that captures it, refcounted.
+function makeBridge(originModule, name, uid) {
+  const waiters = new Set();
+  let state = { v: -1, s: "pending" };
+  let seq = 0;
+
+  const emit = (next) => {
+    state = next;
+    for (const w of waiters) w();
+    waiters.clear();
+  };
+
+  const holder = originModule
+    .variable({
+      pending() {},
+      fulfilled(value) {
+        emit({ v: seq++, s: "ok", value });
+      },
+      rejected(error) {
+        emit({ v: seq++, s: "err", error });
+      }
+    })
+    // `dynamic ` prefix so the five existing corpus guards that test for it already exclude these.
+    .define(`dynamic bridge ${sanitize(name)} ${uid}`, [name], (x) => x);
+
+  const changed = () => new Promise((r) => waiters.add(r));
+
+  // Yields only when the upstream value actually changes; re-yielding on every pull would spin the
+  // runtime, which schedules the next `next()` immediately after each yield.
+  async function* follow() {
+    let seen = -1;
+    for (;;) {
+      while (state.v === seen || state.s === "pending") await changed();
+      seen = state.v;
+      if (state.s === "err") throw state.error;
+      yield state.value;
+    }
+  }
+
+  return {
+    name,
+    follow,
+    refs: 0,
+    variable: holder,
+    destroy() {
+      holder.delete();
+      waiters.clear();
+    }
+  };
+}
+
+function instantiateDataflowFactory(Runtime, options = {}) {
+  const { builtins = {} } = options;
+
+  let sandbox = null;
+  const sandboxOf = () => sandbox || (sandbox = new Runtime(builtins));
+
+  // module -> name -> bridge
+  const bridges = new Map();
+  // runtime._modules is keyed by the define function and only records runtime.module(define),
+  // so anonymous instance modules never appear there — count them here instead.
+  const live = new Set();
+  let uidSeq = 0;
+  const nextUid = () => `b${(uidSeq++).toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+  function acquire(originModule, name) {
+    let byName = bridges.get(originModule);
+    if (!byName) bridges.set(originModule, (byName = new Map()));
+    let bridge = byName.get(name);
+    if (!bridge) byName.set(name, (bridge = makeBridge(originModule, name, nextUid())));
+    bridge.refs++;
+    return bridge;
+  }
+
+  function release(originModule, bridge) {
+    if (--bridge.refs > 0) return;
+    const byName = bridges.get(originModule);
+    if (byName) byName.delete(bridge.name);
+    bridge.destroy();
+  }
+
+  /**
+   * variables  Variable[]   the template, exactly as cloneDataflow takes it
+   * options
+   *   params     {name: value}      injected; shadows a template variable of the same name
+   *   observers  (name) => observer same shape as cloneDataflow's observerFactory
+   *   watch      (cb) => unsub      fires when upstream code may have changed (pass observeSet)
+   */
+  function instantiateDataflow(variables, opts = {}) {
+    if (!variables || !variables.length) throw new Error("instantiateDataflow: no variables");
+    const { params = {}, observers = () => ({}), watch = null } = opts;
+
+    const originModule = variables[0]._module;
+    const templateNames = new Set(variables.map((v) => v._name));
+    const paramNames = new Set(Object.keys(params));
+    const mod = sandboxOf().module();
+    live.add(mod);
+
+    const diagnostics = [];
+    for (const v of variables) {
+      if (v._module !== originModule)
+        diagnostics.push({ code: "warn/mixed-modules", name: v._name });
+      if (v._shadow && v._shadow.size)
+        diagnostics.push({ code: "warn/shadowed", name: v._name });
+    }
+
+    const created = [];
+    const held = [];
+
+    for (const [name, value] of Object.entries(params))
+      created.push(mod.variable().define(name, [], () => value));
+
+    const captured = new Set();
+    for (const v of variables) {
+      if (paramNames.has(v._name)) continue;
+      for (const i of v._inputs) {
+        const n = i._name;
+        if (typeof n !== "string") continue;
+        if (templateNames.has(n) || paramNames.has(n) || SENTINELS.has(n)) continue;
+        captured.add(n);
+      }
+    }
+    for (const name of captured) {
+      const bridge = acquire(originModule, name);
+      held.push(bridge);
+      created.push(mod.variable().define(name, [], () => bridge.follow()));
+    }
+
+    // The body, under its real names — no uid mangling, because the module is private.
+    const body = new Map();
+    for (const v of variables) {
+      if (paramNames.has(v._name)) continue;
+      const inputs = v._inputs.map((i) => i._name);
+      const t = mod.variable(observers(v._name)).define(v._name, inputs, v._definition);
+      body.set(v._name, t);
+      created.push(t);
+    }
+
+    // Same trigger cloneDataflow uses: re-define a clone whose source definition changed.
+    let unwatch = null;
+    if (watch) {
+      unwatch = watch(() => {
+        for (const v of variables) {
+          if (paramNames.has(v._name)) continue;
+          const t = body.get(v._name);
+          if (!t || v._definition === t._definition) continue;
+          t.define(v._name, v._inputs.map((i) => i._name), v._definition);
+        }
+      });
+    }
+
+    let disposed = false;
+    return {
+      module: mod,
+      variables: body,
+      captures: [...captured],
+      diagnostics,
+      value: (name) => mod.value(name),
+      observe(name, observer) {
+        const v = mod.variable(observer).define(null, [name], (x) => x);
+        created.push(v);
+        return () => v.delete();
+      },
+      dispose() {
+        if (disposed) return false;
+        disposed = true;
+        if (unwatch) try { unwatch(); } catch {}
+        // Reverse order, then sweep. Deleting a variable that still has outputs does not free its
+        // scope entry — variable.js:129-137 substitutes a fresh implicit variable so references
+        // stay wired — so dependents must go first, and whatever survives is swept afterwards.
+        for (let i = created.length - 1; i >= 0; i--) created[i].delete();
+        created.length = 0;
+        for (let guard = 0; guard < 8 && mod._scope.size; guard++)
+          for (const v of [...mod._scope.values()]) v.delete();
+        body.clear();
+        live.delete(mod);
+        for (const b of held) release(originModule, b);
+        held.length = 0;
+        return true;
+      }
+    };
+  }
+
+  instantiateDataflow.stats = () => {
+    let total = 0;
+    for (const byName of bridges.values()) total += byName.size;
+    return { sandboxRuntime: sandbox, bridges: total, modules: live.size };
+  };
+  instantiateDataflow.destroy = () => {
+    for (const [m, byName] of bridges) for (const b of byName.values()) b.destroy();
+    bridges.clear();
+    live.clear();
+    if (sandbox) sandbox.dispose();
+    sandbox = null;
+  };
+
+  return instantiateDataflow;
+}
+
+return instantiateDataflowFactory;
+};
+const _dtv2m = function _instantiateDataflow(instantiateDataflowFactory,runtime){return(
+instantiateDataflowFactory(runtime.constructor, {})
+)};
+const _dtv2s = function _cloneViaSandbox(instantiateDataflow,onCodeChange){return(
+(variables, observerFactory = () => ({})) => {
+  const inst = instantiateDataflow(variables, {
+    observers: observerFactory,
+    watch: onCodeChange
+  });
+  return () => inst.dispose();
 }
 )};
 const _1nie1nr = function _49(md){return(
@@ -28587,9 +28888,17 @@ export default function define(runtime, observer) {
   $def("_1u7xzh9", null, ["md"], _1u7xzh9);  
   $def("_78dkom", null, ["md"], _78dkom);  
   $def("_7bk64o", null, ["md"], _7bk64o);  
+  $def("_dtv2a", null, ["md"], _dtv2a);
+  $def("_dtv2b", null, ["md"], _dtv2b);
+  $def("_dtv2c", null, ["md"], _dtv2c);
+  $def("_dtv2d", null, ["md"], _dtv2d);
   $def("_jw42sg", null, ["md"], _jw42sg);  
   $def("_12alikv", null, ["md"], _12alikv);  
-  $def("_ifa1z4", "cloneDataflow", ["observeSet"], _ifa1z4);  
+  $def("_ifa1z4", "cloneDataflow", ["observeSet"], _ifa1z4);
+  $def("_dtv2h", null, ["md"], _dtv2h);
+  $def("_dtv2f", "instantiateDataflowFactory", [], _dtv2f);
+  $def("_dtv2m", "instantiateDataflow", ["instantiateDataflowFactory","runtime"], _dtv2m);
+  $def("_dtv2s", "cloneViaSandbox", ["instantiateDataflow","onCodeChange"], _dtv2s);  
   $def("_1nie1nr", null, ["md"], _1nie1nr);  
   main.define("getPromiseState", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("getPromiseState", _));  
   main.define("descendants", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("descendants", _));  
@@ -28597,7 +28906,8 @@ export default function define(runtime, observer) {
   main.define("thisModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("thisModule", _));  
   main.define("lookupVariable", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("lookupVariable", _));  
   main.define("toObject", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("toObject", _));  
-  main.define("observeSet", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observeSet", _));  
+  main.define("observeSet", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observeSet", _));
+  main.define("onCodeChange", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("onCodeChange", _));  
   main.define("observe", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observe", _));  
   main.define("inspect", ["module @tomlarkworthy/inspector", "@variable"], (_, v) => v.import("inspect", _));  
   main.define("Inspector", ["module @tomlarkworthy/inspector", "@variable"], (_, v) => v.import("Inspector", _));
@@ -29549,7 +29859,7 @@ eyJAdG9tbGFya3dvcnRoeS9zdmctbGVucyI6eyJob3dUb0RyaXZlIjp7InBpbm5lZCI6ZmFsc2V9LCJw
   type="text/plain"
   data-mime="application/javascript"
 >
-const _1tdjp0a = function _title(md){return(
+const _19kcu74 = function _title(md){return(
 md`# Editor: Reactive Userspace Cell Mutator (v5)
 
 [YouTube explainer](https://www.youtube.com/shorts/6FjeJRBC2iw)
@@ -29567,8 +29877,7 @@ import {auto_attach, cellEditor} from '@tomlarkworthy/editor-5'
 #### Use cases
 - Edit notebooks offline
 - Try things out without committing to them
-- Improved debugging workflow, as you can insert \`debugger\` expressions to dependancies on-demand.
-`
+- Improved debugging workflow, as you can insert \`debugger\` expressions to dependancies on-demand.`
 )};
 const _dm53bx = function _2(md){return(
 md`## Example`
@@ -29649,9 +29958,9 @@ function divToVar(runtime, div) {
   }
 }
 )};
-const _1usw8c2 = async function _attachContextManu(Inputs,isOnObservableCom,optionsFile){return(
+const _8yv93h = async function _attachContextManu(Inputs,optionsFile,isOnObservableCom){return(
 Inputs.toggle({
-  label: "attach menu",
+  label: 'attach menu',
   value: (await optionsFile.json())?.__attachMenu ?? !isOnObservableCom()
 })
 )};
@@ -29689,7 +29998,7 @@ lookupVariable(
   editorModule
 )
 )};
-const _1q95xt6 = function _cellEditor(cloneDataflow,editorTemplate,shellTemplate,getOption,Event,setOption,createCell,findCell,pinOnCreate,dragReorder){return(
+const _1p2yypw = function _cellEditor(cloneViaSandbox,editorTemplate,shellTemplate,createCell,findCell,dragReorder,pinOnCreate,getOption,Event,setOption){return(
 (variable, {
     pinned = undefined
 } = {}) => {
@@ -29715,7 +30024,7 @@ const _1q95xt6 = function _cellEditor(cloneDataflow,editorTemplate,shellTemplate
             return;
         if (!body)
             return;
-        heavyDispose = cloneDataflow(editorTemplate, name => {
+        heavyDispose = cloneViaSandbox(editorTemplate, name => {
             if (name === 'editor_panel') {
                 return {
                     fulfilled: element => {
@@ -29753,7 +30062,7 @@ const _1q95xt6 = function _cellEditor(cloneDataflow,editorTemplate,shellTemplate
                 bodyEl.style.display = open ? 'block' : 'none';
         }
     };
-    shellDispose = cloneDataflow(shellTemplate, name => {
+    shellDispose = cloneViaSandbox(shellTemplate, name => {
         if (name === 'hotbar_shell') {
             return {
                 fulfilled: element => {
@@ -29993,16 +30302,19 @@ const _1urs1md = function _findCell($0,modules){return(
   }
 }
 )};
-const _1uhm0y9 = function _selectVariable(findCell,_,$0,Event){return(
+const _1gub4kl = function _selectVariable(findCell,persistentId,$0,Event){return(
 async function selectVariable(variable, dom = undefined) {
-  console.log("selectVariable", variable);
-  let cell = findCell(variable, dom);
-  if (!_.isEqual($0.value, cell)) {
-    $0.value = cell;
-    $0.dispatchEvent(new Event("input"));
-  } else {
-    $0.value = cell;
-  }
+  const cell = findCell(variable, dom);
+  // Dispatch only when the selected cell's identity actually changes. `cell`
+  // embeds live Variable/Module objects that mutate every reactive tick, so the
+  // old `_.isEqual` compare was almost never true and re-dispatched editedCell
+  // forever — an infinite loop when an editor-5 cell is imported into a module
+  // shown alongside editor-5. persistentId lazily mints a stable content-hash pid,
+  // so keying on it guarantees a non-empty id and converges after one dispatch.
+  const cellId = (c) => (c?.variables || []).filter(Boolean).map(persistentId).join(",");
+  const changed = cellId(cell) !== cellId($0.value);
+  $0.value = cell;
+  if (changed) $0.dispatchEvent(new Event("input"));
   return cell;
 }
 )};
@@ -30096,9 +30408,8 @@ function cellLinks(label, variables) {
 const _1opggh8 = async function _identity(lookupVariable,editorModule){return(
 (await lookupVariable("lookupVariable", editorModule))._definition
 )};
-const _1nfia2p = function _variableLink(identity,navHref,modules)
-{
-    return v => {
+const _15v1lje = function _variableLink(identity,modules,navHref){return(
+v => {
         if (v._type === 2 && v._inputs.length == 1) {
             // Implicit variable created on reference, go up one
             v = v._inputs[0];
@@ -30110,9 +30421,13 @@ const _1nfia2p = function _variableLink(identity,navHref,modules)
                 v = v._inputs[0];
             }
         }
-        return navHref(`${ modules.get(v._module).name }${ typeof v._name == 'string' ? `#${ v._name }` : '' }`);
-    };
-};
+        // A module the registry never saw — a cloned dataflow, a module minted at runtime,
+        // any module on observablehq.com — has no page to link to. Link to the cell alone
+        // rather than throwing, which used to take the whole editor panel down with it.
+        const entry = modules.get(v._module);
+        return navHref(`${ entry ? entry.name : '' }${ typeof v._name == 'string' ? `#${ v._name }` : '' }`);
+    }
+)};
 const _1tm2n0w = function _31(md){return(
 md`Save edits by exporting to a single file`
 )};
@@ -30285,186 +30600,6 @@ async (cell, amount) =>
     }
   })
 )};
-const _mvbs01 = function _moveCellBeside($0){return(
-async (cell, target, placeAfter = false) =>
-  $0.send({
-    command: "moveCellBeside",
-    args: {
-      cell,
-      target,
-      placeAfter
-    }
-  })
-)};
-const _drag01 = function _dragReorder(runtime,divToVar,findCell,moveCellBeside){return(
-(variable, handle) => {
-  if (!document.getElementById('lope-reorder-style')) {
-    const s = document.createElement('style');
-    s.id = 'lope-reorder-style';
-    s.textContent =
-      'body.lope-reordering, body.lope-reordering * { user-select: none !important; cursor: grabbing !important; }';
-    document.head.appendChild(s);
-  }
-
-  const THRESH = 5;
-  let pointerId = null, dragging = false, startX = 0, startY = 0;
-  let cells = null, ownIndex = -1, scroller = null, indicator = null;
-  const blockSelect = (ev) => ev.preventDefault();
-
-  // Same-module visible cells in DOM order; one entry per rendered .observablehq div.
-  const getModuleCells = () => {
-    const mod = variable._module;
-    const out = [];
-    for (const div of document.querySelectorAll('.observablehq')) {
-      const v = divToVar(runtime, div);
-      if (v && v._module === mod) out.push({ div, v });
-    }
-    return out;
-  };
-
-  const ensureIndicator = () => {
-    if (indicator) return indicator;
-    indicator = document.createElement('div');
-    indicator.style.cssText =
-      'position: fixed; height: 0; z-index: 2147483646; pointer-events: none;' +
-      'border-top: 2px solid var(--theme-foreground-focus, #3b5bdb);';
-    document.body.appendChild(indicator);
-    return indicator;
-  };
-  const removeIndicator = () => { if (indicator) { indicator.remove(); indicator = null; } };
-
-  // gap 0..N: how many cells sit above pointer Y (by their vertical midpoint).
-  const gapAt = (y) => {
-    for (let i = 0; i < cells.length; i++) {
-      const r = cells[i].div.getBoundingClientRect();
-      if (y < r.top + r.height / 2) return i;
-    }
-    return cells.length;
-  };
-
-  const drawIndicator = (g) => {
-    const ind = ensureIndicator();
-    const ref = cells[Math.min(ownIndex, cells.length - 1)].div.getBoundingClientRect();
-    const y = g < cells.length
-      ? cells[g].div.getBoundingClientRect().top
-      : cells[cells.length - 1].div.getBoundingClientRect().bottom;
-    ind.style.left = ref.left + 'px';
-    ind.style.width = ref.width + 'px';
-    ind.style.top = (y - 1) + 'px';
-  };
-
-  const autoScroll = (y) => {
-    if (!scroller) return;
-    const r = scroller.getBoundingClientRect
-      ? scroller.getBoundingClientRect()
-      : { top: 0, bottom: window.innerHeight };
-    const M = 36;
-    let dy = 0;
-    if (y < r.top + M) dy = -Math.ceil((r.top + M - y) / 3);
-    else if (y > r.bottom - M) dy = Math.ceil((y - (r.bottom - M)) / 3);
-    if (dy && scroller.scrollBy) scroller.scrollBy({ top: dy });
-  };
-
-  const beginDrag = () => {
-    cells = getModuleCells();
-    ownIndex = cells.findIndex(c => c.v === variable);
-    if (ownIndex < 0) return false;
-    dragging = true;
-    scroller = cells[ownIndex].div.closest('.lm_content')
-      || document.scrollingElement || document.documentElement;
-    document.body.classList.add('lope-reordering');
-    handle.style.cursor = 'grabbing';
-    // Drop any selection the gesture already started and block new ones for the drag.
-    const sel = window.getSelection && window.getSelection();
-    if (sel && sel.removeAllRanges) sel.removeAllRanges();
-    document.addEventListener('selectstart', blockSelect, true);
-    return true;
-  };
-
-  const onMove = (e) => {
-    if (pointerId == null) return;
-    if (!dragging) {
-      if (Math.abs(e.clientX - startX) < THRESH && Math.abs(e.clientY - startY) < THRESH) return;
-      if (!beginDrag()) return;
-    }
-    e.preventDefault();
-    drawIndicator(gapAt(e.clientY));
-    autoScroll(e.clientY);
-  };
-
-  const teardown = () => {
-    if (pointerId != null && handle.releasePointerCapture) {
-      try { handle.releasePointerCapture(pointerId); } catch (_) {}
-    }
-    handle.removeEventListener('pointermove', onMove);
-    handle.removeEventListener('pointerup', onUp);
-    handle.removeEventListener('pointercancel', onCancel);
-    document.removeEventListener('selectstart', blockSelect, true);
-    handle.style.cursor = '';
-    document.body.classList.remove('lope-reordering');
-    removeIndicator();
-  };
-
-  const onUp = (e) => {
-    const wasDragging = dragging;
-    let target, placeAfter = false, ownDiv = null, doMove = false;
-    if (wasDragging) {
-      ownDiv = cells[ownIndex].div;
-      const g = gapAt(e.clientY);
-      // Drop in own slot (just above or below self) is a no-op.
-      if (g !== ownIndex && g !== ownIndex + 1) {
-        doMove = true;
-        if (g < cells.length) {
-          target = cells[g].v;         // insert before the cell now at the gap
-        } else {
-          target = cells[cells.length - 1].v;  // dropped past the last visible cell
-          placeAfter = true;
-        }
-      }
-    }
-    teardown();
-    pointerId = null; dragging = false; cells = null; ownIndex = -1; scroller = null;
-    if (wasDragging) {
-      // Suppress the click that would otherwise toggle the editor open/closed.
-      const stop = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
-      handle.addEventListener('click', stop, { capture: true, once: true });
-      setTimeout(() => handle.removeEventListener('click', stop, { capture: true }), 0);
-      if (doMove) moveCellBeside(findCell(variable, ownDiv), target, placeAfter);
-    }
-  };
-
-  const onCancel = () => {
-    teardown();
-    pointerId = null; dragging = false; cells = null; ownIndex = -1; scroller = null;
-  };
-
-  const onDown = (e) => {
-    if (e.button != null && e.button !== 0) return;
-    if (e.target && e.target.closest && e.target.closest('.add-cell-btn')) return;
-    pointerId = e.pointerId;
-    startX = e.clientX; startY = e.clientY;
-    dragging = false;
-    if (handle.setPointerCapture) { try { handle.setPointerCapture(e.pointerId); } catch (_) {} }
-    handle.addEventListener('pointermove', onMove);
-    handle.addEventListener('pointerup', onUp);
-    handle.addEventListener('pointercancel', onCancel);
-  };
-
-  handle.addEventListener('pointerdown', onDown);
-  // Suppress the native text-selection drag that would otherwise start on press.
-  // mousedown-preventDefault leaves `click` intact (same trick as the add button).
-  handle.addEventListener('mousedown', e => {
-    if (!(e.target && e.target.closest && e.target.closest('.add-cell-btn'))) e.preventDefault();
-  });
-  handle.addEventListener('selectstart', blockSelect);
-  handle.style.touchAction = 'none';
-  handle.style.userSelect = 'none';
-  return () => handle.removeEventListener('pointerdown', onDown);
-}
-)};
-const _pinoncr = function _pinOnCreate(){return(
-new Set()  // variable pids to open (pin) their editor as soon as the cell mounts
-)};
 const _19znal9 = function _createCell($0){return(
 async ({cell, source = "{}" } = {}) =>
   $0.send({
@@ -30526,7 +30661,7 @@ const _1rhoxk2 = function _findVariableIndex(runtime){return(
 (variable, variables = runtime._variables) =>
   [...variables].findIndex((vi) => vi === variable)
 )};
-const _2pkmxz = async function _command_processor(command,$0,compile_and_update,remove_variables,$1,findCellIndex,lookupCellByIndex,findVariableIndex,repositionSetElement,runtime,selectVariable,$2,pinOnCreate,findCell)
+const _g08ji8 = async function _command_processor(command,$0,compile_and_update,pinOnCreate,selectVariable,remove_variables,$1,findCellIndex,lookupCellByIndex,findVariableIndex,repositionSetElement,runtime,findCell,$2)
 {
     if (command.processed)
         return;
@@ -31285,22 +31420,14 @@ const _w5q3yf = function _editorModule(thisModule){return(
 thisModule()
 )};
 const _18kaj2p = (G, _) => G.input(_);
-const _yn5gyd = function _editor_jobs(command_processor,submit_summary,save_options,persist_attach_menu)
+const _yeikvo = function _editor_jobs(command_processor,submit_summary,save_options,persist_attach_menu)
 {
   //editedCell;
   command_processor;
   submit_summary;
   save_options;
   persist_attach_menu;
-  return "editor_jobs";
-};
-const _pamenu = function _persist_attach_menu($0,attachContextManu,Event){
-  // Bake the global edit-mode flag into cell_options.json so it survives export/fork.
-  // Depends on `viewof options` (element, stable), not `options` (value), so this
-  // write does not re-trigger itself; save_options then persists the attachment.
-  $0.value.__attachMenu = attachContextManu;
-  $0.dispatchEvent(new Event("input"));
-  return "persist_attach_menu";
+  return 'editor_jobs';
 };
 const _1whoy5n = function _91(md){return(
 md`### Apply Update`
@@ -31608,6 +31735,197 @@ const _bz6mai = function _test_completion_identifier_deferred(completionFixture)
     throw new Error('bare identifier (no dot) must defer');
   return 'identifier / no-dot bases deferred to the identifier-chain path';
 };
+const _y8yyf = function _pinOnCreate()
+{
+  return new Set()  // variable pids to open (pin) their editor as soon as the cell mounts
+;
+};
+const _y040tx = function _persist_attach_menu($0,attachContextManu,Event)
+{
+  // Bake the global edit-mode flag into cell_options.json so it survives export/fork.
+  // Depends on `viewof options` (element, stable), not `options` (value), so this
+  // write does not re-trigger itself; save_options then persists the attachment.
+  $0.value.__attachMenu = attachContextManu;
+  $0.dispatchEvent(new Event('input'));
+  return 'persist_attach_menu';
+};
+const _1jn7thk = function _moveCellBeside($0){return(
+async (cell, target, placeAfter = false) =>
+  $0.send({
+    command: "moveCellBeside",
+    args: {
+      cell,
+      target,
+      placeAfter
+    }
+  })
+)};
+const _2rhl00 = function _dragReorder(divToVar,runtime,moveCellBeside,findCell){return(
+(variable, handle) => {
+  if (!document.getElementById('lope-reorder-style')) {
+    const s = document.createElement('style');
+    s.id = 'lope-reorder-style';
+    s.textContent =
+      'body.lope-reordering, body.lope-reordering * { user-select: none !important; cursor: grabbing !important; }';
+    document.head.appendChild(s);
+  }
+
+  const THRESH = 5;
+  let pointerId = null, dragging = false, startX = 0, startY = 0;
+  let cells = null, ownIndex = -1, scroller = null, indicator = null;
+  const blockSelect = (ev) => ev.preventDefault();
+
+  // Same-module visible cells in DOM order; one entry per rendered .observablehq div.
+  const getModuleCells = () => {
+    const mod = variable._module;
+    const out = [];
+    for (const div of document.querySelectorAll('.observablehq')) {
+      const v = divToVar(runtime, div);
+      if (v && v._module === mod) out.push({ div, v });
+    }
+    return out;
+  };
+
+  const ensureIndicator = () => {
+    if (indicator) return indicator;
+    indicator = document.createElement('div');
+    indicator.style.cssText =
+      'position: fixed; height: 0; z-index: 2147483646; pointer-events: none;' +
+      'border-top: 2px solid var(--theme-foreground-focus, #3b5bdb);';
+    document.body.appendChild(indicator);
+    return indicator;
+  };
+  const removeIndicator = () => { if (indicator) { indicator.remove(); indicator = null; } };
+
+  // gap 0..N: how many cells sit above pointer Y (by their vertical midpoint).
+  const gapAt = (y) => {
+    for (let i = 0; i < cells.length; i++) {
+      const r = cells[i].div.getBoundingClientRect();
+      if (y < r.top + r.height / 2) return i;
+    }
+    return cells.length;
+  };
+
+  const drawIndicator = (g) => {
+    const ind = ensureIndicator();
+    const ref = cells[Math.min(ownIndex, cells.length - 1)].div.getBoundingClientRect();
+    const y = g < cells.length
+      ? cells[g].div.getBoundingClientRect().top
+      : cells[cells.length - 1].div.getBoundingClientRect().bottom;
+    ind.style.left = ref.left + 'px';
+    ind.style.width = ref.width + 'px';
+    ind.style.top = (y - 1) + 'px';
+  };
+
+  const autoScroll = (y) => {
+    if (!scroller) return;
+    const r = scroller.getBoundingClientRect
+      ? scroller.getBoundingClientRect()
+      : { top: 0, bottom: window.innerHeight };
+    const M = 36;
+    let dy = 0;
+    if (y < r.top + M) dy = -Math.ceil((r.top + M - y) / 3);
+    else if (y > r.bottom - M) dy = Math.ceil((y - (r.bottom - M)) / 3);
+    if (dy && scroller.scrollBy) scroller.scrollBy({ top: dy });
+  };
+
+  const beginDrag = () => {
+    cells = getModuleCells();
+    ownIndex = cells.findIndex(c => c.v === variable);
+    if (ownIndex < 0) return false;
+    dragging = true;
+    scroller = cells[ownIndex].div.closest('.lm_content')
+      || document.scrollingElement || document.documentElement;
+    document.body.classList.add('lope-reordering');
+    handle.style.cursor = 'grabbing';
+    // Drop any selection the gesture already started and block new ones for the drag.
+    const sel = window.getSelection && window.getSelection();
+    if (sel && sel.removeAllRanges) sel.removeAllRanges();
+    document.addEventListener('selectstart', blockSelect, true);
+    return true;
+  };
+
+  const onMove = (e) => {
+    if (pointerId == null) return;
+    if (!dragging) {
+      if (Math.abs(e.clientX - startX) < THRESH && Math.abs(e.clientY - startY) < THRESH) return;
+      if (!beginDrag()) return;
+    }
+    e.preventDefault();
+    drawIndicator(gapAt(e.clientY));
+    autoScroll(e.clientY);
+  };
+
+  const teardown = () => {
+    if (pointerId != null && handle.releasePointerCapture) {
+      try { handle.releasePointerCapture(pointerId); } catch (_) {}
+    }
+    handle.removeEventListener('pointermove', onMove);
+    handle.removeEventListener('pointerup', onUp);
+    handle.removeEventListener('pointercancel', onCancel);
+    document.removeEventListener('selectstart', blockSelect, true);
+    handle.style.cursor = '';
+    document.body.classList.remove('lope-reordering');
+    removeIndicator();
+  };
+
+  const onUp = (e) => {
+    const wasDragging = dragging;
+    let target, placeAfter = false, ownDiv = null, doMove = false;
+    if (wasDragging) {
+      ownDiv = cells[ownIndex].div;
+      const g = gapAt(e.clientY);
+      // Drop in own slot (just above or below self) is a no-op.
+      if (g !== ownIndex && g !== ownIndex + 1) {
+        doMove = true;
+        if (g < cells.length) {
+          target = cells[g].v;         // insert before the cell now at the gap
+        } else {
+          target = cells[cells.length - 1].v;  // dropped past the last visible cell
+          placeAfter = true;
+        }
+      }
+    }
+    teardown();
+    pointerId = null; dragging = false; cells = null; ownIndex = -1; scroller = null;
+    if (wasDragging) {
+      // Suppress the click that would otherwise toggle the editor open/closed.
+      const stop = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+      handle.addEventListener('click', stop, { capture: true, once: true });
+      setTimeout(() => handle.removeEventListener('click', stop, { capture: true }), 0);
+      if (doMove) moveCellBeside(findCell(variable, ownDiv), target, placeAfter);
+    }
+  };
+
+  const onCancel = () => {
+    teardown();
+    pointerId = null; dragging = false; cells = null; ownIndex = -1; scroller = null;
+  };
+
+  const onDown = (e) => {
+    if (e.button != null && e.button !== 0) return;
+    if (e.target && e.target.closest && e.target.closest('.add-cell-btn')) return;
+    pointerId = e.pointerId;
+    startX = e.clientX; startY = e.clientY;
+    dragging = false;
+    if (handle.setPointerCapture) { try { handle.setPointerCapture(e.pointerId); } catch (_) {} }
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onCancel);
+  };
+
+  handle.addEventListener('pointerdown', onDown);
+  // Suppress the native text-selection drag that would otherwise start on press.
+  // mousedown-preventDefault leaves `click` intact (same trick as the add button).
+  handle.addEventListener('mousedown', e => {
+    if (!(e.target && e.target.closest && e.target.closest('.add-cell-btn'))) e.preventDefault();
+  });
+  handle.addEventListener('selectstart', blockSelect);
+  handle.style.touchAction = 'none';
+  handle.style.userSelect = 'none';
+  return () => handle.removeEventListener('pointerdown', onDown);
+}
+)};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -31623,6 +31941,7 @@ export default function define(runtime, observer) {
   main.builtin("FileAttachment", runtime.fileAttachments(name => fileAttachments.get(name)));
 
   main.define("module @tomlarkworthy/visualizer", async () => runtime.module((await import("/@tomlarkworthy/visualizer.js?v=4")).default));  
+  main.define("module @tomlarkworthy/modules", async () => runtime.module((await import("/@tomlarkworthy/modules.js?v=4")).default));  
   main.define("module @tomlarkworthy/reversible-attachment", async () => runtime.module((await import("/@tomlarkworthy/reversible-attachment.js?v=4")).default));  
   main.define("module @tomlarkworthy/flow-queue", async () => runtime.module((await import("/@tomlarkworthy/flow-queue.js?v=4")).default));  
   main.define("module @tomlarkworthy/cell-map", async () => runtime.module((await import("/@tomlarkworthy/cell-map.js?v=4")).default));  
@@ -31636,7 +31955,7 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/codemirror-6-v2", async () => runtime.module((await import("/@tomlarkworthy/codemirror-6-v2.js?v=4")).default));  
   main.define("module @tomlarkworthy/observablejs-toolchain", async () => runtime.module((await import("/@tomlarkworthy/observablejs-toolchain.js?v=4")).default));  
   main.define("module @tomlarkworthy/module-map", async () => runtime.module((await import("/@tomlarkworthy/module-map.js?v=4")).default));  
-  $def("_1tdjp0a", "title", ["md"], _1tdjp0a);  
+  $def("_19kcu74", "title", ["md"], _19kcu74);  
   $def("_dm53bx", null, ["md"], _dm53bx);  
   $def("_61oxjf", "title_variable", ["lookupVariable","editorModule"], _61oxjf);  
   $def("_15uilf0", null, ["cellEditor","title_variable"], _15uilf0);  
@@ -31647,11 +31966,11 @@ export default function define(runtime, observer) {
   $def("_hdieof", "editors", [], _hdieof);  
   $def("_ipx6cz", "auto_attach", ["keepalive","editorModule","syncers","attachContextManu","divToVar","runtime","editors","cellEditor"], _ipx6cz);  
   $def("_1iwobxt", "divToVar", [], _1iwobxt);  
-  $def("_1usw8c2", "viewof attachContextManu", ["Inputs","isOnObservableCom","optionsFile"], _1usw8c2);  
+  $def("_8yv93h", "viewof attachContextManu", ["Inputs","optionsFile","isOnObservableCom"], _8yv93h);  
   $def("_1oaz8r1", "attachContextManu", ["Generators","viewof attachContextManu"], _1oaz8r1);  
   $def("_16ks4jz", null, ["md"], _16ks4jz);  
   $def("_199ztvl", "hotbarTemplate", ["lookupVariable","editorModule"], _199ztvl);  
-  $def("_1q95xt6", "cellEditor", ["cloneDataflow","editorTemplate","shellTemplate","getOption","Event","setOption","createCell","findCell","pinOnCreate","dragReorder"], _1q95xt6);  
+  $def("_1p2yypw", "cellEditor", ["cloneViaSandbox","editorTemplate","shellTemplate","createCell","findCell","dragReorder","pinOnCreate","getOption","Event","setOption"], _1p2yypw);  
   $def("_x5ixji", "hotbar_shell", ["viewof edit","Event","htl","edit"], _x5ixji);  
   $def("_1ed5zb9", "editor_panel", ["viewof editedCell","htl","toolbar","nav","reversibleAttach","combine","code_editor"], _1ed5zb9);  
   $def("_yk7udl", "shellTemplate", ["viewof editedCell","editedCell","selectVariable","viewof edit","edit","hotbar_shell","lookupVariable","editorModule"], _yk7udl);  
@@ -31660,7 +31979,7 @@ export default function define(runtime, observer) {
   $def("_1o2h65s", "viewof editedCell", ["Inputs"], _1o2h65s);  
   $def("_7g3h7h", "editedCell", ["Generators","viewof editedCell"], _7g3h7h);  
   $def("_1urs1md", "findCell", ["viewof liveCellMap","modules"], _1urs1md);  
-  $def("_1uhm0y9", "selectVariable", ["findCell","_","viewof editedCell","Event"], _1uhm0y9);  
+  $def("_1gub4kl", "selectVariable", ["findCell","persistentId","viewof editedCell","Event"], _1gub4kl);  
   $def("_3jxaqk", null, ["selectVariable","hotbarTemplate"], _3jxaqk);  
   $def("_49mpmh", "hotbar", ["viewof edit","Event","setOption","viewof editedCell","htl","edit","toolbar","nav","reversibleAttach","combine","code_editor"], _49mpmh);  
   $def("_n8s6yl", null, ["viewof editedCell"], _n8s6yl);  
@@ -31668,7 +31987,7 @@ export default function define(runtime, observer) {
   $def("_1t4gep6", "nav", ["html","cellLinks"], _1t4gep6);  
   $def("_1tv9qxo", "cellLinks", ["html","variableLink"], _1tv9qxo);  
   $def("_1opggh8", "identity", ["lookupVariable","editorModule"], _1opggh8);  
-  $def("_1nfia2p", "variableLink", ["identity","navHref","modules"], _1nfia2p);  
+  $def("_15v1lje", "variableLink", ["identity","modules","navHref"], _15v1lje);  
   $def("_1tm2n0w", null, ["md"], _1tm2n0w);  
   $def("_16wblye", null, ["md"], _16wblye);  
   $def("_1jdvxd9", null, ["md"], _1jdvxd9);  
@@ -31696,9 +32015,6 @@ export default function define(runtime, observer) {
   $def("_xvo1n6", "code_editor", ["code_editor_view"], _xvo1n6);  
   $def("_1imarq2", null, ["md"], _1imarq2);  
   $def("_470wv4", "moveCell", ["viewof command"], _470wv4);  
-  $def("_mvbs01", "moveCellBeside", ["viewof command"], _mvbs01);  
-  $def("_drag01", "dragReorder", ["runtime","divToVar","findCell","moveCellBeside"], _drag01);  
-  $def("_pinoncr", "pinOnCreate", [], _pinoncr);  
   $def("_19znal9", "createCell", ["viewof command"], _19znal9);  
   $def("_d9nzys", "deleteCell", ["viewof command"], _d9nzys);  
   $def("_1toku21", null, ["md"], _1toku21);  
@@ -31709,7 +32025,7 @@ export default function define(runtime, observer) {
   $def("_dmk8lv", "findCellIndex", [], _dmk8lv);  
   $def("_jy01vb", "lookupCellByIndex", [], _jy01vb);  
   $def("_1rhoxk2", "findVariableIndex", ["runtime"], _1rhoxk2);  
-  $def("_2pkmxz", "command_processor", ["command","viewof edit","compile_and_update","remove_variables","viewof liveCellMap","findCellIndex","lookupCellByIndex","findVariableIndex","repositionSetElement","runtime","selectVariable","viewof command","pinOnCreate","findCell"], _2pkmxz);  
+  $def("_g08ji8", "command_processor", ["command","viewof edit","compile_and_update","pinOnCreate","selectVariable","remove_variables","viewof liveCellMap","findCellIndex","lookupCellByIndex","findVariableIndex","repositionSetElement","runtime","findCell","viewof command"], _g08ji8);  
   $def("_8iz5z2", null, ["md"], _8iz5z2);  
   $def("_m873d1", "states", [], _m873d1);  
   $def("_mxwoc4", "cellIdFacet", ["codemirror"], _mxwoc4);  
@@ -31740,11 +32056,11 @@ export default function define(runtime, observer) {
   $def("_1pa2xc8", "readObservableClipboardCells", ["globalThis"], _1pa2xc8);  
   $def("_1w99cbu", "pasteObservableCellsIntoModule", ["viewof liveCellMap","normalizeObservableClipboardCell","findCell","compile_and_update"], _1w99cbu);  
   $def("_z9vacx", null, ["md"], _z9vacx);  
+  main.define("modules", ["module @tomlarkworthy/modules", "@variable"], (_, v) => v.import("currentModules", "modules", _));  
   $def("_gbuhyc", "decompiled", ["editedCell","decompile"], _gbuhyc);  
   $def("_w5q3yf", "viewof editorModule", ["thisModule"], _w5q3yf);  
   $def("_18kaj2p", "editorModule", ["Generators","viewof editorModule"], _18kaj2p);  
-  $def("_yn5gyd", "editor_jobs", ["command_processor","submit_summary","save_options","persist_attach_menu"], _yn5gyd);  
-  $def("_pamenu", "persist_attach_menu", ["viewof options","attachContextManu","Event"], _pamenu);  
+  $def("_yeikvo", "editor_jobs", ["command_processor","submit_summary","save_options","persist_attach_menu"], _yeikvo);  
   $def("_1whoy5n", null, ["md"], _1whoy5n);  
   $def("_gk83fp", "compile_and_update", ["compile","runtime","realize","repositionSetElement","decompile"], _gk83fp);  
   $def("_1g3bdxp", null, ["md"], _1g3bdxp);  
@@ -31769,7 +32085,7 @@ export default function define(runtime, observer) {
   main.define("cellsToClipboard", ["module @tomlarkworthy/cells-to-clipboard", "@variable"], (_, v) => v.import("cellsToClipboard", _));  
   main.define("observable_lezer_parser", ["module @tomlarkworthy/observablehq-lezer", "@variable"], (_, v) => v.import("observable_lezer_parser", _));  
   main.define("lezerhighlight", ["module @tomlarkworthy/observablehq-lezer", "@variable"], (_, v) => v.import("lezerhighlight", _));  
-  main.define("cloneDataflow", ["module @tomlarkworthy/dataflow-templating", "@variable"], (_, v) => v.import("cloneDataflow", _));  
+  main.define("cloneViaSandbox", ["module @tomlarkworthy/dataflow-templating", "@variable"], (_, v) => v.import("cloneViaSandbox", _));  
   main.define("lookupVariable", ["module @tomlarkworthy/dataflow-templating", "@variable"], (_, v) => v.import("lookupVariable", _));  
   main.define("getFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("getFileAttachment", _));  
   main.define("setFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("setFileAttachment", _));  
@@ -31787,6 +32103,7 @@ export default function define(runtime, observer) {
   main.define("isnode", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("isnode", _));  
   main.define("repositionSetElement", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("repositionSetElement", _));  
   main.define("onCodeChange", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("onCodeChange", _));  
+  main.define("persistentId", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("persistentId", _));  
   main.define("EditorState", ["module @tomlarkworthy/codemirror-6-v2", "@variable"], (_, v) => v.import("EditorState", _));  
   main.define("EditorView", ["module @tomlarkworthy/codemirror-6-v2", "@variable"], (_, v) => v.import("EditorView", _));  
   main.define("codemirror", ["module @tomlarkworthy/codemirror-6-v2", "@variable"], (_, v) => v.import("codemirror", _));  
@@ -31800,8 +32117,6 @@ export default function define(runtime, observer) {
   main.define("submit_summary", ["module @tomlarkworthy/module-map", "@variable"], (_, v) => v.import("submit_summary", _));  
   main.define("forcePeek", ["module @tomlarkworthy/module-map", "@variable"], (_, v) => v.import("forcePeek", _));  
   main.define("observe", ["module @tomlarkworthy/module-map", "@variable"], (_, v) => v.import("observe", _));  
-  main.define("module @tomlarkworthy/modules", async () => runtime.module((await import("/@tomlarkworthy/modules.js?v=4")).default));  
-  main.define("modules", ["module @tomlarkworthy/modules", "@variable"], (_, v) => v.import("currentModules", "modules", _));  
   $def("_lbftlp", "literalCompletions", ["codemirror"], _lbftlp);  
   $def("_scoiwp", "completionFixture", ["EditorState","observableJS_language","literalCompletions"], _scoiwp);  
   $def("_160qhf1", "test_completion_string_literal", ["completionFixture"], _160qhf1);  
@@ -31811,7 +32126,11 @@ export default function define(runtime, observer) {
   $def("_quyccp", "test_completion_bool_template_regexp", ["completionFixture"], _quyccp);  
   $def("_1cn3ucr", "test_completion_parenthesised_unwrap", ["completionFixture"], _1cn3ucr);  
   $def("_15vxhca", "test_completion_never_evaluates", ["completionFixture"], _15vxhca);  
-  $def("_bz6mai", "test_completion_identifier_deferred", ["completionFixture"], _bz6mai);
+  $def("_bz6mai", "test_completion_identifier_deferred", ["completionFixture"], _bz6mai);  
+  $def("_y8yyf", "pinOnCreate", [], _y8yyf);  
+  $def("_y040tx", "persist_attach_menu", ["viewof options","attachContextManu","Event"], _y040tx);  
+  $def("_1jn7thk", "moveCellBeside", ["viewof command"], _1jn7thk);  
+  $def("_2rhl00", "dragReorder", ["divToVar","runtime","moveCellBeside","findCell"], _2rhl00);
   return main;
 }</script>
 <script id="@tomlarkworthy/escodegen/escodegen.browser.min.js.gz" 
