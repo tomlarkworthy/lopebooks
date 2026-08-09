@@ -12840,12 +12840,17 @@ const _ktbd9n = function _hexRigCfg(Inputs) {return (Inputs.form({
   // rig sizes itself to what arrives.
   maxWidth: Inputs.range([480, 1920], { step: 160, value: 1920, label: "working width (px)" }),
   // The odd one out: not a threshold to tune but a second scan of the same
-  // frame, down the columns instead of across the rows (§11.1). It halves the
-  // frame rate and it is off by default for that reason, but the rig is where
-  // it earns its keep -- the labels it stores are a homography through these
-  // centres, and the row scan MEASURES a centre's x while only extrapolating
-  // its y. Turn it on before collecting cases you intend to trust.
-  bothAxes: Inputs.toggle({ label: "scan both axes", value: false })
+  // frame, down the columns instead of across the rows (§4.3). The row scan
+  // MEASURES a centre's x while only extrapolating its y, so the column scan
+  // supplies the coordinate the row scan guessed.
+  //
+  // On by default (§4.3). It used to halve the frame rate, which is why it was
+  // not; the two passes now run concurrently across the worker pool and cost
+  // ~26ms against a 33.3ms budget on the phone, inside the 30fps camera cap.
+  // It finds 4 more marks across the bank with no false positives, and now
+  // that the merge fuses by decode margin it no longer costs placement to get
+  // them.
+  bothAxes: Inputs.toggle({ label: "scan both axes", value: true })
 }));};
 const _1pvjep3 = (G, _) => G.input(_);
 const _1kn5g73 = function _liveFacing(Inputs) {return (Inputs.radio(["environment", "user"], {
@@ -16139,9 +16144,37 @@ const _1xa2cta = function _manSceneTest(manScene,analyzeFrameMan) {
   }
   return lines.join("\n");
 };
-const _11vsmkp = function _anonymous(md) {return (md`#### Scanning the orthogonally
+const _11vsmkp = function _anonymous(md) {return (md`#### Scanning orthogonally
 
-This would not work with an MPI interface but for a webcam we can apply the algorithm on the vertical scan lines which gives an estimate of Y too and further accuracy.`);};
+A row scan measures a mark's x and extrapolates its y. The x comes from the involution fit along the scanline; the y only from which scanlines the mark appeared on, so its precision is bounded by the stride. Scanning the same frame down its columns inverts that: measured y, extrapolated x. The column pass is the same detector applied to a quarter-turned frame, so it shares every threshold and gate with the row pass.
+
+Both passes cost two scans. They run concurrently across the worker pool, which is why this is on by default: on the phone the frame goes from about 20.5ms to about 26ms against a 33.3ms budget at the 30fps camera cap, rather than halving the frame rate as a sequential second pass did.
+
+**Recall.** Over the 163 gradable cases in the capture archive, both axes read 941 marks against 874 and leave 89 unread against 155. Misplaced and off-target counts are unchanged at 2 each, so the extra marks are real reads and not new false positives. Placement of the marks both settings find improves as well, from a mean residual of 2.423px to 2.286px.
+
+This was measured before and read as a wash: on the 36-case archive of the time the second pass never found an extra mark, and its median leave-one-out was worse than rows only. Two things changed. The archive is now large enough to separate the settings, and the merge no longer discards the row pass's estimate outright. Leave-one-out is still a wash; the gain is in what gets read at all.
+
+**Which pass to believe.** Both passes decode the mark independently, and must agree on its id to be paired at all — so the id match is a precondition and cannot say which pass placed the mark better. Their vote margins can. The margin is the decode's own confidence, and a mark read with a wide margin was scanned cleanly enough that its geometry can be trusted, extrapolated coordinate or not. The merge takes the column pass's y unless the row pass decoded with a strictly larger margin.
+
+Against an oracle that always picks whichever pass is closer to the frozen label, summed absolute y error over the 37 marks the bank fuses from both passes:
+
+| rule | summed y error |
+|---|---|
+| oracle | 14.2px |
+| by vote margin | 18.3px |
+| by scanline count | 25.5px |
+| by coverage | 34.6px |
+| always the column pass | 45.1px |
+| always the row pass | 49.9px |
+
+Held out over the 149 archived cases the bank does not contain: mean residual 2.251px to 2.194px, a change of -0.057px per mark, 95% CI [-0.090, -0.025], bootstrapped over cases p about 9e-4. 64 cases better, 35 worse, 50 unchanged. Recall, misplaced and off-target counts are unchanged, so the rule only moves marks that were already found.
+
+**Two rules that do not work**, recorded so they are not retried:
+
+- *Weighting by the size of the disagreement.* The gap between the two estimates says the passes disagree, not which one is wrong; where the gap is large the outcome is bimodal, sometimes the row pass extrapolated badly and sometimes the column pass found the wrong thing. A weight that decays with the gap is net worse: 16 marks better totalling -14.5px against 4 worse totalling +26px.
+- *Per-pass coverage.* It picks the better pass 18 times out of 37, which is chance. Deciding the earlier reject gate by coverage measured worse too.
+
+**On measuring this.** Residuals within one frame share a pose and a lighting condition, so a per-mark sign test overstates its own precision: it gave p about 0.06 where resampling whole cases gives p about 9e-4. Judge these comparisons by summed magnitude as well as win/loss count. For the disagreement-weighted rule the two pointed opposite ways, and the count was the misleading one.`);};
 const _zghole = function _rotateFrame() {return (function rotateFrame(frame, turns) {
   // Quarter turns only, done as an index permutation rather than through a
   // canvas: no resampling, so a rotated frame carries exactly the original
@@ -16381,10 +16414,16 @@ const _9mkcus = function _manAxesTest(manScene,analyzeFrameMan,rotateFrame,unrot
   // is not the dominant error at this scale and the second pass is not worth
   // its 2x.
   //
-  // It IS close to a wash on real frames -- see §11.5, where bothAxes never
-  // found an extra mark across the archive and its median leave-one-out was
-  // worse than rows only. This scene is clean enough to show the mechanism
-  // working; it is not evidence that the option earns its cost.
+  // It is NOT a wash on real frames, though it read as one for a while. On the
+  // 36-case archive of the time bothAxes never found an extra mark and its
+  // median leave-one-out was worse than rows only. Re-measured over the 163
+  // gradable cases the archive now holds, and with the merge fusing by decode
+  // margin (§4.3) rather than always taking the column pass: 941 marks read
+  // against 874, 89 missing against 155, misplaced and off-target unchanged,
+  // and residual mean 2.423 -> 2.286px (-0.136px/mark, p ~ 2e-3 bootstrapped
+  // over cases). Leave-one-out remains a wash. This scene is still a clean
+  // demonstration of the mechanism rather than the evidence; the archive is
+  // the evidence.
   const S = manScene;
   const opts = { stride: 4 };
   // Warm up before timing anything. Without this the first call carries the
