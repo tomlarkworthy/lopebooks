@@ -50198,6 +50198,9 @@ const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,a
   // shape track the camera at full frame rate and merely refresh occasionally.
   let outlineMm = null, outlineAt = 0, outlineNote = "";
   let preferDenoised = false;
+  let native = null;
+  let lastT = 0;
+  const periods = [];
   const say = (text, colour) => { hud.innerHTML = ""; hud.append(htl.html`<span style="color:${colour}">${text}</span>`); };
   // Working resolution for the LIVE pass only; the shot itself is always
   // grabbed at the camera's native size. 640 is measured, not guessed: on one
@@ -50218,7 +50221,19 @@ const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,a
       yield el; await new Promise((r) => setTimeout(r, 400)); continue;
     }
 
-    const nw = camVideo.videoWidth, nh = camVideo.videoHeight;
+    // Ask the FRAME, not the element. `video.videoWidth` is the size the browser
+    // DISPLAYS after satisfying the constraints; `VideoFrame.visibleRect` is what
+    // `copyTo` will hand over, and copyTo crops rather than scales — so a
+    // mismatch silently drops every grab to the getImageData fallback. MEASURED
+    // on this MacBook's own camera: the element reports 1280x960 while 1440x1080
+    // NV12 arrives, and the same grab costs 9.7ms element-sized against 1.0ms
+    // frame-sized. Nothing throws and the picture is right either way, so the
+    // only witness is the clock. probe() returns null on the first frames of a
+    // fresh track, hence the retry; a stream change re-runs this cell, which
+    // clears the cache.
+    if (!native) native = grabber.probe(camVideo);
+    const nw = native ? native.w : camVideo.videoWidth;
+    const nh = native ? native.h : camVideo.videoHeight;
     const scale = Math.min(1, LIVE_W / nw);
     const w = Math.round(nw * scale), h = Math.round(nh * scale);
     if (cap.width !== w) { cap.width = w; cap.height = h; overlay.setAttribute("viewBox", `0 0 ${w} ${h}`); }
@@ -50328,6 +50343,18 @@ const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,a
       }
     }
     overlay.innerHTML = parts.join("");
+    // The rate the loop actually achieves, and whether the grab is on the fast
+    // path. Both were invisible until they were measured off-page, and both are
+    // things that regress silently — a wrong working size costs 9x on the grab
+    // without changing a pixel of the picture.
+    const tNow = window.performance.now();
+    if (lastT) { periods.push(tNow - lastT); if (periods.length > 24) periods.shift(); }
+    lastT = tNow;
+    if (periods.length >= 8) {
+      const p = periods.slice().sort((a, b) => a - b)[periods.length >> 1];
+      msg += ` · ${(1000 / p).toFixed(1)}fps`;
+    }
+    if (grabber.path && grabber.path !== "videoframe") msg += " · SLOW GRAB";
     say(msg, colour);
     shoot.style.background = ready ? "#1b6e3c" : "";
     shoot.style.color = ready ? "#fff" : "";
