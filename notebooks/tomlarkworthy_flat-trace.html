@@ -48771,6 +48771,51 @@ const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,m
       onTarget = keep;
     }
   }
+
+  // Then throw out marks that disagree with the OTHERS about where the plane is.
+  // A homography absorbs any perspective, any focal length and any print-scale
+  // error, so whatever will not fit one is a wrong correspondence — an id that
+  // does not belong at the mm position the model puts it. Least squares cannot
+  // survive one: MEASURED on a phone frame, nine marks fitted at 12px median,
+  // while the seven-mark consensus inside them fitted at 0.49px median and
+  // 1.14px worst. The two it rejected decoded as id 0 and id 63 — all-zero and
+  // all-one payloads, which are what a blank or blown-out mark reads as and
+  // which both pass the even-parity guard. Geometry catches what parity cannot.
+  let outliers = [];
+  if (onTarget.length >= 5) {
+    const P = onTarget.map((f) => { const k = T.byId.get(f.id); return { X: k.xMm, Y: k.yMm, u: f.xc, v: f.yc, f }; });
+    const tol = opts.consensusTolPx ?? Math.max(2, frame.w / 360);
+    // Deterministic sampling: exhaustive while it is cheap, a fixed low-discrepancy
+    // walk beyond that. No Math.random, so the same frame always grades the same.
+    const n = P.length, quads = [];
+    if (n <= 10) {
+      for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) for (let c = b + 1; c < n; c++) for (let d = c + 1; d < n; d++) quads.push([a, b, c, d]);
+    } else {
+      let s = 1;
+      for (let i = 0; i < 400; i++) {
+        const q = [];
+        while (q.length < 4) { s = (s * 1103515245 + 12345) & 0x7fffffff; const j = s % n; if (!q.includes(j)) q.push(j); }
+        quads.push(q);
+      }
+    }
+    let best = null;
+    for (const q of quads) {
+      const H = calib.fitH(q.map((i) => P[i]));
+      if (!H) continue;
+      let count = 0;
+      for (const p of P) { const z = calib.applyH(H, p.X, p.Y); if (Math.hypot(z[0] - p.u, z[1] - p.v) <= tol) count++; }
+      if (!best || count > best.count) { best = { count, H }; if (count === n) break; }
+    }
+    if (best && best.count >= 4 && best.count < n) {
+      const inl = P.filter((p) => { const z = calib.applyH(best.H, p.X, p.Y); return Math.hypot(z[0] - p.u, z[1] - p.v) <= tol; });
+      // Only trust a consensus that is actually a majority; below that the
+      // "outliers" may be the real marks and the four-point sample the fluke.
+      if (inl.length >= 4 && inl.length >= 0.5 * n) {
+        outliers = P.filter((p) => !inl.includes(p)).map((p) => p.f.id);
+        onTarget = inl.map((p) => p.f);
+      }
+    }
+  }
   if (onTarget.length < 4) {
     return { ok: false, why: `only ${onTarget.length} mat marks read — need 4`, marks: onTarget.length, denoised, offTarget: offTarget.map((f) => f.id) };
   }
@@ -48873,7 +48918,7 @@ const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,m
   return {
     ok: true, outline, outlines, rings: rings.length, bboxMm,
     sizeMm: [+(bboxMm[2] - bboxMm[0]).toFixed(2), +(bboxMm[3] - bboxMm[1]).toFixed(2)],
-    marks: pairs.length, dropped, offTarget: offTarget.map((f) => f.id), denoised, scaleDropped,
+    marks: pairs.length, dropped, offTarget: offTarget.map((f) => f.id), denoised, scaleDropped, outliers,
     rmsPx: +rms.toFixed(2), matResidualPct,
     tiltDeg: +map.tiltDeg.toFixed(1), distanceMm: Math.round(map.distanceMm),
     areaMm2: +polygonAreaMm2(outline).toFixed(1),
