@@ -48954,51 +48954,6 @@ const _ft44 = function _drawShot(){return(function drawShot(shot, opts = {}) {
   return { canvas: cv, ctx };
 })};
 
-const _ft45 = function _captureUI(htl,camOn,camVideo,camStream,grabber,decodeImageFile,setValue,shots,$shots,drawShot,invalidation){
-  const status = htl.html`<span style="font:12px monospace;color:#666"></span>`;
-  const preview = htl.html`<div></div>`;
-
-  const push = (shot) => {
-    setValue($shots, [...$shots.value, shot]);
-    status.textContent = `${$shots.value.length} shot${$shots.value.length === 1 ? "" : "s"} — last ${shot.w}x${shot.h}${shot.name ? " " + shot.name : ""}`;
-    preview.replaceChildren(drawShot(shot, { maxW: 320 }).canvas);
-  };
-
-  const shoot = htl.html`<button style="padding:8px 14px">Capture from camera</button>`;
-  shoot.onclick = async () => {
-    if (!camOn || !camVideo.videoWidth) { status.textContent = "camera is off, or has not produced a frame yet"; return; }
-    const w = camVideo.videoWidth, h = camVideo.videoHeight;
-    await grabber.grab(camVideo, w, h);
-    push({ gray: grabber.ensureFull().slice(), w, h, name: `live ${new Date().toLocaleTimeString()}`, path: grabber.path });
-  };
-
-  const file = htl.html`<input type="file" accept="image/*" multiple>`;
-  file.onchange = async () => {
-    for (const f of [...file.files]) {
-      status.textContent = "decoding " + f.name + "…";
-      try { push(await decodeImageFile(f)); } catch (e) { status.textContent = String(e); return; }
-    }
-    file.value = "";
-  };
-
-  const clear = htl.html`<button style="padding:8px 14px">Clear</button>`;
-  clear.onclick = () => { setValue($shots, []); status.textContent = "0 shots"; preview.replaceChildren(); };
-
-  status.textContent = `${shots.length} shot${shots.length === 1 ? "" : "s"}`;
-  if (shots.length) preview.replaceChildren(drawShot(shots[shots.length - 1], { maxW: 320 }).canvas);
-  invalidation.then(() => { shoot.onclick = null; file.onchange = null; clear.onclick = null; });
-
-  return htl.html`<div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
-    <div style="font:13px/2 system-ui">
-      ${camStream && camStream.error ? htl.html`<div style="color:#a33">camera: ${camStream.error}</div>` : ""}
-      <div>${shoot} ${clear}</div>
-      <div style="margin-top:6px">…or drop in photos: ${file}</div>
-      <div style="margin-top:6px">${status}</div>
-    </div>
-    ${preview}
-  </div>`;
-};
-
 const _ft46 = function _calibratePanel(htl,shots,matTarget,analyzeFrameMan,detectOpts,calibrate,setValue,$cameraProfile,cameraProfile,invalidation){
   const T = matTarget;
   const out = htl.html`<div style="font:13px/1.6 system-ui"></div>`;
@@ -49290,6 +49245,177 @@ const _ft57 = function _previewPanel(htl,previewOn,THREE,traceResult,partThickne
 };
 
 
+
+const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,analyzeFrameMan,matTarget,calib,cameraProfile,makePlaneMap,makeMatSampler,traceFrame,decodeImageFile,setValue,$shots,invalidation){
+  // A viewfinder that shows THE FRAME THE DETECTOR SEES, with the marks it read
+  // and the mat's own outline drawn on it. Not the raw camera feed: the useful
+  // question before pressing the button is not "is the part in shot" but "is
+  // this frame going to measure", and only the detector can answer that.
+  const T = matTarget;
+  const cap = htl.html`<canvas style="display:block;width:100%;height:auto;background:#151515"></canvas>`;
+  const overlay = htl.svg`<svg preserveAspectRatio="none"
+    style="position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none"></svg>`;
+  const hud = htl.html`<div style="position:absolute;left:0;bottom:0;right:0;padding:5px 9px;
+    background:rgba(0,0,0,0.62);color:#dfe;font:clamp(11px,2.6vw,13px)/1.45 ui-monospace,monospace"></div>`;
+  const stage = htl.html`<div style="position:relative;max-width:760px;background:#1b1b1b;
+    border-radius:6px;overflow:hidden">${cap}${overlay}${hud}</div>`;
+
+  const shoot = htl.html`<button style="font:15px system-ui;padding:10px 20px;border-radius:6px">Shoot</button>`;
+  const file = htl.html`<input type="file" accept="image/*" style="font:13px system-ui">`;
+  const clear = htl.html`<button style="font:13px system-ui;padding:6px 12px">Clear shots</button>`;
+  const tally = htl.html`<span style="font:12px ui-monospace,monospace;color:#888"></span>`;
+  const showOutline = htl.html`<label style="font:13px system-ui;display:flex;gap:5px;align-items:center">
+    <input type="checkbox" checked> outline the part</label>`;
+  const bar = htl.html`<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0">
+    ${shoot}${clear}${file}${showOutline}${tally}</div>`;
+  const el = htl.html`<div>${stage}${bar}</div>`;
+
+  let wantShoot = false;
+  shoot.onclick = () => { wantShoot = true; };
+  clear.onclick = () => setValue($shots, []);
+  file.onchange = async () => {
+    for (const f of [...file.files]) {
+      try { setValue($shots, [...$shots.value, await decodeImageFile(f)]); }
+      catch (e) { hud.textContent = String(e); }
+    }
+    file.value = "";
+  };
+  let alive = true;
+  invalidation.then(() => { alive = false; shoot.onclick = null; clear.onclick = null; file.onchange = null; });
+
+  const ctx = cap.getContext("2d");
+  const matGray = makeMatSampler();
+  // The live outline is kept in PLANE MILLIMETRES and re-projected through the
+  // current pose every frame. Tracing costs ~130ms at working resolution, far
+  // too slow for every frame, but a mm outline stays glued to the mat between
+  // traces because the mat is what it is anchored to -- so the user sees the
+  // shape track the camera at full frame rate and merely refresh occasionally.
+  let outlineMm = null, outlineAt = 0, outlineNote = "";
+  const say = (text, colour) => { hud.innerHTML = ""; hud.append(htl.html`<span style="color:${colour}">${text}</span>`); };
+  // Working resolution for the LIVE pass only. The detector costs time roughly
+  // linearly in pixels and this runs every frame, so it looks at a downscaled
+  // copy; the shot itself is always grabbed at the camera's native size.
+  const LIVE_W = 800;
+
+  while (alive) {
+    tally.textContent = `${$shots.value.length} shot${$shots.value.length === 1 ? "" : "s"} kept`;
+    if (camStream && camStream.error) {
+      say("camera: " + camStream.error, "#f88");
+      yield el; await new Promise((r) => setTimeout(r, 500)); continue;
+    }
+    if (!camOn || !camVideo.videoWidth) {
+      say(camOn ? "waiting for the camera…" : "camera is off — turn it on above, or drop a photo in below", "#bbb");
+      yield el; await new Promise((r) => setTimeout(r, 400)); continue;
+    }
+
+    const nw = camVideo.videoWidth, nh = camVideo.videoHeight;
+    const scale = Math.min(1, LIVE_W / nw);
+    const w = Math.round(nw * scale), h = Math.round(nh * scale);
+    if (cap.width !== w) { cap.width = w; cap.height = h; overlay.setAttribute("viewBox", `0 0 ${w} ${h}`); }
+
+    await grabber.grab(camVideo, w, h);
+    const gray = grabber.ensureFull();
+    const im = ctx.createImageData(w, h);
+    for (let i = 0, q = 0; i < gray.length; i++, q += 4) {
+      im.data[q] = im.data[q + 1] = im.data[q + 2] = gray[i];
+      im.data[q + 3] = 255;
+    }
+    ctx.putImageData(im, 0, 0);
+
+    // rows-only live: bothAxes is a second full pass, and its gain is on the
+    // centre coordinate, which matters for the MEASUREMENT and not for telling
+    // the user whether the mat is in shot. The shot itself gets both passes.
+    const res = analyzeFrameMan({ gray, w, h }, {});
+    const on = res.fused.filter((f) => T.byId.has(f.id));
+    const off = res.fused.filter((f) => !T.byId.has(f.id));
+
+    const parts = [];
+    for (const f of res.fused) {
+      const good = T.byId.has(f.id);
+      parts.push(`<circle cx="${f.xc.toFixed(1)}" cy="${f.yc.toFixed(1)}" r="${Math.max(4, w / 90)}"
+        fill="none" stroke="${good ? "#3ddc84" : "#ff5252"}" stroke-width="${Math.max(1.5, w / 400)}"/>`);
+    }
+
+    let ready = false, msg, colour = "#f2b134";
+    if (on.length < 4) {
+      msg = `${on.length} mat marks — point the camera at the mat`;
+      colour = "#f88";
+      outlineMm = null; outlineNote = "";
+    } else {
+      const I = cameraProfile && cameraProfile.w === nw && cameraProfile.h === nh
+        ? { ...cameraProfile, f: cameraProfile.f * scale, cx: cameraProfile.cx * scale, cy: cameraProfile.cy * scale }
+        : { f: 1.1 * w, cx: w / 2, cy: h / 2, k1: 0, k2: 0, p1: 0, p2: 0 };
+      const pairs = on.map((f) => { const m = T.byId.get(f.id); return { X: m.xMm, Y: m.yMm, u: f.xc, v: f.yc }; });
+      const pose = calib.poseFor(I, pairs);
+      if (!pose) { msg = `${on.length} marks, but the pose did not solve`; colour = "#f88"; }
+      else {
+        const map = makePlaneMap(I, pose);
+        // The mat's own border, drawn where it actually is. This is the frame
+        // the measurement happens in, so showing it is the difference between
+        // guessing at framing and seeing it.
+        const hw = T.pageW / 2, hh = (T.pageH - T.legendMm) / 2;
+        const corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => calib.project(I, pose, x, y));
+        parts.push(`<polygon points="${corners.map((c) => c.map((v) => v.toFixed(1)).join(",")).join(" ")}"
+          fill="none" stroke="#4aa3ff" stroke-width="${Math.max(1.5, w / 400)}" stroke-dasharray="6 5"/>`);
+        if (showOutline.firstElementChild.checked && map.tiltDeg <= 25 && Date.now() - outlineAt > 1000) {
+          outlineAt = Date.now();
+          // At NATIVE resolution, not the working copy the overlay uses. Scaling
+          // the frame down resamples the mark rings soft while the model still
+          // predicts hard ones, and the mat stops cancelling: measured, the same
+          // scene traces at 960 wide and fails the cancellation gate at 25%
+          // when resized to 800. So the live outline costs a second grab and a
+          // slower cadence, and in exchange it is the outline a shot would
+          // actually produce rather than a cheaper one that is not.
+          await grabber.grab(camVideo, nw, nh);
+          const full = { gray: grabber.ensureFull(), w: nw, h: nh };
+          const nat = cameraProfile && cameraProfile.w === nw && cameraProfile.h === nh
+            ? cameraProfile
+            : { f: 1.1 * nw, cx: nw / 2, cy: nh / 2, k1: 0, k2: 0, p1: 0, p2: 0 };
+          const got = traceFrame(full, nat, { matGray, tolMm: 0.2 });
+          outlineMm = got.ok ? got.outline : null;
+          // Say why there is no outline. "Nothing drawn" is the state the user
+          // is standing there trying to fix, and silence is what made the first
+          // version of this panel useless.
+          outlineNote = got.ok
+            ? ` · part ${got.sizeMm[0]}×${got.sizeMm[1]}mm`
+            : " · no outline: " + String(got.why).split("—")[0].trim();
+        }
+        if (outlineMm && showOutline.firstElementChild.checked) {
+          const pts = outlineMm.map(([x, y]) => calib.project(I, pose, x, y).map((v) => v.toFixed(1)).join(",")).join(" ");
+          parts.push(`<polygon points="${pts}" fill="rgba(255,45,85,0.14)" stroke="#ff2d55" stroke-width="${Math.max(1.5, w / 400)}"/>`);
+        }
+        const p0 = map.toPlane(w / 2, h / 2), p1 = map.toPlane(w / 2 + 1, h / 2);
+        const mmPerPx = p0 && p1 ? Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) / scale : null;
+        const tilt = map.tiltDeg;
+        ready = tilt <= 12 && on.length >= 8;
+        msg = `${on.length}/${T.marks.length} marks${off.length ? ` · ${off.length} rejected` : ""}`
+          + ` · tilt ${tilt.toFixed(0)}°` + outlineNote
+          + (mmPerPx ? ` · ${mmPerPx.toFixed(3)} mm/px at ${nw}×${nh}` : "")
+          + (cameraProfile ? "" : " · UNCALIBRATED");
+        if (tilt > 12) { msg += " — too oblique, get over the top of it"; colour = "#f2b134"; }
+        else if (on.length < 8) { msg += " — get more of the mat in shot"; colour = "#f2b134"; }
+        else { msg += " — ready"; colour = "#3ddc84"; }
+      }
+    }
+    overlay.innerHTML = parts.join("");
+    say(msg, colour);
+    shoot.style.background = ready ? "#1b6e3c" : "";
+    shoot.style.color = ready ? "#fff" : "";
+
+    if (wantShoot) {
+      wantShoot = false;
+      say("capturing at " + nw + "×" + nh + "…", "#dfe");
+      // Native resolution, whatever the live pass was looking at: every pixel
+      // thrown away here is measurement resolution thrown away.
+      await grabber.grab(camVideo, nw, nh);
+      setValue($shots, [...$shots.value, { gray: grabber.ensureFull().slice(), w: nw, h: nh, name: `live ${new Date().toLocaleTimeString()}` }]);
+    }
+
+    yield el;
+    await new Promise((r) => setTimeout(r, 60));
+  }
+};
+
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -49309,7 +49435,7 @@ export default function define(runtime, observer) {
   $def("_ft33", "viewof camOn", ["Inputs"], _ft33);
   $def("_ft34", "camOn", ["Generators", "viewof camOn"], _ft34);
   $def("_ft36", "camVideo", ["htl", "camStream", "invalidation"], _ft36);
-  $def("_ft45", "captureUI", ["htl", "camOn", "camVideo", "camStream", "grabber", "decodeImageFile", "setValue", "shots", "viewof shots", "drawShot", "invalidation"], _ft45);
+  $def("_ft58", "viewfinder", ["htl", "camOn", "camVideo", "camStream", "grabber", "analyzeFrameMan", "matTarget", "calib", "cameraProfile", "makePlaneMap", "makeMatSampler", "traceFrame", "decodeImageFile", "setValue", "viewof shots", "invalidation"], _ft58);
   $def("_ft46", "calibratePanel", ["htl", "shots", "matTarget", "analyzeFrameMan", "detectOpts", "calibrate", "setValue", "viewof cameraProfile", "cameraProfile", "invalidation"], _ft46);
   $def("_ft48", "tracePanel", ["htl", "traceResult", "drawShot", "toDxf", "toSvgMm", "invalidation"], _ft48);
   $def("_ft50", "previewSection_md", ["md"], _ft50);
