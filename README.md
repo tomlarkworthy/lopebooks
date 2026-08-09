@@ -14,3 +14,4 @@ These are linked here so they are reachable; they are not listed in `content.jso
 | [DAW](https://tomlarkworthy.github.io/lopebooks/notebooks/tomlarkworthy_daw.html) | A digital audio workstation that is nothing but a notebook — knob positions, drum patterns and rack layout all live in cell source |
 | [Coded Landmark Tracking](https://tomlarkworthy.github.io/lopebooks/notebooks/tomlarkworthy_coded-landmark-tracking.html) | Printing a calibration target, then decoding self-locating marks from a live camera |
 | [Realtime Multi-Barcode Tracking](https://tomlarkworthy.github.io/lopebooks/notebooks/tomlarkworthy_realtime-multi-barcode-tracking.html) | Many circular barcodes at once, on live frames |
+| [Flat Trace](https://tomlarkworthy.github.io/lopebooks/notebooks/tomlarkworthy_flat-trace.html) | Photograph a part lying on a printed mark lattice, get its outline back in true millimetres as a DXF |
