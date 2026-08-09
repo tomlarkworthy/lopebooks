@@ -48057,11 +48057,65 @@ const _ft10 = function _calib(){return((function () {
   return { solve, smallestEigVec, fitH, applyH, invH, rodrigues, rodriguesInv, project, unproject, poseFromH, refinePose, poseFor, zhangK, bundle };
 })())};
 
-const _ft11 = function _calibrate(calib){return(function calibrate(views, W, H, opts = {}) {
+const _ft91 = function _markConsensus(calib){return(function markConsensus(pairs, tolPx) {
+  // The largest subset of plane-to-pixel correspondences that agree on ONE
+  // homography. A homography absorbs any perspective, any focal length and any
+  // print-scale error, so it needs no intrinsics and no pose — which is the
+  // whole point: it can run BEFORE a fit exists, and is therefore immune to a
+  // fit the outliers have already corrupted. Dropping points that disagree with
+  // an initial estimate cannot do that, because the estimate is the casualty.
+  //
+  // What it removes is not noise. A mark misread as a different id is a WRONG
+  // landmark at a confidently stated place, and one is enough to move a least
+  // squares fit by an order of magnitude.
+  if (!pairs || pairs.length < 5) return { inliers: pairs ?? [], outliers: [], H: null };
+  const n = pairs.length, quads = [];
+  if (n <= 10) {
+    for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) for (let c = b + 1; c < n; c++) for (let d = c + 1; d < n; d++) quads.push([a, b, c, d]);
+  } else {
+    // Deterministic walk, not Math.random: the same frame must always grade the
+    // same way, or a marginal shot passes on one run and fails on the next.
+    let s = 1;
+    for (let i = 0; i < 400; i++) {
+      const q = [];
+      while (q.length < 4) { s = (s * 1103515245 + 12345) & 0x7fffffff; const j = s % n; if (!q.includes(j)) q.push(j); }
+      quads.push(q);
+    }
+  }
+  let best = null;
+  for (const q of quads) {
+    const H = calib.fitH(q.map((i) => pairs[i]));
+    if (!H) continue;
+    let count = 0;
+    for (const p of pairs) { const z = calib.applyH(H, p.X, p.Y); if (Math.hypot(z[0] - p.u, z[1] - p.v) <= tolPx) count++; }
+    if (!best || count > best.count) { best = { count, H }; if (count === n) break; }
+  }
+  if (!best) return { inliers: pairs, outliers: [], H: null };
+  const inliers = pairs.filter((p) => { const z = calib.applyH(best.H, p.X, p.Y); return Math.hypot(z[0] - p.u, z[1] - p.v) <= tolPx; });
+  // Only trust a majority. Below that the four-point sample may be the fluke and
+  // the "outliers" the real marks, and silently keeping the wrong half is worse
+  // than keeping everything.
+  if (inliers.length < 4 || inliers.length < 0.5 * n) return { inliers: pairs, outliers: [], H: null };
+  return { inliers, outliers: pairs.filter((p) => !inliers.includes(p)), H: best.H };
+})};
+
+const _ft11 = function _calibrate(calib,markConsensus){return(function calibrate(views, W, H, opts = {}) {
   // views: [{ name, pairs: [{X, Y, u, v}] }] -- plane millimetres against pixels
   const free = opts.free ?? ["f", "cx", "cy", "k1", "k2"];
   const usable = views.filter((v) => v.pairs.length >= 5).map((v) => ({ name: v.name, pairs: [...v.pairs], pose: [0, 0, 0, 0, 0, 400] }));
   if (usable.length < 3) return { ok: false, why: `need at least 3 views with 5+ marks, have ${usable.length}` };
+
+  // Throw out wrong correspondences FIRST, per view, on geometry alone. Doing
+  // it after an initial fit is too late: MEASURED on a real calibration set,
+  // leaving them in gave rms 92.6px with the principal point at (329, 454) on a
+  // 1080x1920 frame and f = 561 — a fit that had not converged at all, and one
+  // the old drop-the-worst round could not rescue because the estimate it
+  // judged against was itself the casualty.
+  let rejected = 0;
+  for (const v of usable) {
+    const c = markConsensus(v.pairs, opts.consensusTolPx ?? Math.max(2, W / 360));
+    if (c.inliers.length >= 5 && c.outliers.length) { rejected += c.outliers.length; v.pairs = c.inliers; }
+  }
   const Hs = usable.map((v) => calib.fitH(v.pairs)).filter(Boolean);
   const z = calib.zhangK(Hs, W, H);
   let I = { f: z.f, cx: z.cx, cy: z.cy, k1: 0, k2: 0, p1: 0, p2: 0 };
@@ -48115,8 +48169,46 @@ const _ft11 = function _calibrate(calib){return(function calibrate(views, W, H, 
   // hundreds of pixels. Fall back rather than hand back something unusable.
   const intrinsics = valid ? I0 : { ...I0, k1: 0, k2: 0, p1: 0, p2: 0 };
   const coverage = +(observed / rMax).toFixed(2);
+
+  // Do these views actually CONSTRAIN a camera? Zhang's method separates focal
+  // length from distance using views at different orientations; from a single
+  // orientation the two trade off exactly, and the solver returns a perfect fit
+  // at an arbitrary f. MEASURED on a real set of five shots, all at 6-7 degrees
+  // of tilt: rms 0.82px at f 6644, rms 0.84px at f 5294 and rms 0.82px at
+  // f 9276, principal points hundreds of pixels apart. A low rms is not evidence
+  // of a good calibration when the geometry is degenerate — it is the symptom.
+  const tilts = usable.map((v) => {
+    const R = calib.rodrigues(v.pose.slice(0, 3));
+    return (Math.acos(Math.min(1, Math.abs(R[2][2]))) * 180) / Math.PI;
+  }).sort((a, b) => a - b);
+  const tiltSpread = tilts.length ? tilts[tilts.length - 1] - tilts[0] : 0;
+  const obliqueViews = tilts.filter((t) => t >= 20).length;
+  if (tiltSpread < (opts.minTiltSpreadDeg ?? 15) || obliqueViews < (opts.minObliqueViews ?? 2)) {
+    return {
+      ok: false, rms: +out.rms.toFixed(3), views: usable.length, dropped, rejected, coverage,
+      intrinsics, viewTilts: tilts.map((t) => +t.toFixed(0)),
+      why: `the views are all the same angle — tilts ${tilts.map((t) => Math.round(t) + "°").join(", ")}, `
+        + `spanning only ${Math.round(tiltSpread)}°. From one orientation the focal length and the distance to the mat trade off exactly, so the fit is perfect at any f and none of it is real. `
+        + `Shoot again with the mat seen from genuinely different angles: keep a couple near-frontal, then at least two tilted 25-45° from different sides, and vary the distance.`
+    };
+  }
+
+  // A calibration that did not converge must not be handed out. Sub-pixel is
+  // what a good set gives; anything past a few pixels means the solver never
+  // found the camera, and every pose built on it afterwards is wrong in a way
+  // that only shows up three steps later as "the mat did not cancel".
+  const maxRms = opts.maxRmsPx ?? 3;
+  if (!(out.rms <= maxRms)) {
+    return {
+      ok: false, rms: +out.rms.toFixed(3), views: usable.length, dropped, rejected, coverage,
+      intrinsics,
+      why: `the fit did not converge — ${out.rms.toFixed(1)}px rms, and a good set is under 1px. `
+        + `Recovered f ${Math.round(intrinsics.f)} with the centre at (${Math.round(intrinsics.cx)}, ${Math.round(intrinsics.cy)}) on a ${W}x${H} frame; the centre should land near (${Math.round(W / 2)}, ${Math.round(H / 2)}). `
+        + `Usually the shots are too alike — the mat needs to be seen from genuinely different angles and distances, not the same view five times.`
+    };
+  }
   return {
-    ok: true, intrinsics, rms: +out.rms.toFixed(3), views: usable.length, dropped,
+    ok: true, intrinsics, rms: +out.rms.toFixed(3), views: usable.length, dropped, rejected,
     zhangFallback: z.fallback, coverage,
     distortionValid: valid, distortionDropped: !valid,
     error: valid ? null
@@ -48722,7 +48814,7 @@ ${paths.join("\n")}
 </svg>`;
 })};
 
-const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,matDifference,objectMask,traceContour,contourToMm,simplifyMm,polygonAreaMm2,polylineLengthMm,analyzeFrameMan,detectOpts,denoise){return(function traceFrame(frame, intrinsics, opts = {}) {
+const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,matDifference,objectMask,traceContour,contourToMm,simplifyMm,polygonAreaMm2,polylineLengthMm,analyzeFrameMan,detectOpts,denoise,markConsensus){return(function traceFrame(frame, intrinsics, opts = {}) {
   // frame: { gray: Uint8Array, w, h }.  intrinsics: { f, cx, cy, k1, k2 }.
   const T = opts.target ?? matTarget;
   // Detect raw, and RETRY DENOISED if that reads too little. A printed mid-grey
@@ -48784,38 +48876,10 @@ const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,m
   let outliers = [];
   if (onTarget.length >= 5) {
     const P = onTarget.map((f) => { const k = T.byId.get(f.id); return { X: k.xMm, Y: k.yMm, u: f.xc, v: f.yc, f }; });
-    const tol = opts.consensusTolPx ?? Math.max(2, frame.w / 360);
-    // Deterministic sampling: exhaustive while it is cheap, a fixed low-discrepancy
-    // walk beyond that. No Math.random, so the same frame always grades the same.
-    const n = P.length, quads = [];
-    if (n <= 10) {
-      for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) for (let c = b + 1; c < n; c++) for (let d = c + 1; d < n; d++) quads.push([a, b, c, d]);
-    } else {
-      let s = 1;
-      for (let i = 0; i < 400; i++) {
-        const q = [];
-        while (q.length < 4) { s = (s * 1103515245 + 12345) & 0x7fffffff; const j = s % n; if (!q.includes(j)) q.push(j); }
-        quads.push(q);
-      }
-    }
-    let best = null;
-    for (const q of quads) {
-      const H = calib.fitH(q.map((i) => P[i]));
-      if (!H) continue;
-      let count = 0;
-      for (const p of P) { const z = calib.applyH(H, p.X, p.Y); if (Math.hypot(z[0] - p.u, z[1] - p.v) <= tol) count++; }
-      if (!best || count > best.count) { best = { count, H }; if (count === n) break; }
-    }
-    if (best && best.count >= 4 && best.count < n) {
-      const inl = P.filter((p) => { const z = calib.applyH(best.H, p.X, p.Y); return Math.hypot(z[0] - p.u, z[1] - p.v) <= tol; });
-      // Only trust a consensus that is actually a majority; below that the
-      // "outliers" may be the real marks and the four-point sample the fluke.
-      if (inl.length >= 4 && inl.length >= 0.5 * n) {
-        outliers = P.filter((p) => !inl.includes(p)).map((p) => p.f.id);
-        onTarget = inl.map((p) => p.f);
-      }
-    }
+    const c = markConsensus(P, opts.consensusTolPx ?? Math.max(2, frame.w / 360));
+    if (c.outliers.length) { outliers = c.outliers.map((p) => p.f.id); onTarget = c.inliers.map((p) => p.f); }
   }
+
   if (onTarget.length < 4) {
     return { ok: false, why: `only ${onTarget.length} mat marks read — need 4`, marks: onTarget.length, denoised, offTarget: offTarget.map((f) => f.id) };
   }
@@ -49328,7 +49392,9 @@ const _ft46 = function _calibratePanel(htl,shots,matTarget,analyzeFrameMan,detec
       <div><b>f</b> ${I.f.toFixed(1)}px &nbsp; <b>centre</b> (${I.cx.toFixed(1)}, ${I.cy.toFixed(1)})
         &nbsp; <b>k1</b> ${I.k1.toFixed(4)} &nbsp; <b>k2</b> ${I.k2.toFixed(4)}</div>
       <div>${r.views} views, reprojection ${r.rms}px${r.dropped ? `, ${r.dropped} misplaced reads dropped` : ""}${r.zhangFallback ? ", closed-form init fell back to a guess" : ""}</div>
+      ${r.error ? htl.html`<div style="color:#a33"><b>${r.error}</b></div>` : null}
       ${r.warning ? htl.html`<div style="color:#a33"><b>${r.warning}</b></div>` : htl.html`<div style="color:#282">marks reached ${(r.coverage * 100).toFixed(0)}% of the way to the frame corner — the lens is constrained.</div>`}
+      ${r.rejected ? htl.html`<div style="color:#666">${r.rejected} mark read(s) dropped as geometrically inconsistent</div>` : null}
     </div>`);
   };
 
@@ -50443,7 +50509,8 @@ export default function define(runtime, observer) {
   $def("_ft09", "calibSection_md", ["md"], _ft09);
   $def("_ft49", "detectOpts", [], _ft49);
   $def("_ft10", "calib", [], _ft10);
-  $def("_ft11", "calibrate", ["calib"], _ft11);
+  $def("_ft11", "calibrate", ["calib", "markConsensus"], _ft11);
+  $def("_ft91", "markConsensus", ["calib"], _ft91);
   $def("_ft12", "traceSection_md", ["md"], _ft12);
   $def("_ft13", "makePlaneMap", ["calib"], _ft13);
   $def("_ft14", "makeMatSampler", ["matTarget", "manColor"], _ft14);
@@ -50457,7 +50524,7 @@ export default function define(runtime, observer) {
   $def("_ft22", "polylineLengthMm", [], _ft22);
   $def("_ft23", "toDxf", [], _ft23);
   $def("_ft24", "toSvgMm", [], _ft24);
-  $def("_ft25", "traceFrame", ["calib", "matTarget", "makeMatSampler", "makePlaneMap", "matDifference", "objectMask", "traceContour", "contourToMm", "simplifyMm", "polygonAreaMm2", "polylineLengthMm", "analyzeFrameMan", "detectOpts", "denoise"], _ft25);
+  $def("_ft25", "traceFrame", ["calib", "matTarget", "makeMatSampler", "makePlaneMap", "matDifference", "objectMask", "traceContour", "contourToMm", "simplifyMm", "polygonAreaMm2", "polylineLengthMm", "analyzeFrameMan", "detectOpts", "denoise", "markConsensus"], _ft25);
   $def("_ft89", "denoise", [], _ft89);
   $def("_ft90", "shrinkLuma", [], _ft90);
   $def("_ft27", "calibSelfTest", ["calib", "calibrate"], _ft27);
