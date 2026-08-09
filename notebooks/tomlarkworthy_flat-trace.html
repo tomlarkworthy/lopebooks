@@ -49124,6 +49124,172 @@ const _ft48 = function _tracePanel(htl,traceResult,drawShot,toDxf,toSvgMm,invali
   </div>`;
 };
 
+
+const _ft50 = function _previewSection_md(md){return(md`## Preview
+
+The outline is flat, so a preview is an extrusion of it: the footprint the tool
+measured, pulled up by a thickness you type in. That is exactly what the tool
+knows and no more.
+
+Two things it deliberately is not. It is not a scan — nothing here saw the top
+of the part, so a chamfer, a boss or a countersink is not in the model and is
+not missing by accident. And **holes do not appear**: a hole shows the mat
+through it, so it cancels against the prediction like any other correctly
+predicted region and gets filled in with the rest of the background. The
+silhouette is honest about the boundary and silent about everything inside it.
+
+Three.js comes from a CDN, so this is the one part of the notebook that needs a
+network. Tracing, DXF and SVG do not.`
+)};
+
+const _ft51 = function _viewof_previewOn(Inputs){return(
+  Inputs.toggle({ label: "3D preview", value: false })
+)};
+const _ft52 = function _previewOn(Generators,$0){return(Generators.input($0))};
+
+const _ft53 = function _viewof_partThicknessMm(Inputs){return(
+  Inputs.range([0.1, 50], { value: 3, step: 0.1, label: "thickness (mm)" })
+)};
+const _ft54 = function _partThicknessMm(Generators,$0){return(Generators.input($0))};
+
+const _ft55 = async function _THREE(previewOn){
+  if (!previewOn) return null;
+  // Absolute URL rather than a bare specifier: nothing in this notebook maps
+  // "three", and the module build has no bare imports of its own to rewrite.
+  // If it fails, say so rather than leaving the cell pending forever.
+  try {
+    return await import("https://unpkg.com/three@0.160.0/build/three.module.js");
+  } catch (e) {
+    return { error: e && e.message ? e.message : String(e) };
+  }
+};
+
+const _ft56 = function _orbit(){return(function orbit(camera, dom, target, onChange) {
+  // Twenty lines instead of OrbitControls. The addon imports "three" itself, so
+  // pulling it from a CDN loads a SECOND copy of the library into the page --
+  // it happens to work, because three guards with .isPerspectiveCamera flags
+  // rather than instanceof, but it is a lot of download and a latent trap for a
+  // drag and a wheel.
+  let r = camera.position.distanceTo(target);
+  let theta = Math.atan2(camera.position.x - target.x, camera.position.z - target.z);
+  let phi = Math.acos(Math.min(1, Math.max(-1, (camera.position.y - target.y) / r)));
+  let drag = null;
+  const apply = () => {
+    camera.position.set(
+      target.x + r * Math.sin(phi) * Math.sin(theta),
+      target.y + r * Math.cos(phi),
+      target.z + r * Math.sin(phi) * Math.cos(theta)
+    );
+    camera.lookAt(target);
+    onChange();
+  };
+  const down = (e) => { drag = { x: e.clientX, y: e.clientY }; dom.setPointerCapture(e.pointerId); };
+  const move = (e) => {
+    if (!drag) return;
+    theta -= (e.clientX - drag.x) * 0.01;
+    phi = Math.min(Math.PI - 0.05, Math.max(0.05, phi - (e.clientY - drag.y) * 0.01));
+    drag = { x: e.clientX, y: e.clientY };
+    apply();
+  };
+  const up = (e) => { drag = null; try { dom.releasePointerCapture(e.pointerId); } catch (err) {} };
+  const wheel = (e) => { e.preventDefault(); r = Math.min(2000, Math.max(20, r * (1 + Math.sign(e.deltaY) * 0.12))); apply(); };
+  dom.style.touchAction = "none";
+  dom.addEventListener("pointerdown", down);
+  dom.addEventListener("pointermove", move);
+  dom.addEventListener("pointerup", up);
+  dom.addEventListener("pointercancel", up);
+  dom.addEventListener("wheel", wheel, { passive: false });
+  apply();
+  return () => {
+    dom.removeEventListener("pointerdown", down);
+    dom.removeEventListener("pointermove", move);
+    dom.removeEventListener("pointerup", up);
+    dom.removeEventListener("pointercancel", up);
+    dom.removeEventListener("wheel", wheel);
+  };
+})};
+
+const _ft57 = function _previewPanel(htl,previewOn,THREE,traceResult,partThicknessMm,matTarget,orbit,invalidation){
+  const note = (t) => htl.html`<div style="font:13px/1.6 system-ui;color:#666">${t}</div>`;
+  if (!previewOn) return note("Tick the box to load three.js and extrude the trace.");
+  if (!THREE) return note("loading three.js…");
+  if (THREE.error) return htl.html`<div style="font:13px/1.6 system-ui;color:#a33">three.js did not load: ${THREE.error}. The trace, the DXF and the SVG do not need it.</div>`;
+  const r = traceResult;
+  if (!r || !r.ok) return note(r && r.why ? `nothing to preview — ${r.why}` : "nothing to preview yet");
+
+  const T = matTarget;
+  const t = partThicknessMm;
+  const shape = new THREE.Shape(r.outline.map(([x, y]) => new THREE.Vector2(x, y)));
+  // No computeVertexNormals: ExtrudeGeometry already emits per-face normals,
+  // and recomputing SMOOTHS them across the side wall, which paints a shading
+  // gradient along a surface that is actually flat facets.
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: t, bevelEnabled: false, curveSegments: 1 });
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x101014);
+  const part = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xc8ccd4, roughness: 0.55, metalness: 0.1 }));
+  // the trace lives in the plane's XY with +y up the sheet; three has +y up in
+  // the world, so lay the sheet down rather than re-expressing the geometry
+  part.rotation.x = -Math.PI / 2;
+  scene.add(part);
+  // Outline the top and bottom rings from the CONTOUR, not with EdgesGeometry.
+  // A traced outline turns by a degree or two per segment, which is above any
+  // useful dihedral threshold, so EdgesGeometry draws a line at every one of the
+  // ~360 side-wall seams and the part comes out looking corrugated. That
+  // corrugation is a rendering artefact and not the 0.1mm of real noise in the
+  // trace, which is the sort of thing a preview must not invent.
+  const ringGeo = (z) => new THREE.BufferGeometry().setFromPoints(
+    r.outline.concat([r.outline[0]]).map(([x, y]) => new THREE.Vector3(x, y, z))
+  );
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x30353d });
+  for (const z of [0, t]) {
+    const ring = new THREE.Line(ringGeo(z), lineMat);
+    ring.rotation.x = -Math.PI / 2;
+    scene.add(ring);
+  }
+
+  // the mat, to the millimetre, so the part is seen at the size it was measured
+  const mat = new THREE.Mesh(
+    new THREE.PlaneGeometry(T.pageW, T.pageH - T.legendMm),
+    new THREE.MeshStandardMaterial({ color: 0x5a5f66, roughness: 1 })
+  );
+  mat.rotation.x = -Math.PI / 2;
+  mat.position.y = -0.05;
+  scene.add(mat);
+  const grid = new THREE.GridHelper(T.pageW, Math.round(T.pageW / 10), 0x3a3f47, 0x2a2e34);
+  grid.position.y = -0.04;
+  scene.add(grid);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.6));
+  const key = new THREE.DirectionalLight(0xffffff, 1.5);
+  key.position.set(120, 200, 90);
+  scene.add(key);
+
+  const W = 700, H = 440;
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  renderer.setSize(W, H, false);
+  renderer.domElement.style = "width:100%;max-width:" + W + "px;height:auto;display:block;border:1px solid #333;border-radius:4px";
+
+  const camera = new THREE.PerspectiveCamera(38, W / H, 0.5, 4000);
+  const c = [(r.bboxMm[0] + r.bboxMm[2]) / 2, (r.bboxMm[1] + r.bboxMm[3]) / 2];
+  const target = new THREE.Vector3(c[0], t / 2, -c[1]);
+  const span = Math.max(r.sizeMm[0], r.sizeMm[1], 40);
+  camera.position.set(c[0] + span * 0.9, span * 1.1, -c[1] + span * 1.6);
+
+  const draw = () => renderer.render(scene, camera);
+  const stop = orbit(camera, renderer.domElement, target, draw);
+  draw();
+  invalidation.then(() => { stop(); geo.dispose(); lineMat.dispose(); renderer.dispose(); });
+
+  return htl.html`<div style="font:13px/1.6 system-ui">
+    <div>${r.sizeMm[0]} × ${r.sizeMm[1]} × ${t} mm — a prism of the measured footprint. Drag to orbit, wheel to zoom.</div>
+    <div style="color:#666">The grid is the printed mat at 10mm.</div>
+    ${renderer.domElement}
+  </div>`;
+};
+
+
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -49146,6 +49312,14 @@ export default function define(runtime, observer) {
   $def("_ft45", "captureUI", ["htl", "camOn", "camVideo", "camStream", "grabber", "decodeImageFile", "setValue", "shots", "viewof shots", "drawShot", "invalidation"], _ft45);
   $def("_ft46", "calibratePanel", ["htl", "shots", "matTarget", "analyzeFrameMan", "detectOpts", "calibrate", "setValue", "viewof cameraProfile", "cameraProfile", "invalidation"], _ft46);
   $def("_ft48", "tracePanel", ["htl", "traceResult", "drawShot", "toDxf", "toSvgMm", "invalidation"], _ft48);
+  $def("_ft50", "previewSection_md", ["md"], _ft50);
+  $def("_ft51", "viewof previewOn", ["Inputs"], _ft51);
+  $def("_ft52", "previewOn", ["Generators", "viewof previewOn"], _ft52);
+  $def("_ft53", "viewof partThicknessMm", ["Inputs"], _ft53);
+  $def("_ft54", "partThicknessMm", ["Generators", "viewof partThicknessMm"], _ft54);
+  $def("_ft55", "THREE", ["previewOn"], _ft55);
+  $def("_ft56", "orbit", [], _ft56);
+  $def("_ft57", "previewPanel", ["htl", "previewOn", "THREE", "traceResult", "partThicknessMm", "matTarget", "orbit", "invalidation"], _ft57);
   $def("_ft26", "tests_md", ["md"], _ft26);
   $def("_ft29", "viewof deepTests", ["Inputs"], _ft29);
   $def("_ft30", "deepTests", ["Generators", "viewof deepTests"], _ft30);
@@ -49174,7 +49348,7 @@ export default function define(runtime, observer) {
   $def("_ft23", "toDxf", [], _ft23);
   $def("_ft24", "toSvgMm", [], _ft24);
   $def("_ft25", "traceFrame", ["calib", "matTarget", "makeMatSampler", "makePlaneMap", "matDifference", "objectMask", "traceContour", "contourToMm", "simplifyMm", "polygonAreaMm2", "polylineLengthMm", "analyzeFrameMan", "detectOpts"], _ft25);
-    $def("_ft27", "calibSelfTest", ["calib", "calibrate"], _ft27);
+  $def("_ft27", "calibSelfTest", ["calib", "calibrate"], _ft27);
   $def("_ft28", "traceSelfTest", ["calib", "matTarget", "makeMatSampler", "makePlaneMap", "traceFrame", "polygonAreaMm2"], _ft28);
   $def("_ft35", "camStream", ["camOn", "invalidation"], _ft35);
   $def("_ft37", "grabber", ["lumaCapture"], _ft37);
