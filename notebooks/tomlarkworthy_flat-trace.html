@@ -48089,10 +48089,38 @@ const _ft11 = function _calibrate(calib){return(function calibrate(views, W, H, 
   rs.sort((a, b) => a - b);
   const rMax = Math.hypot(W, H) / 2;
   const observed = rs.length ? rs[rs.length - 1] : 0;
+
+  // Is the fitted lens PHYSICALLY POSSIBLE out to the frame corner? A radial
+  // model must map radius to radius monotonically: r·(1 + k1r² + k2r⁴) has to
+  // keep increasing, so its derivative 1 + 3k1r² + 5k2r⁴ must stay positive.
+  // When the marks never reach the corners the fit is unconstrained there and
+  // runs away — MEASURED on a real phone: k1 = +0.752, k2 = -4.045 at coverage
+  // 0.52, which folds back 694px from the centre and sends the radial factor
+  // NEGATIVE at 1022px, inside a frame whose half-diagonal is 1101px. Points
+  // near the corners then project to the wrong side of the image, every pose is
+  // tens of pixels out, and the mat never cancels. It looked like a fussy trace
+  // gate; it was a broken calibration accepted three steps earlier.
+  //
+  // The curve is what is checked, never the coefficients — coefficients that
+  // look wild can agree perfectly over the radii that were actually observed.
+  const I0 = out.I;
+  const rCorner = Math.hypot(Math.max(I0.cx, W - I0.cx), Math.max(I0.cy, H - I0.cy)) / I0.f;
+  let foldAt = null;
+  for (let i = 1; i <= 400; i++) {
+    const r = rCorner * i / 400, u = r * r;
+    if (1 + 3 * (I0.k1 || 0) * u + 5 * (I0.k2 || 0) * u * u <= 0) { foldAt = r; break; }
+  }
+  const valid = foldAt === null;
+  // A distortion-free model is wrong by a little; a fold-back one is wrong by
+  // hundreds of pixels. Fall back rather than hand back something unusable.
+  const intrinsics = valid ? I0 : { ...I0, k1: 0, k2: 0, p1: 0, p2: 0 };
+  const coverage = +(observed / rMax).toFixed(2);
   return {
-    ok: true, intrinsics: out.I, rms: +out.rms.toFixed(3), views: usable.length, dropped,
-    zhangFallback: z.fallback,
-    coverage: +(observed / rMax).toFixed(2),
+    ok: true, intrinsics, rms: +out.rms.toFixed(3), views: usable.length, dropped,
+    zhangFallback: z.fallback, coverage,
+    distortionValid: valid, distortionDropped: !valid,
+    error: valid ? null
+      : `the fitted lens is not physically possible — it folds back ${Math.round(foldAt * I0.f)}px from the centre, inside a frame that reaches ${Math.round(rCorner * I0.f)}px. Distortion has been DROPPED (k1 = k2 = 0) so the profile is usable but uncorrected. Recalibrate with the mat filling the frame, marks right into the corners.`,
     warning: observed < 0.85 * rMax
       ? `marks only reach ${(100 * observed / rMax).toFixed(0)}% of the way to the frame corner — the lens is UNCONSTRAINED beyond that and k1/k2 there are extrapolation. Capture views with the mat at the edges and corners.`
       : null
@@ -48710,12 +48738,39 @@ const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,m
   let res = opts.detection ?? analyzeFrameMan(frame, dopts);
   let onTarget = res.fused.filter((f) => T.byId.has(f.id));
   let denoised = false;
-  if (!opts.detection && onTarget.length < 4 && opts.denoise !== false) {
+  // Take the BETTER of the two reads, not "raw unless raw fails". A raw read of
+  // a real print does not fail cleanly — it comes back with a handful of
+  // confidently WRONG marks. Measured on one phone frame: raw read 3-6 marks
+  // with a fitted mark width of 850px where the marks are 241px and the
+  // neighbours only 350px apart, while the denoised read got 7-8 at 253px. A
+  // count threshold cannot tell those apart; more marks can, because a wrong id
+  // has to survive parity to be counted at all.
+  if (!opts.detection && opts.denoise !== false) {
     const alt = analyzeFrameMan(denoise(frame, opts.denoise), dopts);
     const altOn = alt.fused.filter((f) => T.byId.has(f.id));
     if (altOn.length > onTarget.length) { res = alt; onTarget = altOn; denoised = true; }
   }
   const offTarget = res.fused.filter((f) => !T.byId.has(f.id));
+
+  // Drop marks whose measured SCALE disagrees with their neighbours. Every mark
+  // on the mat is the same physical size, so under any sane view their pixel
+  // widths agree; one that does not has been misread whatever its id says, and a
+  // parity-valid id is no defence because a wrong id still lands on the mat.
+  // This needs no pose, so it runs before one is fitted — which matters, because
+  // a single such mark drags the pose with it. MEASURED on a phone frame: seven
+  // marks at half-widths 304, 128, 125, 125, 123, 123, 119; dropping the 304 took
+  // the worst reprojection from 207px to 37px and the recovered tilt from 23.6°
+  // to 6.5° on a near-frontal shot.
+  let scaleDropped = [];
+  if (onTarget.length >= 4 && onTarget.every((f) => f.wHalf > 0)) {
+    const ws = onTarget.map((f) => f.wHalf).sort((a, b) => a - b);
+    const medW = ws[ws.length >> 1];
+    const keep = onTarget.filter((f) => Math.abs(f.wHalf - medW) / medW <= (opts.scaleTol ?? 0.35));
+    if (keep.length >= 4 && keep.length < onTarget.length) {
+      scaleDropped = onTarget.filter((f) => !keep.includes(f)).map((f) => f.id);
+      onTarget = keep;
+    }
+  }
   if (onTarget.length < 4) {
     return { ok: false, why: `only ${onTarget.length} mat marks read — need 4`, marks: onTarget.length, denoised, offTarget: offTarget.map((f) => f.id) };
   }
@@ -48818,7 +48873,7 @@ const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,m
   return {
     ok: true, outline, outlines, rings: rings.length, bboxMm,
     sizeMm: [+(bboxMm[2] - bboxMm[0]).toFixed(2), +(bboxMm[3] - bboxMm[1]).toFixed(2)],
-    marks: pairs.length, dropped, offTarget: offTarget.map((f) => f.id), denoised,
+    marks: pairs.length, dropped, offTarget: offTarget.map((f) => f.id), denoised, scaleDropped,
     rmsPx: +rms.toFixed(2), matResidualPct,
     tiltDeg: +map.tiltDeg.toFixed(1), distanceMm: Math.round(map.distanceMm),
     areaMm2: +polygonAreaMm2(outline).toFixed(1),
@@ -49600,7 +49655,12 @@ const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,a
     const detect = (blur) => analyzeFrameMan(blur ? denoise({ gray, w, h }) : { gray, w, h }, {});
     let res = detect(preferDenoised);
     let on = res.fused.filter((f) => T.byId.has(f.id));
-    if (on.length < 4) {
+    // Try the other path whenever this one is short of the readiness bar, not
+    // just when it fails outright — a raw read of a real print comes back with
+    // a few confidently wrong marks rather than none. So the second pass gets
+    // paid for exactly when the shot is not good enough to take anyway, and a
+    // well framed sheet costs one pass.
+    if (on.length < 8) {
       const alt = detect(!preferDenoised);
       const altOn = alt.fused.filter((f) => T.byId.has(f.id));
       if (altOn.length > on.length) { res = alt; on = altOn; preferDenoised = !preferDenoised; }
