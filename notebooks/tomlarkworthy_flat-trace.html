@@ -47984,10 +47984,75 @@ So the camera is calibrated once — \`f\`, \`cx\`, \`cy\`, \`k1\`, \`k2\` — a
 photo after that only has to solve a pose. \`calibrate\` does the fit;
 \`calibSelfTest\` proves the machinery against synthetic data with known truth.
 
-**Shoot the calibration set so the marks reach the corners of the frame.** That
-is the whole requirement, and the reason the archive that already exists cannot
-be used: its marks never leave the middle, where \`r^3\` is too small to measure.`
+### Why the calibration set has to be shot the way the diagram says
+
+Two requirements, and meeting one without the other produces a calibration that
+looks fine and is not.
+
+**The marks must reach the corners of the frame.** Radial distortion grows as
+\`r^3\`, so a set whose marks stay in the middle says nothing about the edges and
+\`k1\`/\`k2\` there are extrapolation. This is why the archive of tracker footage
+cannot be reused: its marks never leave the centre.
+
+**The mat must be seen from genuinely different angles.** The fit recovers focal
+length by watching how the pattern foreshortens as the plane turns; from a
+single orientation, focal length and distance to the mat trade off exactly and
+*any* focal length fits perfectly. Five near-frontal shots are one view
+repeated, not five views.
+
+Measured on a real set of five shots all taken at 6-7° of tilt: the same data
+fits at **0.82px with f = 6644**, at **0.84px with f = 5294**, and at **0.82px
+with f = 9276**, with principal points hundreds of pixels apart. A low
+reprojection error is not evidence of a good calibration — on a degenerate set
+it is the symptom. So \`calibrate\` refuses a set whose tilts span less than 15°
+or that has fewer than two views past 20°, and the panel grades the shots
+already taken before anything is fitted.`
 )};
+
+const _ft92 = function _calibPosesSvg(htl){
+  // The shot list as a picture, drawn at the tilt each shot wants, because
+  // "30 degrees from the left edge" is a sentence people read as "over there
+  // somewhere". Sits above the calibrate button so it is read at the moment it
+  // is needed; §2 carries the evidence for why the angles matter.
+  const W = 560, H = 250, cx = W / 2, cy = 190, matW = 320, matH = 36, d = 152;
+  const cam = (deg, side, label) => {
+    const t = (deg * Math.PI) / 180;
+    const x = cx + side * d * Math.sin(t), y = cy - d * Math.cos(t);
+    return `<g>
+      <line x1="${x.toFixed(0)}" y1="${y.toFixed(0)}" x2="${cx}" y2="${(cy - 6).toFixed(0)}"
+        stroke="#4aa3ff" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <rect x="${(x - 14).toFixed(0)}" y="${(y - 10).toFixed(0)}" width="28" height="20" rx="3"
+        fill="#1b6e3c" stroke="#0d3c20"/>
+      <text x="${x.toFixed(0)}" y="${(y + 4).toFixed(0)}" font-size="11"
+        fill="#fff" text-anchor="middle">${label}</text>
+      <text x="${x.toFixed(0)}" y="${(y + 24).toFixed(0)}" font-size="10"
+        fill="#888" text-anchor="middle">${deg}&#176;</text>
+    </g>`;
+  };
+  const el = htl.html`<div style="font:13px/1.6 system-ui;margin:8px 0"></div>`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto;font-family:system-ui">
+    <g transform="translate(${cx} ${cy}) skewX(-24) translate(${-cx} ${-cy})">
+      <rect x="${cx - matW / 2}" y="${cy - matH / 2}" width="${matW}" height="${matH}"
+        fill="#f0f0f0" stroke="#999"/>
+    </g>
+    <text x="${cx}" y="${cy + 36}" font-size="11" fill="#888" text-anchor="middle">the mat, flat on the table</text>
+    ${cam(0, 1, "1·2")}
+    ${cam(30, -1, "3")}
+    ${cam(30, 1, "4")}
+    ${cam(48, -1, "5")}
+    ${cam(48, 1, "6")}
+  </svg>
+  <div><b>Six shots, mat filling the frame every time.</b> 1 and 2 straight down at two
+  different heights; 3 to 6 leaning in from the near, right, far and left edges. The
+  viewfinder prints the tilt live, so 3-6 are a matter of leaning over until it reads
+  about 30 and pressing the button.</div>
+  <div style="color:#666">Two things have to be true at once, and one without the other
+  gives a calibration that looks fine and is not: the marks must reach the frame corners
+  (distortion is an r&#179; term, unmeasurable in the middle), and the mat must be seen from
+  genuinely different angles (from one angle, focal length and distance trade off exactly
+  and any focal length fits perfectly). &#167;2 has the measurements.</div>`;
+  return el;
+};
 
 const _ft10 = function _calib(){return((function () {
   // Calibration primitives. One copy, used by the fit, by the self-test and by
@@ -48370,7 +48435,7 @@ const _ft10 = function _calib(){return((function () {
   return { solve, smallestEigVec, fitH, applyH, invH, rodrigues, rodriguesInv, project, unproject, poseFromH, refinePose, poseFor, zhangK, bundle };
 })())};
 
-const _ft91 = function _markConsensus(calib){return(function markConsensus(pairs, tolPx) {
+const _ft91 = function _markConsensus(calib){return(function markConsensus(pairs, tolPx, I) {
   // The largest subset of plane-to-pixel correspondences that agree on ONE
   // homography. A homography absorbs any perspective, any focal length and any
   // print-scale error, so it needs no intrinsics and no pose — which is the
@@ -48381,7 +48446,21 @@ const _ft91 = function _markConsensus(calib){return(function markConsensus(pairs
   // What it removes is not noise. A mark misread as a different id is a WRONG
   // landmark at a confidently stated place, and one is enough to move a least
   // squares fit by an order of magnitude.
+  //
+  // A homography cannot represent lens distortion, so on a wide lens its
+  // residual IS the distortion, and it grows with radius — the tolerance would
+  // then be a filter on how far out a mark sits. Given intrinsics, score on
+  // undistorted coordinates instead and the tolerance goes back to meaning what
+  // it says. Without them (the calibration fit, where the lens is the unknown)
+  // the caller must pass a tolerance loose enough to survive the bend.
   if (!pairs || pairs.length < 5) return { inliers: pairs ?? [], outliers: [], H: null };
+  const src = pairs;
+  if (I) {
+    pairs = pairs.map((p) => {
+      const [xn, yn] = calib.unproject(I, p.u, p.v);
+      return { X: p.X, Y: p.Y, u: xn * I.f + I.cx, v: yn * I.f + I.cy };
+    });
+  }
   const n = pairs.length, quads = [];
   if (n <= 10) {
     for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) for (let c = b + 1; c < n; c++) for (let d = c + 1; d < n; d++) quads.push([a, b, c, d]);
@@ -48403,13 +48482,16 @@ const _ft91 = function _markConsensus(calib){return(function markConsensus(pairs
     for (const p of pairs) { const z = calib.applyH(H, p.X, p.Y); if (Math.hypot(z[0] - p.u, z[1] - p.v) <= tolPx) count++; }
     if (!best || count > best.count) { best = { count, H }; if (count === n) break; }
   }
-  if (!best) return { inliers: pairs, outliers: [], H: null };
-  const inliers = pairs.filter((p) => { const z = calib.applyH(best.H, p.X, p.Y); return Math.hypot(z[0] - p.u, z[1] - p.v) <= tolPx; });
+  if (!best) return { inliers: src, outliers: [], H: null };
+  // Indices, not the undistorted copies: callers carry their own fields on these
+  // objects (the detection, the id) and expect the originals back.
+  const keep = pairs.map((p) => { const z = calib.applyH(best.H, p.X, p.Y); return Math.hypot(z[0] - p.u, z[1] - p.v) <= tolPx; });
+  const inliers = src.filter((_, i) => keep[i]);
   // Only trust a majority. Below that the four-point sample may be the fluke and
   // the "outliers" the real marks, and silently keeping the wrong half is worse
   // than keeping everything.
-  if (inliers.length < 4 || inliers.length < 0.5 * n) return { inliers: pairs, outliers: [], H: null };
-  return { inliers, outliers: pairs.filter((p) => !inliers.includes(p)), H: best.H };
+  if (inliers.length < 4 || inliers.length < 0.5 * n) return { inliers: src, outliers: [], H: null };
+  return { inliers, outliers: src.filter((_, i) => !keep[i]), H: best.H };
 })};
 
 const _ft11 = function _calibrate(calib,markConsensus){return(function calibrate(views, W, H, opts = {}) {
@@ -48426,7 +48508,15 @@ const _ft11 = function _calibrate(calib,markConsensus){return(function calibrate
   // judged against was itself the casualty.
   let rejected = 0;
   for (const v of usable) {
-    const c = markConsensus(v.pairs, opts.consensusTolPx ?? Math.max(2, W / 360));
+    // Loose on purpose: the lens is the unknown here, so the homography cannot
+    // undistort and its residual carries the whole radial bend. MEASURED on
+    // synthetic views of a k1 = -0.22 camera reaching the frame corners, a
+    // W/360 tolerance threw away 41 of 138 CORRECT reads, preferentially the
+    // outermost ones — the only reads that constrain k1 — and dropped coverage
+    // from 0.81 to 0.73. At W/40 it drops none of them, and still rejects
+    // exactly the 14 reads moved a whole 43.5mm pitch (rms 1.21px against
+    // 68.6px and a refusal at W/360, which rejected 44 and kept the wrong set).
+    const c = markConsensus(v.pairs, opts.consensusTolPx ?? Math.max(8, W / 40));
     if (c.inliers.length >= 5 && c.outliers.length) { rejected += c.outliers.length; v.pairs = c.inliers; }
   }
   const Hs = usable.map((v) => calib.fitH(v.pairs)).filter(Boolean);
@@ -49189,7 +49279,13 @@ const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,m
   let outliers = [];
   if (onTarget.length >= 5) {
     const P = onTarget.map((f) => { const k = T.byId.get(f.id); return { X: k.xMm, Y: k.yMm, u: f.xc, v: f.yc, f }; });
-    const c = markConsensus(P, opts.consensusTolPx ?? Math.max(2, frame.w / 360));
+    // Undistort first, so the tolerance is a tolerance on misplacement rather
+    // than on radius. Without a real lens (k1 = k2 = 0 is the guessed profile)
+    // undistorting is a no-op and the bend is still in there, so stay loose.
+    const lensKnown = !!(intrinsics.k1 || intrinsics.k2);
+    const c = markConsensus(P,
+      opts.consensusTolPx ?? (lensKnown ? Math.max(2, frame.w / 360) : Math.max(8, frame.w / 40)),
+      intrinsics);
     if (c.outliers.length) { outliers = c.outliers.map((p) => p.f.id); onTarget = c.inliers.map((p) => p.f); }
   }
 
@@ -49691,11 +49787,23 @@ const _ft44 = function _drawShot(){return(function drawShot(shot, opts = {}) {
   return { canvas: cv, ctx };
 })};
 
-const _ft46 = function _calibratePanel(htl,shots,matTarget,analyzeFrameMan,detectOpts,calibrate,setValue,$cameraProfile,cameraProfile,invalidation){
+const _ft46 = function _calibratePanel(htl,shots,matTarget,analyzeFrameMan,detectOpts,calib,calibrate,setValue,$cameraProfile,cameraProfile,invalidation){
   const T = matTarget;
   const out = htl.html`<div style="font:13px/1.6 system-ui"></div>`;
   const run = htl.html`<button style="padding:8px 14px">Calibrate from ${shots.length} shot${shots.length === 1 ? "" : "s"}</button>`;
   const forget = htl.html`<button style="padding:8px 14px">Forget the stored profile</button>`;
+
+  // Read every shot once; the survey below and the fit both want the same marks
+  // and detection is the expensive part of either.
+  let _views = null;
+  const readShots = () => _views ?? (_views = shots.map((s) => {
+    const res = analyzeFrameMan({ gray: s.gray, w: s.w, h: s.h }, detectOpts);
+    const pairs = res.fused.filter((f) => T.byId.has(f.id)).map((f) => {
+      const m = T.byId.get(f.id);
+      return { X: m.xMm, Y: m.yMm, u: f.xc, v: f.yc };
+    });
+    return { name: s.name ?? "shot", w: s.w, h: s.h, pairs };
+  }));
 
   const show = (r) => {
     if (!r.ok) { out.innerHTML = ""; out.append(htl.html`<div style="color:#a33">${r.why}</div>`); return; }
@@ -49716,16 +49824,7 @@ const _ft46 = function _calibratePanel(htl,shots,matTarget,analyzeFrameMan,detec
     const W = shots[0].w, H = shots[0].h;
     const mixed = shots.some((s) => s.w !== W || s.h !== H);
     if (mixed) { out.innerHTML = ""; out.append(htl.html`<div style="color:#a33">the shots are not all the same size — intrinsics are per resolution, so calibrate one resolution at a time</div>`); return; }
-    const views = [];
-    for (const s of shots) {
-      const res = analyzeFrameMan({ gray: s.gray, w: s.w, h: s.h }, detectOpts);
-      const pairs = res.fused.filter((f) => T.byId.has(f.id)).map((f) => {
-        const m = T.byId.get(f.id);
-        return { X: m.xMm, Y: m.yMm, u: f.xc, v: f.yc };
-      });
-      views.push({ name: s.name ?? "shot", pairs });
-    }
-    const r = calibrate(views, W, H);
+    const r = calibrate(readShots().map((v) => ({ name: v.name, pairs: v.pairs.map((p) => ({ ...p })) })), W, H);
     show(r);
     if (r.ok) {
       const profile = { ...r.intrinsics, w: W, h: H, rms: r.rms, views: r.views, coverage: r.coverage };
@@ -49744,8 +49843,70 @@ const _ft46 = function _calibratePanel(htl,shots,matTarget,analyzeFrameMan,detec
     ? htl.html`<div style="color:#282">stored profile: f ${cameraProfile.f.toFixed(1)}px, k1 ${cameraProfile.k1.toFixed(4)}, from ${cameraProfile.views} views at ${cameraProfile.w}x${cameraProfile.h}, ${cameraProfile.rms}px</div>`
     : htl.html`<div style="color:#a33">no stored profile — traces will use a guessed focal length</div>`;
 
+  // Grade the set BEFORE fitting. A degenerate set still fits to sub-pixel, so
+  // by the time there is an rms to look at the damage is invisible; the only
+  // honest moment to say "these are all the same view" is now, while the
+  // camera is still in the room.
+  const survey = (() => {
+    if (!shots.length) return htl.html`<div style="color:#888">no shots yet — the six above are what a usable set looks like</div>`;
+    const SIDES = ["right", "far", "left", "near"];
+    const rows = [], tilts = [], sides = new Set();
+    for (const v of readShots()) {
+      let tilt = null, cover = null, side = null;
+      if (v.pairs.length >= 4) {
+        // Tilt and azimuth off a GUESSED focal length. Both are angles the pose
+        // recovers almost independently of f, which is the whole reason the set
+        // can be graded before the camera is known.
+        const I = { f: 1.1 * v.w, cx: v.w / 2, cy: v.h / 2, k1: 0, k2: 0, p1: 0, p2: 0 };
+        const pose = calib.poseFor(I, v.pairs);
+        if (pose) {
+          const R = calib.rodrigues(pose.slice(0, 3)), t = pose.slice(3, 6);
+          tilt = (Math.acos(Math.min(1, Math.abs(R[2][2]))) * 180) / Math.PI;
+          tilts.push(tilt);
+          const C = [0, 1, 2].map((i) => -(R[0][i] * t[0] + R[1][i] * t[1] + R[2][i] * t[2]));
+          const az = Math.atan2(C[1], C[0]);
+          side = SIDES[(Math.round((2 * az) / Math.PI) + 4) % 4];
+          if (tilt >= 20) sides.add(side);
+        }
+        const rr = Math.max(...v.pairs.map((p) => Math.hypot(p.u - v.w / 2, p.v - v.h / 2)));
+        cover = rr / (Math.hypot(v.w, v.h) / 2);
+      }
+      rows.push({ name: v.name, marks: v.pairs.length, tilt, cover, side });
+    }
+    tilts.sort((a, b) => a - b);
+    const spread = tilts.length ? tilts[tilts.length - 1] - tilts[0] : 0;
+    const oblique = tilts.filter((t) => t >= 20).length;
+    const frontal = tilts.filter((t) => t < 20).length;
+    const bestCover = Math.max(0, ...rows.map((r) => r.cover ?? 0));
+    const tick = (ok) => htl.html`<span style="color:${ok ? "#282" : "#a33"}">${ok ? "✓" : "✗"}</span>`;
+    return htl.html`<div>
+      <table style="border-collapse:collapse;font:12px/1.5 ui-monospace,monospace;margin:6px 0">
+        <tr style="text-align:left;color:#888"><th>shot</th><th style="padding:0 10px">marks</th><th style="padding:0 10px">tilt</th><th style="padding:0 10px">from</th><th>reaches</th></tr>
+        ${rows.map((r) => htl.html`<tr>
+          <td>${r.name}</td>
+          <td style="padding:0 10px;color:${r.marks >= 8 ? "#282" : "#a33"}">${r.marks}</td>
+          <td style="padding:0 10px">${r.tilt == null ? "—" : r.tilt.toFixed(0) + "°"}</td>
+          <td style="padding:0 10px;color:#666">${r.tilt >= 20 ? r.side : "overhead"}</td>
+          <td style="color:${(r.cover ?? 0) >= 0.85 ? "#282" : "#a33"}">${r.cover == null ? "—" : (100 * r.cover).toFixed(0) + "%"}</td>
+        </tr>`)}
+      </table>
+      <div>${tick(shots.length >= 4)} ${shots.length} shots &nbsp;
+        ${tick(frontal >= 1)} ${frontal} overhead &nbsp;
+        ${tick(oblique >= 2)} ${oblique} past 20° &nbsp;
+        ${tick(spread >= 15)} ${spread.toFixed(0)}° of tilt spread &nbsp;
+        ${tick(sides.size >= 2)} ${sides.size} side${sides.size === 1 ? "" : "s"} &nbsp;
+        ${tick(bestCover >= 0.85)} reaching ${(100 * bestCover).toFixed(0)}% to the corner</div>
+      ${oblique < 2 || spread < 15
+        ? htl.html`<div style="color:#a33"><b>These are all the same view.</b> From one plane angle the focal length and the distance trade off exactly, so a fit on this set will look perfect and mean nothing. Lean over the mat until the tilt column reads about 30° and take four more, one from each side.</div>`
+        : bestCover < 0.85
+        ? htl.html`<div style="color:#a33"><b>The marks never leave the middle of the frame.</b> Distortion is an <i>r</i>³ term, so it cannot be measured where <i>r</i> is small. Get closer, or crop less, until the mat reaches the frame corners.</div>`
+        : null}
+    </div>`;
+  })();
+
   return htl.html`<div style="font:13px/1.6 system-ui">
     ${cur}
+    ${survey}
     <div style="margin:6px 0">${run} ${forget}</div>
     ${out}
   </div>`;
@@ -50791,7 +50952,8 @@ export default function define(runtime, observer) {
   $def("_ft34", "camOn", ["Generators", "viewof camOn"], _ft34);
   $def("_ft36", "camVideo", ["htl", "camStream", "invalidation"], _ft36);
   $def("_ft58", "viewfinder", ["htl", "camOn", "camVideo", "camStream", "grabber", "analyzeFrameMan", "matTarget", "calib", "cameraProfile", "makePlaneMap", "makeMatSampler", "traceFrame", "decodeImageFile", "setValue", "viewof shots", "invalidation", "denoise", "shrinkLuma"], _ft58);
-  $def("_ft46", "calibratePanel", ["htl", "shots", "matTarget", "analyzeFrameMan", "detectOpts", "calibrate", "setValue", "viewof cameraProfile", "cameraProfile", "invalidation"], _ft46);
+  $def("_ft92", "calibPosesSvg", ["htl"], _ft92);
+  $def("_ft46", "calibratePanel", ["htl", "shots", "matTarget", "analyzeFrameMan", "detectOpts", "calib", "calibrate", "setValue", "viewof cameraProfile", "cameraProfile", "invalidation"], _ft46);
   $def("_ft48", "tracePanel", ["htl", "traceResult", "drawShot", "toDxf", "toSvgMm", "invalidation"], _ft48);
   $def("_ft50", "previewSection_md", ["md"], _ft50);
   $def("_ft51", "viewof previewOn", ["Inputs"], _ft51);
