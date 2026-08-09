@@ -47372,7 +47372,7 @@ white and mid-grey in every frame — the exposure. Nothing is inferred from the
 part itself.
 
 Measured end to end against rendered scenes with known truth (\`traceSelfTest\`):
-**0.14mm median, 0.31mm p95, 0.48mm worst, area to 0.02%** shot near-frontal, at
+**0.17mm median, 0.35mm p95, 0.50mm worst, area to 0.01%** shot near-frontal, at
 a framing where one pixel is 0.27mm. Tilt is the thing that costs you, and it
 costs \`thickness x tan(tilt)\` — see §3.
 
@@ -47404,7 +47404,12 @@ somewhere else on the sheet.`
 
 const _ft03 = function _makeMatTarget(manLayout){return(function makeMatTarget(opts = {}) {
   const L = opts.layout ?? manLayout;
-  const diameterMm = opts.diameterMm ?? 32;
+  // 30mm, and the sweep in probe-mat-sweep.ts is why: at this pitch the lattice
+  // fits FIVE rows inside a 5mm margin where 32mm fits three, giving 27 marks
+  // against 17, all of them read, and 27 sites still inside the 32 available
+  // even-parity ids. 28mm fits a 33rd site there is no id for and reads less
+  // reliably; 26mm and below start losing marks outright.
+  const diameterMm = opts.diameterMm ?? 30;
   const pitchFactor = opts.pitchFactor ?? 1.45;
   // UPRIGHT, and that is not a typo. The seven-mark cluster is printed rotated
   // 30 degrees because that reads 7/7 where upright reads 3/7. For a LATTICE
@@ -47427,9 +47432,17 @@ const _ft03 = function _makeMatTarget(manLayout){return(function makeMatTarget(o
   const pool = [];
   for (let v = 0; v < (1 << L.nBits); v++) if (!parityGuard || parity(v) === 0) pool.push(v);
 
-  const halfW = pageW / 2 - marginMm - radiusMm;
-  const topLimit = pageH / 2 - marginMm - radiusMm;
-  const botLimit = pageH / 2 - marginMm - legendMm - radiusMm;
+  // The pattern lives in the band above the legend, so it is centred on THAT
+  // band, not on the page. Deriving cy0 here and handing it to the renderer is
+  // the point: when the two computed it separately they disagreed by
+  // legendMm/2, which put the whole lattice 7.5mm high -- the top row's ink
+  // ended up 1.13mm from the paper edge, inside the unprintable margin of most
+  // printers, while 41.3mm went to waste at the bottom against a 40.2mm row
+  // pitch. Nothing in the output said so; it took measuring the emitted SVG.
+  const cx0 = pageW / 2;
+  const cy0 = (pageH - legendMm) / 2;
+  const halfW = cx0 - marginMm - radiusMm;
+  const halfH = cy0 - marginMm - radiusMm;
 
   const ro = (rollDeg * Math.PI) / 180;
   const cos = Math.cos(ro), sin = Math.sin(ro);
@@ -47442,7 +47455,7 @@ const _ft03 = function _makeMatTarget(manLayout){return(function makeMatTarget(o
       const xMm = ux * cos - uy * sin;
       const yMm = ux * sin + uy * cos;
       if (Math.abs(xMm) > halfW) continue;
-      if (yMm > topLimit || yMm < -botLimit) continue;
+      if (Math.abs(yMm) > halfH) continue;
       sites.push({ q, r, xMm: +xMm.toFixed(4), yMm: +yMm.toFixed(4) });
     }
   }
@@ -47493,7 +47506,7 @@ const _ft03 = function _makeMatTarget(manLayout){return(function makeMatTarget(o
   return {
     marks, byId: new Map(marks.map((m) => [m.id, m])),
     diameterMm, radiusMm, pitchMm, pitchFactor, rollDeg, mmPerUnit, layout: L,
-    pageW, pageH, marginMm, legendMm, parityGuard,
+    pageW, pageH, marginMm, legendMm, parityGuard, cx0, cy0,
     idsAvailable: pool.length, sitesTruncated: truncated,
     minRowGapMm: Number.isFinite(minRowGapMm) ? +minRowGapMm.toFixed(2) : null,
     rowGapInDiscs: Number.isFinite(minRowGapMm) ? +(minRowGapMm / (2 * 6 * mmPerUnit)).toFixed(2) : null,
@@ -47507,8 +47520,7 @@ const _ft04 = function _matTarget(makeMatTarget){return(makeMatTarget())};
 const _ft05 = function _matMarkPagePx(){return(function matMarkPagePx(T, m, pxPerMm) {
   // Where a mark lands on the rasterised page, from the millimetre geometry --
   // the truth the print check grades against, owing nothing to the detector.
-  const cx0 = T.pageW / 2, cy0 = (T.pageH - T.legendMm) / 2;
-  return { x: (cx0 + m.xMm) * pxPerMm, y: (cy0 - m.yMm) * pxPerMm };
+  return { x: (T.cx0 + m.xMm) * pxPerMm, y: (T.cy0 - m.yMm) * pxPerMm };
 })};
 
 const _ft06 = function _matTargetSvg(matTarget,manColor){return(function matTargetSvg(opts = {}) {
@@ -47518,8 +47530,7 @@ const _ft06 = function _matTargetSvg(matTarget,manColor){return(function matTarg
   // row segmenter is trying to find background.
   const T = opts.target ?? matTarget;
   const L = T.layout;
-  const { pageW, pageH } = T;
-  const cx0 = pageW / 2, cy0 = (pageH - T.legendMm) / 2;
+  const { pageW, pageH, cx0, cy0 } = T;
   const scale = T.radiusMm / L.R;
   const parts = [];
   for (const m of T.marks) {
