@@ -48622,6 +48622,62 @@ const _ft23 = function _toDxf(){return(function toDxf(rings, opts = {}) {
   return out.join("\n") + "\n";
 })};
 
+const _ft89 = function _denoise(){return(function denoise(frame, radius) {
+  // A printed mid-grey is a HALFTONE, and its dither is a black/white edge every
+  // few pixels across the whole sheet. The row scanner counts run lengths, so it
+  // drowns: measured on a phone shot of the printed mat, the raw frame read 0 of
+  // 27 marks at every working size from 440 to 1080 wide, and one box blur first
+  // read 17. Costs 12ms at 640 wide and PAYS for itself -- the detector also runs
+  // 30% faster with the spurious candidates gone (103ms -> 72ms).
+  //
+  // The radius has to track the mark size in pixels, and the window is narrow:
+  // at 1080 wide r=2 read 17 and r=3 read 4; at 640 wide r=1 read 17 and r=2
+  // read 0. r = w/540 hits the measured optimum at every size tested.
+  const r = radius ?? Math.max(1, Math.round(frame.w / 540));
+  if (!(r > 0)) return frame;
+  const { gray, w, h } = frame;
+  const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h), n = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    let s = 0;
+    for (let x = -r; x <= r; x++) s += gray[y * w + Math.min(w - 1, Math.max(0, x))];
+    for (let x = 0; x < w; x++) {
+      tmp[y * w + x] = (s / n) | 0;
+      s += gray[y * w + Math.min(w - 1, x + r + 1)] - gray[y * w + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let y = -r; y <= r; y++) s += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = (s / n) | 0;
+      s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return { gray: out, w, h };
+})};
+
+const _ft90 = function _shrinkLuma(){return(function shrinkLuma(frame, dw) {
+  // Asking the grabber for a scaled frame is SLOWER than asking for the native
+  // one and shrinking it here: measured 34.9ms for a 800-wide grab against
+  // 13.0ms native, both on the fast VideoFrame path. Box average, so it also
+  // anti-aliases -- though not enough on its own to save the detector, which is
+  // what `denoise` is for.
+  const { gray, w, h } = frame;
+  if (dw >= w) return frame;
+  const dh = Math.round(h * dw / w), out = new Uint8Array(dw * dh);
+  const fx = w / dw, fy = h / dh;
+  for (let y = 0; y < dh; y++) {
+    const y0 = (y * fy) | 0, y1 = Math.max(y0 + 1, Math.min(h, ((y + 1) * fy) | 0));
+    for (let x = 0; x < dw; x++) {
+      const x0 = (x * fx) | 0, x1 = Math.max(x0 + 1, Math.min(w, ((x + 1) * fx) | 0));
+      let s = 0, n = 0;
+      for (let yy = y0; yy < y1; yy++) { const row = yy * w; for (let xx = x0; xx < x1; xx++) { s += gray[row + xx]; n++; } }
+      out[y * dw + x] = (s / n) | 0;
+    }
+  }
+  return { gray: out, w: dw, h: dh };
+})};
+
 const _ft24 = function _toSvgMm(){return(function toSvgMm(rings, opts = {}) {
   if (!rings.length) return "";
   const all = rings.flat();
@@ -48638,14 +48694,30 @@ ${paths.join("\n")}
 </svg>`;
 })};
 
-const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,matDifference,objectMask,traceContour,contourToMm,simplifyMm,polygonAreaMm2,polylineLengthMm,analyzeFrameMan,detectOpts){return(function traceFrame(frame, intrinsics, opts = {}) {
+const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,matDifference,objectMask,traceContour,contourToMm,simplifyMm,polygonAreaMm2,polylineLengthMm,analyzeFrameMan,detectOpts,denoise){return(function traceFrame(frame, intrinsics, opts = {}) {
   // frame: { gray: Uint8Array, w, h }.  intrinsics: { f, cx, cy, k1, k2 }.
   const T = opts.target ?? matTarget;
-  const res = opts.detection ?? analyzeFrameMan(frame, opts.detect ?? detectOpts);
-  const onTarget = res.fused.filter((f) => T.byId.has(f.id));
+  // Detect raw, and RETRY DENOISED if that reads too little. A printed mid-grey
+  // is a halftone, and its dither drowns the row scanner: a phone shot of the
+  // printed mat read 0 of 27 marks raw at every size from 440 to 1080 wide, and
+  // 17 after one box blur. But the right blur radius follows the mark size in
+  // PIXELS, which is not known until something has been detected — and on a
+  // clean render the same blur reads nothing at all. So raw first, blur only to
+  // rescue. Whichever wins, everything downstream — mat cancellation, the
+  // silhouette, the contour — uses the frame as shot; blurring the boundary is
+  // exactly what this tool must not do.
+  const dopts = opts.detect ?? detectOpts;
+  let res = opts.detection ?? analyzeFrameMan(frame, dopts);
+  let onTarget = res.fused.filter((f) => T.byId.has(f.id));
+  let denoised = false;
+  if (!opts.detection && onTarget.length < 4 && opts.denoise !== false) {
+    const alt = analyzeFrameMan(denoise(frame, opts.denoise), dopts);
+    const altOn = alt.fused.filter((f) => T.byId.has(f.id));
+    if (altOn.length > onTarget.length) { res = alt; onTarget = altOn; denoised = true; }
+  }
   const offTarget = res.fused.filter((f) => !T.byId.has(f.id));
   if (onTarget.length < 4) {
-    return { ok: false, why: `only ${onTarget.length} mat marks read — need 4`, marks: onTarget.length, offTarget: offTarget.map((f) => f.id) };
+    return { ok: false, why: `only ${onTarget.length} mat marks read — need 4`, marks: onTarget.length, denoised, offTarget: offTarget.map((f) => f.id) };
   }
   const pairs = onTarget.map((f) => {
     const m = T.byId.get(f.id);
@@ -48746,7 +48818,7 @@ const _ft25 = function _traceFrame(calib,matTarget,makeMatSampler,makePlaneMap,m
   return {
     ok: true, outline, outlines, rings: rings.length, bboxMm,
     sizeMm: [+(bboxMm[2] - bboxMm[0]).toFixed(2), +(bboxMm[3] - bboxMm[1]).toFixed(2)],
-    marks: pairs.length, dropped, offTarget: offTarget.map((f) => f.id),
+    marks: pairs.length, dropped, offTarget: offTarget.map((f) => f.id), denoised,
     rmsPx: +rms.toFixed(2), matResidualPct,
     tiltDeg: +map.tiltDeg.toFixed(1), distanceMm: Math.round(map.distanceMm),
     areaMm2: +polygonAreaMm2(outline).toFixed(1),
@@ -49434,7 +49506,7 @@ const _ft57 = function _previewPanel(htl,previewOn,THREE,traceResult,partThickne
 
 
 
-const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,analyzeFrameMan,matTarget,calib,cameraProfile,makePlaneMap,makeMatSampler,traceFrame,decodeImageFile,setValue,$shots,invalidation){
+const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,analyzeFrameMan,matTarget,calib,cameraProfile,makePlaneMap,makeMatSampler,traceFrame,decodeImageFile,setValue,$shots,invalidation,denoise,shrinkLuma){
   // A viewfinder that shows THE FRAME THE DETECTOR SEES, with the marks it read
   // and the mat's own outline drawn on it. Not the raw camera feed: the useful
   // question before pressing the button is not "is the part in shot" but "is
@@ -49479,11 +49551,15 @@ const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,a
   // traces because the mat is what it is anchored to -- so the user sees the
   // shape track the camera at full frame rate and merely refresh occasionally.
   let outlineMm = null, outlineAt = 0, outlineNote = "";
+  let preferDenoised = false;
   const say = (text, colour) => { hud.innerHTML = ""; hud.append(htl.html`<span style="color:${colour}">${text}</span>`); };
-  // Working resolution for the LIVE pass only. The detector costs time roughly
-  // linearly in pixels and this runs every frame, so it looks at a downscaled
-  // copy; the shot itself is always grabbed at the camera's native size.
-  const LIVE_W = 800;
+  // Working resolution for the LIVE pass only; the shot itself is always
+  // grabbed at the camera's native size. 640 is measured, not guessed: on one
+  // phone frame of the printed mat, 640 with a radius-1 denoise read the same
+  // 17 marks as native-with-radius-2 for a third less time (102ms against
+  // 152ms), and 540 read 14 while 440 read none. Cost is roughly linear in
+  // pixels, the marks-read cliff is not.
+  const LIVE_W = 640;
 
   while (alive) {
     tally.textContent = `${$shots.value.length} shot${$shots.value.length === 1 ? "" : "s"} kept`;
@@ -49501,8 +49577,12 @@ const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,a
     const w = Math.round(nw * scale), h = Math.round(nh * scale);
     if (cap.width !== w) { cap.width = w; cap.height = h; overlay.setAttribute("viewBox", `0 0 ${w} ${h}`); }
 
-    await grabber.grab(camVideo, w, h);
-    const gray = grabber.ensureFull();
+    // Grab NATIVE and shrink here. Asking the grabber to scale drops it off the
+    // fast VideoFrame path in effect if not in name: 34.9ms for an 800-wide
+    // grab against 13.0ms native on the same phone, same camera, same frame.
+    await grabber.grab(camVideo, nw, nh);
+    const small = shrinkLuma({ gray: grabber.ensureFull(), w: nw, h: nh }, w);
+    const gray = small.gray;
     const im = ctx.createImageData(w, h);
     for (let i = 0, q = 0; i < gray.length; i++, q += 4) {
       im.data[q] = im.data[q + 1] = im.data[q + 2] = gray[i];
@@ -49513,8 +49593,18 @@ const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,a
     // rows-only live: bothAxes is a second full pass, and its gain is on the
     // centre coordinate, which matters for the MEASUREMENT and not for telling
     // the user whether the mat is in shot. The shot itself gets both passes.
-    const res = analyzeFrameMan({ gray, w, h }, {});
-    const on = res.fused.filter((f) => T.byId.has(f.id));
+    // Same raw-then-denoised rescue as traceFrame, but STICKY: whichever won
+    // last frame is tried first, so a steady state costs one pass, not two.
+    // Without it a halftoned print reads nothing at all and the panel simply
+    // says "point the camera at the mat" while pointed straight at it.
+    const detect = (blur) => analyzeFrameMan(blur ? denoise({ gray, w, h }) : { gray, w, h }, {});
+    let res = detect(preferDenoised);
+    let on = res.fused.filter((f) => T.byId.has(f.id));
+    if (on.length < 4) {
+      const alt = detect(!preferDenoised);
+      const altOn = alt.fused.filter((f) => T.byId.has(f.id));
+      if (altOn.length > on.length) { res = alt; on = altOn; preferDenoised = !preferDenoised; }
+    }
     const off = res.fused.filter((f) => !T.byId.has(f.id));
 
     const parts = [];
@@ -49577,6 +49667,7 @@ const _ft58 = async function* _viewfinder(htl,camOn,camVideo,camStream,grabber,a
         const tilt = map.tiltDeg;
         ready = tilt <= 12 && on.length >= 8;
         msg = `${on.length}/${T.marks.length} marks${off.length ? ` · ${off.length} rejected` : ""}`
+          + (preferDenoised ? " · denoised" : "")
           + ` · tilt ${tilt.toFixed(0)}°` + outlineNote
           + (mmPerPx ? ` · ${mmPerPx.toFixed(3)} mm/px at ${nw}×${nh}` : "")
           + (cameraProfile ? "" : " · UNCALIBRATED");
@@ -50215,7 +50306,7 @@ export default function define(runtime, observer) {
   $def("_ft33", "viewof camOn", ["Inputs"], _ft33);
   $def("_ft34", "camOn", ["Generators", "viewof camOn"], _ft34);
   $def("_ft36", "camVideo", ["htl", "camStream", "invalidation"], _ft36);
-  $def("_ft58", "viewfinder", ["htl", "camOn", "camVideo", "camStream", "grabber", "analyzeFrameMan", "matTarget", "calib", "cameraProfile", "makePlaneMap", "makeMatSampler", "traceFrame", "decodeImageFile", "setValue", "viewof shots", "invalidation"], _ft58);
+  $def("_ft58", "viewfinder", ["htl", "camOn", "camVideo", "camStream", "grabber", "analyzeFrameMan", "matTarget", "calib", "cameraProfile", "makePlaneMap", "makeMatSampler", "traceFrame", "decodeImageFile", "setValue", "viewof shots", "invalidation", "denoise", "shrinkLuma"], _ft58);
   $def("_ft46", "calibratePanel", ["htl", "shots", "matTarget", "analyzeFrameMan", "detectOpts", "calibrate", "setValue", "viewof cameraProfile", "cameraProfile", "invalidation"], _ft46);
   $def("_ft48", "tracePanel", ["htl", "traceResult", "drawShot", "toDxf", "toSvgMm", "invalidation"], _ft48);
   $def("_ft50", "previewSection_md", ["md"], _ft50);
@@ -50261,7 +50352,9 @@ export default function define(runtime, observer) {
   $def("_ft22", "polylineLengthMm", [], _ft22);
   $def("_ft23", "toDxf", [], _ft23);
   $def("_ft24", "toSvgMm", [], _ft24);
-  $def("_ft25", "traceFrame", ["calib", "matTarget", "makeMatSampler", "makePlaneMap", "matDifference", "objectMask", "traceContour", "contourToMm", "simplifyMm", "polygonAreaMm2", "polylineLengthMm", "analyzeFrameMan", "detectOpts"], _ft25);
+  $def("_ft25", "traceFrame", ["calib", "matTarget", "makeMatSampler", "makePlaneMap", "matDifference", "objectMask", "traceContour", "contourToMm", "simplifyMm", "polygonAreaMm2", "polylineLengthMm", "analyzeFrameMan", "detectOpts", "denoise"], _ft25);
+  $def("_ft89", "denoise", [], _ft89);
+  $def("_ft90", "shrinkLuma", [], _ft90);
   $def("_ft27", "calibSelfTest", ["calib", "calibrate"], _ft27);
   $def("_ft28", "traceSelfTest", ["calib", "matTarget", "makeMatSampler", "makePlaneMap", "traceFrame", "polygonAreaMm2", "cameraPoseAt"], _ft28);
   $def("_ft35", "camStream", ["camOn", "invalidation"], _ft35);
