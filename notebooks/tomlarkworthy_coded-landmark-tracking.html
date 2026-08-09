@@ -12871,7 +12871,33 @@ const _xdtu1n = async function _liveStream(liveOn,liveFacing,invalidation) {
         facingMode: liveFacing
       }
     });
+    // Hold the screen awake for as long as the camera is on, and no longer.
+    // Tracking is minutes of not touching the phone, and Android then blanks
+    // the screen -- which hides the tab, and a hidden tab fires no rAF, so the
+    // rig stops dead. Tying it to the stream rather than to a toggle of its own
+    // means an idle notebook can never pin someone's display on.
+    let lock = null, done = false;
+    const hold = async () => {
+      // request() rejects outright while the page is not visible, so this has
+      // to be retried on visibilitychange rather than attempted once here.
+      if (done || lock || !window.navigator.wakeLock) return;
+      if (window.document.visibilityState !== "visible") return;
+      try {
+        lock = await window.navigator.wakeLock.request("screen");
+        // The UA drops the lock every time the page hides and does NOT restore
+        // it on return; clearing the handle is what lets onVisible re-take it.
+        lock.addEventListener("release", () => { lock = null; });
+      } catch (e) {
+        lock = null; // a refusal must never take the camera down with it
+      }
+    };
+    const onVisible = () => { if (window.document.visibilityState === "visible") hold(); };
+    window.document.addEventListener("visibilitychange", onVisible);
+    hold();
     invalidation.then(() => {
+      done = true;
+      window.document.removeEventListener("visibilitychange", onVisible);
+      if (lock) lock.release().catch(() => {});
       for (const t of s.getTracks()) t.stop();
     });
     return s;
@@ -16845,7 +16871,7 @@ const _13ae255 = function _detectKernelSource(manLayout,edges1Dsub,findInvolutio
     // the main thread. Rows arrive packed and transferred, which moves ~1KB
     // per row rather than the whole frame.
     `
-let FRAME = null;
+const FRAMES = new Map();
 self.onmessage = (e) => {
   const d = e.data;
   // The buffer is sized from the job, not from a separate init handshake. A
@@ -16854,8 +16880,17 @@ self.onmessage = (e) => {
   // routine, since it alternates 960x720 and 720x960 every frame. A dropped
   // resolver is a promise that never settles, and one of those stops the whole
   // runtime, not just this pool.
-  if (!FRAME || FRAME.w !== d.w || FRAME.h !== d.h)
+  //
+  // Keyed by dimensions rather than one slot, because bothAxes runs its two
+  // passes CONCURRENTLY: a worker alternates 960x1280 and 1280x960 chunk by
+  // chunk, and a single slot would reallocate and zero 1.2MB every time --
+  // ~43MB a frame. Two buffers per worker instead of one costs ~7MB total.
+  const key = d.w + "x" + d.h;
+  let FRAME = FRAMES.get(key);
+  if (!FRAME) {
     FRAME = { gray: new Uint8Array(d.w * d.h), w: d.w, h: d.h };
+    FRAMES.set(key, FRAME);
+  }
   const w = FRAME.w, ys = d.ys, px = d.px;
   for (let i = 0; i < ys.length; i++)
     FRAME.gray.set(px.subarray(i * w, (i + 1) * w), ys[i] * w);
@@ -17019,8 +17054,23 @@ const _p4hc5x = function _analyzeFrameManAsync(rotateFrame,mergeManAxes,manScanR
   const t0 = window.performance.now();
   if (opts.bothAxes) {
     const single = { ...opts, bothAxes: false };
-    const rows = await analyzeFrameManAsync(frame, single);
-    const rot = await analyzeFrameManAsync(rotateFrame(frame, 1), single);
+    // Both passes at once, not one after the other. They are independent --
+    // different buffers, merged only at the end -- and a single pass leaves the
+    // pool 48% idle (53.7ms of work in a 19ms wall across 6 workers). Almost
+    // all of that idle is a worker asleep waiting to be handed its next chunk:
+    // ~1.2ms per chunk, ~3.2ms for the first. With two streams in flight a
+    // worker finishing a chunk usually finds the next message already queued
+    // and never sleeps, so the second axis costs far less than the first.
+    //
+    // The transpose is hoisted out because it is main-thread work: doing it
+    // here starts both streams together instead of stalling pass 2 behind it.
+    // Requires the per-dimension frame cache in the worker kernel -- without it
+    // the alternating job sizes reallocate the worker's buffer every chunk.
+    const rotated = rotateFrame(frame, 1);
+    const [rows, rot] = await Promise.all([
+      analyzeFrameManAsync(frame, single),
+      analyzeFrameManAsync(rotated, single)
+    ]);
     return { ...mergeManAxes(rows, rot, frame, opts), ms: window.performance.now() - t0 };
   }
   const ys = manScanRows(frame, opts);
