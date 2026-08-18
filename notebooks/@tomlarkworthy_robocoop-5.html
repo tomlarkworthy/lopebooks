@@ -5422,7 +5422,188 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         globToRe
     };
 };
-const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefine, createModule, cellHelpers, summarizeJS, rc5_watchBus, observe, importShim, location,navigate, rc5_store, descendants) {
+const _1e7rc5x = function _srcContext(rc5_store, cellHelpers) {
+    const {oneLine} = cellHelpers;
+    const MAX_LINES = 40, HEAD = 15, TAIL = 15;
+    const esc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const clip = (s, n) => {
+        const t = oneLine(String(s));
+        return t.length > n ? t.slice(0, n) + '…' : t;
+    };
+    const elide = src => {
+        const lines = String(src).split('\n');
+        if (lines.length <= MAX_LINES)
+            return lines.join('\n');
+        return [
+            ...lines.slice(0, HEAD),
+            '… ' + (lines.length - HEAD - TAIL) + ' lines elided …',
+            ...lines.slice(-TAIL)
+        ].join('\n');
+    };
+    const moduleSrc = id => {
+        const ent = rc5_store.srcFns.get(id);
+        return ent && typeof ent.src === 'string' ? ent.src : null;
+    };
+    const pidFor = (src, name) => {
+        if (!name)
+            return null;
+        let m = new RegExp('\\$def\\(\\s*["\']([\\w$]+)["\']\\s*,\\s*["\']' + esc(name) + '["\']').exec(src);
+        if (m)
+            return m[1];
+        m = new RegExp('\\.define\\(\\s*["\']' + esc(name) + '["\'][^;]{0,400}?(_[\\w$]+)\\s*\\)').exec(src);
+        return m ? m[1] : null;
+    };
+    // Whole-cell granularity: notebook cells are small, so the unit of blame is the top-level
+    // `const _pid = ...` declaration, ending where the next one (or the define footer) begins.
+    const sliceDecl = (src, pid) => {
+        const m = new RegExp('^(?:const|let|var)\\s+' + esc(pid) + '\\s*=', 'm').exec(src);
+        if (!m)
+            return null;
+        const from = m.index + m[0].length;
+        const nxt = /^(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=|^export\s+default\b/m.exec(src.slice(from));
+        return src.slice(m.index, nxt ? from + nxt.index : src.length).replace(/\s+$/, '');
+    };
+    const cellSource = (id, name, pid, variable) => {
+        try {
+            const src = moduleSrc(id);
+            if (src) {
+                const p = pid || pidFor(src, name);
+                const d = p && sliceDecl(src, p);
+                if (d)
+                    return {
+                        src: elide(d),
+                        pid: p
+                    };
+            }
+        } catch (e) {
+        }
+        try {
+            const fn = variable && variable._definition;
+            if (typeof fn === 'function') {
+                const t = String(fn);
+                if (!/\[native code\]/.test(t))
+                    return {
+                        src: elide(t),
+                        pid: variable.pid || pid || null
+                    };
+            }
+        } catch (e) {
+        }
+        return null;
+    };
+    // jest-expect (what @tomlarkworthy/testing's `expect` is) hangs .matcherResult on the thrown
+    // error; node:assert and chai put .expected/.actual on the error itself. Both give a real diff.
+    const diffOf = err => {
+        try {
+            const mr = err && err.matcherResult;
+            const src = mr && ('expected' in mr || 'actual' in mr) ? mr : err && ('expected' in err || 'actual' in err) ? err : null;
+            if (!src)
+                return '';
+            const show = v => {
+                let t;
+                try {
+                    t = JSON.stringify(v);
+                } catch (e) {
+                }
+                return clip(t === undefined ? String(v) : t, 200);
+            };
+            const nm = mr && mr.name || err && err.operator;
+            const got = 'actual' in src ? src.actual : src.received;
+            return ' \xB7 expected ' + show(src.expected) + ', received ' + show(got) + (nm ? ' (' + nm + ')' : '');
+        } catch (e) {
+            return '';
+        }
+    };
+    const fence = (id, name, pid, body) => '\n```js\n// ' + id + ' \xB7 cell ' + (name ? '`' + name + '`' : '(anonymous)') + (pid ? ' (pid ' + pid + ')' : '') + '\n' + body + '\n```';
+    // Every entry point is total: enriched feedback must never be the thing that throws.
+    const sourcesFor = (id, cells) => {
+        try {
+            const blocks = [];
+            const seen = new Set();
+            for (const c of cells || []) {
+                if (blocks.length >= 3 || seen.has(c.name))
+                    continue;
+                seen.add(c.name);
+                const got = cellSource(id, c.name, c.pid, c.variable);
+                if (got)
+                    blocks.push(fence(id, c.name, got.pid, got.src));
+            }
+            if (!blocks.length)
+                return '';
+            return ' \xB7 source of the failing cell' + (blocks.length === 1 ? '' : 's') + ':' + blocks.join('');
+        } catch (e) {
+            return '';
+        }
+    };
+    // eval_js: the snippet is already in the agent's context, so only surface a CELL it leaned on.
+    // Two signals — the stack names the cell's function, or a cell the code references is in error.
+    const blamedCells = (vars, code, err) => {
+        const out = [];
+        const push = v => {
+            if (v && !out.some(o => o.variable === v))
+                out.push({
+                    name: v._name,
+                    pid: v.pid,
+                    variable: v
+                });
+        };
+        try {
+            const byFn = new Map();
+            for (const v of vars || []) {
+                if (v._name)
+                    byFn.set(v._name, v);
+                try {
+                    const fn = v._definition;
+                    if (typeof fn === 'function' && fn.name)
+                        byFn.set(fn.name, v);
+                } catch (e) {
+                }
+            }
+            const stack = err && err.stack ? String(err.stack) : '';
+            const re = /\bat\s+(?:async\s+)?(?:new\s+)?([A-Za-z_$][\w$]*)/g;
+            let m;
+            while (out.length < 2 && (m = re.exec(stack)))
+                push(byFn.get(m[1]));
+        } catch (e) {
+        }
+        try {
+            for (const v of vars || []) {
+                if (out.length >= 2)
+                    break;
+                if (v._error == null || !v._name || !/^[A-Za-z_$][\w$]*$/.test(v._name))
+                    continue;
+                if (new RegExp('\\b' + esc(v._name) + '\\b').test(String(code || '')))
+                    push(v);
+            }
+        } catch (e) {
+        }
+        return out;
+    };
+    // Named cells the snippet mentions — candidates to re-read when the thrown error is the
+    // runtime's wrapper rather than the original.
+    const referencedCells = (vars, code) => {
+        const out = [];
+        try {
+            for (const v of vars || []) {
+                if (!v._name || !/^[A-Za-z_$][\w$]*$/.test(v._name))
+                    continue;
+                if (new RegExp('\\b' + esc(v._name) + '\\b').test(String(code || '')))
+                    out.push(v);
+            }
+        } catch (e) {
+        }
+        return out;
+    };
+    return {
+        cellSource,
+        diffOf,
+        sourcesFor,
+        blamedCells,
+        referencedCells,
+        elide
+    };
+};
+const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefine, createModule, cellHelpers, summarizeJS, rc5_watchBus, observe, importShim, location,navigate, rc5_store, descendants, srcContext) {
     const apply = jbApply({
         currentModules,
         runtime,
@@ -5448,9 +5629,15 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
             }
         };
         if (v._error != null)
-            return finish({ error: v._error && v._error.message || String(v._error) });
+            return finish({
+                error: v._error && v._error.message || String(v._error),
+                errObj: v._error
+            });
         if (v._name)
-            Promise.resolve().then(() => mod.value(v._name)).then(value => finish({ value }), error => finish({ error: error && error.message || String(error) }));
+            Promise.resolve().then(() => mod.value(v._name)).then(value => finish({ value }), error => finish({
+                error: error && error.message || String(error),
+                errObj: error
+            }));
         else {
             try {
                 mod.value((varsOf(mod).find(x => x._name && !isStructural(x)) || {})._name).catch(() => {
@@ -5477,7 +5664,7 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
                 try {
                     observe(v, {
                         fulfilled: val => rc5_watchBus.record(wid, summ(val)),
-                        rejected: err => rc5_watchBus.record(wid, '\u26A0 ' + (err && err.message || String(err))),
+                        rejected: err => rc5_watchBus.record(wid, '\u26A0 ' + (err && err.message || String(err)) + srcContext.diffOf(err)),
                         pending: () => {
                         }
                     }, { invalidation: inv });
@@ -5487,18 +5674,35 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
             }
             return {
                 name: v._name,
+                pid: v.pid,
+                variable: v,
                 error: base.error,
+                errObj: base.errObj,
                 value: base.error ? undefined : baseText
             };
         }));
     };
-    const probeStatus = probe => {
+    const probeStatus = (probe, id) => {
         if (!probe || !probe.length)
             return '';
         const errored = probe.filter(r => r.error);
         const okCount = probe.length - errored.length;
-        if (errored.length)
-            return ' \xB7 \u26A0 ' + errored.length + ' cell' + (errored.length === 1 ? '' : 's') + ' ERRORING at runtime \u2014 ' + errored.map(e => e.name + ': ' + e.error).join('; ') + ' \u2014 FIX before task_complete (a compile-clean cell can still error when observed)';
+        if (errored.length) {
+            let sources = '';
+            try {
+                sources = id ? srcContext.sourcesFor(id, errored) : '';
+            } catch (e) {
+            }
+            const detail = errored.map(e => {
+                let d = '';
+                try {
+                    d = srcContext.diffOf(e.errObj);
+                } catch (x) {
+                }
+                return e.name + ': ' + e.error + d;
+            }).join('; ');
+            return ' \xB7 \u26A0 ' + errored.length + ' cell' + (errored.length === 1 ? '' : 's') + ' ERRORING at runtime \u2014 ' + detail + ' \u2014 FIX before task_complete (a compile-clean cell can still error when observed)' + sources;
+        }
         const vals = probe.filter(r => r.value !== undefined).slice(0, 8).map(r => r.name + '=' + r.value).join(', ');
         return ' \xB7 \u2713 all ' + okCount + ' cell' + (okCount === 1 ? '' : 's') + ' compute with no runtime error (auto-watched; changes stream to you)' + (vals ? ' \xB7 values: ' + vals + (probe.length > 8 ? ' \u2026(+' + (probe.length - 8) + ' more)' : '') : '');
     };
@@ -5517,7 +5721,12 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
         const parts = await Promise.all(dependents.slice(0, 12).map(async v => {
             const label = (v._module && v._module._name ? v._module._name + ':' : '') + v._name;
             const r = await readVar(v._module, v);
-            return label + '=' + (r.error ? '\u26A0 ' + r.error : r.pending ? '\u23F3 still computing' : summ(r.value));
+            let d = '';
+            try {
+                d = r.error ? srcContext.diffOf(r.errObj) : '';
+            } catch (e) {
+            }
+            return label + '=' + (r.error ? '\u26A0 ' + r.error + d : r.pending ? '\u23F3 still computing' : summ(r.value));
         }));
         return ' \xB7 downstream recomputed: ' + parts.join(', ') + (dependents.length > 12 ? ' \u2026(+' + (dependents.length - 12) + ' more)' : '');
     };
@@ -5631,7 +5840,7 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
             const surfaced = wasNew && /\bviewof\s|\bmd`|\bhtml`/.test(src) && surfaceInView(id);
             let status = '';
             try {
-                status = probeStatus(await probeAndWatch(id));
+                status = probeStatus(await probeAndWatch(id), id);
             } catch (e) {
             }
             let downstream = '';
@@ -5666,7 +5875,7 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
         moduleExists
     };
 };
-const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus)
+const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus,srcContext)
 {
   const {resolveModule, varsOf, isStructural, label, oneLine, watchKey} = cellHelpers;
   const nudge = mod => {
@@ -5695,16 +5904,25 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       resolve(res);
     };
     if (v._error != null)
-      return finish({ error: v._error && v._error.message || String(v._error) });
+      return finish({
+        error: v._error && v._error.message || String(v._error),
+        errObj: v._error
+      });
     if (v._value !== undefined)
       return finish({ value: v._value });
     if (v._name) {
-      Promise.resolve().then(() => mod.value(v._name)).then(value => finish({ value }), error => finish({ error: error && error.message || String(error) }));
+      Promise.resolve().then(() => mod.value(v._name)).then(value => finish({ value }), error => finish({
+        error: error && error.message || String(error),
+        errObj: error
+      }));
     } else {
       try {
         observe(v, {
           fulfilled: value => finish({ value }),
-          rejected: error => finish({ error: error && error.message || String(error) }),
+          rejected: error => finish({
+            error: error && error.message || String(error),
+            errObj: error
+          }),
           pending: () => {
           }
         }, { invalidation: inv });
@@ -5815,7 +6033,10 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     try {
       v = mod.variable({
         fulfilled: val => finish({ value: val }),
-        rejected: err => finish({ error: err && err.message || String(err) }),
+        rejected: err => finish({
+          error: err && err.message || String(err),
+          errObj: err
+        }),
         pending: () => {
         }
       });
@@ -5868,12 +6089,22 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
         };
       const r = await readVar(mod, v);
       const tag = module + ':' + (name || pid);
-      if (r.error)
+      if (r.error) {
+        let extra = '';
+        try {
+          extra = srcContext.diffOf(r.errObj) + srcContext.sourcesFor(module, [{
+            name: v._name,
+            pid: v.pid,
+            variable: v
+          }]);
+        } catch (e) {
+        }
         return {
           title: 'inspect ' + tag,
-          output: '\u26A0 runtime error: ' + r.error,
+          output: '\u26A0 runtime error: ' + r.error + extra,
           metadata: { error: true }
         };
+      }
       return {
         title: 'inspect ' + tag,
         output: summary(r.value, 4000)
@@ -5950,12 +6181,37 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
           output: 'Module not found: ' + module + ' (try glob /src/**/*.js).'
         };
       const r = await evalInModule(mod, code);
-      if (r.error)
+      if (r.error) {
+        let extra = '';
+        try {
+          let errObj = r.errObj;
+          let cells = srcContext.blamedCells(varsOf(mod), code, errObj);
+          if (!cells.length) {
+            // A dependent gets the runtime's wrapper, not the cell's own error, so re-read the
+            // cells the snippet named: the one that rejects is the culprit, with the real error.
+            const cands = srcContext.referencedCells(varsOf(mod), code).filter(v => v._value === undefined).slice(0, 3);
+            for (const v of cands) {
+              const rr = await readVar(mod, v);
+              if (!rr.error)
+                continue;
+              errObj = rr.errObj || errObj;
+              cells = [{
+                name: v._name,
+                pid: v.pid,
+                variable: v
+              }];
+              break;
+            }
+          }
+          extra = srcContext.diffOf(errObj) + srcContext.sourcesFor(module, cells);
+        } catch (e) {
+        }
         return {
           title: 'eval_js ' + module,
-          output: '\u26A0 ' + r.error,
+          output: '\u26A0 ' + r.error + extra,
           metadata: { error: true }
         };
+      }
       return {
         title: 'eval_js ' + module,
         output: summary(r.value, 6000)
@@ -6010,7 +6266,12 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
           output: 'Already watching ' + tag + '.'
         };
       const base = await readVar(mod, v);
-      const baseText = base.error ? '\u26A0 ' + base.error : oneLine(summary(base.value, 400));
+      let baseDiff = '';
+      try {
+        baseDiff = base.error ? srcContext.diffOf(base.errObj) : '';
+      } catch (e) {
+      }
+      const baseText = base.error ? '\u26A0 ' + base.error + baseDiff : oneLine(summary(base.value, 400));
       let stop;
       const inv = new Promise(r => {
         stop = r;
@@ -6018,7 +6279,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       try {
         observe(v, {
           fulfilled: val => rc5_watchBus.record(id, oneLine(summary(val, 400))),
-          rejected: err => rc5_watchBus.record(id, '\u26A0 ' + (err && err.message || String(err))),
+          rejected: err => rc5_watchBus.record(id, '\u26A0 ' + (err && err.message || String(err)) + srcContext.diffOf(err)),
           pending: () => {
           }
         }, { invalidation: inv });
@@ -6492,8 +6753,9 @@ export default function define(runtime, observer) {
   $def("_76otvk", "cellHelpers", ["currentModules","runtime"], _76otvk);  
   $def("_19x8b93", "rc5_store", [], _19x8b93);  
   $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim"], _o37ix1);  
-  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","importShim","location","navigate","rc5_store","descendants"], _190yjiu);  
-  $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus"], _ual70b);  
+  $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
+  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","importShim","location","navigate","rc5_store","descendants","srcContext"], _190yjiu);
+  $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext"], _ual70b);
   $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS"], _qc0bl);  
   $def("_1nb19yl", "hostSetup", ["valueTools","fileTools","registerTool","invalidation","unregisterTool"], _1nb19yl);  
