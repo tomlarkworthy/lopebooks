@@ -59066,6 +59066,17 @@ class Ship {
     return [this.x + lx * k - ly * s, this.y + lx * s + ly * k];
   }
 
+  // The inverse: a world point -> the ship-local cell it falls in. Every editor
+  // needs it to turn a click into a tile, and a second copy of this arithmetic is
+  // a sign error waiting to put a click one cell out -- so it lives beside the
+  // forward map that has to agree with it.
+  tileOf(wx, wy) {
+    const dx = wx - this.x, dy = wy - this.y;
+    const s = Math.sin(this.a * geom.D), k = Math.cos(this.a * geom.D);
+    const lx = dx * k + dy * s, ly = -dx * s + dy * k;
+    return [Math.round(lx + this.cx), Math.round(this.cy - ly)];
+  }
+
   // Unity applied force at a world-unit position to a world-unit inertia. Working
   // in tiles the lever arm is 1/0.64 too long and the inertia 1/0.64^2 too small,
   // so BOTH accelerations pick up the same 1/0.64. The ratio is unchanged -- turn
@@ -61457,7 +61468,7 @@ const _stepSession = function _stepSession(Ship, geom, DT){return(
 
 const _viewof_game = function _viewof_game(
     MISSIONS, newSession, evaluateObjectives, stepSession, battlefield, objectiveHtml,
-    TYPES, PORTS, TILE, geom, htl, invalidation) {
+    TYPES, PORTS, TILE, htl, invalidation) {
   let mi = 0, S = newSession(MISSIONS[0]);
   let mode = "build", picked = null, wireFrom = null, selected = null, clock = null;
   let raf = null, stop = false;
@@ -61482,23 +61493,20 @@ const _viewof_game = function _viewof_game(
     color:${on ? hue : "#8b9bb0"}">${label}</button>`;
 
   // ---- geometry: click -> the player's local tile ---------------------------
+  // Ship.worldOf/tileOf are the pair, and they are the ENGINE's, not a copy: the
+  // shipyard needs the same map and two copies of it is one sign error away from
+  // a click that lands a cell out.
   let view = null;
   const localTile = (ev) => {
     const svg = view.svg, r = svg.getBoundingClientRect();
     const vb = svg.viewBox.baseVal;
     const wx = (vb.x + (ev.clientX - r.left) / r.width * vb.width) / TILE;
     const wy = (vb.y + (ev.clientY - r.top) / r.height * vb.height) / TILE;
-    const p = S.player;
-    const dx = wx - p.x, dy = wy - p.y;
-    const s = Math.sin(p.a * geom.D), k = Math.cos(p.a * geom.D);
-    const lx = dx * k + dy * s, ly = -dx * s + dy * k;
-    return [Math.round(lx + p.cx), Math.round(p.cy - ly)];
+    return S.player.tileOf(wx, wy);
   };
   const tileToView = (px, py) => {
-    const p = S.player;
-    const lx = px - p.cx, ly = -(py - p.cy);
-    const s = Math.sin(p.a * geom.D), k = Math.cos(p.a * geom.D);
-    return [(p.x + lx * k - ly * s) * TILE, (p.y + lx * s + ly * k) * TILE];
+    const [wx, wy] = S.player.worldOf({px, py});
+    return [wx * TILE, wy * TILE];
   };
 
   // ---- editing --------------------------------------------------------------
@@ -61874,7 +61882,7 @@ export default function define(runtime, observer) {
   };
   main.variable(observer("viewof game")).define("viewof game",
     ["MISSIONS","newSession","evaluateObjectives","stepSession","battlefield","objectiveHtml",
-     "TYPES","PORTS","TILE","geom","htl","invalidation"], _viewof_game).pid = "_viewof_game";
+     "TYPES","PORTS","TILE","htl","invalidation"], _viewof_game).pid = "_viewof_game";
   main.variable(observer("game")).define("game", ["Generators", "viewof game"],
     (G, _) => G.input(_)).pid = "_game";
   main.define("module @tomlarkworthy/corepox-engine",
@@ -61902,12 +61910,984 @@ export default function define(runtime, observer) {
   return main;
 }</script>
 
+<script id="@tomlarkworthy/corepox-shipyard" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// Build a ship outside a mission.
+//
+// The campaign editor in @tomlarkworthy/corepox-game is deliberately constrained
+// -- an inventory, an envelope, and whichever of build/connect/rotate/modify the
+// mission allows -- because that is the level design. This is the same gestures
+// with none of the constraints: every type, anywhere, wire anything to anything,
+// and the ship spec falls out as source you can paste into corepox-missions.
+//
+// `shipEditor` is the reusable piece. @tomlarkworthy/corepox-lab opens one on each
+// ship in a level and on each side of an arena match, which is why it takes a spec
+// and returns a spec rather than owning a mission.
+//
+// It is NOT a copy of the game's editor. The two arithmetic pieces that have to
+// agree with the renderer -- world point to local cell, local cell to world point
+// -- are Ship.tileOf and Ship.worldOf, in the engine, used by both.
+
+const _title = function _title(md){return(
+md`# Corepox shipyard
+
+Every component, no inventory, no envelope. Click a part then a cell to place it, drag nothing --
+this is a grid. The spec at the bottom is what \`SHIPS\` in \`@tomlarkworthy/corepox-missions\` wants.`
+)};
+
+// Which of a component's cells carry connectors, in ship coordinates. The engine
+// resolves a wire by CELL, not by anchor -- a Binary's `b`, a Radar's `dist` and a
+// turret's `fire` all sit away from the anchor -- so the editor has to know where
+// they are before it can offer them.
+const _portsOfShip = function _portsOfShip(PORTS){return(
+(ship) => {
+  const rot = {0: (x, y) => [x, y], 90: (x, y) => [-y, x],
+               180: (x, y) => [-x, -y], 270: (x, y) => [y, -x]};
+  const out = [];
+  for (const c of ship.live) {
+    const d = ((Math.round((c.dir ?? 0) / 90) % 4 + 4) % 4) * 90;
+    const P = PORTS[c.type] ?? {};
+    for (const [kind, tbl] of [["out", P.outs ?? {}], ["in", P.ins ?? {}]])
+      for (const [name, o] of Object.entries(tbl)) {
+        const [rx, ry] = rot[d](o[0], o[1]);
+        out.push({c, kind, name, px: c.px + rx, py: c.py + ry, anchor: [c.px, c.py]});
+      }
+  }
+  return out;
+}
+)};
+
+// A spec back out of a live Ship. The editor rebuilds rather than mutates -- mass,
+// centre of mass, inertia and the topological order are all computed in the
+// constructor -- so this runs on every edit.
+const _specOfShip = function _specOfShip(){return(
+(ship, name = "ship") => ({
+  name,
+  components: ship.comps.map(c => ({
+    type: c.type, pos: [c.px, c.py],
+    dir: ["up", "right", "down", "left"][(Math.round((c.dir ?? 0) / 90) % 4 + 4) % 4],
+    ...(c.param != null ? {param: c.param} : {}),
+    ...(c.overrides ? {overrides: c.overrides} : {})
+  })),
+  connections: ship.conns.map(k => ({...k}))
+})
+)};
+
+// The spec as source. Two-space indent and one component per line, which is how
+// SHIPS is written, so the output can go straight in.
+const _shipSource = function _shipSource(){return(
+(spec, name = spec.name ?? "ship") => {
+  const j = (v) => JSON.stringify(v);
+  const comp = (c) => `    {type: "${c.type}", pos: [${c.pos[0]}, ${c.pos[1]}]` +
+    (c.dir && c.dir !== "up" ? `, dir: "${c.dir}"` : "") +
+    (c.param != null ? `, param: ${j(String(c.param))}` : "") +
+    (c.overrides ? `, overrides: ${j(c.overrides)}` : "") + "}";
+  const conn = (k) => `    {from: [${k.from[0]}, ${k.from[1]}], fromPort: "${k.fromPort}", ` +
+    `to: [${k.to[0]}, ${k.to[1]}], toPort: "${k.toPort}"}`;
+  return `${name}: {\n  name: "${spec.name ?? name}",\n  components: [\n` +
+    spec.components.map(comp).join(",\n") + "\n  ],\n  connections: [\n" +
+    spec.connections.map(conn).join(",\n") + "\n  ]\n}";
+}
+)};
+
+// One ship, one board, every gesture. Returns a node whose `value` is the spec and
+// which fires `input` on every edit.
+//
+//   shipEditor(spec, {
+//     name,          // what the emitted spec is called
+//     types,         // which parts the palette offers (default: all of TYPES)
+//     height,        // board height in px (default 420)
+//     span           // how many tiles across the camera holds at minimum
+//   })
+const _shipEditor = function _shipEditor(
+    Ship, World, TYPES, battlefield, TILE, portsOfShip, specOfShip, htl, invalidation){return(
+(spec0, {name = "ship", types = null, height = 420, span = 14} = {}) => {
+  const PALETTE = types ?? Object.keys(TYPES).filter(t => t !== "Composite");
+  let ship = new Ship(structuredClone(spec0 ?? {name, components: [], connections: []}),
+                      {team: "player", x: 0, y: 0, a: 0});
+  const world = new World([ship]);
+  let mode = "build", picked = PALETTE[0], wireFrom = null, selected = null;
+
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;
+    font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
+  const bar = htl.html`<div style="display:flex;flex-wrap:wrap;gap:7px;align-items:center"></div>`;
+  const tray = htl.html`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>`;
+  const stage = htl.html`<div style="position:relative"></div>`;
+  const foot = htl.html`<div></div>`;
+  root.append(bar, tray, stage, foot);
+
+  const btn = (label, on, click, hue = "#5ef2a0") => htl.html`<button onclick=${click} style="
+    font:12px ui-monospace,monospace;padding:4px 10px;border-radius:4px;cursor:pointer;
+    border:1px solid ${on ? hue : "#26364a"};background:${on ? hue + "22" : "transparent"};
+    color:${on ? hue : "#8b9bb0"}">${label}</button>`;
+
+  // Shape the board through battlefield's own width/height, never by overriding
+  // the element's height afterwards: it sets `aspect-ratio` from that pair and
+  // sizes the viewBox to match, and forcing a different height letterboxes the
+  // drawing inside the element. The click map then reads a linear viewBox that is
+  // not linear -- measured 913px for a point the board draws at 858, which is a
+  // whole tile out and, on a tall page, off the bottom of the window entirely.
+  const view = battlefield(world, {span, width: 900, height, follow: true});
+  view.minSpan = span;
+  const ns = "http://www.w3.org/2000/svg";
+  const overlay = document.createElementNS(ns, "g");
+  view.svg.appendChild(overlay);
+  view.svg.style.cursor = "crosshair";
+  stage.append(view.svg);
+  let raf = null, stop = false;
+  invalidation.then(() => { stop = true; if (raf) cancelAnimationFrame(raf); });
+
+  const rebuild = (components, connections) => {
+    const next = new Ship({name: spec0?.name ?? name, components, connections},
+                          {team: "player", x: ship.x, y: ship.y, a: ship.a});
+    // Same correction the campaign editor makes: x,y is the world position of the
+    // CENTRE OF MASS, so a rebuild whose centre moved teleports the hull by that
+    // much unless the origin moves with it (tools/corepox-build-shift.ts).
+    const dcx = next.cx - ship.cx, dcy = next.cy - ship.cy;
+    const rad = ship.a * Math.PI / 180, sn = Math.sin(rad), cs = Math.cos(rad);
+    next.x = ship.x + dcx * cs + dcy * sn;
+    next.y = ship.y + dcx * sn - dcy * cs;
+    world.ships[world.ships.indexOf(ship)] = next;
+    ship = next;
+    render();
+    root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
+  };
+
+  const occupied = (px, py) => ship.comps.some(c => c.tiles.some(t => t[0] === px && t[1] === py));
+  // Where a part may go: every free cell touching the hull, or the origin when the
+  // board is empty. The affordance and the click test the SAME set -- painting one
+  // set and accepting another is how you end up with a detached part the physics
+  // immediately splits off, from a click the board never invited.
+  const offers = () => {
+    const seen = new Set(), out = [];
+    const offer = (x, y) => {
+      const k = x + "," + y;
+      if (seen.has(k) || occupied(x, y)) return;
+      seen.add(k); out.push([x, y]);
+    };
+    if (!ship.comps.length) offer(0, 0);
+    for (const c of ship.comps) for (const [tx, ty] of c.tiles)
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) offer(tx + dx, ty + dy);
+    return out;
+  };
+  const compAt = (px, py) => ship.live.find(c => c.tiles.some(t => t[0] === px && t[1] === py));
+  const portsAt = (px, py) => portsOfShip(ship).filter(q => q.px === px && q.py === py);
+
+  const localTile = (ev) => {
+    const r = view.svg.getBoundingClientRect(), vb = view.svg.viewBox.baseVal;
+    return ship.tileOf((vb.x + (ev.clientX - r.left) / r.width * vb.width) / TILE,
+                       (vb.y + (ev.clientY - r.top) / r.height * vb.height) / TILE);
+  };
+  const tileToView = (px, py) => {
+    const [wx, wy] = ship.worldOf({px, py});
+    return [wx * TILE, wy * TILE];
+  };
+
+  const clickTile = (px, py) => {
+    const S = specOfShip(ship, name);
+    if (mode === "build") {
+      if (!picked) return;
+      if (!offers().some(([x, y]) => x === px && y === py)) return;
+      const cells = (TYPES[picked]?.tiles ?? [[0, 0]]).map(t => [px + t[0], py + t[1]]);
+      if (cells.some(([x, y]) => occupied(x, y))) return;
+      S.components.push({type: picked, pos: [px, py], dir: "up"});
+      rebuild(S.components, S.connections);
+    } else if (mode === "erase") {
+      const c = compAt(px, py);
+      if (!c) return;
+      // A wire whose end is gone would be dropped by loadShipSpec anyway; drop it
+      // here so the emitted spec never carries a connection to nothing.
+      const comps = S.components.filter(x => !(x.pos[0] === c.px && x.pos[1] === c.py));
+      const live = new Set(comps.map(x => x.pos.join(",")));
+      const conns = S.connections.filter(k => live.has(k.from.join(",")) && live.has(k.to.join(",")));
+      rebuild(comps, conns);
+    } else if (mode === "rotate") {
+      const c = compAt(px, py);
+      if (!c) return;
+      const t = S.components.find(x => x.pos[0] === c.px && x.pos[1] === c.py);
+      const o = ["up", "right", "down", "left"];
+      if (t) t.dir = o[(o.indexOf(t.dir ?? "up") + 1) % 4];
+      rebuild(S.components, S.connections);
+    } else if (mode === "connect") {
+      const here = portsAt(px, py);
+      if (!here.length) { wireFrom = null; render(); return; }
+      if (!wireFrom) {
+        const o = here.find(q => q.kind === "out");
+        if (o) wireFrom = {anchor: o.anchor, cell: [px, py], port: o.name};
+      } else {
+        const i = here.find(q => q.kind === "in");
+        if (i) {
+          // one wire per input: a second source would only be overwritten each tick
+          const conns = S.connections.filter(k =>
+            !(k.to[0] === i.anchor[0] && k.to[1] === i.anchor[1] && k.toPort === i.name));
+          conns.push({from: [...wireFrom.anchor], fromPort: wireFrom.port,
+                      to: [...i.anchor], toPort: i.name});
+          wireFrom = null;
+          rebuild(S.components, conns);
+          return;
+        }
+        wireFrom = null;
+      }
+      render();
+    } else if (mode === "modify") {
+      const c = compAt(px, py);
+      selected = c && (c.type === "Constant" || c.type === "Binary")
+        ? {px: c.px, py: c.py} : null;
+      render();
+    }
+  };
+  view.svg.addEventListener("click", (ev) => clickTile(...localTile(ev)));
+
+  const paint = () => {
+    overlay.textContent = "";
+    const add = (n, at) => { const e = document.createElementNS(ns, n);
+      for (const [k, v] of Object.entries(at)) e.setAttribute(k, v);
+      overlay.appendChild(e); return e; };
+    if (mode === "build" && picked) {
+      // Without this a blank board is a starfield with no hint that a click does
+      // anything.
+      for (const [cx, cy] of offers()) {
+        const [vx, vy] = tileToView(cx, cy);
+        add("rect", {x: vx - TILE / 2, y: vy - TILE / 2, width: TILE, height: TILE, rx: 5,
+          fill: "#5ef2a018", stroke: "#5ef2a0", "stroke-width": 2, "stroke-dasharray": "8 7"});
+        const arm = TILE * 0.22;
+        add("path", {d: `M${vx - arm} ${vy}H${vx + arm}M${vx} ${vy - arm}V${vy + arm}`,
+          stroke: "#5ef2a0", "stroke-width": 2, "stroke-linecap": "round", opacity: 0.6});
+      }
+    }
+    if (mode === "connect") for (const q of portsOfShip(ship)) {
+      const [vx, vy] = tileToView(q.px, q.py);
+      const hot = wireFrom ? q.kind === "in" : q.kind === "out";
+      add("circle", {cx: vx, cy: vy, r: TILE * 0.22,
+        fill: hot ? (q.kind === "out" ? "#5ef2a0" : "#8fd0ff") : "none",
+        stroke: q.kind === "out" ? "#5ef2a0" : "#8fd0ff",
+        "stroke-width": 2, opacity: hot ? 0.95 : 0.35});
+    }
+    if (wireFrom) {
+      const [vx, vy] = tileToView(wireFrom.cell[0], wireFrom.cell[1]);
+      add("circle", {cx: vx, cy: vy, r: TILE * 0.5, fill: "none",
+                     stroke: "#f2c14e", "stroke-width": 3});
+    }
+    if (selected) {
+      const [vx, vy] = tileToView(selected.px, selected.py);
+      add("rect", {x: vx - TILE / 2, y: vy - TILE / 2, width: TILE, height: TILE, rx: 5,
+                   fill: "none", stroke: "#f2c14e", "stroke-width": 3});
+    }
+  };
+
+  const setParam = (v) => {
+    const S = specOfShip(ship, name);
+    const t = S.components.find(x => x.pos[0] === selected.px && x.pos[1] === selected.py);
+    if (t) t.param = v;
+    rebuild(S.components, S.connections);
+  };
+
+  const render = () => {
+    // snap, not ease: a click has to land on the connector that is on screen now
+    view.draw(true); paint();
+    bar.textContent = "";
+    for (const m of ["build", "connect", "rotate", "modify", "erase"])
+      bar.append(btn(m, mode === m, () => {
+        mode = m; wireFrom = null; if (m !== "modify") selected = null; render();
+      }, m === "erase" ? "#ff6b5a" : "#5ef2a0"));
+    bar.append(htl.html`<span style="flex:1"></span>`);
+    bar.append(htl.html`<span style="color:#5b6b7d">${ship.comps.length} parts ·
+      ${ship.conns.length} wires · pwr ${ship.comps.reduce((n, c) =>
+        n + (TYPES[c.type]?.pwr ?? 0), 0)}</span>`);
+    bar.append(btn("clear", false, () => rebuild([], []), "#ff6b5a"));
+
+    tray.textContent = "";
+    if (mode === "build") {
+      tray.append(htl.html`<span style="color:#8b9bb0">parts</span>`);
+      for (const t of PALETTE)
+        tray.append(btn(t, picked === t, () => { picked = t; render(); }));
+    } else if (mode === "connect") {
+      tray.append(htl.html`<span style="color:#5b6b7d">${wireFrom
+        ? `wiring from ${wireFrom.anchor} (${wireFrom.port}) — click an input`
+        : "click an output, then an input"}</span>`);
+    } else if (mode === "modify" && selected) {
+      const c = ship.at(selected.px, selected.py);
+      tray.append(htl.html`<span style="color:#5b6b7d">${c.type} at ${selected.px},${selected.py}</span>
+        <input value=${c.param ?? ""} onchange=${(e) => setParam(e.target.value)} style="
+          font:12px ui-monospace,monospace;background:#0d1420;color:#dbe6f2;
+          border:1px solid #26364a;border-radius:4px;padding:4px 8px;width:8em">`);
+    } else if (mode === "erase") {
+      tray.append(htl.html`<span style="color:#5b6b7d">click a part to remove it and its wires</span>`);
+    } else {
+      tray.append(htl.html`<span style="color:#5b6b7d">click a part to turn it a quarter turn</span>`);
+    }
+    root.value = specOfShip(ship, name);
+  };
+  render();
+
+  // QA seam, and what corepox-lab drives: the same tile map the board is painted
+  // with, so a test never re-derives it.
+  return Object.assign(root, {
+    qa: {tileToView, localTile, ship: () => ship, mode: () => mode, svg: () => view.svg,
+         ports: () => portsOfShip(ship).map(q => ({kind: q.kind, name: q.name,
+                        px: q.px, py: q.py, type: q.c.type, anchor: q.anchor}))},
+    load: (spec) => { const s = structuredClone(spec);
+                      rebuild(s.components ?? [], s.connections ?? []); }
+  });
+}
+)};
+
+const _viewof_shipDesign = function _viewof_shipDesign(SHIPS, shipEditor, htl){
+  const names = Object.keys(SHIPS);
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px"></div>`;
+  const pick = htl.html`<div style="display:flex;gap:8px;align-items:center;
+    font:12px ui-monospace,monospace;color:#8b9bb0"></div>`;
+  const host = htl.html`<div></div>`;
+  root.append(pick, host);
+  const ed = shipEditor(SHIPS[names[0]], {name: names[0], span: 14});
+  ed.addEventListener("input", () => {
+    root.value = ed.value;
+    root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
+  });
+  host.append(ed);
+  pick.append(htl.html`<span>start from</span>`,
+    htl.html`<select onchange=${(e) => {
+      ed.load(e.target.value === "" ? {components: [], connections: []} : SHIPS[e.target.value]);
+    }} style="font:12px ui-monospace,monospace;background:#0d1420;color:#8b9bb0;
+      border:1px solid #26364a;border-radius:4px;padding:4px 6px">${
+      // One array, not a literal <option> after an interpolated list: htl appends
+      // interpolated nodes after the parsed markup, so a trailing literal option
+      // came FIRST in the DOM and the board showed manualAim while the select
+      // read "— empty —".
+      [...names, ""].map(n => htl.html`<option value=${n} selected=${n === names[0]}>${
+        n || "— empty —"}</option>`)}</select>`);
+  root.value = ed.value;
+  // The editor's tile map, handed up. A test that drives this view must click the
+  // cell the board is painted with, and re-deriving that map in the test is a copy
+  // that drifts (tools/corepox-shipyard-shot.ts).
+  return Object.assign(root, {qa: ed.qa, editor: ed});
+};
+
+const _shipDesignSource = function _shipDesignSource(shipDesign, shipSource, htl){return(
+htl.html`<pre style="margin:0;padding:12px;background:#0d1420;border:1px solid #1c2836;
+  border-radius:5px;overflow-x:auto;font:11.5px/1.5 ui-monospace,monospace;color:#dbe6f2"
+>${shipSource(shipDesign)}</pre>`
+)};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  main.define("module @tomlarkworthy/corepox-engine",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-render",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-render.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-assets",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-missions",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
+  for (const n of ["Ship", "World", "TYPES", "PORTS"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
+    (_, v) => v.import("battlefield", _));
+  main.define("TILE", ["module @tomlarkworthy/corepox-assets", "@variable"],
+    (_, v) => v.import("TILE", _));
+  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
+    (_, v) => v.import("SHIPS", _));
+
+  $def("_title", "title", ["md"], _title);
+  $def("_portsOfShip", "portsOfShip", ["PORTS"], _portsOfShip);
+  $def("_specOfShip", "specOfShip", [], _specOfShip);
+  $def("_shipSource", "shipSource", [], _shipSource);
+  $def("_shipEditor", "shipEditor",
+       ["Ship","World","TYPES","battlefield","TILE","portsOfShip","specOfShip","htl","invalidation"],
+       _shipEditor);
+  main.variable(observer("viewof shipDesign")).define("viewof shipDesign",
+    ["SHIPS","shipEditor","htl"], _viewof_shipDesign).pid = "_viewof_shipDesign";
+  main.variable(observer("shipDesign")).define("shipDesign",
+    ["Generators", "viewof shipDesign"], (G, _) => G.input(_)).pid = "_shipDesign";
+  $def("_shipDesignSource", "shipDesignSource",
+       ["shipDesign","shipSource","htl"], _shipDesignSource);
+  return main;
+}</script>
+
+<script id="@tomlarkworthy/corepox-lab" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// Two surfaces the campaign does not give you: edit a level, and fight two
+// arbitrary ships.
+//
+// Both are built on @tomlarkworthy/corepox-shipyard's `shipEditor`, so the ship a
+// level starts you with and the ships in a match are edited with the same gestures
+// as anything else, and none of it is a second copy of the campaign editor.
+//
+// The level editor emits a MISSIONS entry as source. It does not write it back:
+// MISSIONS is a data cell in @tomlarkworthy/corepox-missions and every mission in
+// it is anchored to a recovered Unity scene (tools/corepox-mission-fidelity.ts
+// diffs the two), so a level edited here is a proposal to paste, not a fact about
+// the original.
+
+const _title = function _title(md){return(
+md`# Corepox lab
+
+**Level editor** — drag the enemies, edit the ship you are given, set the inventory and the box you
+may build in. The snippet is a \`MISSIONS\` entry.
+
+**Arena** — any two ships, any separation, any heading. Runs the real \`World.step\`, so a match here
+resolves the same way it would in a mission.`
+)};
+
+// SHIPS entries are shared objects and a mission holds references to them, so an
+// editable copy has to be deep. Emitting the copy back would inline a ship that
+// was written as `SHIPS.rocket`, so the writer looks for an entry it matches.
+const _shipRefOf = function _shipRefOf(SHIPS){return(
+(spec) => {
+  const j = JSON.stringify(spec);
+  for (const [n, s] of Object.entries(SHIPS)) if (JSON.stringify(s) === j) return n;
+  return null;
+}
+)};
+
+// A mission back out as source. Fields are written in the order MISSIONS uses so a
+// paste lands in a file that reads the same as the rest of it.
+const _missionSource = function _missionSource(shipRefOf, shipSource){return(
+(M) => {
+  const q = (v) => JSON.stringify(v);
+  const ship = (spec) => {
+    const ref = shipRefOf(spec);
+    return ref ? `SHIPS.${ref}` : shipSource(spec, "").replace(/^: /, "").trim();
+  };
+  const L = [];
+  L.push(`{`);
+  L.push(`  id: ${q(M.id)}, title: ${q(M.title)},`);
+  L.push(`  brief: ${q(M.brief)},`);
+  if (M.ship) L.push(`  ship: ${ship(M.ship)},`);
+  if (M.inventory?.length)
+    L.push(`  inventory: [${M.inventory.map(i => `{type: ${q(i.type)}, n: ${i.n}}`).join(", ")}],`);
+  if (M.envelope?.length)
+    L.push(`  envelope: [${M.envelope.map(c => `[${c[0]}, ${c[1]}]`).join(", ")}],`);
+  if (M.allow) L.push(`  allow: {${Object.entries(M.allow)
+    .filter(([, v]) => v).map(([k]) => `${k}: true`).join(", ")}},`);
+  if (M.enemies?.length) {
+    L.push(`  enemies: [`);
+    for (const e of M.enemies)
+      L.push(`    {spec: ${ship(e.spec)}, x: ${+e.x.toFixed(2)}, y: ${+e.y.toFixed(2)}` +
+             `, a: ${+(e.a ?? 0).toFixed(2)}` +
+             (e.team ? `, team: ${q(e.team)}` : "") + `},`);
+    L.push(`  ],`);
+  }
+  if (M.zone) L.push(`  zone: {x: ${+M.zone.x.toFixed(2)}, y: ${+M.zone.y.toFixed(2)}` +
+    `, r: ${+M.zone.r.toFixed(2)}${M.zone.label ? `, label: ${q(M.zone.label)}` : ""}},`);
+  if (M.spawn) L.push(`  spawn: ${q(M.spawn).replace(/"(\w+)":/g, "$1: ")},`);
+  if (M.span) L.push(`  span: ${M.span},`);
+  if (M.live) L.push(`  live: true,`);
+  if (M.spoils?.length)
+    L.push(`  spoils: [${M.spoils.map(i => `{type: ${q(i.type)}, n: ${i.n}}`).join(", ")}],`);
+  L.push(`  objectives: [`);
+  for (const o of M.objectives ?? [])
+    L.push(`    ${q(o).replace(/"(\w+)":/g, "$1: ").replace(/,/g, ", ")},`);
+  L.push(`  ]`);
+  L.push(`}`);
+  return L.join("\n");
+}
+)};
+
+// A grid of cells you toggle: the build envelope, in the player's own tile frame.
+// It is NOT edited on the battlefield -- the envelope is ship-local and the board
+// is world space, so two coordinate systems would share one surface and a click
+// would be ambiguous the moment the ship is not at the origin facing up.
+const _cellGrid = function _cellGrid(){return(
+(cells, {radius = 4, occupied = [], onchange} = {}) => {
+  const C = 22, N = radius * 2 + 1, W = N * C;
+  const key = (a) => a[0] + "," + a[1];
+  const have = new Set(cells.map(key));
+  const busy = new Set(occupied.map(key));
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("width", W); svg.setAttribute("height", W);
+  svg.setAttribute("viewBox", `0 0 ${W} ${W}`);
+  svg.style.cssText = "display:block;background:#0d1420;border:1px solid #1c2836;" +
+                      "border-radius:5px;cursor:crosshair";
+  const X = (x) => (x + radius) * C, Y = (y) => (radius - y) * C;      // +y is UP
+  for (let x = -radius; x <= radius; x++) for (let y = -radius; y <= radius; y++) {
+    const r = document.createElementNS(ns, "rect");
+    r.setAttribute("x", X(x) + 1); r.setAttribute("y", Y(y) + 1);
+    r.setAttribute("width", C - 2); r.setAttribute("height", C - 2);
+    r.setAttribute("rx", 2);
+    const on = have.has(key([x, y])), taken = busy.has(key([x, y]));
+    r.setAttribute("fill", on ? "#5ef2a028" : taken ? "#ffffff10" : "#ffffff05");
+    r.setAttribute("stroke", on ? "#5ef2a0" : taken ? "#3a4657" : "#1c2836");
+    svg.appendChild(r);
+  }
+  const o = document.createElementNS(ns, "path");
+  o.setAttribute("d", `M${X(0) + C / 2 - 5},${Y(0) + C / 2} h10 M${X(0) + C / 2},${Y(0) + C / 2 - 5} v10`);
+  o.setAttribute("stroke", "#8b9bb0"); o.setAttribute("stroke-width", 1.5);
+  svg.appendChild(o);
+  svg.addEventListener("click", (ev) => {
+    const r = svg.getBoundingClientRect();
+    const x = Math.floor((ev.clientX - r.left) / r.width * N) - radius;
+    const y = radius - Math.floor((ev.clientY - r.top) / r.height * N);
+    const k = key([x, y]);
+    onchange?.(have.has(k) ? cells.filter(c => key(c) !== k) : [...cells, [x, y]]);
+  });
+  return svg;
+}
+)};
+
+const _viewof_levelEditor = function _viewof_levelEditor(
+    MISSIONS, SHIPS, Ship, World, TYPES, battlefield, TILE, shipEditor, specOfShip,
+    missionSource, cellGrid, htl, invalidation){
+  let mi = 0, M = structuredClone(MISSIONS[0]);
+  let sel = null;                                   // index into M.enemies, or "player"
+
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:10px;
+    font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
+  const bar = htl.html`<div style="display:flex;flex-wrap:wrap;gap:7px;align-items:center"></div>`;
+  const stage = htl.html`<div style="position:relative"></div>`;
+  const panel = htl.html`<div style="display:flex;flex-wrap:wrap;gap:22px;align-items:flex-start"></div>`;
+  const shipHost = htl.html`<div></div>`;
+  root.append(bar, stage, panel, shipHost);
+
+  const btn = (label, on, click, hue = "#5ef2a0") => htl.html`<button onclick=${click} style="
+    font:12px ui-monospace,monospace;padding:4px 10px;border-radius:4px;cursor:pointer;
+    border:1px solid ${on ? hue : "#26364a"};background:${on ? hue + "22" : "transparent"};
+    color:${on ? hue : "#8b9bb0"}">${label}</button>`;
+  const num = (v, on, {step = 0.25, width = "5.5em"} = {}) =>
+    htl.html`<input type="number" value=${v} step=${step} onchange=${(e) => on(+e.target.value)}
+      style="font:12px ui-monospace,monospace;background:#0d1420;color:#dbe6f2;width:${width};
+        border:1px solid #26364a;border-radius:4px;padding:3px 6px">`;
+
+  let world = null, view = null, overlay = null, editor = null, stop = false;
+  invalidation.then(() => { stop = true; });
+
+  // Rebuild the world from M on every structural change. The board is a VIEW of
+  // the mission, so nothing on it holds state the mission does not.
+  const build = () => {
+    const player = new Ship(M.ship ?? {name: "player", components: [], connections: []},
+                            {team: "player", x: 0, y: 0, a: 0});
+    world = new World([player]);
+    for (const e of M.enemies ?? [])
+      world.ships.push(new Ship(e.spec, {team: e.team ?? "enemy", x: e.x, y: e.y, a: e.a ?? 0}));
+    stage.textContent = "";
+    view = battlefield(world, {span: M.span ?? 30, width: 900, height: 460, follow: true});
+    view.minSpan = M.span ?? 30;
+    const ns = "http://www.w3.org/2000/svg";
+    overlay = document.createElementNS(ns, "g");
+    view.svg.appendChild(overlay);
+    view.svg.style.cursor = "grab";
+    view.svg.style.touchAction = "none";
+    stage.append(view.svg);
+    wireDrag();
+  };
+
+  const worldAt = (ev) => {
+    const r = view.svg.getBoundingClientRect(), vb = view.svg.viewBox.baseVal;
+    return [(vb.x + (ev.clientX - r.left) / r.width * vb.width) / TILE,
+            (vb.y + (ev.clientY - r.top) / r.height * vb.height) / TILE];
+  };
+  // The nearest ship ORIGIN, not centre of mass: the origin cell is what the
+  // mission's x,y means and what the camera frames, and on a long hull the two are
+  // most of a tile apart.
+  const shipAt = (wx, wy) => {
+    let best = null, bd = 3.5;
+    world.ships.forEach((s, i) => {
+      const [ox, oy] = s.worldOf({px: 0, py: 0});
+      const d = Math.hypot(ox - wx, oy - wy);
+      if (d < bd) { bd = d; best = i; }
+    });
+    return best;
+  };
+
+  const wireDrag = () => {
+    let drag = null;
+    view.svg.addEventListener("pointerdown", (ev) => {
+      const [wx, wy] = worldAt(ev);
+      const i = shipAt(wx, wy);
+      if (i == null) { sel = null; render(); return; }
+      sel = i === 0 ? "player" : i - 1;
+      // The player sits at the origin by definition -- MissionController spawns it
+      // there and every enemy position in the scene is relative to it -- so it is
+      // selectable but not draggable. Moving it would move the whole level.
+      if (sel !== "player") {
+        drag = {i: sel, ox: wx - M.enemies[sel].x, oy: wy - M.enemies[sel].y};
+        // Freeze the camera for the duration. battlefield re-frames to contain
+        // every ship, so moving one moves the viewBox, and the grab offset taken
+        // at pointerdown is then measured against a box that no longer exists --
+        // a 3-tile drag landed 6.13 tiles away, growing with the distance because
+        // the ship being dragged is what makes the camera zoom out. `framed = []`
+        // leaves frame() with no points and it returns without writing a viewBox.
+        view.framed = [];
+        drag.wasFocus = view.focus; view.focus = [];
+        view.svg.setPointerCapture(ev.pointerId);
+        view.svg.style.cursor = "grabbing";
+      }
+      render();
+    });
+    view.svg.addEventListener("pointermove", (ev) => {
+      if (!drag) return;
+      const [wx, wy] = worldAt(ev);
+      M.enemies[drag.i].x = Math.round((wx - drag.ox) * 100) / 100;
+      M.enemies[drag.i].y = Math.round((wy - drag.oy) * 100) / 100;
+      const s = world.ships[drag.i + 1];
+      s.x = M.enemies[drag.i].x; s.y = M.enemies[drag.i].y;
+      view.draw(true); paint(); emit();
+    });
+    const end = (ev) => {
+      if (!drag) return;
+      view.framed = null; view.focus = drag.wasFocus ?? [];
+      drag = null; view.svg.style.cursor = "grab";
+      try { view.svg.releasePointerCapture(ev.pointerId); } catch (e) { /* already gone */ }
+      render();
+    };
+    view.svg.addEventListener("pointerup", end);
+    view.svg.addEventListener("pointercancel", end);
+  };
+
+  const paint = () => {
+    if (!overlay) return;
+    const ns = "http://www.w3.org/2000/svg";
+    overlay.textContent = "";
+    const add = (n, at) => { const e = document.createElementNS(ns, n);
+      for (const [k, v] of Object.entries(at)) e.setAttribute(k, v);
+      overlay.appendChild(e); return e; };
+    if (M.zone) add("circle", {cx: M.zone.x * TILE, cy: M.zone.y * TILE, r: M.zone.r * TILE,
+      fill: "#c17bff18", stroke: "#c17bff", "stroke-width": 3, "stroke-dasharray": "14 10"});
+    // A ring on every ship origin: it is the handle, so it has to be visible even
+    // when the hull under it is one tile.
+    world.ships.forEach((s, i) => {
+      const [ox, oy] = s.worldOf({px: 0, py: 0});
+      const on = (i === 0 && sel === "player") || (i > 0 && sel === i - 1);
+      add("circle", {cx: ox * TILE, cy: oy * TILE, r: TILE * 0.85, fill: "none",
+        stroke: i === 0 ? "#5ef2a0" : "#ff6b5a", "stroke-width": on ? 4 : 1.5,
+        opacity: on ? 1 : 0.5});
+    });
+  };
+
+  const emit = () => {
+    root.value = structuredClone(M);
+    root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
+  };
+  const restructure = () => { build(); render(); };
+
+  const render = () => {
+    view.draw(true); paint();
+
+    bar.textContent = "";
+    bar.append(htl.html`<select onchange=${(e) => {
+      mi = +e.target.value; M = structuredClone(MISSIONS[mi]); sel = null; restructure();
+    }} style="font:12px ui-monospace,monospace;background:#0d1420;color:#8b9bb0;
+      border:1px solid #26364a;border-radius:4px;padding:4px 6px">${
+      MISSIONS.map((x, i) => htl.html`<option value=${i} selected=${i === mi}>${i + 1}. ${x.title}</option>`)
+    }</select>`);
+    bar.append(htl.html`<input value=${M.title} onchange=${(e) => { M.title = e.target.value; emit(); }}
+      style="font:12px ui-monospace,monospace;background:#0d1420;color:#dbe6f2;width:12em;
+        border:1px solid #26364a;border-radius:4px;padding:3px 6px">`);
+    bar.append(htl.html`<span style="color:#5b6b7d">span</span>`,
+      num(M.span ?? 30, (v) => { M.span = v; restructure(); }, {step: 2, width: "4.5em"}));
+    bar.append(htl.html`<span style="flex:1"></span>`);
+    bar.append(htl.html`<select onchange=${(e) => {
+      if (!e.target.value) return;
+      (M.enemies ??= []).push({spec: structuredClone(SHIPS[e.target.value]), x: 0, y: 8, a: 180});
+      e.target.value = ""; sel = M.enemies.length - 1; restructure(); emit();
+    }} style="font:12px ui-monospace,monospace;background:#0d1420;color:#8b9bb0;
+      border:1px solid #26364a;border-radius:4px;padding:4px 6px">${
+      ["", ...Object.keys(SHIPS)].map(n => htl.html`<option value=${n}>${n || "+ add enemy"}</option>`)
+    }</select>`);
+
+    panel.textContent = "";
+    // ---- the selected body ---------------------------------------------------
+    const selBox = htl.html`<div style="display:flex;flex-direction:column;gap:6px"></div>`;
+    if (sel === "player") {
+      selBox.append(htl.html`<b style="color:#5ef2a0">player ship</b>`,
+        htl.html`<span style="color:#5b6b7d">at the origin, and every enemy position is
+          relative to it — edit its parts below</span>`);
+    } else if (sel != null && M.enemies?.[sel]) {
+      const e = M.enemies[sel];
+      selBox.append(htl.html`<b style="color:#ff6b5a">enemy ${sel + 1} · ${e.spec.name ?? "?"}</b>`);
+      selBox.append(htl.html`<div style="display:flex;gap:6px;align-items:center">
+        <span style="color:#5b6b7d">x</span>${num(e.x, (v) => { e.x = v; restructure(); emit(); })}
+        <span style="color:#5b6b7d">y</span>${num(e.y, (v) => { e.y = v; restructure(); emit(); })}
+        <span style="color:#5b6b7d">a</span>${num(e.a ?? 0, (v) => { e.a = v; restructure(); emit(); },
+          {step: 15})}</div>`);
+      selBox.append(htl.html`<div style="display:flex;gap:6px">
+        ${btn("remove", false, () => { M.enemies.splice(sel, 1); sel = null; restructure(); emit(); },
+              "#ff6b5a")}
+        ${btn("edit its parts", false, () => { sel = {enemy: sel}; render(); }, "#8fd0ff")}</div>`);
+    } else {
+      selBox.append(htl.html`<span style="color:#5b6b7d">click a ship's ring to select it;
+        drag an enemy to move it</span>`);
+    }
+    panel.append(selBox);
+
+    // ---- inventory -----------------------------------------------------------
+    const inv = htl.html`<div style="display:flex;flex-direction:column;gap:5px"></div>`;
+    inv.append(htl.html`<b style="color:#8b9bb0">inventory</b>`);
+    for (const [i, it] of (M.inventory ?? []).entries())
+      inv.append(htl.html`<div style="display:flex;gap:6px;align-items:center">
+        <span style="width:8em;color:#dbe6f2">${it.type}</span>
+        ${num(it.n, (v) => { it.n = Math.max(0, Math.round(v)); emit(); render(); },
+              {step: 1, width: "4em"})}
+        ${btn("×", false, () => { M.inventory.splice(i, 1); emit(); render(); }, "#ff6b5a")}</div>`);
+    inv.append(htl.html`<select onchange=${(e) => {
+      if (!e.target.value) return;
+      (M.inventory ??= []).push({type: e.target.value, n: 1});
+      e.target.value = ""; emit(); render();
+    }} style="font:12px ui-monospace,monospace;background:#0d1420;color:#8b9bb0;
+      border:1px solid #26364a;border-radius:4px;padding:3px 6px">${
+      ["", ...Object.keys(TYPES)].map(t => htl.html`<option value=${t}>${t || "+ part"}</option>`)
+    }</select>`);
+    panel.append(inv);
+
+    // ---- envelope ------------------------------------------------------------
+    const env = htl.html`<div style="display:flex;flex-direction:column;gap:5px"></div>`;
+    const filled = (M.ship?.components ?? []).flatMap(c =>
+      (TYPES[c.type]?.tiles ?? [[0, 0]]).map(t => [c.pos[0] + t[0], c.pos[1] + t[1]]));
+    env.append(htl.html`<b style="color:#8b9bb0">envelope
+      <span style="font-weight:400;color:#5b6b7d">${(M.envelope ?? []).length} cells</span></b>`,
+      cellGrid(M.envelope ?? [], {occupied: filled,
+        onchange: (cells) => { M.envelope = cells; emit(); render(); }}),
+      htl.html`<span style="color:#5b6b7d;max-width:16em">grey is filled by the starting ship;
+        the envelope constrains the ANCHOR, not the footprint</span>`);
+    panel.append(env);
+
+    // ---- objectives ----------------------------------------------------------
+    const obj = htl.html`<div style="display:flex;flex-direction:column;gap:5px"></div>`;
+    obj.append(htl.html`<b style="color:#8b9bb0">objectives</b>`);
+    for (const [i, o] of (M.objectives ?? []).entries())
+      obj.append(htl.html`<div style="display:flex;gap:6px;align-items:center">
+        <span style="color:#8fd0ff;width:5em">${o.kind}</span>
+        <input value=${o.text ?? ""} onchange=${(e) => { o.text = e.target.value; emit(); }}
+          style="font:12px ui-monospace,monospace;background:#0d1420;color:#dbe6f2;width:15em;
+            border:1px solid #26364a;border-radius:4px;padding:3px 6px">
+        ${btn("×", false, () => { M.objectives.splice(i, 1); emit(); render(); }, "#ff6b5a")}</div>`);
+    obj.append(htl.html`<select onchange=${(e) => {
+      if (!e.target.value) return;
+      (M.objectives ??= []).push({kind: e.target.value, text: e.target.value});
+      e.target.value = ""; emit(); render();
+    }} style="font:12px ui-monospace,monospace;background:#0d1420;color:#8b9bb0;
+      border:1px solid #26364a;border-radius:4px;padding:3px 6px">${
+      ["", "place", "connect", "adjust", "defend", "destroy", "reach", "survive"]
+        .map(k => htl.html`<option value=${k}>${k || "+ objective"}</option>`)
+    }</select>`);
+    panel.append(obj);
+
+    // ---- the ship being edited, under everything -----------------------------
+    const want = sel === "player" ? {kind: "player"}
+               : (sel && sel.enemy != null) ? {kind: "enemy", i: sel.enemy} : null;
+    const wantKey = want ? want.kind + (want.i ?? "") : "";
+    if (shipHost.dataset.on !== wantKey) {
+      shipHost.textContent = ""; shipHost.dataset.on = wantKey; editor = null;
+      if (want) {
+        const spec = want.kind === "player" ? M.ship : M.enemies[want.i].spec;
+        editor = shipEditor(spec, {name: spec?.name ?? "ship", span: 12, height: 320});
+        editor.addEventListener("input", () => {
+          if (want.kind === "player") M.ship = editor.value;
+          else M.enemies[want.i].spec = editor.value;
+          emit(); build(); paint(); view.draw(true);
+        });
+        shipHost.append(htl.html`<div style="margin-top:8px;color:#5b6b7d">editing
+          ${want.kind === "player" ? "the player's ship" : `enemy ${want.i + 1}`}</div>`, editor);
+      }
+    }
+    root.value = structuredClone(M);
+  };
+
+  build();
+  render();
+  root.value = structuredClone(M);
+  root.qa = {mission: () => M, select: (i) => { sel = i; render(); },
+             world: () => world, svg: () => view.svg,
+             worldToClient: (wx, wy) => {
+               const r = view.svg.getBoundingClientRect(), vb = view.svg.viewBox.baseVal;
+               return {x: r.left + (wx * TILE - vb.x) / vb.width * r.width,
+                       y: r.top + (wy * TILE - vb.y) / vb.height * r.height};
+             }};
+  return root;
+};
+
+const _levelSource = function _levelSource(levelEditor, missionSource, htl){return(
+htl.html`<pre style="margin:0;padding:12px;background:#0d1420;border:1px solid #1c2836;
+  border-radius:5px;overflow-x:auto;font:11.5px/1.5 ui-monospace,monospace;color:#dbe6f2"
+>${missionSource(levelEditor)}</pre>`
+)};
+
+// ---- arena ----------------------------------------------------------------
+
+// One match between two ships, stepped by the real World. A match that resolves
+// nothing is a draw, which is the honest answer for two hulls with no weapon
+// between them.
+//
+// When a ship is out is NOT the mission rule. stepSession loses the match when the
+// player has no Brain, and applying that here made every warhead lose at t=0.0
+// with all its parts alive -- rocket, proximityMine, delayBomb and lazerHardpoint
+// have no Brain to begin with, because they are ordnance and not ships. Measured
+// as 0W/16L for all four in tools/corepox-arena-matrix.ts, which is what exposed
+// it. A side is out when it has lost everything it was flying, or when it has lost
+// a Brain it STARTED with.
+const _runMatch = function _runMatch(Ship, World, DT){return(
+(specA, specB, {gap = 14, aA = 0, aB = 180, limit = 60} = {}) => {
+  const A = new Ship(specA, {team: "player", x: 0, y: -gap / 2, a: aA});
+  const B = new Ship(specB, {team: "enemy", x: 0, y: gap / 2, a: aB});
+  const w = new World([A, B]);
+  const hadBrain = new Map([[A, A.comps.some(c => c.type === "Brain")],
+                            [B, B.comps.some(c => c.type === "Brain")]]);
+  const alive = (s) => s.live.length > 0 &&
+    (!hadBrain.get(s) || s.live.some(c => c.type === "Brain"));
+  let t = 0;
+  while (t < limit) {
+    w.step(); t += DT;
+    if (!alive(A) || !alive(B)) break;
+  }
+  return {world: w, A, B, t,
+          verdict: !alive(A) && !alive(B) ? "mutual"
+                 : !alive(B) ? "A" : !alive(A) ? "B" : "draw"};
+}
+)};
+
+const _viewof_arena = function _viewof_arena(
+    SHIPS, Ship, World, DT, battlefield, htl, invalidation){
+  const names = Object.keys(SHIPS);
+  // A default that resolves, and resolves BECAUSE of something on screen: the mine
+  // closes and detonates, and the blast takes manualAim's Brain at 1.2s -- A ends
+  // 1/13 parts, B 2/3. Every other pair drew, at every separation tried
+  // (tools/corepox-arena-matrix.ts). The two ships that do die in that table die
+  // unaided, so a pair picked off the win column would have shown a verdict
+  // nothing caused.
+  const first = (want) => names.find(n => n === want) ?? names[0];
+  let a = first("proximityMine"), b = first("manualAim");
+  let gap = 6, aA = 0, aB = 180;
+  let world = null, view = null, raf = null, running = false, t = 0, stop = false;
+  invalidation.then(() => { stop = true; if (raf) cancelAnimationFrame(raf); });
+
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:9px;
+    font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
+  const bar = htl.html`<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center"></div>`;
+  const stage = htl.html`<div></div>`;
+  const out = htl.html`<div style="color:#8b9bb0"></div>`;
+  root.append(bar, stage, out);
+
+  const btn = (label, on, click, hue = "#5ef2a0") => htl.html`<button onclick=${click} style="
+    font:12px ui-monospace,monospace;padding:5px 11px;border-radius:4px;cursor:pointer;
+    border:1px solid ${on ? hue : "#26364a"};background:${on ? hue + "22" : "transparent"};
+    color:${on ? hue : "#8b9bb0"}">${label}</button>`;
+  const pick = (v, on) => htl.html`<select onchange=${(e) => on(e.target.value)} style="
+    font:12px ui-monospace,monospace;background:#0d1420;color:#dbe6f2;
+    border:1px solid #26364a;border-radius:4px;padding:4px 6px">${
+    names.map(n => htl.html`<option value=${n} selected=${n === v}>${n}</option>`)}</select>`;
+  const num = (v, on, step = 1) => htl.html`<input type="number" value=${v} step=${step}
+    onchange=${(e) => on(+e.target.value)} style="font:12px ui-monospace,monospace;
+      background:#0d1420;color:#dbe6f2;width:4.5em;border:1px solid #26364a;
+      border-radius:4px;padding:3px 6px">`;
+
+  // Same rule as runMatch, and for the same reason: a warhead has no Brain and
+  // must not be counted dead for it.
+  let hadBrain = new Map();
+  const alive = (s) => s.live.length > 0 &&
+    (!hadBrain.get(s) || s.live.some(c => c.type === "Brain"));
+  const setup = () => {
+    if (raf) cancelAnimationFrame(raf);
+    running = false; t = 0;
+    const A = new Ship(SHIPS[a], {team: "player", x: 0, y: -gap / 2, a: aA});
+    const B = new Ship(SHIPS[b], {team: "enemy", x: 0, y: gap / 2, a: aB});
+    world = new World([A, B]);
+    hadBrain = new Map([[A, A.comps.some(c => c.type === "Brain")],
+                        [B, B.comps.some(c => c.type === "Brain")]]);
+    stage.textContent = "";
+    view = battlefield(world, {span: gap + 14, width: 900, height: 460, follow: true});
+    stage.append(view.svg);
+    render();
+  };
+  const start = () => {
+    if (running) return;
+    running = true; render();
+    const tick = () => {
+      if (stop || !running) return;
+      for (let i = 0; i < 2; i++) { world.step(); t += DT; }
+      view.draw();
+      const A = world.ships[0], B = world.ships[1];
+      if (!alive(A) || !alive(B) || t > 60) { running = false; render(); return; }
+      out.textContent = `running · ${t.toFixed(1)}s`;
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+  };
+
+  const render = () => {
+    view.draw(true);
+    bar.textContent = "";
+    bar.append(htl.html`<span style="color:#5ef2a0">A</span>`, pick(a, (v) => { a = v; setup(); }),
+               htl.html`<span style="color:#5b6b7d">heading</span>`, num(aA, (v) => { aA = v; setup(); }, 15),
+               htl.html`<span style="color:#ff6b5a">B</span>`, pick(b, (v) => { b = v; setup(); }),
+               htl.html`<span style="color:#5b6b7d">heading</span>`, num(aB, (v) => { aB = v; setup(); }, 15),
+               htl.html`<span style="color:#5b6b7d">gap</span>`, num(gap, (v) => { gap = Math.max(2, v); setup(); }),
+               running ? btn("■ stop", true, () => { running = false; render(); }, "#ff8f6d")
+                       : btn("▶ fight", false, start, "#8fd0ff"),
+               btn("↺ reset", false, setup, "#8b9bb0"));
+    const A = world.ships[0], B = world.ships[1];
+    const state = running ? "running"
+      : !alive(A) && !alive(B) ? "both cores destroyed"
+      : !alive(B) ? "A wins" : !alive(A) ? "B wins"
+      : t > 0 ? "draw — nothing resolved in 60s" : "ready";
+    out.textContent = `${state} · ${t.toFixed(1)}s · ` +
+      `A ${A.live.length}/${A.comps.length} parts · B ${B.live.length}/${B.comps.length} parts`;
+    root.value = {a, b, gap, aA, aB, t, state};
+  };
+  setup();
+  root.qa = {setup: (o) => { if (o.a) a = o.a; if (o.b) b = o.b;
+                             if (o.gap) gap = o.gap; setup(); },
+             start, state: () => ({t, running, state: root.value.state}),
+             world: () => world};
+  return root;
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  main.define("module @tomlarkworthy/corepox-engine",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-render",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-render.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-assets",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-missions",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-shipyard",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-shipyard.js?v=4")).default));
+  for (const n of ["Ship", "World", "TYPES", "DT"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
+    (_, v) => v.import("battlefield", _));
+  main.define("TILE", ["module @tomlarkworthy/corepox-assets", "@variable"],
+    (_, v) => v.import("TILE", _));
+  for (const n of ["SHIPS", "MISSIONS"])
+    main.define(n, ["module @tomlarkworthy/corepox-missions", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["shipEditor", "shipSource", "specOfShip"])
+    main.define(n, ["module @tomlarkworthy/corepox-shipyard", "@variable"], (_, v) => v.import(n, _));
+
+  $def("_title", "title", ["md"], _title);
+  $def("_shipRefOf", "shipRefOf", ["SHIPS"], _shipRefOf);
+  $def("_missionSource", "missionSource", ["shipRefOf","shipSource"], _missionSource);
+  $def("_cellGrid", "cellGrid", [], _cellGrid);
+  main.variable(observer("viewof levelEditor")).define("viewof levelEditor",
+    ["MISSIONS","SHIPS","Ship","World","TYPES","battlefield","TILE","shipEditor","specOfShip",
+     "missionSource","cellGrid","htl","invalidation"], _viewof_levelEditor).pid = "_viewof_levelEditor";
+  main.variable(observer("levelEditor")).define("levelEditor",
+    ["Generators", "viewof levelEditor"], (G, _) => G.input(_)).pid = "_levelEditor";
+  $def("_levelSource", "levelSource", ["levelEditor","missionSource","htl"], _levelSource);
+  $def("_runMatch", "runMatch", ["Ship","World","DT"], _runMatch);
+  main.variable(observer("viewof arena")).define("viewof arena",
+    ["SHIPS","Ship","World","DT","battlefield","htl","invalidation"], _viewof_arena).pid = "_viewof_arena";
+  main.variable(observer("arena")).define("arena",
+    ["Generators", "viewof arena"], (G, _) => G.input(_)).pid = "_arena";
+  return main;
+}</script>
+
 <!-- Bootloader -->
 <script id="bootconf.json"
         type="text/plain"
         data-mime="application/json"
->
-{
+>{
  "mains": [
   "@tomlarkworthy/lopepage-2",
   "@tomlarkworthy/blank-notebook",
@@ -61931,13 +62911,14 @@ export default function define(runtime, observer) {
   "@tomlarkworthy/corepox-engine",
   "@tomlarkworthy/corepox-render",
   "@tomlarkworthy/corepox-components",
-      "@tomlarkworthy/corepox-missions",
-      "@tomlarkworthy/corepox-game"
+  "@tomlarkworthy/corepox-missions",
+  "@tomlarkworthy/corepox-game",
+  "@tomlarkworthy/corepox-shipyard",
+  "@tomlarkworthy/corepox-lab"
  ],
  "hash": "#view=R100(S70(@tomlarkworthy/corepox-game),S30(@tomlarkworthy/claude-code-pairing))",
  "headless": true
-}
-</script>
+}</script>
 <script id="@tomlarkworthy/bootloader" 
   type="text/plain"
   data-mime="application/javascript"
