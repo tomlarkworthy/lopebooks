@@ -58503,17 +58503,51 @@ const _SYMBOL_FOR = function _SYMBOL_FOR(){return(
   Explosive:    ["explosive-3",  28,   28],
   Armour:       ["armour-2",     28,   28],
   Orb:          ["energy-store", 28,   28],
-  LaserTurret2: ["turret2",      135,  79.5],
+  // Was (135, 79.5), which put the gear nowhere near the base cells. The teeth
+  // ring centres on art (111.0, 124.0) and the mount's left edge and bottom sit
+  // exactly on the left and bottom edges of the origin tile from there, so the
+  // gear is centred on cell [0,0] -- not on the 2x2 above the base. That
+  // contradicts TYPES.pivot [0.5, 0.5], which came from recollection; the art is
+  // the measurable one, and the pivot below is the one the barrel turns about.
+  LaserTurret2: ["turret2",      111,  124],
   Hyperdrive:   ["hyperdrive",   124,  149.5]
 }
 )};
 
+// `turret2` is not one drawing. Its 35 children are, in order:
+//   0-8    the barrel, drawn at 64.2 degrees off forward, hinged at the gear
+//   9-17   a SECOND barrel, upright, attached to nothing -- it floated beside
+//          every turret on the board until this split
+//   18-22  the mount
+//   23-34  twelve gear teeth, a ring 54.6 units across centred on (111.0, 124.0)
+// Measured with getBBox on each group (tools/corepox-art-split.ts). Split into two
+// symbols sharing turret2's viewBox, so a <use> of either lands in the same frame
+// and the renderer can rotate the barrel alone.
 const _symbolSheet = function _symbolSheet(SHEET){
   const host = document.createElement("div");
   host.style.display = "none";
   host.innerHTML = SHEET;
   document.body.appendChild(host);
-  return host.firstElementChild;
+  const sheet = host.firstElementChild;
+  const src = sheet.querySelector("#cp-turret2");
+  if (src) {
+    const kids = [...src.children];
+    const part = (id, from, to) => {
+      const sym = src.cloneNode(false);
+      sym.id = id;
+      for (let i = from; i <= to; i++) sym.appendChild(kids[i].cloneNode(true));
+      sheet.appendChild(sym);
+    };
+    part("cp-turret2-barrel", 0, 8);
+    part("cp-turret2-base", 18, 34);
+  }
+  // The connector sprites are stroked with a literal magenta. ConnectionView tints
+  // them per frame from the connector's value, so the stroke has to be inheritable
+  // -- currentColor lets one `color` on the <use>'s parent do it.
+  for (const sym of sheet.querySelectorAll('[id^="cp-connection-"]'))
+    for (const el of sym.querySelectorAll("[stroke]"))
+      el.setAttribute("stroke", "currentColor");
+  return sheet;
 };
 
 const _use = function _use(SYMBOLS, symbolSheet){return(
@@ -58968,6 +59002,19 @@ const _NEIGHBOURS = function _NEIGHBOURS(){return(
 )};
 
 // Pull the saved connector values that belong to this side of the component.
+// ConstantFn.deserialize, verbatim: an empty param means the ship predates
+// constants-as-params, and the value is the saved `output` connector value cast
+// to int. Without this every old-format Constant reads 0 -- ProximityMine's
+// threshold is stored that way (param "", output 4), so the mine could never arm.
+const _constantParam = function _constantParam(){return(
+(c) => {
+  if (c.type !== "Constant") return c.param;
+  if (c.param != null && c.param !== "") return c.param;
+  const o = (c.overrides ?? []).find(o => o.name === "output");
+  return String(o ? Math.trunc(o.value) : 0);
+}
+)};
+
 const _applyOverrides = function _applyOverrides(OVERRIDE_PORT){return(
 (spec, ports) => {
   const out = {};
@@ -58979,7 +59026,7 @@ const _applyOverrides = function _applyOverrides(OVERRIDE_PORT){return(
 }
 )};
 
-const _Ship = function _Ship(NEIGHBOURS, TYPES, DIRS, rotTile, geom, DT, UNITS, applyOverrides){return(
+const _Ship = function _Ship(NEIGHBOURS, TYPES, DIRS, rotTile, geom, DT, UNITS, applyOverrides, constantParam){return(
 class Ship {
   static SUPPLY = 20;   // power per Brain
   constructor(spec, {team = "a", x = 0, y = 0, a = 0} = {}) {
@@ -58992,7 +59039,7 @@ class Ship {
       const dir = typeof c.dir === "number" ? c.dir : (DIRS[c.dir ?? "up"] ?? 0);
       return {
         i, type: c.type, px: c.pos[0], py: c.pos[1], dir,
-        hp: c.hp ?? T.hp, param: c.param, out: applyOverrides(c, T.outs),
+        hp: c.hp ?? T.hp, param: constantParam(c), out: applyOverrides(c, T.outs),
         // kept so a rebuilt ship can be written back out: a saved connector value
         // is ship state, and the editor rebuilds the whole ship on every edit
         overrides: c.overrides, in: applyOverrides(c, T.ins), t: 0, powered: true,
@@ -59553,9 +59600,10 @@ export default function define(runtime, observer) {
   $def("_TYPE_ALIAS", "TYPE_ALIAS", ["TYPES"], _TYPE_ALIAS);
   $def("_loadShipSpec", "loadShipSpec", ["PORTS","PORT_ALT","TYPE_ALIAS"], _loadShipSpec);
   $def("_geom", "geom", [], _geom);
+  $def("_constantParam", "constantParam", [], _constantParam);
   $def("_rotTile", "rotTile", [], _rotTile);
   $def("_NEIGHBOURS", "NEIGHBOURS", [], _NEIGHBOURS);
-  $def("_Ship", "Ship", ["NEIGHBOURS","TYPES","DIRS","rotTile","geom","DT","UNITS","applyOverrides"], _Ship);
+  $def("_Ship", "Ship", ["NEIGHBOURS","TYPES","DIRS","rotTile","geom","DT","UNITS","applyOverrides","constantParam"], _Ship);
   $def("_World", "World", ["BINOPS","geom","DT","UNITS"], _World);
   $def("_simulate", "simulate", ["World","Ship"], _simulate);
   return main;
@@ -59575,11 +59623,39 @@ const _teamFilter = function _teamFilter(){return(
 {a: "none", b: "hue-rotate(190deg) saturate(1.3)"}
 )};
 
+// The barrel is drawn 64.2 degrees off forward in the art (pivot 111,124 to the
+// far end of the barrel bbox 129.4,107.5 -> 266.2,41.3). Subtracting it makes a
+// turret angle of 0 point where the component points.
+const _ART_TURRET_DEG = function _ART_TURRET_DEG(){return(
+64.2
+)};
+
 const _componentNode = function _componentNode(SYMBOL_FOR, SYMBOLS, TILE){return(
 (c) => {
   const ns = "http://www.w3.org/2000/svg";
   const g = document.createElementNS(ns, "g");
   const spec = SYMBOL_FOR[c.type];
+  // A turret aims. Drawing it as one stamp froze every barrel at the angle the
+  // art happened to be authored at, and drew the sheet's unattached second barrel
+  // next to it. Base and barrel are separate uses in the same frame, and the
+  // barrel turns about the component origin, which is where the gear is.
+  if (c.type === "LaserTurret2" && spec) {
+    const [w, h] = SYMBOLS[spec[0]];
+    const [, ax, ay] = spec;
+    const put = (name, into) => {
+      const u = document.createElementNS(ns, "use");
+      u.setAttribute("href", "#cp-" + name);
+      u.setAttribute("x", -ax); u.setAttribute("y", -ay);
+      u.setAttribute("width", w); u.setAttribute("height", h);
+      into.appendChild(u);
+    };
+    put("turret2-base", g);
+    const barrel = document.createElementNS(ns, "g");
+    put("turret2-barrel", barrel);
+    g.appendChild(barrel);
+    g.barrel = barrel;
+    return g;
+  }
   if (spec) {
     const [name, ax, ay] = spec;
     const [w, h] = SYMBOLS[name];
@@ -59619,20 +59695,125 @@ const _valueNode = function _valueNode(){return(
 }
 )};
 
-const _shipNode = function _shipNode(componentNode, valueNode, TYPES, TILE, teamFilter){return(
+// ConnectionView.cs, verbatim. A connector is tinted from the value flowing
+// through it: white-gold at rest, green as it goes positive, violet as it goes
+// negative, saturating at MAX_SATURATION_VALUE. Misc.Parse reads RRGGBBAA, and
+// Color.Lerp interpolates alpha with the rest, which is why a zero connector is
+// nearly transparent and a live one is not.
+const _CONN_COLOURS = function _CONN_COLOURS(){return(
+{
+  MAX: 100,
+  ZERO_GLOW:  [255, 244, 200, 0x27], NEG_GLOW:  [232,  91, 255, 0xFF],
+  POS_GLOW:   [144, 255,  69, 0xE3],
+  ZERO_SHAPE: [255, 255, 255, 0x6F], NEG_SHAPE: [193, 160, 255, 0xFF],
+  POS_SHAPE:  [186, 255, 140, 0xFF]
+}
+)};
+
+const _connColour = function _connColour(CONN_COLOURS){return(
+(value) => {
+  const C = CONN_COLOURS;
+  const v = Number.isFinite(value) ? value : 0;
+  const t = Math.min(1, Math.abs(v) / C.MAX);
+  const mix = (a, b) => `rgba(${a.slice(0, 3).map((x, i) => Math.round(x + (b[i] - x) * t)).join(",")},` +
+                        `${((a[3] + (b[3] - a[3]) * t) / 255).toFixed(3)})`;
+  return {glow:  mix(C.ZERO_GLOW,  v > 0 ? C.POS_GLOW  : C.NEG_GLOW),
+          shape: mix(C.ZERO_SHAPE, v > 0 ? C.POS_SHAPE : C.NEG_SHAPE)};
+}
+)};
+
+// Which CELL a named port sits on. A connection addresses component ANCHORS, but
+// the connector itself belongs to a cell -- Connection.transform.localPosition is
+// `input.toWp()`, the source connector's own coordinate.
+const _portCell = function _portCell(PORTS, rotTile){return(
+(ship, at, port, kind) => {
+  const c = ship.at(at[0], at[1]);
+  if (!c || c.hp <= 0) return null;
+  const o = (PORTS[c.type] ?? {})[kind === "out" ? "outs" : "ins"]?.[port];
+  if (!o) return null;
+  const [rx, ry] = rotTile(o, c.dir);
+  return [c.px + rx, c.py + ry];
+}
+)};
+
+// The connector sprites are authored at 64 units per tile with a 9-unit end cap,
+// so `connection-N-0` is 64N + 18 wide and its two end circles are 64N apart.
+// ConnectionAtlas.findNearest picks the closest authored length and ConnectionView
+// scales it UNIFORMLY by length/nearest.length -- a 5-tile wire is the 3-tile
+// sprite at 1.67x, arc height and all, which is why long wires bow more.
+const _CONN_ART = function _CONN_ART(){return(
+{unit: 64, cap: 9, lengths: [1, 2, 3]}
+)};
+
+const _wireNode = function _wireNode(CONN_ART, connColour, TILE, SYMBOLS){return(
+() => {
+  const ns = "http://www.w3.org/2000/svg";
+  const g = document.createElementNS(ns, "g");
+  const glow = document.createElementNS(ns, "g");
+  glow.setAttribute("filter", "url(#cp-bloom)");
+  const shape = document.createElementNS(ns, "g");
+  const uses = [];
+  for (const layer of [glow, shape]) {
+    const u = document.createElementNS(ns, "use");
+    u.setAttribute("y", -CONN_ART.cap);          // put the run of the wire on y=0
+    layer.appendChild(u);
+    uses.push(u);
+  }
+  g.appendChild(glow); g.appendChild(shape);
+  // Placed at the SOURCE cell, rotated to face the destination, scaled uniformly.
+  g.place = (ax, ay, bx, by, value) => {
+    const dx = bx - ax, dy = by - ay;
+    const len = Math.hypot(dx, dy) / TILE;                 // in tiles
+    if (!(len > 0)) { g.style.display = "none"; return; }
+    g.style.display = "";
+    const near = CONN_ART.lengths.reduce((p, l) =>
+      Math.abs(l - len) < Math.abs(p - len) ? l : p, CONN_ART.lengths[0]);
+    const k = (len / near) * (TILE / CONN_ART.unit);
+    const name = `#cp-connection-${near}-0`;
+    const box = SYMBOLS[`connection-${near}-0`];
+    for (const u of uses) if (u.getAttribute("href") !== name) {
+      u.setAttribute("href", name);
+      // REQUIRED, same trap as componentNode: a <use> of a <symbol> with no
+      // width/height stretches it to the viewport, which drew every wire as a
+      // smear the size of the battlefield.
+      u.setAttribute("width", box[0]); u.setAttribute("height", box[1]);
+    }
+    g.setAttribute("transform",
+      `translate(${ax.toFixed(1)} ${ay.toFixed(1)}) ` +
+      `rotate(${(Math.atan2(dy, dx) * 180 / Math.PI).toFixed(2)}) ` +
+      `scale(${k.toFixed(4)}) translate(${-CONN_ART.cap} 0)`);
+    const col = connColour(value);
+    glow.style.color = col.glow;
+    shape.style.color = col.shape;
+  };
+  return g;
+}
+)};
+
+const _shipNode = function _shipNode(componentNode, valueNode, TYPES, TILE, teamFilter, ART_TURRET_DEG, wireNode, portCell, PORTS, rotTile){return(
 (ship) => {
   const ns = "http://www.w3.org/2000/svg";
   const root = document.createElementNS(ns, "g");
   root.style.filter = teamFilter[ship.team] ?? "none";
+  const wires = document.createElementNS(ns, "g");        // under the hull, as drawn
   const body = document.createElementNS(ns, "g");
   body.setAttribute("filter", "url(#cp-bloom)");
   const labels = document.createElementNS(ns, "g");
-  root.appendChild(body); root.appendChild(labels);
+  root.appendChild(wires); root.appendChild(body); root.appendChild(labels);
+
+  // One node per connection, built once: reconcile() makes a new shipNode whenever
+  // the Ship object is replaced, and the editor replaces it on every edit.
+  const links = (ship.conns ?? []).map(k => {
+    const n = wireNode();
+    wires.appendChild(n);
+    return {k, n};
+  });
 
   const parts = [];
   for (const c of ship.comps) {
     const holder = document.createElementNS(ns, "g");
-    holder.appendChild(componentNode(c));
+    const art = componentNode(c);
+    holder.appendChild(art);
     body.appendChild(holder);
     const T = TYPES[c.type];
     const ports = [...T.outs.map(p => ["out", p]), ...T.ins.map(p => ["in", p])];
@@ -59640,30 +59821,47 @@ const _shipNode = function _shipNode(componentNode, valueNode, TYPES, TILE, team
       const t = valueNode();
       t.setAttribute("fill", kind === "out" ? "#6dffa8" : "#ff8f6d");
       labels.appendChild(t);
-      return {kind, port, t};
+      // A value belongs to its CONNECTOR, which is where ConnectorCommon.LateUpdate
+      // drew it. Stacking every port over the component anchor 22 units apart put
+      // ProximityMine's 13 components under a pile of twenty numbers, which read
+      // as overlapping parts.
+      const o = (PORTS[c.type] ?? {})[kind === "out" ? "outs" : "ins"]?.[port];
+      const [rx, ry] = o ? rotTile(o, c.dir) : [0, 0];
+      return {kind, port, t, cell: [c.px + rx, c.py + ry]};
     });
-    parts.push({c, holder, texts});
+    parts.push({c, holder, texts, barrel: art.barrel});
   }
 
+  const at = (px, py) => [(px - ship.cx) * TILE, -(py - ship.cy) * TILE];
   const update = () => {
+    for (const {k, n} of links) {
+      const a = portCell(ship, k.from, k.fromPort, "out");
+      const b = portCell(ship, k.to, k.toPort, "in");
+      if (!a || !b) { n.style.display = "none"; continue; }
+      const src = ship.at(k.from[0], k.from[1]);
+      const [ax, ay] = at(a[0], a[1]), [bx, by] = at(b[0], b[1]);
+      n.place(ax, ay, bx, by, src?.out?.[k.fromPort]);
+    }
     root.setAttribute("transform",
       `translate(${(ship.x * TILE).toFixed(1)} ${(ship.y * TILE).toFixed(1)}) ` +
       `rotate(${ship.a.toFixed(2)})`);
-    for (const {c, holder, texts} of parts) {
+    for (const {c, holder, texts, barrel} of parts) {
       const lx = (c.px - ship.cx) * TILE, ly = -(c.py - ship.cy) * TILE;
       holder.setAttribute("transform", `translate(${lx.toFixed(1)} ${ly.toFixed(1)}) rotate(${c.dir})`);
       holder.style.display = c.hp > 0 ? "" : "none";
       holder.style.opacity = c.powered ? 1 : 0.35;
-      texts.forEach(({kind, port, t}, i) => {
+      if (barrel) barrel.setAttribute("transform",
+        `rotate(${((c.turret ?? 0) - ART_TURRET_DEG).toFixed(1)})`);
+      texts.forEach(({kind, port, t, cell}) => {
         if (c.hp <= 0) { t.style.display = "none"; return; }
         const v = kind === "out" ? c.out[port] : c.in[port];
         if (v == null || Number.isNaN(v)) { t.style.display = "none"; return; }
         t.style.display = "";
         t.textContent = Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1);
-        const dy = (i - (texts.length - 1) / 2) * 22;
+        const [cx, cy] = at(cell[0], cell[1]);
         // counter-rotate so numbers stay upright, as they did in screen space
         t.setAttribute("transform",
-          `translate(${lx.toFixed(1)} ${(ly + dy).toFixed(1)}) rotate(${(-ship.a).toFixed(2)})`);
+          `translate(${cx.toFixed(1)} ${cy.toFixed(1)}) rotate(${(-ship.a).toFixed(2)})`);
       });
     }
   };
@@ -59890,14 +60088,20 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
   for (const n of ["SYMBOLS", "SYMBOL_FOR", "TILE", "symbolSheet", "sprite", "use"])
     main.define(n, ["module @tomlarkworthy/corepox-assets", "@variable"], (_, v) => v.import(n, _));
-  for (const n of ["Ship", "World", "TYPES", "geom", "DT", "UNITS", "simulate"])
+  for (const n of ["Ship", "World", "TYPES", "PORTS", "rotTile", "geom", "DT", "UNITS", "simulate"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
 
   $def("_title", "title", ["md"], _title);
   $def("_teamFilter", "teamFilter", [], _teamFilter);
   $def("_componentNode", "componentNode", ["SYMBOL_FOR", "SYMBOLS", "TILE"], _componentNode);
   $def("_valueNode", "valueNode", [], _valueNode);
-  $def("_shipNode", "shipNode", ["componentNode","valueNode","TYPES","TILE","teamFilter"], _shipNode);
+  $def("_ART_TURRET_DEG", "ART_TURRET_DEG", [], _ART_TURRET_DEG);
+  $def("_CONN_COLOURS", "CONN_COLOURS", [], _CONN_COLOURS);
+  $def("_connColour", "connColour", ["CONN_COLOURS"], _connColour);
+  $def("_portCell", "portCell", ["PORTS","rotTile"], _portCell);
+  $def("_CONN_ART", "CONN_ART", [], _CONN_ART);
+  $def("_wireNode", "wireNode", ["CONN_ART","connColour","TILE","SYMBOLS"], _wireNode);
+  $def("_shipNode", "shipNode", ["componentNode","valueNode","TYPES","TILE","teamFilter","ART_TURRET_DEG","wireNode","portCell","PORTS","rotTile"], _shipNode);
   $def("_starfield", "starfield", [], _starfield);
   $def("_battlefield", "battlefield", ["shipNode","starfield","symbolSheet","TILE","UNITS"], _battlefield);
   $def("_SEEKER", "SEEKER", [], _SEEKER);
@@ -60254,6 +60458,18 @@ is place a core, protect it, aim by hand, wire a constant to an engine, wire a r
 then fight. Ships and objectives are recovered from the original; positions are authored.`
 )};
 
+// `live` is MissionController.liveMode, read out of each binary scene with UnityPy
+// (tools/corepox-scene-transforms.py installs the reader). The C# only comments the
+// field -- "Is play/pause a thing?" -- and UIState.Idle spends it:
+//
+//     if (settings.liveMode) { Controller.Instance.play(); this.setBottomLeft(null); }
+//
+// A live mission has no Play button and is already running, so a change to a
+// Constant shows up in the numbers immediately. That is every mission whose lesson
+// is a value moving -- the two wiring tutorials, manual aim, and Avoid. The fights
+// are the paused ones, and their pause is a hard stop: MissionController never sets
+// kinematicPauses, so Controller.pause() sets Time.timeScale = 0.
+//
 // The objective kinds the original actually had, one per C# class:
 //   place    a component of this type exists on the player ship
 //   connect  this output cell is wired to this input cell   (ConnectComponentsObjective)
@@ -60275,7 +60491,7 @@ const _SHIPS = function _SHIPS(){return(
   manualAim: {name: "manual_aim", components: [
     {type: "Brain", pos: [1, 0]},
     {type: "LaserTurret2", pos: [0, 1], overrides: [{name: "fire_input", value: 1}]},
-    {type: "Constant", pos: [0, 0], param: "0"}],
+    {type: "Constant", pos: [0, 0], param: ""}],
     connections: [{from: [0, 0], fromPort: "out", to: [0, 1], toPort: "angle"}]},
 
   liteCore: {name: "LiteDisconnectedRocketCore", components: [
@@ -60284,12 +60500,14 @@ const _SHIPS = function _SHIPS(){return(
 
   rocketCore: {name: "DisconnectedRocketCore", components: [
     {type: "Brain", pos: [0, 0]}, {type: "Engine", pos: [0, -1]},
-    {type: "Constant", pos: [0, 1], param: "0"}], connections: []},
+    {type: "Constant", pos: [0, 1], param: ""}], connections: []},
 
   // Aim's player ship: an armoured box with a turret and a radar, unwired -- the
   // whole mission is to connect the radar's angle to the turret's angle.
   aimPlayer: {name: "player", components: [
-    {type: "Brain", pos: [-1, 0]}, {type: "LaserTurret2", pos: [0, 0]},
+    {type: "Brain", pos: [-1, 0]},
+    {type: "LaserTurret2", pos: [0, 0],
+     overrides: [{name: "rot_input", value: 45}, {name: "fire_input", value: 1}]},
     {type: "Radar", pos: [0, -3]},
     ...[[2,-4],[2,-3],[2,-2],[2,-1],[2,0],[1,-4],[0,-4],
         [-1,-1],[-1,-2],[-1,-3],[-1,-4]].map(p => ({type: "Armour", pos: p}))],
@@ -60307,20 +60525,36 @@ const _SHIPS = function _SHIPS(){return(
 
   // Ten explosives around a radar: it does not chase, it just has to be near you.
   proximityMine: {name: "ProximityMine", components: [
-    {type: "Radar", pos: [1, 0], dir: "left"},
-    {type: "Binary", pos: [0, -1], param: "MINUS"},
-    {type: "Constant", pos: [0, 2], param: "6"},
+    {type: "Radar", pos: [1, 0], dir: "left",
+     overrides: [{name: "distance", value: Infinity}, {name: "angle", value: 90}]},
+    {type: "Binary", pos: [0, -1], param: "MINUS",
+     overrides: [{name: "a", value: 4}, {name: "b", value: Infinity},
+                 {name: "output", value: Infinity}]},
+    // param "" + an `output` override of 4 is the old constants-as-overrides
+    // format; ConstantFn.deserialize reads the override. The threshold is 4
+    // world units, not the 6 guessed here before the scene JSON was recovered.
+    {type: "Constant", pos: [0, 2], param: "", overrides: [{name: "output", value: 4}]},
     ...[[-1,2],[1,2],[2,1],[2,0],[2,-1],[1,-2],[-1,-2],[-2,-1],[-2,1],[-2,0]]
-        .map(p => ({type: "Explosive", pos: p}))],
+        .map(p => ({type: "Explosive", pos: p,
+          // only the two the Binary drives carry a saved input, and it is inf
+          ...(Math.abs(p[0]) === 1 && p[1] === -2
+              ? {overrides: [{name: "input", value: Infinity}]} : {})}))],
     // MINUS computes a - b, so the CONSTANT has to be `a` and the distance `b`:
-    // 6 - dist goes positive only inside 6 world units (9.4 tiles). Wired the
+    // 4 - dist goes positive only inside 4 world units (6.3 tiles). Wired the
     // other way the mine reads dist - 6 and detonates the instant it can see
     // anything at all, which is what it did until 2026-08-19.
+    //
+    // FOUR wires, not twelve. The scene has exactly these, cell-addressed:
+    //   {from:[0,2],to:[-1,-1]}  {from:[1,0],to:[1,-1]}
+    //   {from:[0,-2],to:[-1,-2]} {from:[0,-2],to:[1,-2]}
+    // Only the two bombs at (+-1,-2) are driven; the other eight go up in the
+    // chain reaction. Driving all ten -- which this did until 2026-08-19 -- made
+    // the mine detonate as one ring instead of a pair plus a cascade.
     connections: [
       {from: [0, 2], fromPort: "out", to: [0, -1], toPort: "a"},
       {from: [1, 0], fromPort: "dist", to: [0, -1], toPort: "b"},
-      ...[[-1,2],[1,2],[2,1],[2,0],[2,-1],[1,-2],[-1,-2],[-2,-1],[-2,1],[-2,0]]
-        .map(p => ({from: [0, -1], fromPort: "out", to: p, toPort: "in"}))]},
+      {from: [0, -1], fromPort: "out", to: [-1, -2], toPort: "in"},
+      {from: [0, -1], fromPort: "out", to: [1, -2], toPort: "in"}]},
 
   // Assets/prefabs/ships/Rocket.prefab, verbatim: one Explosive, one Engine with
   // its input latched at 40, no wiring. It flies straight and it is a bomb, which
@@ -60330,12 +60564,22 @@ const _SHIPS = function _SHIPS(){return(
     {type: "Engine", pos: [0, -1], overrides: [{name: "input", value: 40}]}],
     connections: []},
 
+  // SideShooter.unity. The Lazer's input is latched at 1, so this ship fires from
+  // the first tick with nothing wired -- which is the whole point of a side
+  // shooter, and it was inert here until 2026-08-19.
   shooter: {name: "shooter", components: [
-    {type: "Brain", pos: [0, 0]}, {type: "Lazer", pos: [0, 1]},
+    {type: "Brain", pos: [0, 0]},
+    {type: "Lazer", pos: [0, 1], overrides: [{name: "input", value: 1}]},
     {type: "Explosive", pos: [1, 0]}], connections: []},
 
+  // TwinTurrets.unity, verbatim. The turret's fire_input is LATCHED at 1 and its
+  // barrel starts at -15.7 degrees -- transcribing the components and the one wire
+  // but not the overrides is why both posts tracked the player and never shot.
   laserpost: {name: "laserpost", components: [
-    {type: "Radar", pos: [0, 0]}, {type: "LaserTurret2", pos: [0, 3]},
+    {type: "Radar", pos: [0, 0]},
+    {type: "LaserTurret2", pos: [0, 3],
+     overrides: [{name: "rot_input", value: -15.73702621459961},
+                 {name: "fire_input", value: 1}]},
     {type: "Brain", pos: [2, 0]},
     {type: "Explosive", pos: [2, 1]}, {type: "Explosive", pos: [2, 2]},
     {type: "Explosive", pos: [2, 3]}],
@@ -60390,7 +60634,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
   // objective text nor a campaign slot; one of their composites is called
   // "UnfinishedOrbDrone", which is a fair summary.
   {
-    id: "PlaceBrain", title: "Core",
+    id: "PlaceBrain", live: false, title: "Core",
     brief: "A ship is whatever you bolt to a core. Place one, then press play.",
     ship: null,
     inventory: [{type: "Brain", n: 1}],
@@ -60404,7 +60648,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     span: 22
   },
   {
-    id: "Cocoon", title: "Cocoon",
+    id: "Cocoon", live: false, title: "Cocoon",
     brief: "Two bombs, north and south, on a one-second fuse. Armour is all you get.",
     ship: SHIPS.lonelyCore,
     inventory: [{type: "Armour", n: 2}],
@@ -60424,7 +60668,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     span: 30
   },
   {
-    id: "ConnectionLite", title: "Wire",
+    id: "ConnectionLite", live: true, title: "Wire",
     brief: "The constant already reads 100. Nothing happens until it reaches the engine.",
     ship: SHIPS.liteCore,
     inventory: [],
@@ -60443,7 +60687,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     span: 46
   },
   {
-    id: "ManualAim", title: "Manual aim",
+    id: "ManualAim", live: true, title: "Manual aim",
     brief: "The turret takes an angle. A constant is an angle you type in.",
     ship: SHIPS.manualAim,
     inventory: [],
@@ -60465,7 +60709,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     span: 34
   },
   {
-    id: "Connection", title: "Throttle",
+    id: "Connection", live: true, title: "Throttle",
     brief: "Same wire, but this constant reads zero. A number is a throttle.",
     ship: SHIPS.rocketCore,
     inventory: [],
@@ -60485,7 +60729,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     span: 52
   },
   {
-    id: "Aim", title: "Aim",
+    id: "Aim", live: false, title: "Aim",
     brief: "The radar knows where they are. The turret does not, until you tell it.",
     ship: SHIPS.aimPlayer,
     inventory: [],
@@ -60519,7 +60763,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     span: 56
   },
   {
-    id: "Avoid", title: "Avoid",
+    id: "Avoid", live: true, title: "Avoid",
     brief: "It steers. So does the thing with ten bombs on it.",
     ship: SHIPS.drifter,
     inventory: [],
@@ -60551,7 +60795,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
   },
   // --- not in the shipped campaign --------------------------------------------
   {
-    id: "SideShooter", title: "Side shooter",
+    id: "SideShooter", live: false, title: "Side shooter",
     brief: "It only fires forwards. You get to decide where forwards points.",
     ship: SHIPS.shooter,
     inventory: [{type: "Engine", n: 2}, {type: "Constant", n: 2}],
@@ -60575,7 +60819,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     span: 46
   },
   {
-    id: "TwinTurrets", title: "Twin turrets",
+    id: "TwinTurrets", live: false, title: "Twin turrets",
     brief: "Two posts, each tracking you, each wearing its own bombs.",
     ship: SHIPS.shooter,
     inventory: [{type: "Engine", n: 2}, {type: "Constant", n: 2}, {type: "Armour", n: 4}],
@@ -60589,17 +60833,19 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
       {kind: "destroy", team: "enemy", type: "Brain", n: 2, text: "destroy [!enemy cores]"},
       {kind: "defend", type: "Brain", text: "defend your [core]"}
     ],
-    // Found by tools/corepox-solve.ts, not by hand: 48 of the 140 legal builds the
-    // inventory and envelope allow can win, this is the quickest at 15.0s. The
-    // engine sits off to one side, so the ship arrives yawing and the fixed Lazer
-    // sweeps -- which is the same lesson SideShooter teaches, under fire.
-    solution: {components: [{type: "Brain", pos: [0, 0]}, {type: "Lazer", pos: [0, 1]},
-      {type: "Explosive", pos: [1, 0]}, {type: "Engine", pos: [-2, 0]},
-      {type: "Constant", pos: [2, 0], param: "30"},
-      {type: "Armour", pos: [-1, 0]}, {type: "Armour", pos: [0, -1]},
-      {type: "Armour", pos: [1, -1]}, {type: "Armour", pos: [-1, -1]}],
-      connections: [{from: [2, 0], fromPort: "out", to: [-2, 0], toPort: "in"},
-                    {from: [2, 0], fromPort: "out", to: [0, 1], toPort: "in"}]},
+    // Found by tools/corepox-solve.ts, not by hand. Re-solved 2026-08-19 after the
+    // posts' fire_input override was restored: the previous reference build now
+    // LOSES at 12.7s, and the winning set shrank from 48 of 140 legal builds to
+    // 16. This is the quickest at 12.5s -- a centre-mounted engine and full
+    // throttle, because with both posts actually shooting the level is a race.
+    solution: {components: [{type: "Brain", pos: [0, 0]},
+      {type: "Lazer", pos: [0, 1], overrides: [{name: "input", value: 1}]},
+      {type: "Explosive", pos: [1, 0]}, {type: "Engine", pos: [0, -1]},
+      {type: "Constant", pos: [-2, 0], param: "100"},
+      {type: "Armour", pos: [-1, 0]}, {type: "Armour", pos: [1, -1]},
+      {type: "Armour", pos: [-1, -1]}, {type: "Armour", pos: [1, 1]}],
+      connections: [{from: [-2, 0], fromPort: "out", to: [0, -1], toPort: "in"},
+                    {from: [-2, 0], fromPort: "out", to: [0, 1], toPort: "in"}]},
     spoils: [],
     span: 62
   }
@@ -60920,8 +61166,12 @@ const _viewof_game = function _viewof_game(
     }
     return out;
   };
+  // Editing is allowed while the match runs. MissionController leaves buildOnce
+  // false for every campaign mission, so the build UI is never hidden after play,
+  // and the four live missions never have a build phase at all.
+  const editable = () => S.state === "build" || S.state === "playing";
   const clickTile = (px, py) => {
-    if (S.state !== "build") return;
+    if (!editable()) return;
     if (mode === "build") { place(px, py); }
     else if (mode === "connect") {
       const here = portsAt(px, py);
@@ -60969,6 +61219,7 @@ const _viewof_game = function _viewof_game(
   const play = () => {
     if (S.state !== "build") return;
     S.state = "playing";
+    picked = null; wireFrom = null;
     S.enemyWas = new Map();
     const tick = () => {
       if (stop || S.state !== "playing") return;
@@ -60996,6 +61247,8 @@ const _viewof_game = function _viewof_game(
          : (MISSIONS[mi].allow?.modify) ? "modify" : "build";
     picked = null; wireFrom = null; selected = null;
     render();
+    // liveMode: no build phase and no Play button, the clock is already running.
+    if (MISSIONS[mi].live) play();
   };
 
   // ---- painting -------------------------------------------------------------
@@ -61015,7 +61268,7 @@ const _viewof_game = function _viewof_game(
         "font-size": 34, "font-family": "ui-monospace, monospace", "text-anchor": "middle"});
       t.textContent = z.label ?? "zone";
     }
-    if (S.state !== "build") return;
+    if (!editable()) return;
     for (const [ex, ey] of S.mission.envelope ?? []) {
       if (occupied(ex, ey)) continue;
       const [vx, vy] = tileToView(ex, ey);
@@ -61082,10 +61335,13 @@ const _viewof_game = function _viewof_game(
       <b style="font-size:15px">${m.title}</b>
       <span style="color:#8b9bb0">${m.brief}</span></div>`);
 
-    if (!view || view.mission !== m) {
+    // Keyed on the SESSION, not the mission. `battlefield` closes over the world it
+    // was handed, so retrying a mission built a fresh world and kept drawing the
+    // old one -- the objectives reset, the play area did not.
+    if (!view || view.sess !== S) {
       stage.textContent = "";
       view = battlefield(S.world, {span: m.span ?? 40});
-      view.mission = m;
+      view.sess = S;
       const ns = "http://www.w3.org/2000/svg";
       overlay = document.createElementNS(ns, "g");
       view.svg.appendChild(overlay);
@@ -61097,9 +61353,6 @@ const _viewof_game = function _viewof_game(
       hud = htl.html`<div style="position:absolute;left:14px;top:12px;display:flex;
         flex-direction:column;gap:5px;pointer-events:none;text-shadow:0 1px 4px #000"></div>`;
       stage.append(hud);
-    } else {
-      // same mission, new session: point the view at the new world
-      view.svg.parentNode && null;
     }
     // Editing wants a close frame on the ship; a running match wants everything
     // that matters in shot, including a jump zone 26 tiles away that nothing on
@@ -61113,14 +61366,16 @@ const _viewof_game = function _viewof_game(
 
     bar.textContent = "";
     const allow = m.allow ?? {};
-    if (S.state === "build") {
+    if (editable()) {
       if (allow.build)   bar.append(btn("build",   mode === "build",   () => { mode = "build"; render(); }));
       if (allow.connect) bar.append(btn("connect", mode === "connect", () => { mode = "connect"; wireFrom = null; render(); }));
       if (allow.rotate)  bar.append(btn("rotate",  mode === "rotate",  () => { mode = "rotate"; render(); }));
       if (allow.modify)  bar.append(btn("modify",  mode === "modify",  () => { mode = "modify"; render(); }));
+    }
+    if (S.state === "build") {
       bar.append(btn("▶ play", false, play, "#8fd0ff"));
     } else if (S.state === "playing") {
-      clock = htl.html`<span style="color:#8fd0ff">running · ${S.world.t.toFixed(1)}s</span>`;
+      clock = htl.html`<span style="color:#8fd0ff">${m.live ? "live" : "running"} · ${S.world.t.toFixed(1)}s</span>`;
       bar.append(clock);
       bar.append(btn("↺ retry", false, () => reset(mi), "#ff8f6d"));
     } else {
@@ -61138,7 +61393,7 @@ const _viewof_game = function _viewof_game(
     </select>`);
 
     side.textContent = "";
-    if (S.state === "build" && mode === "build" && S.inventory.length)
+    if (editable() && mode === "build" && S.inventory.length)
       side.append(htl.html`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <span style="color:#8b9bb0">parts</span>
         ${S.inventory.map(i => btn(`${i.type} ×${i.n}`, picked === i.type,
@@ -61146,11 +61401,11 @@ const _viewof_game = function _viewof_game(
         <span style="color:#8b9bb0">${picked
           ? "\u2192 now click a dashed cell"
           : "pick a part, then click a dashed cell"}</span></div>`);
-    if (S.state === "build" && mode === "connect")
+    if (editable() && mode === "connect")
       side.append(htl.html`<div style="color:#5b6b7d">${wireFrom
         ? `wiring from ${wireFrom.px},${wireFrom.py} (${wireFrom.port}) — click an input`
         : "click a component with an output, then one with an input"}</div>`);
-    if (S.state === "build" && mode === "modify" && selected) {
+    if (editable() && mode === "modify" && selected) {
       const c = S.player.at(selected.px, selected.py);
       side.append(htl.html`<div style="display:flex;gap:8px;align-items:center">
         <span style="color:#5b6b7d">${c.type} at ${selected.px},${selected.py}</span>
