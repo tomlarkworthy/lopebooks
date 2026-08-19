@@ -59765,6 +59765,16 @@ const _shipNode = function _shipNode(componentNode, valueNode, TYPES, TILE, team
 }
 )};
 
+// Stars are at infinity: they do not move when the camera moves and they do not
+// change size when it zooms. Reported as "the star map resizes but I think that
+// wouldn't if the stars were infinity away" -- the field used to be a plain <g> in
+// user space, so it scaled and slid with every viewBox write, and every reframe
+// during a match visibly breathed.
+//
+// So it is laid out in the 0..w x 0..h box the view was CONSTRUCTED with, and the
+// caller maps that box onto the current viewBox on every draw. Fixed on screen,
+// no edges to reach, and the cost is that a moving ship gets no parallax from the
+// background -- the camera follows it, so there was little to begin with.
 const _starfield = function _starfield(){return(
 (w, h, n = 260, seed = 7) => {
   const ns = "http://www.w3.org/2000/svg";
@@ -59773,7 +59783,7 @@ const _starfield = function _starfield(){return(
   const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
   for (let i = 0; i < n; i++) {
     const c = document.createElementNS(ns, "circle");
-    c.setAttribute("cx", (rnd() - 0.5) * w); c.setAttribute("cy", (rnd() - 0.5) * h);
+    c.setAttribute("cx", rnd() * w); c.setAttribute("cy", rnd() * h);
     c.setAttribute("r", rnd() * 1.6 + 0.3);
     c.setAttribute("fill", "#cfe6ff");
     c.setAttribute("opacity", (rnd() * 0.5 + 0.08).toFixed(2));
@@ -59792,7 +59802,8 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   svg.setAttribute("viewBox", `${-W/2} ${-H/2} ${W} ${H}`);
   svg.setAttribute("width", "100%");
   svg.style.cssText = `display:block;background:#05070a;border-radius:6px;aspect-ratio:${width}/${height}`;
-  svg.appendChild(starfield(W, H));
+  const stars = starfield(W, H);
+  svg.appendChild(stars);
 
   const hulls = document.createElementNS(ns, "g");
   const locks = document.createElementNS(ns, "g");     // radar -> what it is looking at
@@ -59852,9 +59863,14 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
       pts.push([ox * TILE, oy * TILE]);
     }
     for (const f of api.focus) pts.push([f[0] * TILE, f[1] * TILE]);
-    const write = () => svg.setAttribute("viewBox",
-      `${(cam.cx - cam.w / 2).toFixed(0)} ${(cam.cy - cam.h / 2).toFixed(0)} ` +
-      `${cam.w.toFixed(0)} ${cam.h.toFixed(0)}`);
+    const write = () => {
+      const x = cam.cx - cam.w / 2, y = cam.cy - cam.h / 2;
+      svg.setAttribute("viewBox",
+        `${x.toFixed(0)} ${y.toFixed(0)} ${cam.w.toFixed(0)} ${cam.h.toFixed(0)}`);
+      stars.setAttribute("transform",
+        `translate(${x.toFixed(1)} ${y.toFixed(1)}) ` +
+        `scale(${(cam.w / W).toFixed(4)} ${(cam.h / H).toFixed(4)})`);
+    };
     if (!pts.length) {
       // Nothing to frame: the first mission starts you with an EMPTY ship, so
       // there is no live component anywhere and the board would otherwise ignore
@@ -59933,13 +59949,28 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   // preventDefault, so the page does not scroll under the pointer at the same
   // time; snap rather than ease, because a viewBox that is still moving when the
   // click lands puts the hit a tile out in every editor built on this.
+  // A wheel arrives many times per frame and each event used to draw, which is
+  // where "super janky" came from: a mouse notch is deltaY 100, so several
+  // events between two frames compounded into one visible jump, and every one of
+  // them reconciled and redrew every ship. The events accumulate into a target
+  // instead, and one rAF eases toward it -- the frame still SNAPS to whatever
+  // zoom the ease is at, so the click map an editor reads is always the viewBox
+  // on screen, never one it is on the way to.
+  let zoomTo = 1, zoomRaf = null;
+  const settle = () => {
+    api.zoom += (zoomTo - api.zoom) * 0.3;
+    const done = Math.abs(zoomTo - api.zoom) < 1e-3;
+    if (done) api.zoom = zoomTo;
+    draw(true);
+    zoomRaf = done ? null : requestAnimationFrame(settle);
+  };
   svg.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     const dy = ev.deltaMode === 1 ? ev.deltaY * 16
              : ev.deltaMode === 2 ? ev.deltaY * (svg.clientHeight || 400)
              : ev.deltaY;
-    api.zoom = Math.min(8, Math.max(0.15, api.zoom * Math.exp(-dy * 0.0015)));
-    draw(true);
+    zoomTo = Math.min(8, Math.max(0.15, zoomTo * Math.exp(-dy * 0.0008)));
+    if (!zoomRaf) zoomRaf = requestAnimationFrame(settle);
   }, {passive: false});
 
   draw();
