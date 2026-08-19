@@ -58492,12 +58492,23 @@ const _TILE = function _TILE(){return(
 
 // component type -> [symbol, anchorX, anchorY] where the anchor is the point in
 // symbol units that sits at the centre of the component's origin tile.
+//
+// These were eyeballed off the traces until the shipped APK turned up. A Unity
+// Sprite stores m_Pivot -- the fraction of its rect the Transform sits on -- which
+// is the anchor by definition, so anchor = (pivot.x * W, (1 - pivot.y) * H).
+// tools/corepox-anchor-truth.ts prints have-vs-want; Binary, Radar and Hyperdrive
+// were out by 0.5-1.2 tiles and are now the pivot values. Brain, Constant,
+// Explosive and Armour were already exact (all pivot 0.5,0.5). Engine's want is
+// (28, 32.1) and it is left alone: that trace is 13% off uniform against the
+// sprite (49.8 svg/tile across, 56.4 down), so its 4-unit offset is inside the
+// trace's own error. LaserTurret2 is composite -- cap, gear and barrel are three
+// sprites in one trace -- so no single pivot maps onto it.
 const _SYMBOL_FOR = function _SYMBOL_FOR(){return(
 {
   Brain:        ["brain",        41,   38.5],
   Constant:     ["constant-3",   28,   28],
-  Binary:       ["binary",       96.5, 100],
-  Radar:        ["radar",        59,   85.5],
+  Binary:       ["binary",       96.5,  34.1],
+  Radar:        ["radar",        31.9, 139.4],
   Engine:       ["engine-3",     28,   28],
   Lazer:        ["lazer-2",      28,   141],
   Explosive:    ["explosive-3",  28,   28],
@@ -58510,7 +58521,7 @@ const _SYMBOL_FOR = function _SYMBOL_FOR(){return(
   // contradicts TYPES.pivot [0.5, 0.5], which came from recollection; the art is
   // the measurable one, and the pivot below is the one the barrel turns about.
   LaserTurret2: ["turret2",      111,  124],
-  Hyperdrive:   ["hyperdrive",   124,  149.5]
+  Hyperdrive:   ["hyperdrive",   153.8, 155.5]
 }
 )};
 
@@ -58540,6 +58551,20 @@ const _symbolSheet = function _symbolSheet(SHEET){
     };
     part("cp-turret2-barrel", 0, 8);
     part("cp-turret2-base", 18, 34);
+  }
+  // The binary trace is a y-mirror of the sprite the game ships. binary_600x408
+  // has its bar along the TOP and the stem hanging BELOW it (pivot 0.500,0.734 --
+  // most of the drawing is under the anchor); the trace has the stem above the bar,
+  // so the odd cell pointed forward while occupancy [[0,0],[-1,0],[1,0],[0,-1]]
+  // puts it aft. Reported as "the binary looks flipped in the Y". Mirrored back at
+  // load, which also lets SYMBOL_FOR.Binary take its anchor from the sprite pivot
+  // like every other type.
+  const bin = sheet.querySelector("#cp-binary");
+  if (bin) {
+    const flip = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    flip.setAttribute("transform", "matrix(1 0 0 -1 0 128)");   // SYMBOLS.binary[1]
+    while (bin.firstChild) flip.appendChild(bin.firstChild);
+    bin.appendChild(flip);
   }
   // The connector sprites are stroked with a literal magenta. ConnectionView tints
   // them per frame from the connector's value, so the stroke has to be inheritable
@@ -58724,7 +58749,12 @@ const _TYPES = function _TYPES(){return(
                  ins: [], outs: []},
   Armour:       {hp: 100, pwr: 0, tiles: [[0,0]], ins: [],                    outs: []},
   // 12 cells, verbatim from TurretFn.Awake() -- the SHIPPED occupancy, with the
-  // ASCII in that comment matching cell for cell:
+  // ASCII in that comment matching cell for cell. LaserTurret2.prefab serialises
+  // only 10 (no y=3 row) and is the stale one: Awake() runs after deserialisation
+  // and overwrites the field, and its own comment says why the prefab still holds
+  // a copy -- "we still had to save the prefab with occupancy prepopulated".
+  // TurretFn is the only component that does this (CompositeFn builds occupancy
+  // from its children); for every other type the prefab is the definition.
   //    XX        y=3      x=0..1
   //   XXXX       y=1..2   x=-1..2
   //    0X        y=0      x=0..1   <- the 2x1 BASE Tom described
@@ -58736,15 +58766,18 @@ const _TYPES = function _TYPES(){return(
                  tiles: [[-1,1],[-1,2],[0,1],[0,2],[1,1],[1,2],[2,1],[2,2],
                          [0,0],[1,0],[0,3],[1,3]],
                  ins: ["fire","angle"], outs: []},
-  // A 2x4 hammer head joined to a 3x2 stem, joints placed sparsely (Tom). Rests
-  // entirely on Tom: only 57 instances exist and every anchor scores ~50% overlap
-  // against a 46.9% baseline, so the corpus cannot resolve it. Art is 248x299
-  // (~4x4.8 cells), consistent with 4 wide x 5 long.
+  // Straight out of Hyperdrive.prefab (tools/corepox-component-truth.py). Was a
+  // guess: "a 2x4 hammer head joined to a 3x2 stem, joints placed sparsely" (Tom),
+  // with no joint table at all, because only 57 instances exist and every anchor
+  // scores ~50% overlap against a 46.9% baseline -- the corpus cannot resolve it.
+  // The guessed shape was right and the ORIGIN was not: the head is at y=1..2 and
+  // the stem at y=-2..0, so every cell moved 2 forward and the anchor is in the
+  // stem's forward row, not its aft-left corner. Confirmed twice over -- the
+  // sprite is 4.13 x 4.92 tiles against this 4 x 5 bounding box, and its pivot
+  // lands on cell (0,0) to within 0.1 of a tile (tools/corepox-anchor-truth.ts).
   Hyperdrive:   {hp: 200, pwr: 4, ins: ["in"], outs: [],
-                 // Hammerhead FORWARD, stem aft (Tom, on the drawing). Was drawn
-                 // head-aft; every y is negated from that reading.
-                 tiles: [[-1,4],[0,4],[1,4],[2,4],[-1,3],[0,3],[1,3],[2,3],
-                         [0,2],[1,2],[0,1],[1,1],[0,0],[1,0]]},
+                 tiles: [[-2,2],[-1,2],[0,2],[1,2],[-2,1],[-1,1],[0,1],[1,1],
+                         [-1,0],[0,0],[-1,-1],[0,-1],[-1,-2],[0,-2]]},
   Composite:    {hp: 25, pwr: 1,  tiles: [[0,0]], ins: [],                    outs: []}
 }
 )};
@@ -58843,8 +58876,16 @@ const _JOINTS = function _JOINTS(){return(
   // out". A 2x1 perimeter is 12 slots; opening one long side leaves exactly 8.
   // This entry was already engine frame, which is why the art-to-engine fit could
   // not place it and the component page showed the turret with no joints at all.
-  LaserTurret2: {"0,0": {S: [0, 1], W: [0, 1]}, "1,0": {S: [0, 1], E: [0, 1]}}
-  // Hyperdrive: still not recovered.
+  LaserTurret2: {"0,0": {S: [0, 1], W: [0, 1]}, "1,0": {S: [0, 1], E: [0, 1]}},
+  // Recovered from Hyperdrive.prefab, which is also where the footprint above came
+  // from. 16 slots, and "sparse" was the right word: the 4-wide head offers two
+  // slots on its nose and the two outer columns' aft faces, the rest run down the
+  // stem's flanks. Tom's LaserTurret2 entry above is the same shape of claim and
+  // the prefab agrees with it, which is the check on this one.
+  Hyperdrive: {"-2,1": {S: [0, 1], W: [0]},   "-1,2": {N: [1]},
+               "-1,0": {W: [0, 1]},           "0,2":  {N: [0]},
+               "-1,-1": {W: [0, 1]},          "0,0":  {E: [0, 1]},
+               "0,-1": {E: [0, 1]},           "1,1":  {E: [0], S: [0, 1]}}
 }
 )};
 
@@ -60513,15 +60554,22 @@ const _SHIPS = function _SHIPS(){return(
         [-1,-1],[-1,-2],[-1,-3],[-1,-4]].map(p => ({type: "Armour", pos: p}))],
     connections: []},
 
+  // The wiring is the whole mission and it was transcribed wrong. The scene sends
+  // the constant to the MINUS's `b` with `a` left unwired, so out = 0 - c: one
+  // engine gets +c and the other -c and a single number STEERS. Ours fed `a`
+  // (out = c - 0) and drove both engines the same way, which is a throttle, not a
+  // steering wheel -- the ship could only go straight, in a mission called Avoid.
+  // Recovered by resolving the scene's cell-addressed wires through the engine's
+  // own loadShipSpec (tools/corepox-spec-fidelity.ts).
   drifter: {name: "SteerableDrifterV2", components: [
     {type: "Brain", pos: [1, 0]},
     {type: "Binary", pos: [0, -1], dir: "down", param: "MINUS"},
     {type: "Engine", pos: [-2, -1]}, {type: "Engine", pos: [2, -1]},
     {type: "Constant", pos: [-1, 0], param: "0"}],
     connections: [
-      {from: [-1, 0], fromPort: "out", to: [0, -1], toPort: "a"},
-      {from: [0, -1], fromPort: "out", to: [-2, -1], toPort: "in"},
-      {from: [-1, 0], fromPort: "out", to: [2, -1], toPort: "in"}]},
+      {from: [-1, 0], fromPort: "out", to: [0, -1], toPort: "b"},
+      {from: [0, -1], fromPort: "out", to: [2, -1], toPort: "in"},
+      {from: [-1, 0], fromPort: "out", to: [-2, -1], toPort: "in"}]},
 
   // Ten explosives around a radar: it does not chase, it just has to be near you.
   proximityMine: {name: "ProximityMine", components: [
@@ -60654,9 +60702,13 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     inventory: [{type: "Armour", n: 2}],
     envelope: [[0, -1], [0, 1]],
     allow: {build: true},
+    // Cocoon.unity, not authored: the bombs are offset a tile to either side and
+    // sit 3.12 tiles out, not 3. The brief says north and south and they are, but
+    // the offset is what makes armour on [0,-1] and [0,1] a real choice rather
+    // than a straight-line block.
     enemies: [
-      {spec: SHIPS.delayBomb, x: 0, y: -3, a: 180, team: "enemy"},
-      {spec: SHIPS.delayBomb, x: 0, y: 3, a: 0, team: "enemy"}
+      {spec: SHIPS.delayBomb, x: -1, y: 3.12, a: 180, team: "enemy"},
+      {spec: SHIPS.delayBomb, x: 1, y: -3.12, a: 0, team: "enemy"}
     ],
     objectives: [
       {kind: "defend", type: "Brain", text: "protect [core] from [!mines]"},
@@ -60683,7 +60735,8 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     solution: {components: [{type: "Brain", pos: [0, 0]}, {type: "Engine", pos: [0, -1]},
       {type: "Constant", pos: [0, 1], param: "100"}],
       connections: [{from: [0, 1], fromPort: "out", to: [0, -1], toPort: "in"}]},
-    spoils: [{type: "Engine", n: 1}],
+    // ConnectionMission.cs:78-81, and both connection scenes use that subclass.
+    spoils: [{type: "Constant", n: 1}, {type: "Engine", n: 1}],
     span: 46
   },
   {
@@ -60705,7 +60758,9 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
       {type: "LaserTurret2", pos: [0, 1], overrides: [{name: "fire_input", value: 1}]},
       {type: "Constant", pos: [0, 0], param: "45"}],
       connections: [{from: [0, 0], fromPort: "out", to: [0, 1], toPort: "angle"}]},
-    spoils: [{type: "Constant", n: 2}],
+    // ManualAim has no mission subclass, so its SpoilsOverride is the whole story:
+    // one LaserTurret2 (data/corepox/mission-settings.json).
+    spoils: [{type: "LaserTurret2", n: 1}],
     span: 34
   },
   {
@@ -60740,8 +60795,20 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     // degrees -- past that the radar-to-turret parallax throws the shot, and past
     // 45 the ship's own armour box is in the way (tools/corepox-parallax.ts).
     // CircleSpawn carries angle_min_deg/angle_max_deg for exactly this purpose.
-    spawn: {spec: SHIPS.rocket, every: 4.5, radius: 22, count: 4, team: "enemy",
-            toward: true, arc: [-22, 22]},
+    // Period and radius are the CircleSpawn on Aim.unity verbatim (5 and 18, up
+    // from the 4.5 and 22 authored here). The arc is NOT: the scene's is [-2, 10],
+    // a 12 degree window centred on +4, and this hull cannot hit off the boresight.
+    // Every arc centred on zero wins and every arc centred anywhere else loses,
+    // which is parallax and not luck (tools/corepox-aim-spawn.ts, 5 runs each):
+    //     [-6,6]   win 22.5s      [-14,14] win 22.5s     [-22,22] win 26.8s
+    //     [-2,10]  loss 22-26s    [2,10]   loss 20.1s    [-10,-2] loss 23.1s
+    // The radar sits 3 tiles behind the turret, so at 18 tiles a target 6 degrees
+    // off centre is thrown by atan(3/18) = 9.5 degrees -- more than the target is
+    // wide. The original had the same geometry, so either its beam was more
+    // forgiving than ours or the level was hard; UNRESOLVED, and the arc is
+    // centred here rather than ship a mission its own reference solution loses.
+    spawn: {spec: SHIPS.rocket, every: 5, radius: 18, count: 4, team: "enemy",
+            toward: true, arc: [-6, 6]},
     objectives: [
       {kind: "connect", from: [0, -3], to: [0, 0], text: "connect [radar angle] to [!turret angle]"},
       {kind: "destroy", team: "enemy", type: "Explosive", n: 4,
@@ -60754,7 +60821,9 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
           [-1,-1],[-1,-2],[-1,-3],[-1,-4]].map(p => ({type: "Armour", pos: p}))],
       connections: [{from: [0, -3], fromPort: "bearing", to: [0, 0], toPort: "angle"},
                     {from: [0, -3], fromPort: "dist", to: [0, 0], toPort: "fire"}]},
-    spoils: [{type: "Radar", n: 1}, {type: "LaserTurret2", n: 1}],
+    // AimMission.cs:27-32 gives Radar plus the LazerHardpoint RELIC, and the relic
+    // is the composite below -- not a loose turret.
+    spoils: [{type: "Radar", n: 1}],
     // AimMission.getComposites() hands this over on a win: the radar sits directly
     // behind the turret, which is the arrangement that zeroes the aim parallax
     // dead ahead. Recovered, not yet spendable -- carrying spoils between missions
@@ -60768,30 +60837,52 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     ship: SHIPS.drifter,
     inventory: [],
     envelope: [],
-    allow: {connect: true, modify: true},
+    // Avoid.unity's InitialSettingsOverride hides Build, Modify and Connect and
+    // highlights Customize: one knob, live, and nothing else. Honoured here.
+    // AvoidMission.cs:34-44 also hands out 3 engines and 3 constants in a 3x3 box,
+    // and that half is NOT honoured -- with Build hidden it is unreachable, and it
+    // could not be used anyway: Engine occupies two cells, and every free cell in
+    // the drifter's 3x3 has its second cell already taken.
+    allow: {modify: true},
+    // ONE mine, dead ahead at 9.73 tiles (Avoid.unity). The two-mine corridor here
+    // before was invented, and it was invented to give a ship that could only go
+    // straight something to thread -- see SHIPS.drifter, whose steering wire was
+    // transcribed wrong. With the wire right, one mine head-on is the mission:
+    // turn or die.
     enemies: [
-      // A mine's fragments carry 2 world units/s for 3s, so the nominal kill
-      // radius is 9.4 tiles -- but the radar measures to the nearest COMPONENT,
-      // so a 5x5 mine against a 5-wide ship actually reaches about 11. Measured:
-      // 10 tiles apart kills the reference run, 12 clears it by a tile
-      // (tools/corepox-avoid-sweep.ts). The corridor is the mission.
-      {spec: SHIPS.proximityMine, x: -12, y: -15, a: 0, team: "enemy"},
-      {spec: SHIPS.proximityMine, x: 12, y: -27, a: 0, team: "enemy"}
+      {spec: SHIPS.proximityMine, x: 0, y: -9.73, a: 0, team: "enemy"}
     ],
-    zone: {x: 0, y: -38, r: 5, label: "jump"},
+    // AUTHORED, and the radius is the only part of it that is not. Avoid.unity has
+    // a real jumpzone -- a CircleCollider2D trigger, r 1.66 tiles, 4.69 tiles
+    // ASTERN -- and the ship cannot get there. With the scene's own wiring one
+    // engine fires at a time (EngineFn clamps thrust to [0,100]) so the ship loops,
+    // and tools/corepox-drifter-arc.ts measures that loop: it never leaves a 3.6
+    // tile circle, at any throttle, and returns to the start every half second.
+    // 4.69 is outside it. The scene is inconsistent with itself in three places at
+    // once -- an unreachable zone, an inventory the UI override hides, and a build
+    // box no Engine fits in -- so Avoid.unity is read as mid-edit, and this zone is
+    // put ON the measured loop instead: (2.75, -1.7) is where a throttle around 50
+    // swings to. Sign picks the side, magnitude picks how far forward the swing
+    // reaches, and reaching too far forward puts you inside the mine.
+    zone: {x: 2.75, y: -1.7, r: 1.66, label: "jump"},
     objectives: [
       {kind: "reach", text: "get to [~jump] zone"},
       {kind: "defend", type: "Brain", text: "keep your [core]"}
     ],
+    // Only the constant differs from the ship you are handed -- there is nothing
+    // else to change. 50 is the middle of the winning band: tools/corepox-avoid-
+    // constant.ts sweeps every value from -100 to 100 in fives and every positive
+    // one from 5 up wins (4-16s), every negative one loses or never arrives, and 0
+    // sits still. Sign picks the side the loop swings to; the zone is on one side.
     solution: {components: [{type: "Brain", pos: [1, 0]},
       {type: "Binary", pos: [0, -1], dir: "down", param: "MINUS"},
       {type: "Engine", pos: [-2, -1]}, {type: "Engine", pos: [2, -1]},
-      {type: "Constant", pos: [-1, 0], param: "60"}],
-      connections: [{from: [-1, 0], fromPort: "out", to: [0, -1], toPort: "a"},
-                    {from: [0, -1], fromPort: "out", to: [-2, -1], toPort: "in"},
-                    {from: [-1, 0], fromPort: "out", to: [2, -1], toPort: "in"}]},
+      {type: "Constant", pos: [-1, 0], param: "50"}],
+      connections: [{from: [-1, 0], fromPort: "out", to: [0, -1], toPort: "b"},
+                    {from: [0, -1], fromPort: "out", to: [2, -1], toPort: "in"},
+                    {from: [-1, 0], fromPort: "out", to: [-2, -1], toPort: "in"}]},
     spoils: [{type: "Explosive", n: 2}],
-    span: 64
+    span: 24
   },
   // --- not in the shipped campaign --------------------------------------------
   {
@@ -60825,26 +60916,32 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     inventory: [{type: "Engine", n: 2}, {type: "Constant", n: 2}, {type: "Armour", n: 4}],
     envelope: [[-1,0],[0,-1],[1,-1],[-1,-1],[1,1],[-1,1],[-2,0],[2,0],[0,2]],
     allow: {build: true, connect: true, modify: true, rotate: true},
+    // TwinTurrets.unity. The posts were authored at (-11,-21)/(12,-23) facing
+    // roughly back at you; the scene has them half as far out and canted much
+    // harder -- 144.87 and -156.42 degrees, which is a real toe-in, not a
+    // rounded 170/190.
     enemies: [
-      {spec: SHIPS.laserpost, x: -11, y: -21, a: 170, team: "enemy"},
-      {spec: SHIPS.laserpost, x: 12, y: -23, a: 190, team: "enemy"}
+      {spec: SHIPS.laserpost, x: -6.47, y: -9.75, a: 144.87, team: "enemy"},
+      {spec: SHIPS.laserpost, x: 6.75, y: -9.48, a: -156.42, team: "enemy"}
     ],
     objectives: [
       {kind: "destroy", team: "enemy", type: "Brain", n: 2, text: "destroy [!enemy cores]"},
       {kind: "defend", type: "Brain", text: "defend your [core]"}
     ],
-    // Found by tools/corepox-solve.ts, not by hand. Re-solved 2026-08-19 after the
-    // posts' fire_input override was restored: the previous reference build now
-    // LOSES at 12.7s, and the winning set shrank from 48 of 140 legal builds to
-    // 16. This is the quickest at 12.5s -- a centre-mounted engine and full
-    // throttle, because with both posts actually shooting the level is a race.
+    // Found by tools/corepox-solve.ts, not by hand. Re-solved 2026-08-19 twice: once
+    // after the posts' fire_input override was restored, and again after the posts
+    // moved onto their scene placement, which brought them from ~22 tiles out to
+    // 9.6 and made the old build lose in 1.4s. 19 of 140 legal builds still win and
+    // this is the quickest at 9.7s. The engine moved from behind the core to the
+    // right flank -- at this range the answer is to get off the line between the
+    // two posts, not to charge down it.
     solution: {components: [{type: "Brain", pos: [0, 0]},
       {type: "Lazer", pos: [0, 1], overrides: [{name: "input", value: 1}]},
-      {type: "Explosive", pos: [1, 0]}, {type: "Engine", pos: [0, -1]},
+      {type: "Explosive", pos: [1, 0]}, {type: "Engine", pos: [2, 0]},
       {type: "Constant", pos: [-2, 0], param: "100"},
       {type: "Armour", pos: [-1, 0]}, {type: "Armour", pos: [1, -1]},
       {type: "Armour", pos: [-1, -1]}, {type: "Armour", pos: [1, 1]}],
-      connections: [{from: [-2, 0], fromPort: "out", to: [0, -1], toPort: "in"},
+      connections: [{from: [-2, 0], fromPort: "out", to: [2, 0], toPort: "in"},
                     {from: [-2, 0], fromPort: "out", to: [0, 1], toPort: "in"}]},
     spoils: [],
     span: 62
