@@ -59661,7 +59661,7 @@ const _starfield = function _starfield(){return(
 )};
 
 const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TILE, UNITS){return(
-(world, {width = 900, height = 560, span = 60} = {}) => {
+(world, {width = 900, height = 560, span = 60, follow = true, focus = []} = {}) => {
   symbolSheet;
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
@@ -59693,8 +59693,44 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
     }
   };
 
-  const draw = () => {
+  // The view used to be a fixed box on the origin, so Avoid's player left the top
+  // of the frame at y=-38 and Aim's rockets spawned 22 tiles outside it. Frame
+  // everything that matters instead -- every live body plus any fixed points the
+  // caller cares about (a jump zone) -- never tighter than the mission's own span,
+  // and eased so the box does not snap when a ship dies.
+  // `focus` and `minSpan` are mutable on the returned view: the editor wants a
+  // close frame on the ship, the match wants everything that matters in shot, and
+  // it is the same view object either way.
+  const api = {focus, minSpan: span};
+  let cam = {cx: 0, cy: 0, w: W, h: H};
+  const frame = (k = 0.12) => {
+    const pts = [];
+    for (const s of world.ships) if (s.live.length) pts.push([s.x * TILE, s.y * TILE]);
+    for (const f of api.focus) pts.push([f[0] * TILE, f[1] * TILE]);
+    if (!pts.length) return;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const [x, y] of pts) {
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    const pad = 6 * TILE;
+    const minW = api.minSpan * TILE;
+    let w = Math.max(x1 - x0 + 2 * pad, minW, (y1 - y0 + 2 * pad) * width / height);
+    const h = w * height / width;
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    cam = {cx: cam.cx + (cx - cam.cx) * k, cy: cam.cy + (cy - cam.cy) * k,
+           w: cam.w + (w - cam.w) * k, h: cam.h + (h - cam.h) * k};
+    svg.setAttribute("viewBox",
+      `${(cam.cx - cam.w/2).toFixed(0)} ${(cam.cy - cam.h/2).toFixed(0)} ` +
+      `${cam.w.toFixed(0)} ${cam.h.toFixed(0)}`);
+  };
+
+  // snap=true jumps the camera to its target instead of easing. The editor needs
+  // it: a click is aimed at a connector the player can SEE, and a viewBox that
+  // moves between the paint and the click puts the hit a tile out.
+  const draw = (snap = false) => {
     reconcile();
+    if (follow) frame(snap ? 1 : 0.12);
     for (const n of nodes.values()) n.update();
     fx.textContent = "";
     for (const p of world.particles ?? []) {
@@ -59720,7 +59756,7 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
     }
   };
   draw();
-  return {svg, draw};
+  return Object.assign(api, {svg, draw});
 }
 )};
 
@@ -60319,6 +60355,27 @@ const _SHIPS = function _SHIPS(){return(
   // up one per tick and crosses zero after 51 ticks -- a 1.0s fuse built out of
   // arithmetic, with no timer component in the game. The two Explosives read the
   // same output. (tools/corepox-extract-missions.py, Cocoon.ships[1..3])
+  // --- composites -------------------------------------------------------------
+  // Tom asked whether composite definitions were in the Firebase DB. They are not.
+  // A CompositeSpec is a JSON string and it lives in three local places:
+  // SpoilsOverride.composites (a scene field), hard-coded in a MissionController,
+  // and inside any ship that uses one, as the Composite component's `param`.
+  // tools/corepox-extract-composites.py finds four; all four load with 0 dropped
+  // wires, 1 island and no overlapping cells.
+  //
+  //   LazerHardpoint      AimMission.cs                    10c  2w   Aim's spoil
+  //   UnfinishedOrbDrone  scenes/missions/FollowCourse     9c   4w
+  //   UnwiredOrbDrone     scenes/missions/FollowCourseAdv  13c  0w
+  //   BrautenbourgsFirst  firebase/data/ships.json         5c   4w   228 corpus uses
+  //
+  // LazerHardpoint reads bearing->angle and dist->fire, which is a fourth
+  // independent confirmation of the LaserTurret2 port cells.
+  lazerHardpoint: {id: "LazerHardpoint", name: "Lazer Turret Hardpoint", components: [
+    {type: "LaserTurret2", pos: [0, 2]}, {type: "Radar", pos: [0, -1]},
+    ...[[2,-1],[2,0],[2,1],[-1,-1],[-1,0],[-1,1],[2,2],[-1,2]]
+        .map(p => ({type: "Armour", pos: p}))],
+    connections: [{from: [1, -1], to: [0, 2]}, {from: [0, -1], to: [1, 2]}]},
+
   delayBomb: {name: "delayBomb", components: [
     {type: "Binary", pos: [0, 0], param: "PLUS",
      overrides: [{name: "a", value: -50}, {name: "b", value: 1}, {name: "output", value: -50}]},
@@ -60332,6 +60389,13 @@ const _SHIPS = function _SHIPS(){return(
 
 const _MISSIONS = function _MISSIONS(SHIPS){return(
 [
+  // Everything below shipped in InitialCampaign.prefab, in this order. Two more
+  // scenes exist with full objective text in Objectives.textByScene -- SideShooter
+  // and TwinTurrets -- but the campaign list does not name them, so they are kept
+  // after the seven as bonus levels rather than promoted into the arc. Three
+  // further scenes (FollowBoss, FollowCourse, FollowCourseAdvanced) have neither
+  // objective text nor a campaign slot; one of their composites is called
+  // "UnfinishedOrbDrone", which is a fair summary.
   {
     id: "PlaceBrain", title: "Core",
     brief: "A ship is whatever you bolt to a core. Place one, then press play.",
@@ -60367,6 +60431,25 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     span: 30
   },
   {
+    id: "ConnectionLite", title: "Wire",
+    brief: "The constant already reads 100. Nothing happens until it reaches the engine.",
+    ship: SHIPS.liteCore,
+    inventory: [],
+    envelope: [],
+    allow: {connect: true},
+    enemies: [],
+    zone: {x: 0, y: -26, r: 4, label: "jump"},
+    objectives: [
+      {kind: "connect", from: [0, 1], to: [0, -1], text: "connect [constant] to [!engine]"},
+      {kind: "reach", text: "get to [~jump] zone"}
+    ],
+    solution: {components: [{type: "Brain", pos: [0, 0]}, {type: "Engine", pos: [0, -1]},
+      {type: "Constant", pos: [0, 1], param: "100"}],
+      connections: [{from: [0, 1], fromPort: "out", to: [0, -1], toPort: "in"}]},
+    spoils: [{type: "Engine", n: 1}],
+    span: 46
+  },
+  {
     id: "ManualAim", title: "Manual aim",
     brief: "The turret takes an angle. A constant is an angle you type in.",
     ship: SHIPS.manualAim,
@@ -60387,25 +60470,6 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
       connections: [{from: [0, 0], fromPort: "out", to: [0, 1], toPort: "angle"}]},
     spoils: [{type: "Constant", n: 2}],
     span: 34
-  },
-  {
-    id: "ConnectionLite", title: "Wire",
-    brief: "The constant already reads 100. Nothing happens until it reaches the engine.",
-    ship: SHIPS.liteCore,
-    inventory: [],
-    envelope: [],
-    allow: {connect: true},
-    enemies: [],
-    zone: {x: 0, y: -26, r: 4, label: "jump"},
-    objectives: [
-      {kind: "connect", from: [0, 1], to: [0, -1], text: "connect [constant] to [!engine]"},
-      {kind: "reach", text: "get to [~jump] zone"}
-    ],
-    solution: {components: [{type: "Brain", pos: [0, 0]}, {type: "Engine", pos: [0, -1]},
-      {type: "Constant", pos: [0, 1], param: "100"}],
-      connections: [{from: [0, 1], fromPort: "out", to: [0, -1], toPort: "in"}]},
-    spoils: [{type: "Engine", n: 1}],
-    span: 46
   },
   {
     id: "Connection", title: "Throttle",
@@ -60454,6 +60518,11 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
       connections: [{from: [0, -3], fromPort: "bearing", to: [0, 0], toPort: "angle"},
                     {from: [0, -3], fromPort: "dist", to: [0, 0], toPort: "fire"}]},
     spoils: [{type: "Radar", n: 1}, {type: "LaserTurret2", n: 1}],
+    // AimMission.getComposites() hands this over on a win: the radar sits directly
+    // behind the turret, which is the arrangement that zeroes the aim parallax
+    // dead ahead. Recovered, not yet spendable -- carrying spoils between missions
+    // is not implemented.
+    composites: [SHIPS.lazerHardpoint],
     span: 56
   },
   {
@@ -60487,6 +60556,7 @@ const _MISSIONS = function _MISSIONS(SHIPS){return(
     spoils: [{type: "Explosive", n: 2}],
     span: 64
   },
+  // --- not in the shipped campaign --------------------------------------------
   {
     id: "SideShooter", title: "Side shooter",
     brief: "It only fires forwards. You get to decide where forwards points.",
@@ -60803,11 +60873,40 @@ const _viewof_game = function _viewof_game(
     }
     return next;
   };
+  // A connector belongs to a CELL, not to a component. Resolving by anchor and
+  // taking ports[0] meant a Binary's `b`, a Radar's `dist` and a turret's `fire`
+  // could never be wired at all -- which is most of what the corpus does.
+  // Same rule loadShipSpec uses to read a saved ship's connections.
+  const unrot = {0: (x, y) => [x, y], 90: (x, y) => [y, -x],
+                 180: (x, y) => [-x, -y], 270: (x, y) => [-y, x]};
   const portsAt = (px, py) => {
-    const c = S.player.at(px, py);
-    if (!c) return null;
-    const P = PORTS[c.type] ?? {};
-    return {c, outs: Object.keys(P.outs ?? {}), ins: Object.keys(P.ins ?? {})};
+    for (const c of S.player.live) {
+      const d = ((Math.round((c.dir ?? 0) / 90) % 4 + 4) % 4) * 90;
+      const [lx, ly] = unrot[d](px - c.px, py - c.py);
+      const P = PORTS[c.type] ?? {};
+      const outs = Object.entries(P.outs ?? {})
+        .filter(([, o]) => o[0] === lx && o[1] === ly).map(([n]) => n);
+      const ins = Object.entries(P.ins ?? {})
+        .filter(([, o]) => o[0] === lx && o[1] === ly).map(([n]) => n);
+      if (outs.length || ins.length) return {c, outs, ins, px: c.px, py: c.py};
+    }
+    return null;
+  };
+  // every connector cell on the ship, for painting the affordance
+  const allPorts = () => {
+    const out = [];
+    for (const c of S.player.live) {
+      const d = ((Math.round((c.dir ?? 0) / 90) % 4 + 4) % 4) * 90;
+      const rot = {0: (x, y) => [x, y], 90: (x, y) => [-y, x],
+                   180: (x, y) => [-x, -y], 270: (x, y) => [y, -x]}[d];
+      const P = PORTS[c.type] ?? {};
+      for (const [kind, tbl] of [["out", P.outs ?? {}], ["in", P.ins ?? {}]])
+        for (const [name, o] of Object.entries(tbl)) {
+          const [rx, ry] = rot(o[0], o[1]);
+          out.push({c, kind, name, px: c.px + rx, py: c.py + ry});
+        }
+    }
+    return out;
   };
   const clickTile = (px, py) => {
     if (S.state !== "build") return;
@@ -60815,13 +60914,16 @@ const _viewof_game = function _viewof_game(
     else if (mode === "connect") {
       const here = portsAt(px, py);
       if (!here) { wireFrom = null; }
-      else if (!wireFrom) { if (here.outs.length) wireFrom = {px, py, port: here.outs[0]}; }
+      else if (!wireFrom) { if (here.outs.length) wireFrom = {px: here.px, py: here.py,
+                                                             cell: [px, py], port: here.outs[0]}; }
       else {
         if (here.ins.length) {
+          // one wire per input: a second source would just be overwritten each tick
           const conns = specOf(S.player).connections
-            .filter(k => !(k.to[0] === px && k.to[1] === py && k.toPort === here.ins[0]));
+            .filter(k => !(k.to[0] === here.px && k.to[1] === here.py &&
+                           k.toPort === here.ins[0]));
           conns.push({from: [wireFrom.px, wireFrom.py], fromPort: wireFrom.port,
-                      to: [px, py], toPort: here.ins[0]});
+                      to: [here.px, here.py], toPort: here.ins[0]});
           S.player = rebuild(specOf(S.player).components, conns);
         }
         wireFrom = null;
@@ -60908,8 +61010,20 @@ const _viewof_game = function _viewof_game(
         fill: picked ? "#5ef2a022" : "none", stroke: "#5ef2a0", "stroke-width": 2.5,
         "stroke-dasharray": "8 7"});
     }
+    if (mode === "connect") {
+      // show where the connectors ARE. Without this the player is guessing which
+      // cell of a six-cell Radar carries `dist`.
+      for (const q of allPorts()) {
+        const [vx, vy] = tileToView(q.px, q.py);
+        const hot = wireFrom ? q.kind === "in" : q.kind === "out";
+        add("circle", {cx: vx, cy: vy, r: TILE * 0.22,
+          fill: hot ? (q.kind === "out" ? "#5ef2a0" : "#8fd0ff") : "none",
+          stroke: q.kind === "out" ? "#5ef2a0" : "#8fd0ff",
+          "stroke-width": 2, opacity: hot ? 0.95 : 0.35});
+      }
+    }
     if (wireFrom) {
-      const [vx, vy] = tileToView(wireFrom.px, wireFrom.py);
+      const [vx, vy] = tileToView(wireFrom.cell[0], wireFrom.cell[1]);
       add("circle", {cx: vx, cy: vy, r: TILE * 0.5, fill: "none", stroke: "#f2c14e",
                      "stroke-width": 3});
     }
@@ -60961,7 +61075,14 @@ const _viewof_game = function _viewof_game(
       // same mission, new session: point the view at the new world
       view.svg.parentNode && null;
     }
-    view.draw(); paintOverlay(); paintHud();
+    // Editing wants a close frame on the ship; a running match wants everything
+    // that matters in shot, including a jump zone 26 tiles away that nothing on
+    // screen would otherwise put in view.
+    view.focus = S.state === "playing" && m.zone ? [[m.zone.x, m.zone.y]] : [];
+    view.minSpan = S.state === "playing" ? (m.span ?? 40) : 16;
+    // snap, not ease: in the editor a click has to hit the connector the player
+    // can see, so the viewBox must not move between paint and click
+    view.draw(S.state !== "playing"); paintOverlay(); paintHud();
 
     bar.textContent = "";
     const allow = m.allow ?? {};
