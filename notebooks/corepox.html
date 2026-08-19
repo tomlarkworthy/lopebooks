@@ -58986,7 +58986,9 @@ class Ship {
       return {
         i, type: c.type, px: c.pos[0], py: c.pos[1], dir,
         hp: c.hp ?? T.hp, param: c.param, out: applyOverrides(c, T.outs),
-        in: applyOverrides(c, T.ins), t: 0, powered: true,
+        // kept so a rebuilt ship can be written back out: a saved connector value
+        // is ship state, and the editor rebuilds the whole ship on every edit
+        overrides: c.overrides, in: applyOverrides(c, T.ins), t: 0, powered: true,
         tiles: T.tiles.map(t => { const [rx, ry] = rotTile(t, dir);
                                   return [c.pos[0] + rx, c.pos[1] + ry]; })
       };
@@ -60831,6 +60833,11 @@ const _viewof_game = function _viewof_game(
   // ---- editing --------------------------------------------------------------
   const occupied = (px, py) => S.player.comps.some(c =>
     c.tiles.some(t => t[0] === px && t[1] === py));
+  // Ship.at() is anchor-only because connections address anchors. Picking a
+  // component to rotate or edit is a different question -- any of its cells will
+  // do, and a Binary's anchor is its bar centre, so clicking the stem missed.
+  const compAt = (px, py) => S.player.live.find(c =>
+    c.tiles.some(t => t[0] === px && t[1] === py));
   const place = (px, py) => {
     if (!picked) return;
     // Check the whole FOOTPRINT, not just the anchor: an Engine is two cells and
@@ -60839,8 +60846,13 @@ const _viewof_game = function _viewof_game(
     const cells = (TYPES[picked]?.tiles ?? [[0, 0]])
       .map(t => [px + t[0], py + t[1]]);
     if (cells.some(([x, y]) => occupied(x, y))) return;
-    if (env.length && !cells.every(([x, y]) => env.some(e => e[0] === x && e[1] === y)))
-      return;
+    // The envelope constrains the ANCHOR, not the footprint. SideShooter's
+    // envelope has [0,-1] and its own recovered solution puts an Engine there --
+    // an Engine is [[0,0],[0,-1]], so its nozzle lands on [0,-2], outside. Testing
+    // the whole footprint against the envelope made both engine missions
+    // unbuildable while the headless gate, which is handed the finished ship,
+    // still read 9/9.
+    if (env.length && !env.some(e => e[0] === px && e[1] === py)) return;
     const item = S.inventory.find(i => i.type === picked);
     if (!item || item.n <= 0) return;
     item.n--;
@@ -60854,7 +60866,12 @@ const _viewof_game = function _viewof_game(
     name: "player",
     components: ship.comps.map(c => ({type: c.type, pos: [c.px, c.py],
       dir: ["up","right","down","left"][(Math.round((c.dir ?? 0)/90)%4+4)%4],
-      hp: c.hp, ...(c.param != null ? {param: c.param} : {})})),
+      hp: c.hp, ...(c.param != null ? {param: c.param} : {}),
+      // ManualAim's turret arrives with fire_input latched at 1. Dropping the
+      // overrides here disarmed it the moment the player typed an angle -- which
+      // is the entire mission -- and the headless gate could not see it, because
+      // it is handed the solution spec and never rebuilds.
+      ...(c.overrides ? {overrides: c.overrides} : {})})),
     connections: ship.conns.map(k => ({...k}))
   });
   // Rebuilding rather than mutating keeps mass, centre of mass, inertia and the
@@ -60929,17 +60946,18 @@ const _viewof_game = function _viewof_game(
         wireFrom = null;
       }
     } else if (mode === "rotate") {
-      const c = S.player.at(px, py);
+      const c = compAt(px, py);
       if (c) {
         const comps = specOf(S.player).components;
-        const t = comps.find(x => x.pos[0] === px && x.pos[1] === py);
+        const t = comps.find(x => x.pos[0] === c.px && x.pos[1] === c.py);
         if (t) { const o = ["up","right","down","left"];
                  t.dir = o[(o.indexOf(t.dir ?? "up") + 1) % 4]; }
         S.player = rebuild(comps, specOf(S.player).connections);
       }
     } else if (mode === "modify") {
-      const c = S.player.at(px, py);
-      selected = c && (c.type === "Constant" || c.type === "Binary") ? {px, py} : null;
+      const c = compAt(px, py);
+      selected = c && (c.type === "Constant" || c.type === "Binary")
+        ? {px: c.px, py: c.py} : null;
     }
     render();
   };
@@ -61131,6 +61149,12 @@ const _viewof_game = function _viewof_game(
     }
     root.value = {mission: m.id, state: S.state, ship: specOf(S.player)};
   };
+
+  // QA seam: the only input this game takes is a click on an SVG, so a test that
+  // drives it needs the same tile->pixel map the overlay paints with. Re-deriving
+  // it in the test would be a copy that drifts, so hand the real one out.
+  root.qa = {tileToView, localTile, session: () => S, svg: () => view.svg,
+             mode: () => mode, picked: () => picked};
 
   reset(0);
   return root;
