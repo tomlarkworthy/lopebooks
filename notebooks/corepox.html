@@ -59109,6 +59109,13 @@ class Ship {
   }
 
   reindex() {
+    // x,y is the world position of the CENTRE OF MASS and worldOf places every tile
+    // relative to it, so recomputing the centre without moving the origin teleports
+    // the whole ship. It fires on every component death: measured at up to 0.833
+    // tiles on the mission ships (tools/corepox-damage-shift.ts), a ship jumping
+    // most of a tile sideways the instant it loses a part. Remember the old centre
+    // and move the origin by the same amount, rotated into the ship's frame.
+    const wasX = this.cx, wasY = this.cy;
     const live = this.live;
     this.tileCount = live.reduce((n, c) => n + c.tiles.length, 0);
     // Mass is per COMPONENT (Constants.MASS_SCALE), spread uniformly over that
@@ -59136,6 +59143,12 @@ class Ship {
       }
     }
     this.I = Math.max(0.05, I);
+    if (wasX !== undefined) {                  // undefined on the constructor's call
+      const dcx = this.cx - wasX, dcy = this.cy - wasY;
+      const sn = Math.sin(this.a * geom.D), cs = Math.cos(this.a * geom.D);
+      this.x += dcx * cs + dcy * sn;
+      this.y += dcx * sn - dcy * cs;
+    }
     this.powerUp();
     this.alive = live.some(c => c.type === "Brain" && c.powered);
   }
@@ -59978,7 +59991,16 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   let cam = {cx: 0, cy: 0, w: W, h: H};
   const frame = (k = 0.12) => {
     const pts = [];
-    for (const s of api.framed ?? world.ships) if (s.live.length) pts.push([s.x * TILE, s.y * TILE]);
+    // The ORIGIN CELL, not ship.x/y. ship.x/y is the world position of the centre
+    // of mass, and the centre of mass moves every time a part is placed or lost, so
+    // a camera on it pans on every edit -- the second half of "when i place a
+    // component the center of the ship shifts". worldOf is pure arithmetic on
+    // px/py, so a bare {px, py} is a legal argument. In a match the two differ by
+    // less than a tile and this changes nothing.
+    for (const s of api.framed ?? world.ships) if (s.live.length) {
+      const [ox, oy] = s.worldOf({px: 0, py: 0});
+      pts.push([ox * TILE, oy * TILE]);
+    }
     for (const f of api.focus) pts.push([f[0] * TILE, f[1] * TILE]);
     if (!pts.length) return;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -61230,6 +61252,17 @@ const _viewof_game = function _viewof_game(
     const p = S.player;
     const next = new (p.constructor)({name: "player", components, connections},
                                      {team: "player", x: p.x, y: p.y, a: p.a});
+    // A ship's x,y is the world position of its CENTRE OF MASS, and worldOf places
+    // every tile relative to that -- so carrying x,y across a rebuild teleports the
+    // whole ship by however far the centre of mass moved. Reported as "when i place
+    // a component the center of the ship shifts": measured at 0.443 tiles, 27.6px
+    // on screen with the viewBox unchanged, for one part on Twin turrets
+    // (tools/corepox-build-shift.ts). Move the origin by the same shift, rotated
+    // into the ship's frame, and the parts already on the board stay put.
+    const dcx = next.cx - p.cx, dcy = next.cy - p.cy;
+    const rad = p.a * Math.PI / 180, sn = Math.sin(rad), cs = Math.cos(rad);
+    next.x = p.x + dcx * cs + dcy * sn;
+    next.y = p.y + dcx * sn - dcy * cs;
     next.vx = p.vx; next.vy = p.vy; next.w = p.w;
     const i = S.world.ships.indexOf(p);
     if (i >= 0) S.world.ships[i] = next; else S.world.ships.unshift(next);
