@@ -15259,6 +15259,282 @@ const _toc = function _toc(TYPES, CPX, SYMBOL_FOR, htl){
   </nav>`;
 };
 
+
+const _h_sheet = function _h_sheet(md){return(
+md`## The art, on one plate`
+)};
+
+// Every drawing on this page in one rectangle, at TRUE relative scale, with its
+// name and its connectors on it. The sections below are the place to EDIT one
+// component; this is the place to hand the set to someone else, which is a
+// different job and wants the one relationship the sections destroy -- a
+// Hyperdrive is five Brains tall.
+//
+// Asked for by Tom, 2026-08-20: "all the components next to teach other with their
+// names bin packed in a ractangle so I can easily handover the major art assets.
+// We want the input/output parts included."
+//
+// Skyline packing, bottom-left: keep the upper contour of what is already placed
+// as a list of segments, and put each next box at the lowest position that spans
+// it. Shelf packing was tried first and wasted the right third of the sheet --
+// the Hyperdrive opens a 263-unit shelf and every short component beside it
+// leaves that height unused. Optimal 2D packing is NP-hard, this is a contact
+// sheet and not an atlas the runtime indexes into, so "sweep the width, keep the
+// tightest" is the whole method. The score trades wasted area against how far the
+// aspect drifts from 1.45.
+const _packPlates = function _packPlates(){return(
+(boxes, {gap = 16} = {}) => {
+  const items = [...boxes].sort((a, b) => b.bh - a.bh || b.bw - a.bw);
+  const area = items.reduce((a, it) => a + (it.bw + gap) * (it.bh + gap), 0);
+  const widest = Math.max(...items.map(it => it.bw + gap));
+
+  const fit = (sky, w, lim) => {                 // lowest, then leftmost
+    let best = null;
+    for (const seg of sky) {
+      const x = seg.x;
+      if (x + w > lim) continue;
+      let y = -Infinity, rem = w, ok = false;
+      for (const t of sky) {
+        if (t.x + t.w <= x) continue;
+        y = Math.max(y, t.y); rem -= Math.min(t.x + t.w, x + w) - Math.max(t.x, x);
+        if (rem <= 1e-9) { ok = true; break; }
+      }
+      if (!ok) continue;
+      if (!best || y < best.y - 1e-9 || (Math.abs(y - best.y) < 1e-9 && x < best.x))
+        best = {x, y};
+    }
+    return best;
+  };
+  const raise = (sky, x, y, w, h) => {           // stamp the box onto the contour
+    const out = [{x, y: y + h, w}];
+    for (const t of sky) {
+      const right = t.x + t.w;
+      if (right <= x || t.x >= x + w) { out.push({...t}); continue; }
+      if (t.x < x) out.push({x: t.x, y: t.y, w: x - t.x});
+      if (right > x + w) out.push({x: x + w, y: t.y, w: right - (x + w)});
+    }
+    out.sort((a, b) => a.x - b.x);
+    const m = [];
+    for (const t of out) {
+      const last = m[m.length - 1];
+      if (last && Math.abs(last.y - t.y) < 1e-9) last.w = t.x + t.w - last.x;
+      else m.push(t);
+    }
+    return m;
+  };
+
+  let best = null;
+  for (let k = 0.55; k <= 2.6001; k += 0.05) {
+    const lim = Math.max(widest, Math.sqrt(area) * k);
+    let sky = [{x: 0, y: 0, w: lim}];
+    const out = [];
+    let ok = true;
+    for (const it of items) {
+      const at = fit(sky, it.bw + gap, lim);
+      if (!at) { ok = false; break; }
+      out.push({...it, x: at.x, y: at.y});
+      sky = raise(sky, at.x, at.y, it.bw + gap, it.bh + gap);
+    }
+    if (!ok) continue;
+    const H = Math.max(...out.map(o => o.y + o.bh));
+    const W = Math.max(...out.map(o => o.x + o.bw));
+    const score = (W * H) / area + Math.abs(Math.log((W / H) / 1.45)) * 0.35;
+    if (!best || score < best.score) best = {score, W, H, placed: out};
+  }
+  return best;
+}
+)};
+
+// The plate. Drawings are CLONED, not `<use>`d: a clone serialises into a
+// standalone file, which is the whole point of a handover, and it takes the page's
+// styling with it instead of hiding in a shadow tree that cannot be restyled.
+// The connector art. These are recovered Unity sprites and they live on
+// corepox-assets' symbol sheet, which is BELOW this module in the dependency
+// order (assets imports COMPONENT_ART from here), so they cannot be imported
+// without a cycle. They are cloned out of the live sheet in the document
+// instead -- the same route `cp-bloom` and `cp-tooth` already take -- and every
+// one of them is optional, so the plate still builds if assets has not booted.
+const _PLATE_PARTS = function _PLATE_PARTS(){return(
+[["output", "output port"], ["input", "input port"],
+ ["turret-gear", "turret gear"], ["tooth", "cog tooth"],
+ ["connection-1-0", "wire 1 tile"], ["connection-2-0", "wire 2 tiles"],
+ ["connection-3-0", "wire 3 tiles"]]
+)};
+
+const _artPlate = function _artPlate(COMPONENT_ART, SYMBOL_FOR, componentTables, ART_TILE, CPX, packPlates, PLATE_PARTS){return(
+({gap = 16, label = 24, ports = true, turretSplit = true, parts = true,
+  wire = "#b0ff77"} = {}) => {
+  const ns = "http://www.w3.org/2000/svg";
+  const el = (n, at, into) => { const e = document.createElementNS(ns, n);
+    for (const [k, v] of Object.entries(at)) e.setAttribute(k, v);
+    if (into) into.appendChild(e); return e; };
+  const vbOf = (node) => {
+    const vb = (node.getAttribute("viewBox") || "").trim().split(/\s+/).map(Number);
+    if (vb.length !== 4 || vb.some(Number.isNaN))
+      throw new Error("corepox-components: art has no usable viewBox");
+    return vb;
+  };
+  // A whole component's viewBox is already tight -- that is the invariant
+  // tools/corepox-art-ink.py holds -- but a PART of one carries the whole
+  // component's frame, so the barrel plate came out 275x164 for a diagonal bar.
+  // getBBox needs a rendered document, hence the offscreen probe, and it ignores
+  // stroke, hence the pad.
+  const tightBox = (kids, vb, pad = 6) => {
+    const probe = el("svg", {viewBox: vb.join(" ")});
+    probe.setAttribute("style", "position:absolute;left:-99999px;top:0;width:1px;height:1px");
+    document.body.appendChild(probe);
+    const g = el("g", {}, probe);
+    for (const k of kids) g.appendChild(k.cloneNode(true));
+    let b = null;
+    try { b = g.getBBox(); } catch (e) { b = null; }
+    probe.remove();
+    return b && b.width > 0 && b.height > 0
+      ? [b.x - pad, b.y - pad, b.width + pad * 2, b.height + pad * 2] : vb;
+  };
+
+  // A plate is as wide as its widest LABEL, not just its drawing. Packing on the
+  // art alone ran the captions of the five 51-unit components into each other:
+  // "brain 51x51constant-3 50x50explosive-3 51x51". Monospace, so the width is
+  // just a character count.
+  const NAME_PX = 12, SUB_PX = 8.5;
+  const boxes = [];
+  const push = (o) => {
+    const cap = `${o.name}  ${o.w.toFixed(0)}\u00d7${o.h.toFixed(0)}`;
+    o.cap = cap;
+    o.bw = Math.max(o.w, o.label.length * NAME_PX * 0.61, cap.length * SUB_PX * 0.61);
+    o.bh = o.h + label;
+    boxes.push(o);
+  };
+  for (const [type, spec] of Object.entries(SYMBOL_FOR)) {
+    const art = COMPONENT_ART[spec[0]];
+    if (!art) continue;
+    const vb = vbOf(art);
+    push({type, name: spec[0], label: type, kids: [...art.children], vb, w: vb[2], h: vb[3],
+          anchor: [spec[1], spec[2]]});
+  }
+  // The turret is the one component the renderer splits, because the barrel turns
+  // about a hinge inside the dome. Both halves ship, so both are handed over.
+  if (turretSplit) {
+    const art = COMPONENT_ART[SYMBOL_FOR.LaserTurret2?.[0]];
+    for (const [id, name] of [["turret2-base", "turret base"], ["turret2-barrel", "turret barrel"]]) {
+      const part = art && art.querySelector("#" + id);
+      if (!part) continue;
+      // the PART, not its children: a transform on the group is part of the drawing
+      const kids = [part], vb = tightBox(kids, vbOf(art));
+      push({name: id, label: name, kids, vb, w: vb[2], h: vb[3], anchor: null});
+    }
+  }
+
+  if (parts)
+    for (const [id, name] of PLATE_PARTS) {
+      const sym = document.getElementById("cp-" + id);
+      if (!sym) continue;
+      const vb = vbOf(sym);
+      push({name: id, label: name, kids: [...sym.children], vb, w: vb[2], h: vb[3],
+            anchor: null, tint: true});
+    }
+
+  const pack = packPlates(boxes, {gap});
+  const pad = 28, foot = 34;
+  const W = pack.W + pad * 2, H = pack.H + pad * 2 + foot;
+  const svg = el("svg", {xmlns: ns, viewBox: `0 0 ${W.toFixed(1)} ${H.toFixed(1)}`,
+                         width: W.toFixed(0), height: H.toFixed(0)});
+  svg.style.cssText = "max-width:100%;height:auto;display:block;border-radius:6px";
+  el("rect", {x: 0, y: 0, width: W, height: H, fill: CPX.ground}, svg);
+  // The bloom is what makes these read as the game rather than as flat vector, and
+  // it has to travel INSIDE the file for the download to look like the page. It is
+  // corepox-assets' filter and this module sits BELOW corepox-assets, so it cannot
+  // be imported without a cycle -- it is cloned out of the live symbol sheet in
+  // the document instead, and skipped if that sheet has not booted.
+  const defs = el("defs", {}, svg);
+  const bloom = document.getElementById("cp-bloom");
+  if (bloom) defs.appendChild(bloom.cloneNode(true));
+
+  for (const it of pack.placed) {
+    const x = pad + it.x + (it.bw - it.w) / 2, y = pad + it.y;
+    const g = el("g", {transform:
+      `translate(${(x - it.vb[0]).toFixed(2)} ${(y - it.vb[1]).toFixed(2)})`,
+      ...(bloom ? {filter: "url(#cp-bloom)"} : {})}, svg);
+    // ConnectionView tints the wire sprites per frame from the value on the
+    // connector, so they stroke with currentColor and a static sheet has to
+    // choose one. This is the colour a positive value paints.
+    if (it.tint) g.setAttribute("color", wire);
+    for (const kid of it.kids) g.appendChild(kid.cloneNode(true));
+    // The connectors, in art coordinates: the anchor IS tile [0,0]'s centre and
+    // +y is DOWN in the art, so a port on cell (ox, oy) lands at
+    // (ax + ox*ART_TILE, ay - oy*ART_TILE). Same shapes the sections use -- a ring
+    // is an output, a box is an input.
+    const tbl = it.type && componentTables[it.type];
+    if (ports && tbl && it.anchor) {
+      for (const kind of ["outs", "ins"])
+        for (const [pname, off] of Object.entries(tbl.ports[kind] ?? {})) {
+          const cx = it.anchor[0] + off[0] * ART_TILE, cy = it.anchor[1] - off[1] * ART_TILE;
+          const c = kind === "outs" ? CPX.wire : CPX.sink;
+          if (kind === "outs") el("circle", {cx, cy, r: 7.5, fill: "none", stroke: c,
+                                             "stroke-width": 2.2}, g);
+          else el("rect", {x: cx - 7, y: cy - 7, width: 14, height: 14, fill: "none",
+                           stroke: c, "stroke-width": 2.2}, g);
+          const t = el("text", {x: cx, y: cy + 18, fill: c, "font-size": 9,
+            "font-family": "ui-monospace, monospace", "text-anchor": "middle",
+            "paint-order": "stroke", stroke: CPX.ground, "stroke-width": 3}, g);
+          t.textContent = pname;
+        }
+    }
+    const nm = el("text", {x: (x + it.w / 2).toFixed(1), y: (y + it.h + 14).toFixed(1),
+      fill: it.type ? (CPX.colour[it.type] ?? "#dbe6f2") : "#dbe6f2",
+      "font-family": "ui-monospace, monospace", "font-size": 12,
+      "text-anchor": "middle"}, svg);
+    nm.textContent = it.label;
+    const sub = el("text", {x: (x + it.w / 2).toFixed(1), y: (y + it.h + 24).toFixed(1),
+      fill: CPX.dim, "font-family": "ui-monospace, monospace", "font-size": 8.5,
+      "text-anchor": "middle"}, svg);
+    sub.textContent = it.cap;
+  }
+  // The drawings are not all leaves: the turret's gear is 24 <use href="#cp-tooth">,
+  // and a blob that references a symbol it does not carry loses them silently -- the
+  // page looks right and the handed-over file has a bald gear. Pull the closure of
+  // whatever the clones point at out of the live sheet. Verified by
+  // tools/corepox-sheet-export.ts, which renders the FILE in a fresh page and
+  // reports any reference it cannot resolve.
+  const XLINK = "http://www.w3.org/1999/xlink";
+  for (let pass = 0; pass < 8; pass++) {
+    const want = new Set();
+    for (const e of svg.querySelectorAll("*")) {
+      const h = e.getAttribute("href") || e.getAttributeNS(XLINK, "href");
+      if (h && h.startsWith("#") && !svg.querySelector(`[id="${h.slice(1)}"]`)) want.add(h.slice(1));
+    }
+    if (!want.size) break;
+    for (const id of want) {
+      const node = document.getElementById(id);
+      if (node) defs.appendChild(node.cloneNode(true));
+      else throw new Error("corepox-components: art references #" + id + " and nothing defines it");
+    }
+  }
+
+  const cap = el("text", {x: pad, y: (H - 15).toFixed(1), fill: CPX.dim,
+    "font-family": "ui-monospace, monospace", "font-size": 9.5}, svg);
+  cap.textContent = `corepox art \u00b7 ${pack.placed.length} drawings at true relative scale ` +
+    `\u00b7 ${ART_TILE} units = 1 tile \u00b7 ` +
+    `\u25cb output \u25a1 input \u00b7 skyline-packed to ${W.toFixed(0)}\u00d7${H.toFixed(0)}`;
+  svg.plate = pack;
+  return svg;
+}
+)};
+
+const _artSheet = function _artSheet(artPlate, htl, CPX){
+  const svg = artPlate();
+  // A handover is a FILE, so the plate ships with the button that makes one. The
+  // drawings are already clones, so serialising the live node IS the export --
+  // there is no second render path to drift from what you are looking at.
+  const dl = htl.html`<a download="corepox-art-sheet.svg" style="font:12px ui-monospace,monospace;
+    color:${CPX.wire};text-decoration:none;border:1px solid ${CPX.rule};
+    border-radius:4px;padding:4px 10px">download .svg</a>`;
+  dl.href = URL.createObjectURL(
+    new Blob([new XMLSerializer().serializeToString(svg)], {type: "image/svg+xml"}));
+  return htl.html`<div style="display:flex;flex-direction:column;gap:9px;align-items:flex-start">
+    ${svg}${dl}</div>`;
+};
+
 const _CPX = function _CPX(){return(
 {
   cell: 46, pad: 3, pick: 13,
@@ -15930,6 +16206,13 @@ export default function define(runtime, observer) {
   $def("_initialTables", "initialTables", ["TYPES","JOINTS","PORTS"], _initialTables);
   $def("_drawComponent", "drawComponent", ["CPX","slotPoint","SYMBOL_FOR","ART_TILE"], _drawComponent);
   $def("_section", "section", ["CPX","SYMBOL_FOR","TYPES","htl"], _section);
+  $def("_h_sheet", "h_sheet", ["md"], _h_sheet);
+  $def("_packPlates", "packPlates", [], _packPlates);
+  $def("_PLATE_PARTS", "PLATE_PARTS", [], _PLATE_PARTS);
+  $def("_artPlate", "artPlate",
+       ["COMPONENT_ART","SYMBOL_FOR","componentTables","ART_TILE","CPX","packPlates","PLATE_PARTS"],
+       _artPlate);
+  $def("_artSheet", "artSheet", ["artPlate","htl","CPX"], _artSheet);
   $def("_componentEditor", "componentEditor",
        ["initialTables","drawComponent","CPX","htl"], _componentEditor);
 
