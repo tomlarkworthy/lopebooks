@@ -8311,7 +8311,12 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   // plus the aspect correction floors the board at ~19 tiles across, so minSpan
   // below that does nothing. The editor drops it to get near the shipped board
   // zoom, where a tile is ~12% of the screen width.
-  const api = {focus, minSpan: span, pad: 6, framed: null, zoom: 1, follow};
+  // `pan` offsets the camera centre from whatever the auto-frame chose, in view
+  // units. Without it the wheel could only zoom about the centre of the framed
+  // content, so there was no way to look at a corner. Tom, 2026-08-20: "Zoom is
+  // always centered, so I can't use it to pan."
+  const api = {focus, minSpan: span, pad: 6, framed: null, zoom: 1, pan: [0, 0],
+               follow, dragging: false, panLock: false};
   let cam = {cx: 0, cy: 0, w: W, h: H};
   const frame = (k = 0.12) => {
     const pts = [];
@@ -8339,7 +8344,7 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
       // there is no live component anywhere and the board would otherwise ignore
       // the wheel entirely -- which is how "we need to zoom" read as "zoom is
       // broken" on two of the three boards. Hold the centre, honour the zoom.
-      cam = {cx: cam.cx, cy: cam.cy,
+      cam = {cx: cam.cx + (api.pan[0] - cam.cx) * k, cy: cam.cy + (api.pan[1] - cam.cy) * k,
              w: cam.w + (W / api.zoom - cam.w) * k, h: cam.h + (H / api.zoom - cam.h) * k};
       write();
       return;
@@ -8353,7 +8358,7 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
     const minW = api.minSpan * TILE;
     let w = Math.max(x1 - x0 + 2 * pad, minW, (y1 - y0 + 2 * pad) * width / height) / api.zoom;
     const h = w * height / width;
-    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    const cx = (x0 + x1) / 2 + api.pan[0], cy = (y0 + y1) / 2 + api.pan[1];
     cam = {cx: cam.cx + (cx - cam.cx) * k, cy: cam.cy + (cy - cam.cy) * k,
            w: cam.w + (w - cam.w) * k, h: cam.h + (h - cam.h) * k};
     write();
@@ -8419,22 +8424,67 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   // instead, and one rAF eases toward it -- the frame still SNAPS to whatever
   // zoom the ease is at, so the click map an editor reads is always the viewBox
   // on screen, never one it is on the way to.
-  let zoomTo = 1, zoomRaf = null;
+  //
+  // The zoom is anchored on the POINTER, not on the centre. The auto-frame width is
+  // base/zoom with base independent of zoom, so the next width is predictable --
+  // w' = w * zoomOld / zoomNew -- and holding the world point under the cursor
+  // still needs the centre to move by (f - 0.5)(w - w'), where f is the cursor's
+  // fraction across the box. Predicting it means one draw per frame rather than a
+  // draw, a measure and a correcting draw.
+  let zoomTo = 1, zoomRaf = null, at = [0.5, 0.5];
   const settle = () => {
+    const z0 = api.zoom;
     api.zoom += (zoomTo - api.zoom) * 0.3;
     const done = Math.abs(zoomTo - api.zoom) < 1e-3;
     if (done) api.zoom = zoomTo;
+    if (api.zoom !== z0) {
+      const w1 = cam.w * z0 / api.zoom, h1 = cam.h * z0 / api.zoom;
+      api.pan[0] += (at[0] - 0.5) * (cam.w - w1);
+      api.pan[1] += (at[1] - 0.5) * (cam.h - h1);
+    }
     draw(true);
     zoomRaf = done ? null : requestAnimationFrame(settle);
   };
   svg.addEventListener("wheel", (ev) => {
     ev.preventDefault();
+    const r = svg.getBoundingClientRect();
+    at = [(ev.clientX - r.left) / r.width, (ev.clientY - r.top) / r.height];
     const dy = ev.deltaMode === 1 ? ev.deltaY * 16
              : ev.deltaMode === 2 ? ev.deltaY * (svg.clientHeight || 400)
              : ev.deltaY;
     zoomTo = Math.min(8, Math.max(0.15, zoomTo * Math.exp(-dy * 0.0008)));
     if (!zoomRaf) zoomRaf = requestAnimationFrame(settle);
   }, {passive: false});
+
+  // Drag to pan. `panLock` is for an editor whose own drag starts on the board --
+  // the connect gesture sets it in its pointerdown, which runs after this one, so
+  // the lock is read on the first MOVE and not on the down. `dragging` stays true
+  // through the click that follows a real drag, so the editor can ignore it: a pan
+  // that ends over a component must not also select it.
+  let down = null;
+  svg.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0) return;
+    down = {x: ev.clientX, y: ev.clientY, pan: [api.pan[0], api.pan[1]], moved: false};
+  });
+  svg.addEventListener("pointermove", (ev) => {
+    if (!down || api.panLock) return;
+    const dx = ev.clientX - down.x, dy = ev.clientY - down.y;
+    if (!down.moved && Math.hypot(dx, dy) < 5) return;
+    down.moved = true; api.dragging = true;
+    const r = svg.getBoundingClientRect();
+    api.pan[0] = down.pan[0] - dx / r.width * cam.w;
+    api.pan[1] = down.pan[1] - dy / r.height * cam.h;
+    draw(true);
+  });
+  const release = () => {
+    const wasDrag = down?.moved;
+    down = null;
+    if (wasDrag) setTimeout(() => { api.dragging = false; }, 0);
+  };
+  svg.addEventListener("pointerup", release);
+  svg.addEventListener("pointercancel", release);
+  api.resetView = () => { api.pan[0] = api.pan[1] = 0; zoomTo = api.zoom = 1; draw(true); };
+  api.moved = () => api.pan[0] !== 0 || api.pan[1] !== 0 || api.zoom !== 1;
 
   draw();
   return Object.assign(api, {svg, draw});
@@ -10098,6 +10148,23 @@ const _viewof_game = function _viewof_game(
       ? allPorts().filter(q => q.kind === "in")
       : allPorts().filter(q => q.kind === "out");
   };
+  // Tapping `connect` on a component that has exactly ONE port asked a question
+  // with one answer, and made the player answer it: tap connect, then tap the same
+  // component again to pick the only port it has. Tom, 2026-08-20: "I click the
+  // 'connect' from a component and then I have to click that component *again* to
+  // connect it." Constant, Engine, Explosive and Lazer are all single-port, which
+  // is every wire in `run` and `connection` -- the two missions that teach wiring.
+  // A multi-port part (Radar has dist and bearing, Binary has a and b) still
+  // chequers and still asks, because there the question is real.
+  const armConnect = () => {
+    act = "connect"; wire = null; panel = "none";
+    const c = sel && S.player.at(sel.px, sel.py);
+    const mine = c ? allPorts().filter(q => q.c === c) : [];
+    if (mine.length !== 1) return;
+    const q = mine[0];
+    wire = {auto: true, from: {px: q.c.px, py: q.c.py, cell: [q.px, q.py],
+                               port: q.name, kind: q.kind}, to: null};
+  };
   const commitWire = () => {
     if (!wire?.to) return;
     const a = wire.from.kind === "out" ? wire.from : wire.to;
@@ -10145,8 +10212,12 @@ const _viewof_game = function _viewof_game(
       render(); return;
     }
     if (act === "connect") {
+      // tapping the port you are already wired FROM is a no-op, not a cancel --
+      // with the arm now automatic it is the cell most likely to be tapped first
+      if (wire && !wire.to && wire.from.cell[0] === px && wire.from.cell[1] === py) return;
       const hit = legalPorts().find(q => q.px === px && q.py === py);
-      if (!hit) { if (wire) wire = null; else { act = null; panel = "menu"; } }
+      if (!hit) { if (wire && !wire.auto) wire = null;
+                  else { wire = null; act = null; panel = "menu"; } }
       else if (!wire) wire = {from: {px: hit.c.px, py: hit.c.py, cell: [px, py],
                                      port: hit.name, kind: hit.kind}, to: null};
       else wire = {...wire, to: {px: hit.c.px, py: hit.c.py, cell: [px, py],
@@ -10180,7 +10251,7 @@ const _viewof_game = function _viewof_game(
         const r = stepSession(S, objs);
         if (r !== "playing") { S.state = r; break; }
       }
-      view.draw(); paintOverlay(); paintHud();
+      camera(); view.draw(); paintOverlay(); paintHud();
       // the clock is only repainted on a state change, so it has to be written
       // straight into its node or it reads 0.0s for the whole match
       if (clock) clock.textContent = `${S.world.t.toFixed(1)}s`;
@@ -10191,10 +10262,52 @@ const _viewof_game = function _viewof_game(
     raf = requestAnimationFrame(tick);
     render();
   };
+  // The camera rule, called from render AND from every animation frame. It used
+  // to live inside render only, which was fine while it depended on UI state --
+  // a menu opening is a render. It now depends on where the ship IS, and a ship
+  // that moves without a click would never have been noticed.
+  const camera = () => {
+      const m = MISSIONS[mi];
+      // The zoom depends on the SHIP and never on the UI. It used to depend on a
+      // `busy` flag -- is a menu open, a part picked, a component selected -- so
+      // opening the info panel zoomed the board in and closing it zoomed back out,
+      // under the player's fingers. Tom, 2026-08-20: "I don't think accessing menu
+      // items should change zoom levels."
+      //
+      // What replaces it is whether the ship has left the mark. A live wiring mission
+      // (`run`, `connection`, `avoiding`) opens with the hull filling the board,
+      // because that is where the work is; once the Engine fires and the ship is more
+      // than 2 tiles out, the mission's own span opens up and the jump zone comes into
+      // frame. `gunner` never moves and so stays close, which is right -- it is a
+      // stepper mission fought from a standstill. A fight (`cocoon`, `aiming`) is
+      // wide from its first frame, as before.
+      if (S.home == null) S.home = [S.player.x, S.player.y];
+      const moved = Math.hypot(S.player.x - S.home[0], S.player.y - S.home[1]) > 2;
+      const close = S.state === "build" || (m.live && !moved);
+      // The ghosts have to be IN FRAME, and on `birthing` they are the only thing on
+      // the board -- the ship is empty, so the camera has nothing to frame and falls
+      // back to the constructed span. Feeding the legal cells in as focus points
+      // keeps the first mission at the same zoom as every other.
+      const ghostCells = picked ? legalCells(picked) : [];
+      view.focus = ghostCells.length
+        ? ghostCells.map(([x, y]) => S.player.worldOf({px: x, py: y}))
+        : !close && S.state === "playing" && m.zone ? [[m.zone.x, m.zone.y]] : [];
+      // ALWAYS your ship. `framed = null` means the camera has to contain every ship
+      // in the world, so `connection`'s two rivals and `avoiding`'s three mines pulled
+      // it open until the hull was a few pixels across. Tom, annotating this cell on
+      // 2026-08-20: "the zoom follows the oppents so I can't use the UI after a few
+      // seconds". The enemies stay visible because minSpan is per-mission and already
+      // sized to the fight -- Aim's spawn ring is 18 tiles and its span is 56.
+      view.framed = [S.player];
+      view.minSpan = close ? 10 : S.state === "playing" ? (m.span ?? 40) : 16;
+      view.pad = close ? 2.2 : 6;
+  };
+
   const reset = (idx = mi) => {
     if (raf) cancelAnimationFrame(raf);
     mi = idx; S = newSession(MISSIONS[mi]);
     picked = null; wire = null; sel = null; act = null; panel = "none";
+    view?.resetView?.();         // a hand-panned camera does not carry to the next mission
     render();
     // liveMode: no build phase and no Play button, the clock is already running.
     if (MISSIONS[mi].live) play();
@@ -10426,7 +10539,7 @@ const _viewof_game = function _viewof_game(
           else if (a.id === "rotate") doRotate();
           else if (a.id === "delete") doDelete();
           else if (a.id === "move") { act = "move"; panel = "none"; }
-          else if (a.id === "connect") { act = "connect"; wire = null; panel = "none"; }
+          else if (a.id === "connect") { armConnect(); }
           else if (a.id === "cut") { act = "cut"; }
           render();
         }} style="display:flex;flex-direction:column;align-items:center;gap:3px;
@@ -10488,6 +10601,7 @@ const _viewof_game = function _viewof_game(
       overlay = document.createElementNS(ns, "g");
       view.svg.appendChild(overlay);
       view.svg.addEventListener("click", (ev) => {
+        if (view.dragging) return;   // that click was a pan, not a tap
         const [px, py] = localTile(ev); clickTile(px, py);
       });
       // Drag is the shipped connect gesture; tap-tap works too, because a tap is
@@ -10495,9 +10609,13 @@ const _viewof_game = function _viewof_game(
       view.svg.addEventListener("pointerdown", (ev) => {
         if (act !== "connect") return;
         const [px, py] = localTile(ev);
-        if (legalPorts().some(q => q.px === px && q.py === py)) view.svg.dragging = true;
+        // a drag that starts on a port is a wire, not a pan; the camera reads
+        // panLock on the first MOVE, which is after this handler has run
+        if (legalPorts().some(q => q.px === px && q.py === py))
+          view.svg.dragging = view.panLock = true;
       });
       view.svg.addEventListener("pointerup", (ev) => {
+        view.panLock = false;
         if (!view.svg.dragging) return;
         view.svg.dragging = false;
         const [px, py] = localTile(ev);
@@ -10521,36 +10639,18 @@ const _viewof_game = function _viewof_game(
       };
       stage.append(hud, corners.tr, corners.bl, corners.br, corners.mid);
     }
-    // The camera follows the ATTENTION, not the state. A live wiring mission runs
-    // from the first frame, so the old rule -- playing means frame the jump zone 26
-    // tiles away -- put the whole ship inside 60 px while the player was trying to
-    // tap a port on it. `busy` is any gesture aimed at the hull, and it pulls the
-    // camera in to about the shipped board zoom (a tile is ~129 device px of 1080,
-    // so ~8.4 tiles across; 10 here, because the ship is off-centre).
-    const busy = editable() && (panel !== "none" || act != null || picked != null || sel != null);
-    // The ghosts have to be IN FRAME, and on `birthing` they are the only thing on
-    // the board -- the ship is empty, so the camera has nothing to frame and falls
-    // back to the constructed span. Feeding the legal cells in as focus points
-    // keeps the first mission at the same zoom as every other.
-    const ghostCells = picked ? legalCells(picked) : [];
-    view.focus = ghostCells.length
-      ? ghostCells.map(([x, y]) => S.player.worldOf({px: x, py: y}))
-      : !busy && S.state === "playing" && m.zone ? [[m.zone.x, m.zone.y]] : [];
-    // ALWAYS your ship. `framed = null` means the camera has to contain every ship
-    // in the world, so `connection`'s two rivals and `avoiding`'s three mines pulled
-    // it open until the hull was a few pixels across. Tom, annotating this cell on
-    // 2026-08-20: "the zoom follows the oppents so I can't use the UI after a few
-    // seconds". The enemies stay visible because minSpan is per-mission and already
-    // sized to the fight -- Aim's spawn ring is 18 tiles and its span is 56.
-    view.framed = [S.player];
-    view.minSpan = busy ? 10 : S.state === "playing" ? (m.span ?? 40) : 16;
-    view.pad = busy ? 2.2 : 6;
+    camera();
     // snap, not ease: in the editor a click has to hit the connector the player
     // can see, so the viewBox must not move between paint and click
     view.draw(S.state !== "playing"); paintOverlay(); paintHud();
 
     for (const k of ["tr", "bl", "br"]) corners[k].textContent = "";
     corners.mid.textContent = "";
+    // Drag-to-pan has no undo of its own, and a camera parked on empty space looks
+    // like the ship is gone. The pad only exists once the view has actually been
+    // moved, so it is never a control the player has to learn.
+    if (view?.moved?.())
+      corners.tr.append(pad("⌖", () => { view.resetView(); render(); }, "#8fd0ff", "recentre", 40));
     if (S.state !== "build") corners.tr.append(pad("↺", () => reset(mi), "#ff8f6d", "restart", 40));
 
     if (S.state === "build") corners.bl.append(pad("▶", play, "#5ef2a0", "play", 52));
@@ -10607,7 +10707,7 @@ const _viewof_game = function _viewof_game(
              open: (px, py) => { clickTile(px, py); },
              menu: (id) => { const c = S.player.at(sel.px, sel.py);
                if (!canDo(id, c)) return false;
-               if (id === "connect") { act = "connect"; wire = null; panel = "none"; }
+               if (id === "connect") { armConnect(); }
                else if (id === "rotate") doRotate();
                else if (id === "delete") doDelete();
                else if (id === "move") { act = "move"; panel = "none"; }
@@ -15550,14 +15650,24 @@ const _h_Engine = function _h_Engine(section){return(
 section("Engine")
 )};
 
+// Two of the three shapes were missing their wide bright stroke. Every other
+// component pairs a thin pale under-stroke with a 4.16 bright one (Armour, and the
+// Engine's own indigo arch); the green head and the red nozzle carried 0.84 twice,
+// so the Engine's silhouette came out 5.7% narrow and 4.1% short against its sprite
+// and did not butt up against the parts beside it. Tom, 2026-08-20: "the engine or
+// binary do not look properly aligned to their grids yet".
+//
+// The viewBox is the proof, not the eye: it is 51.20 x 104.08, and 47.01 + 4.16 =
+// 51.17, 99.89 + 4.16 = 104.05. It was already sized for a stroke that was not
+// there. tools/corepox-art-ink.py agrees after the change.
 const _art_Engine = function _art_Engine(svg){return(
 svg`<svg viewBox="-2.09 -2.09 51.20 104.08" width="157.4" height="320.0">
   <path d="M0,0C0,0,0,23.83,0,23.83C0,37.45,6.38,47.8,23.5,47.8C40.62,47.8,47.01,36.39,47.01,23.83C47.01,23.83,47.01,0,47.01,0L0,0Z" fill="rgba(0,0,0,0.298)" stroke="rgb(207,230,207)" stroke-width="0.84" stroke-linejoin="round"/>
-  <path d="M0,0C0,0,0,23.83,0,23.83C0,37.45,6.38,47.8,23.5,47.8C40.62,47.8,47.01,36.39,47.01,23.83C47.01,23.83,47.01,0,47.01,0L0,0Z" fill="none" stroke="rgb(184,230,184)" stroke-width="0.84" stroke-linejoin="round"/>
+  <path d="M0,0C0,0,0,23.83,0,23.83C0,37.45,6.38,47.8,23.5,47.8C40.62,47.8,47.01,36.39,47.01,23.83C47.01,23.83,47.01,0,47.01,0L0,0Z" fill="none" stroke="rgb(184,230,184)" stroke-width="4.16" stroke-linejoin="round"/>
   <path d="M4.45,81.3C4.45,81.3,3.42,49.02,23.47,49.16C43.55,49.3,42.53,81.3,42.53,81.3" fill="rgba(16,9,44,0.500)" stroke="rgba(207,207,230,0.520)" stroke-width="0.84" stroke-linejoin="round"/>
   <path d="M4.45,81.3C4.45,81.3,3.42,49.02,23.47,49.16C43.55,49.3,42.53,81.3,42.53,81.3" fill="none" stroke="rgb(138,138,230)" stroke-width="4.2" stroke-linejoin="round"/>
   <path d="M5.04,80.58L41.97,80.58L41.97,99.05L5.04,99.05L5.04,80.58Z" fill="rgb(78,19,19)" stroke="rgb(230,142,142)" stroke-width="0.84" stroke-linejoin="round"/>
-  <path d="M5.04,81.42L41.97,81.42L41.97,99.89L5.04,99.89L5.04,81.42Z" fill="none" stroke="rgb(230,142,142)" stroke-width="0.84" stroke-linejoin="round"/>
+  <path d="M5.04,81.42L41.97,81.42L41.97,99.89L5.04,99.89L5.04,81.42Z" fill="none" stroke="rgb(230,142,142)" stroke-width="4.16" stroke-linejoin="round"/>
 </svg>`
 )};
 
