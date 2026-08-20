@@ -16520,7 +16520,7 @@ const _PLATE_PARTS = function _PLATE_PARTS(){return(
  ["connection-3-0", "wire 3 tiles"]]
 )};
 
-const _artPlate = function _artPlate(COMPONENT_ART, SYMBOL_FOR, componentTables, ART_TILE, CPX, packPlates, PLATE_PARTS){return(
+const _artPlate = function _artPlate(COMPONENT_ART, SYMBOL_FOR, componentTables, ART_TILE, CPX, packPlates, PLATE_PARTS, artKids){return(
 ({gap = 16, label = 24, ports = true, turretSplit = true, parts = true,
   wire = "#b0ff77"} = {}) => {
   const ns = "http://www.w3.org/2000/svg";
@@ -16618,7 +16618,7 @@ const _artPlate = function _artPlate(COMPONENT_ART, SYMBOL_FOR, componentTables,
     // connector, so they stroke with currentColor and a static sheet has to
     // choose one. This is the colour a positive value paints.
     if (it.tint) g.setAttribute("color", wire);
-    for (const kid of it.kids) g.appendChild(kid.cloneNode(true));
+    for (const kid of artKids(it.kids)) g.appendChild(kid);
     // The connectors, in art coordinates: the anchor IS tile [0,0]'s centre and
     // +y is DOWN in the art, so a port on cell (ox, oy) lands at
     // (ax + ox*ART_TILE, ay - oy*ART_TILE). Same shapes the sections use -- a ring
@@ -16777,6 +16777,40 @@ Object.fromEntries(Object.keys(TYPES).map(type => [type, {
 }]))
 )};
 
+// Take a drawing's children for somewhere else, with PRIVATE ids.
+//
+// A drawing is cloned into three places -- the symbol sheet, the plate, and the
+// footprint underlay -- and cloning duplicates every id in its <defs>. A duplicate
+// id is not harmless: `url(#x)` takes the FIRST match in the document, and the
+// first match may be in a lopepage pane that is display:none, where Blink builds
+// no paint server at all. With the components page open beside the board there
+// were four #cpx-orb-glow, one of them hidden, and every orb on the board painted
+// nothing -- Tom, 2026-08-20: "I do not see the orb". The board was correct in
+// isolation, which is why the first fix looked like it had worked.
+//
+// href="#..." is rewritten too, because artPlate resolves unresolved hrefs against
+// the document and would otherwise throw on a namespaced id.
+const _artKids = function _artKids(){
+  let n = 0;
+  return (src, keep = () => true) => {
+    const c = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    for (const k of Array.isArray(src) ? src : src.children) c.appendChild(k.cloneNode(true));
+    const tag = "-a" + ++n;
+    const ids = new Map([...c.querySelectorAll("[id]")].map(e => [e.id, e.id + tag]));
+    for (const e of c.querySelectorAll("[id]")) e.id = ids.get(e.id);
+    if (ids.size)
+      for (const e of [c, ...c.querySelectorAll("*")])
+        for (const a of e.attributes) {
+          if (a.value.includes("url(#"))
+            a.value = a.value.replace(/url\(#([^)]+)\)/g,
+              (m, id) => ids.has(id) ? `url(#${ids.get(id)})` : m);
+          else if (a.name.endsWith("href") && ids.has(a.value.slice(1)))
+            a.value = "#" + ids.get(a.value.slice(1));
+        }
+    return [...c.children].filter(keep);
+  };
+};
+
 // One component as an SVG the user can click, with its drawing underneath at the
 // scale the game draws it: art unit / ART_TILE = tile, offset so SYMBOL_FOR's
 // anchor lands on the centre of cell [0,0]. That underlay is the anchor gate made
@@ -16787,7 +16821,7 @@ Object.fromEntries(Object.keys(TYPES).map(type => [type, {
 // node here would empty its own section and orphan the svg-lens overlay attached
 // to it. A commit redefines the art cell, this cell recomputes, and the clone is
 // taken again -- which is why an edit shows up under the grid immediately.
-const _drawComponent = function _drawComponent(CPX, slotPoint, SYMBOL_FOR, ART_TILE){return(
+const _drawComponent = function _drawComponent(CPX, slotPoint, SYMBOL_FOR, ART_TILE, artKids){return(
 (type, tbl, {onpick = null, selected = null, art = null, showArt = true} = {}) => {
   const ns = "http://www.w3.org/2000/svg";
   const C = CPX.cell, col = CPX.colour[type] ?? "#8899aa";
@@ -16830,7 +16864,7 @@ const _drawComponent = function _drawComponent(CPX, slotPoint, SYMBOL_FOR, ART_T
     const g = add("g", {transform:
       `translate(${X(0.5) - spec[1] * k} ${Y(0.5) - spec[2] * k}) scale(${k} ${k})`},
       "opacity:0.85;pointer-events:none");
-    for (const kid of art.children) g.appendChild(kid.cloneNode(true));
+    for (const kid of artKids(art)) g.appendChild(kid);
   }
 
   for (let gx = minx; gx <= maxx + 1; gx++)
@@ -17405,13 +17439,14 @@ export default function define(runtime, observer) {
   $def("_ART_TILE", "ART_TILE", [], _ART_TILE);
   $def("_slotPoint", "slotPoint", [], _slotPoint);
   $def("_initialTables", "initialTables", ["TYPES","JOINTS","PORTS"], _initialTables);
-  $def("_drawComponent", "drawComponent", ["CPX","slotPoint","SYMBOL_FOR","ART_TILE"], _drawComponent);
+  $def("_artKids", "artKids", [], _artKids);
+  $def("_drawComponent", "drawComponent", ["CPX","slotPoint","SYMBOL_FOR","ART_TILE","artKids"], _drawComponent);
   $def("_section", "section", ["CPX","SYMBOL_FOR","TYPES","htl"], _section);
   $def("_h_sheet", "h_sheet", ["md"], _h_sheet);
   $def("_packPlates", "packPlates", [], _packPlates);
   $def("_PLATE_PARTS", "PLATE_PARTS", [], _PLATE_PARTS);
   $def("_artPlate", "artPlate",
-       ["COMPONENT_ART","SYMBOL_FOR","componentTables","ART_TILE","CPX","packPlates","PLATE_PARTS"],
+       ["COMPONENT_ART","SYMBOL_FOR","componentTables","ART_TILE","CPX","packPlates","PLATE_PARTS","artKids"],
        _artPlate);
   $def("_artSheet", "artSheet", ["artPlate","htl","CPX"], _artSheet);
   $def("_componentEditor", "componentEditor",
@@ -23206,7 +23241,7 @@ const _SHEET_SYMBOLS = function _SHEET_SYMBOLS(){return(
 // attached to nothing, which floated beside every turret on the board until the
 // split; it is not in the cell. Groups were identified by getBBox
 // (tools/corepox-art-split.ts) and the split is source now, not surgery at load.
-const _symbolSheet = function _symbolSheet(SHEET, COMPONENT_ART){
+const _symbolSheet = function _symbolSheet(SHEET, COMPONENT_ART, artKids){
   const NS = "http://www.w3.org/2000/svg";
   const host = document.createElement("div");
   // NOT display:none, and the two words are load-bearing. Blink gives a
@@ -23227,7 +23262,7 @@ const _symbolSheet = function _symbolSheet(SHEET, COMPONENT_ART){
     const sym = document.createElementNS(NS, "symbol");
     sym.id = "cp-" + id;
     sym.setAttribute("viewBox", viewBox);
-    for (const k of kids) sym.appendChild(k.cloneNode(true));
+    for (const k of kids) sym.appendChild(k);
     sheet.appendChild(sym);
     return sym;
   };
@@ -23238,14 +23273,15 @@ const _symbolSheet = function _symbolSheet(SHEET, COMPONENT_ART){
     // what the drawing itself declares.
     const kids = [...art.children].filter(e => e.namespaceURI === NS &&
       !(e.getAttribute("class") || "").includes("svg-lens"));
-    // A drawing's own <defs> goes in with it: the Orb's glow gradient resolves from
-    // inside the <symbol>, once the sheet itself is laid out (see host, above).
-    put(name, vb, kids);
+    // A drawing's own <defs> goes in with it and gets PRIVATE ids on the way (see
+    // artKids): the sheet's copy must not share an id with the copy the components
+    // page renders, or url(#...) resolves to whichever is first in the document.
+    put(name, vb, artKids(kids));
     if (name === "turret2")
       for (const part of ["turret2-base", "turret2-barrel"]) {
         const g = art.querySelector("#" + part);
         if (!g) throw new Error("corepox-assets: turret2 art has no #" + part);
-        put(part, vb, [g]);
+        put(part, vb, artKids([g]));
       }
   }
   // The connector sprites are stroked with a literal magenta. ConnectionView tints
@@ -23338,7 +23374,7 @@ export default function define(runtime, observer) {
   // the section that documents it, and the sheet is assembled from those cells.
   main.define("module @tomlarkworthy/corepox-components",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-components.js?v=4")).default));
-  for (const n of ["COMPONENT_ART", "SYMBOL_FOR"])
+  for (const n of ["COMPONENT_ART", "SYMBOL_FOR", "artKids"])
     main.define(n, ["module @tomlarkworthy/corepox-components", "@variable"],
                 (_, v) => v.import(n, _));
   // Three arguments, not two: Variable.import(remote, name, module) takes the
@@ -23353,7 +23389,7 @@ export default function define(runtime, observer) {
   $def("_SHEET", "SHEET", [], _SHEET);
   $def("_SHEET_SYMBOLS", "SHEET_SYMBOLS", [], _SHEET_SYMBOLS);
   $def("_SYMBOLS", "SYMBOLS", ["SHEET_SYMBOLS", "COMPONENT_ART"], _SYMBOLS);
-  $def("_symbolSheet", "symbolSheet", ["SHEET", "COMPONENT_ART"], _symbolSheet);
+  $def("_symbolSheet", "symbolSheet", ["SHEET", "COMPONENT_ART", "artKids"], _symbolSheet);
   $def("_use", "use", ["SYMBOLS", "symbolSheet"], _use);
   $def("_sprite", "sprite", ["SYMBOLS", "symbolSheet"], _sprite);
   $def("_gallery", "gallery", ["htl", "SYMBOLS", "sprite"], _gallery);
