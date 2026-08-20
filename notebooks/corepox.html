@@ -10766,7 +10766,7 @@ const _evaluateObjectives = function _evaluateObjectives(){return(
 }
 )};
 
-const _stepSession = function _stepSession(Ship, geom, DT){return(
+const _stepSession = function _stepSession(Ship, geom, DT, pilot){return(
 (S, objectives) => {
   const m = S.mission, w = S.world;
   // count enemy components lost since last tick, for `destroy` objectives
@@ -10805,6 +10805,10 @@ const _stepSession = function _stepSession(Ship, geom, DT){return(
       S.spawned++;
     }
   }
+  // Manual control: the player names an intent and the solver actuates whatever
+  // the hull has. Only runs when a caller has set S.cmd, so a mission that is
+  // teaching wiring is unaffected -- it simply never offers the control.
+  if (S.cmd) S.pilotState = pilot(S.player, S.cmd, S.pilotMemo ??= {});
   w.step();
   // Only the missions that can kill you check for a dead core: PlaceBrainMission
   // and ConnectionMission have no loss branch at all in the C#, and an empty
@@ -10861,6 +10865,9 @@ const _viewof_game = function _viewof_game(
     MISSIONS, newSession, evaluateObjectives, stepSession, battlefield, objectiveHtml,
     componentNode, INFO, MENU_ACTIONS, TYPES, PORTS, TILE, htl, invalidation) {
   let mi = 0, S = newSession(MISSIONS[0]);
+  let pilotDrag = null;                       // world point the current drag started on
+  // same convention as geom.bearing: 0 is up, clockwise positive
+  const geomBearing = (dx, dy) => Math.atan2(dx, -dy) * 180 / Math.PI;
   // The shipped board has no modes. It has a SELECTION, and the selection's menu
   // says what can be done to it. `act` is whichever menu action is mid-gesture --
   // "connect" waiting for a target, "move" waiting for a cell -- and it is null
@@ -10874,7 +10881,18 @@ const _viewof_game = function _viewof_game(
   let wire = null;            // {from:{px,py,cell,port}, to:{...}|null}
   let panel = "none";         // "none" | "build" | "menu" | "info"
   let clock = null, raf = null, stop = false;
-  invalidation.then(() => { stop = true; if (raf) cancelAnimationFrame(raf); });
+  const fireKey = (down) => (ev) => {
+    if (ev.key !== "f" && ev.key !== "F") return;
+    if (S.state === "playing" && S.cmd) S.cmd.fire = down;
+  };
+  const kd = fireKey(true), ku = fireKey(false);
+  window.addEventListener("keydown", kd);
+  window.addEventListener("keyup", ku);
+  invalidation.then(() => {
+    stop = true; if (raf) cancelAnimationFrame(raf);
+    window.removeEventListener("keydown", kd);
+    window.removeEventListener("keyup", ku);
+  });
 
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;
     font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
@@ -10907,6 +10925,14 @@ const _viewof_game = function _viewof_game(
     const wx = (vb.x + (ev.clientX - r.left) / r.width * vb.width) / TILE;
     const wy = (vb.y + (ev.clientY - r.top) / r.height * vb.height) / TILE;
     return S.player.tileOf(wx, wy);
+  };
+  // localTile answers "which cell of MY ship", which is the editor's question. A
+  // waypoint is a point in the world, so it stops before tileOf.
+  const worldTile = (ev) => {
+    const svg = view.svg, r = svg.getBoundingClientRect();
+    const vb = svg.viewBox.baseVal;
+    return [(vb.x + (ev.clientX - r.left) / r.width * vb.width) / TILE,
+            (vb.y + (ev.clientY - r.top) / r.height * vb.height) / TILE];
   };
   const tileToView = (px, py) => {
     const [wx, wy] = S.player.worldOf({px, py});
@@ -11190,6 +11216,7 @@ const _viewof_game = function _viewof_game(
     S.state = "playing";
     picked = null; wire = null;
     S.enemyWas = new Map();
+    S.cmd = {target: null, face: null, fire: false};
     const tick = () => {
       if (stop || S.state !== "playing") return;
       for (let i = 0; i < 2; i++) {
@@ -11285,6 +11312,21 @@ const _viewof_game = function _viewof_game(
   const paintOverlay = () => {
     if (!overlay) return;
     overlay.textContent = "";
+    // Where you told it to go, and -- if you dragged -- which way to be pointing
+    // when it gets there. Drawn from S.cmd, so it shows the INTENT; whether the
+    // hull can honour it is the allocator's business and the ship's fault.
+    if (S.state === "playing" && S.cmd?.target) {
+      const [tx, ty] = S.cmd.target, vx = tx * TILE, vy = ty * TILE;
+      const g = add(overlay, "g", {opacity: 0.9});
+      add(g, "circle", {cx: vx, cy: vy, r: TILE * 1.1, fill: "none",
+        stroke: "#4fd8e8", "stroke-width": 3, "stroke-dasharray": "9 8"});
+      add(g, "circle", {cx: vx, cy: vy, r: 4, fill: "#4fd8e8"});
+      if (S.cmd.face != null) {
+        const a = S.cmd.face * Math.PI / 180, r = TILE * 2.6;
+        add(g, "line", {x1: vx, y1: vy, x2: vx + Math.sin(a) * r, y2: vy - Math.cos(a) * r,
+          stroke: "#ffc42e", "stroke-width": 3});
+      }
+    }
     // Jump zone: nested ellipses in perspective, not a dashed circle. The shipped
     // funnel is the most recognisable piece of furniture on the board
     // (data/corepox/shipped-ui/36-run-board.avif) and a ring read as a target
@@ -11552,6 +11594,28 @@ const _viewof_game = function _viewof_game(
       });
       // Drag is the shipped connect gesture; tap-tap works too, because a tap is
       // a drag of zero length and the port under the finger is the same either way.
+      // Flying. A tap names where to go; a drag names where to go and which way
+      // to be pointing on arrival. Both are intents -- stepSession hands them to
+      // the allocator, which decides what the hull can actually do about it.
+      view.svg.addEventListener("pointerdown", (ev) => {
+        if (S.state !== "playing" || ev.button !== 0) return;
+        const [lx, ly] = localTile(ev);
+        if (S.player.at(lx, ly)?.hp > 0) return;      // tapping your own hull is an edit
+        pilotDrag = worldTile(ev);
+        S.cmd = {...(S.cmd ?? {}), target: pilotDrag, face: null};
+        view.panLock = true;
+        view.svg.setPointerCapture(ev.pointerId);
+      });
+      view.svg.addEventListener("pointermove", (ev) => {
+        if (!pilotDrag) return;
+        const [x, y] = worldTile(ev);
+        const dx = x - pilotDrag[0], dy = y - pilotDrag[1];
+        S.cmd.face = Math.hypot(dx, dy) > 1.5 ? geomBearing(dx, dy) : null;
+      });
+      view.svg.addEventListener("pointerup", () => {
+        if (!pilotDrag) return;
+        pilotDrag = null; view.panLock = false;
+      });
       view.svg.addEventListener("pointerdown", (ev) => {
         if (act !== "connect") return;
         const [px, py] = localTile(ev);
@@ -11684,7 +11748,7 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-missions",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
-  for (const n of ["Ship", "World", "TYPES", "PORTS", "geom", "DT"])
+  for (const n of ["Ship", "World", "TYPES", "PORTS", "geom", "DT", "pilot", "pilotActuators", "flightModel"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   for (const n of ["battlefield", "componentNode"])
     main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
@@ -11697,7 +11761,7 @@ export default function define(runtime, observer) {
   $def("_objectiveHtml", "objectiveHtml", ["htl"], _objectiveHtml);
   $def("_newSession", "newSession", ["Ship","World"], _newSession);
   $def("_evaluateObjectives", "evaluateObjectives", [], _evaluateObjectives);
-  $def("_stepSession", "stepSession", ["Ship","geom","DT"], _stepSession);
+  $def("_stepSession", "stepSession", ["Ship","geom","DT","pilot"], _stepSession);
   $def("_INFO", "INFO", [], _INFO);
   $def("_MENU_ACTIONS", "MENU_ACTIONS", [], _MENU_ACTIONS);
   return main;
@@ -16132,6 +16196,146 @@ Physics, dataflow and damage. No DOM — it runs headless, which is what lets th
 battle in the browser and verify a ladder result outside it.`
 )};
 
+// ---------------------------------------------------------------------------
+// The robot pilot. Ship.force is LINEAR in throttle, so throttles -> (ax, ay,
+// alpha) is a constant 3xn matrix and piloting is control allocation, not a
+// script: the player names an intent and the solver works out which nozzles.
+// Measured 2026-08-20 over 200 corpus ships, 25-tile waypoint, 40s cap
+// (tools/corepox-autopilot.ts): 70.5% arrive, median 12.6s. The ships that fail
+// are the ones that cannot torque both ways (3.1% arrive against 83.3%), which
+// is the point -- the solver is handed the same matrix either way, so the
+// failure belongs to the build.
+
+// One column per Engine the pilot may command: [ax, ay, alpha] at full throttle,
+// ship frame. Three filters, each of which cost a wrong answer to find:
+//   own island -- the Brain pilots what it is attached to and nothing else
+//   powered    -- World.evaluate skips an unpowered engine, so commanding one
+//                 puts thrust on a dead nozzle and the ship sits still
+//   unwired    -- Ship.propagate writes only ports that carry a connection, so a
+//                 directly set in.in survives the tick; a wired engine is a
+//                 program's, not the pilot's
+const _pilotActuators = function _pilotActuators(geom){return(
+(ship, {all = false} = {}) => {
+  const withBrain = ship.islands().filter(g => g.some(c => c.type === "Brain" && c.hp > 0));
+  if (!withBrain.length) return [];
+  const grp = withBrain.reduce((a, b) => (b.length > a.length ? b : a));
+  const cols = [];
+  for (const c of grp) {
+    if (c.type !== "Engine" || !c.powered) continue;
+    if (!all && ship.conns.some(k => k.to[0] === c.px && k.to[1] === c.py)) continue;
+    const lx = c.px - ship.cx, ly = -(c.py - ship.cy);
+    const [dx, dy] = geom.unit(c.dir);
+    const ux = dx / ship.mass, uy = dy / ship.mass;
+    cols.push({c, ux, uy, t: (lx * uy - ly * ux) / ship.I});
+  }
+  return cols;
+}
+)};
+
+// min over f in [0,1]^n of || diag(wt) (A f - b) ||^2, by cyclic coordinate
+// descent. n is the engine count -- median 3, max 13 across the corpus -- so an
+// exact per-coordinate step converges in a handful of sweeps.
+const _pilotAllocate = function _pilotAllocate(){return(
+(A, b, wt, sweeps = 24) => {
+  const n = A.length, f = new Array(n).fill(0);
+  const col = A.map(a => [a.ux, a.uy, a.t]);
+  const diag = col.map(c => wt[0] * c[0] ** 2 + wt[1] * c[1] ** 2 + wt[2] * c[2] ** 2);
+  const r = [-b[0], -b[1], -b[2]];
+  for (let s = 0; s < sweeps; s++)
+    for (let i = 0; i < n; i++) {
+      if (diag[i] < 1e-12) continue;
+      const g = wt[0] * col[i][0] * r[0] + wt[1] * col[i][1] * r[1] + wt[2] * col[i][2] * r[2];
+      const step = Math.max(-f[i], Math.min(1 - f[i], -g / diag[i]));
+      if (!step) continue;
+      f[i] += step;
+      for (let k = 0; k < 3; k++) r[k] += step * col[i][k];
+    }
+  return {f, residual: Math.hypot(r[0], r[1], r[2])};
+}
+)};
+
+// The flight model is READ OFF THE BUILD, never configured. h(d), the support
+// function of the reachable force set, is max thrust in body direction d, so the
+// best thrust axis and the isotropy both fall out of one sweep. Body +y is not
+// assumed to be the nose: a hull whose engines all point sideways flies sideways.
+const _flightModel = function _flightModel(geom, UNITS){return(
+(A) => {
+  const KL = 1 / UNITS.W, TAU = 1;
+  let phi = 0, ax = 0, ay = -1, hi = 0, lo = Infinity;
+  for (let k = 0; k < 72; k++) {
+    const th = k * 5, [dx, dy] = geom.unit(th);
+    let h = 0;
+    for (const a of A) h += Math.max(0, a.ux * dx + a.uy * dy);
+    if (h > hi) { hi = h; ax = dx; ay = dy; phi = th; }
+    if (h < lo) lo = h;
+  }
+  let p = 0, n = 0;
+  for (const a of A) { p += Math.max(0, a.t); n += Math.max(0, -a.t); }
+  return {rocket: lo < 0.2 * hi, axis: [ax, ay], phi,
+          vmax: KL * hi * TAU, yawP: p * KL / geom.D, yawN: n * KL / geom.D};
+}
+)};
+
+// pilot(ship, {target, face, fire}) -- writes engine throttles for one tick.
+// `memo` is per-ship scratch the caller owns; it latches the turn direction.
+const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, geom, UNITS){return(
+(ship, cmd = {}, memo = {}, A = pilotActuators(ship)) => {
+  for (const a of A) a.c.in.in = 0;
+  if (!A.length) return {residual: 0, err: 0, model: null, throttles: []};
+  const KL = 1 / UNITS.W, KA = KL / geom.D, TAU = 1;
+  const G = {vel: 2.4, rate: 3.2, torque: 8};
+  const R = flightModel(A);
+  let bx = 0, by = 0, want = cmd.face ?? ship.a;
+
+  if (cmd.target && R.vmax > 1e-6) {
+    const ex = cmd.target[0] - ship.x, ey = cmd.target[1] - ship.y;
+    const d = Math.hypot(ex, ey) || 1e-9;
+    // Drag is first order with TAU = 1s, so a ship carrying v coasts about v*TAU
+    // further. Commanding d/TAU is the fastest approach that still stops, and it
+    // has to be, because 61% of the corpus cannot thrust aft at all.
+    const sp = Math.min(R.vmax * 0.9, d / TAU);
+    const vx = ex / d * sp, vy = ey / d * sp;
+    const wx = G.vel * (vx - ship.vx) + vx / TAU, wy = G.vel * (vy - ship.vy) + vy / TAU;
+    const mag = Math.hypot(wx, wy);
+    if (cmd.face == null) {
+      // Point the strongest thrust axis at the demand, and gate the burn on how
+      // well the nose already agrees -- without the gate a rocket fights itself.
+      want = geom.norm(geom.bearing(0, 0, wx, wy) - R.phi);
+      const gate = Math.max(0, Math.cos(geom.norm(want - ship.a) * geom.D));
+      bx = R.axis[0] * mag * gate / KL; by = R.axis[1] * mag * gate / KL;
+    } else {
+      const [rx, ry] = geom.rot([wx, wy], -ship.a);          // world -> body
+      bx = rx / KL; by = ry / KL;
+    }
+  }
+
+  // Time-optimal turn against the authority this build actually has. Near 180 the
+  // sign of the error chatters tick to tick, so the direction is latched until the
+  // turn is well under way; without it a two-engine hull oscillated at +-179 for 20s.
+  const err = geom.norm(want - ship.a);
+  if (Math.abs(err) > 150) { if (memo.turn === undefined) memo.turn = R.yawP >= R.yawN ? 1 : -1; }
+  else memo.turn = undefined;
+  const sweep = memo.turn === undefined ? err
+    : memo.turn > 0 ? (err + 360) % 360 : -((360 - err) % 360);
+  const amax = Math.max(1e-6, sweep >= 0 ? R.yawP : R.yawN);
+  const wWant = Math.sign(sweep) * Math.min(Math.sqrt(2 * amax * Math.abs(sweep)), 300);
+  const alpha = G.rate * (wWant - ship.w) / KA;
+
+  const out = pilotAllocate(A, [bx, by, alpha], [1, 1, G.torque]);
+  A.forEach((a, i) => { a.c.in.in = out.f[i] * 100; });
+
+  // Guns are not part of the allocation: a fixed Lazer points where the hull
+  // points, and a turret has its own servo, so both are direct writes.
+  if (cmd.fire !== undefined)
+    for (const c of ship.live)
+      if ((c.type === "Lazer" || c.type === "Explosive") && c.powered &&
+          !ship.conns.some(k => k.to[0] === c.px && k.to[1] === c.py))
+        c.in.in = cmd.fire ? 100 : 0;
+
+  return {residual: out.residual, err, model: R, throttles: out.f};
+}
+)};
+
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -16159,6 +16363,10 @@ export default function define(runtime, observer) {
   $def("_Ship", "Ship", ["NEIGHBOURS","TYPES","DIRS","rotTile","geom","DT","UNITS","applyOverrides","constantParam","SENSOR"], _Ship);
   $def("_World", "World", ["BINOPS","geom","DT","UNITS"], _World);
   $def("_simulate", "simulate", ["World","Ship"], _simulate);
+  $def("_pilotActuators", "pilotActuators", ["geom"], _pilotActuators);
+  $def("_pilotAllocate", "pilotAllocate", [], _pilotAllocate);
+  $def("_flightModel", "flightModel", ["geom","UNITS"], _flightModel);
+  $def("_pilot", "pilot", ["pilotActuators","pilotAllocate","flightModel","geom","UNITS"], _pilot);
   return main;
 }</script><!--/-->
 
@@ -16525,7 +16733,7 @@ const _SYMBOL_FOR = function _SYMBOL_FOR(){return(
   Lazer:        ["lazer-2",      28,   141],
   Explosive:    ["explosive-3",    24.9,  24.9],
   Armour:       ["armour-2",    23.3,  23.3],
-  Orb:          ["energy-store", 28,   28],
+  Orb:          ["orb",       89.66, 145.10],
   // Was (135, 79.5), which put the gear nowhere near the base cells. The teeth
   // ring centres on art (111.0, 124.0) and the mount's left edge and bottom sit
   // exactly on the left and bottom edges of the origin tile from there, so the
@@ -16943,14 +17151,56 @@ const _h_Orb = function _h_Orb(section){return(
 section("Orb")
 )};
 
+// The Orb is a glowing sphere on a rail, and it was four purple rings until
+// 2026-08-20, when Tom said "The orb graphic is completely wrong, this is apparent
+// in Yin Opposses Yang mission". The rings were the components page's OCCUPANCY
+// sketch -- one ring per cell in a 56x56 box -- and no part of the shipped art.
+//
+// Orb.prefab (vendor/corepox/Meritocracy/Assets/prefabs/components/Resources) is
+// the ruler, and it is the only component prefab whose root is not at scale 1:
+//
+//   Orb            localScale 0.33      sprite `orb`         339 x 48 px @ ppu 100
+//    \_ weapon     localPos (0.96,0.96) sprite `orb_weapon`  813 x 813 px @ ppu 100
+//
+// A tile is 192 px at ppu 300 = 0.64 world units (corepox-art-ink.py), so at 0.33:
+//   glow    8.13 * 0.33 = 2.683 world = 4.192 tiles across, centred at
+//           (0.96,0.96)*0.33 = 0.495 tiles up and right of the origin tile -- the
+//           middle of the 2x2 footprint.
+//   rail    3.39 x 0.48 * 0.33 = 1.748 x 0.248 tiles, centred (+0.433, -0.322),
+//           which lays it along the BOTTOM edge of the footprint. That is where
+//           JOINTS.Orb puts its four joints, and the two agree by measurement, not
+//           by design: the rail is the part that bolts on.
+// The root BoxCollider2D is 3.39 x 0.48 -- the rail, not the 2x2 -- so the sphere
+// really is all glow, and it overspills its cells by ~1.1 tiles. corepox-art-align
+// flags that as OFF and is right to: nothing else here overhangs.
+//
+// Gradient stops are a radial sample of data/corepox/sprites/orb_weapon.png about
+// (406,406), r/R against straight RGBA:
+//   0.00 251,253,251 a255   0.24 251,253,251 a255   0.30 252,102,227 a246
+//   0.50 202, 65,178 a208   0.74 146, 49,130 a126   0.97 121, 44,107 a13
+// The white core ends at r/R 0.27, and the weapon's CircleCollider2D radius 1.1
+// works out at 0.567 tiles = r/R 0.27 -- the hit box is the white core exactly,
+// which is what says the 0.33 scale is real and not a leftover.
 const _art_Orb = function _art_Orb(svg){return(
-svg`<svg viewBox="-1.00 -1.00 58.00 58.00" width="320.0" height="320.0">
-  <path d="M0.00,0.00L56.00,0.00L56.00,56.00L0.00,56.00L0.00,0.00Z" fill="rgba(0,0,0,0.298)" stroke="rgb(207,230,207)" stroke-width="1" stroke-linejoin="round"/>
-  <path d="M0.00,0.00L56.00,0.00L56.00,56.00L0.00,56.00L0.00,0.00Z" fill="none" stroke="rgb(184,230,184)" stroke-width="1" stroke-linejoin="round"/>
-  <path d="M16.00,28.00C22.63,28.00 28.00,22.63 28.00,16.00C28.00,9.37 22.63,4.00 16.00,4.00C9.37,4.00 4.00,9.37 4.00,16.00C4.00,22.63 9.37,28.00 16.00,28.00Z" fill="none" stroke="rgb(144,19,254)" stroke-width="2" stroke-linejoin="round"/>
-  <path d="M40.00,28.00C46.63,28.00 52.00,22.63 52.00,16.00C52.00,9.37 46.63,4.00 40.00,4.00C33.37,4.00 28.00,9.37 28.00,16.00C28.00,22.63 33.37,28.00 40.00,28.00Z" fill="none" stroke="rgb(144,19,254)" stroke-width="2" stroke-linejoin="round"/>
-  <path d="M16.00,52.00C22.63,52.00 28.00,46.63 28.00,40.00C28.00,33.37 22.63,28.00 16.00,28.00C9.37,28.00 4.00,33.37 4.00,40.00C4.00,46.63 9.37,52.00 16.00,52.00Z" fill="none" stroke="rgb(144,19,254)" stroke-width="2" stroke-linejoin="round"/>
-  <path d="M40.00,52.00C46.63,52.00 52.00,46.63 52.00,40.00C52.00,33.37 46.63,28.00 40.00,28.00C33.37,28.00 28.00,33.37 28.00,40.00C28.00,46.63 33.37,52.00 40.00,52.00Z" fill="none" stroke="rgb(144,19,254)" stroke-width="2" stroke-linejoin="round"/>
+svg`<svg viewBox="0.00 0.00 234.75 234.75" width="320.0" height="320.0">
+  <defs>
+    <radialGradient id="cpx-orb-glow" gradientUnits="userSpaceOnUse" cx="117.38" cy="117.38" r="117.38">
+      <stop offset="0.00" stop-color="rgb(251,253,251)" stop-opacity="1"/>
+      <stop offset="0.24" stop-color="rgb(251,253,251)" stop-opacity="1"/>
+      <stop offset="0.27" stop-color="rgb(245,136,226)" stop-opacity="0.996"/>
+      <stop offset="0.30" stop-color="rgb(252,102,227)" stop-opacity="0.965"/>
+      <stop offset="0.32" stop-color="rgb(252,85,224)" stop-opacity="0.937"/>
+      <stop offset="0.38" stop-color="rgb(240,79,213)" stop-opacity="0.890"/>
+      <stop offset="0.50" stop-color="rgb(202,65,178)" stop-opacity="0.816"/>
+      <stop offset="0.62" stop-color="rgb(170,58,150)" stop-opacity="0.733"/>
+      <stop offset="0.74" stop-color="rgb(146,49,130)" stop-opacity="0.494"/>
+      <stop offset="0.86" stop-color="rgb(133,46,117)" stop-opacity="0.275"/>
+      <stop offset="0.97" stop-color="rgb(121,44,107)" stop-opacity="0.051"/>
+      <stop offset="1.00" stop-color="rgb(118,43,104)" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <path d="M72.90,157.60L153.80,157.60L161.90,169.20L65.90,169.20L72.90,157.60Z" fill="rgba(0,0,0,0.300)" stroke="rgb(236,236,150)" stroke-width="1.44" stroke-linejoin="round"/>
+  <path d="M234.75,117.38C234.75,182.20 182.20,234.75 117.38,234.75C52.55,234.75 0.00,182.20 0.00,117.38C0.00,52.55 52.55,0.00 117.38,0.00C182.20,0.00 234.75,52.55 234.75,117.38Z" fill="url(#cpx-orb-glow)" stroke="none" style="mix-blend-mode:plus-lighter"/>
 </svg>`
 )};
 
@@ -22376,7 +22626,7 @@ export default function define(runtime, observer) {
 // The neon look was NEVER in the vectors -- in Unity it came from the 2DxFX
 // shaders at draw time. `cp-bloom` reproduces it with feGaussianBlur/feMerge.
 const _SHEET = function _SHEET(){return(
-`<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+`<svg xmlns="http://www.w3.org/2000/svg" style="position:absolute;width:0;height:0;overflow:hidden">
   <defs>
     <filter id="cp-bloom" x="-75%" y="-75%" width="250%" height="250%" color-interpolation-filters="sRGB">
       <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="n"/>
@@ -22556,10 +22806,6 @@ const _SHEET = function _SHEET(){return(
     <path d="M196.00,6.00L211.03,6.00L196.00,6.00L196.00,16.00L196.00,6.00Z" fill="rgb(78,19,19)" stroke="rgb(230,142,142)" stroke-width="1" stroke-linejoin="round"/>
     <path d="M21.00,12.00L149.00,12.00L149.00,76.00L21.00,76.00L21.00,12.00Z" fill="rgb(216,216,216)" stroke="rgb(151,151,151)" stroke-width="0.5" stroke-linejoin="round"/>
   </symbol>
-  <symbol id="cp-orb" viewBox="0 0 271.00 271.00">
-    <path d="M0.00,0.00L271.00,0.00L271.00,271.00L0.00,271.00L0.00,0.00Z" fill="url(#g11)"/>
-    <path d="M81.00,197.00L192.00,197.00L192.00,192.00L183.94,183.94L88.00,183.94L81.00,192.00L81.00,197.00Z" fill="rgba(0,0,0,0.298)" stroke="rgb(230,230,207)" stroke-width="1" stroke-linejoin="round"/>
-  </symbol>
   <symbol id="cp-explosive-2" viewBox="0 0 56.00 56.00">
     <path d="M0.00,0.00L56.00,0.00L56.00,56.00L0.00,56.00L0.00,0.00Z" fill="none" stroke="rgb(230,142,142)" stroke-width="1" stroke-linejoin="round"/>
     <path d="M0.00,0.00L56.00,0.00L56.00,56.00L0.00,56.00L0.00,0.00Z" fill="rgb(78,19,19)" stroke="rgb(230,142,142)" stroke-width="1" stroke-linejoin="round"/>
@@ -22703,14 +22949,6 @@ const _SHEET = function _SHEET(){return(
     <path d="M4.00,8.00C6.21,8.00 8.00,6.21 8.00,4.00C8.00,1.79 6.21,0.00 4.00,0.00C1.79,0.00 0.00,1.79 0.00,4.00C0.00,6.21 1.79,8.00 4.00,8.00Z" fill="rgb(254,255,253)" stroke="rgb(157,236,69)" stroke-width="1" stroke-linejoin="round"/>
     <path d="M4.00,32.00C6.21,32.00 8.00,30.21 8.00,28.00C8.00,25.79 6.21,24.00 4.00,24.00C1.79,24.00 0.00,25.79 0.00,28.00C0.00,30.21 1.79,32.00 4.00,32.00Z" fill="rgb(254,255,253)" stroke="rgb(157,236,69)" stroke-width="1" stroke-linejoin="round"/>
   </symbol>
-  <symbol id="cp-energy-store-2" viewBox="0 0 56.00 56.00">
-    <path d="M0.00,0.00L56.00,0.00L56.00,56.00L0.00,56.00L0.00,0.00Z" fill="rgba(0,0,0,0.298)" stroke="rgb(207,230,207)" stroke-width="1" stroke-linejoin="round"/>
-    <path d="M0.00,0.00L56.00,0.00L56.00,56.00L0.00,56.00L0.00,0.00Z" fill="none" stroke="rgb(184,230,184)" stroke-width="1" stroke-linejoin="round"/>
-    <path d="M16.00,28.00C22.63,28.00 28.00,22.63 28.00,16.00C28.00,9.37 22.63,4.00 16.00,4.00C9.37,4.00 4.00,9.37 4.00,16.00C4.00,22.63 9.37,28.00 16.00,28.00Z" fill="none" stroke="rgb(144,19,254)" stroke-width="2" stroke-linejoin="round"/>
-    <path d="M40.00,28.00C46.63,28.00 52.00,22.63 52.00,16.00C52.00,9.37 46.63,4.00 40.00,4.00C33.37,4.00 28.00,9.37 28.00,16.00C28.00,22.63 33.37,28.00 40.00,28.00Z" fill="none" stroke="rgb(144,19,254)" stroke-width="2" stroke-linejoin="round"/>
-    <path d="M16.00,52.00C22.63,52.00 28.00,46.63 28.00,40.00C28.00,33.37 22.63,28.00 16.00,28.00C9.37,28.00 4.00,33.37 4.00,40.00C4.00,46.63 9.37,52.00 16.00,52.00Z" fill="none" stroke="rgb(144,19,254)" stroke-width="2" stroke-linejoin="round"/>
-    <path d="M40.00,52.00C46.63,52.00 52.00,46.63 52.00,40.00C52.00,33.37 46.63,28.00 40.00,28.00C33.37,28.00 28.00,33.37 28.00,40.00C28.00,46.63 33.37,52.00 40.00,52.00Z" fill="none" stroke="rgb(144,19,254)" stroke-width="2" stroke-linejoin="round"/>
-  </symbol>
   <symbol id="cp-build-zone-3" viewBox="0 0 64.00 64.00">
     <path d="M0.00,20.00L64.00,20.00" fill="none" stroke="rgb(190,255,119)" stroke-width="1" stroke-linejoin="round"/>
     <path d="M0.00,44.00L64.00,44.00" fill="none" stroke="rgb(190,255,119)" stroke-width="1" stroke-linejoin="round"/>
@@ -22847,10 +23085,6 @@ const _SHEET_SYMBOLS = function _SHEET_SYMBOLS(){return(
   600.0,
   93.0
  ],
- "orb": [
-  271.0,
-  271.0
- ],
  "explosive-2": [
   56.0,
   56.0
@@ -22927,10 +23161,6 @@ const _SHEET_SYMBOLS = function _SHEET_SYMBOLS(){return(
   36.0,
   32.0
  ],
- "energy-store-2": [
-  56.0,
-  56.0
- ],
  "build-zone-3": [
   64.0,
   64.0
@@ -22979,7 +23209,17 @@ const _SHEET_SYMBOLS = function _SHEET_SYMBOLS(){return(
 const _symbolSheet = function _symbolSheet(SHEET, COMPONENT_ART){
   const NS = "http://www.w3.org/2000/svg";
   const host = document.createElement("div");
-  host.style.display = "none";
+  // NOT display:none, and the two words are load-bearing. Blink gives a
+  // display:none <svg> root no layout object and therefore builds no PAINT SERVER
+  // for anything in its defs: the Orb's glow gradient painted nothing at all, in
+  // the sheet and from a plain circle in the light DOM alike, and a clone of the
+  // same gradient moved into a rendered defs painted correctly. Making only the
+  // host div visible changed nothing; making the <svg> visible fixed it
+  // (tools/corepox-orb-probe.ts, three-step probe, 2026-08-20).
+  // Filters are NOT affected -- cp-bloom resolved out of the same hidden defs the
+  // whole time, which is why every board screenshot before this has neon on it.
+  // That asymmetry is why the bug survived: the sheet looked like it worked.
+  host.setAttribute("style", "position:absolute;width:0;height:0;overflow:hidden");
   host.innerHTML = SHEET;
   document.body.appendChild(host);
   const sheet = host.firstElementChild;
@@ -22998,6 +23238,8 @@ const _symbolSheet = function _symbolSheet(SHEET, COMPONENT_ART){
     // what the drawing itself declares.
     const kids = [...art.children].filter(e => e.namespaceURI === NS &&
       !(e.getAttribute("class") || "").includes("svg-lens"));
+    // A drawing's own <defs> goes in with it: the Orb's glow gradient resolves from
+    // inside the <symbol>, once the sheet itself is laid out (see host, above).
     put(name, vb, kids);
     if (name === "turret2")
       for (const part of ["turret2-base", "turret2-barrel"]) {
