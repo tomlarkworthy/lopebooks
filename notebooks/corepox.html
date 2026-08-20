@@ -7831,14 +7831,22 @@ const _teamFilter = function _teamFilter(){return(
 {a: "none", b: "hue-rotate(190deg) saturate(1.3)"}
 )};
 
-// The barrel is drawn 64.2 degrees off forward in the art (pivot 111,124 to the
-// far end of the barrel bbox 129.4,107.5 -> 266.2,41.3). Subtracting it makes a
-// turret angle of 0 point where the component points.
-const _ART_TURRET_DEG = function _ART_TURRET_DEG(){return(
-64.2
+// Where the barrel meets the panel, in symbol units relative to the anchor. See
+// componentNode for the measurement.
+const _TURRET_PIVOT = function _TURRET_PIVOT(){return(
+[33.95, -30.44]
 )};
 
-const _componentNode = function _componentNode(SYMBOL_FOR, SYMBOLS, TILE){return(
+// The barrel is drawn 68.8 degrees off forward in the art: hinge (144.95, 93.56)
+// to the muzzle tip (264.05, 47.41), which is atan2(119.1, 46.2). Subtracting it
+// makes a turret angle of 0 point where the component points. It was 64.2, taken
+// from the anchor to the corner of the barrel's bounding box -- the wrong pivot and
+// the wrong end, and both are fixed together because the angle depends on the hinge.
+const _ART_TURRET_DEG = function _ART_TURRET_DEG(){return(
+68.82
+)};
+
+const _componentNode = function _componentNode(SYMBOL_FOR, SYMBOLS, TILE, TURRET_PIVOT){return(
 (c) => {
   const ns = "http://www.w3.org/2000/svg";
   const g = document.createElementNS(ns, "g");
@@ -7850,17 +7858,31 @@ const _componentNode = function _componentNode(SYMBOL_FOR, SYMBOLS, TILE){return
   if (c.type === "LaserTurret2" && spec) {
     const [w, h] = SYMBOLS[spec[0]];
     const [, ax, ay] = spec;
-    const put = (name, into) => {
+    const put = (name, into, dx = 0, dy = 0) => {
       const u = document.createElementNS(ns, "use");
       u.setAttribute("href", "#cp-" + name);
-      u.setAttribute("x", -ax); u.setAttribute("y", -ay);
+      u.setAttribute("x", -ax - dx); u.setAttribute("y", -ay - dy);
       u.setAttribute("width", w); u.setAttribute("height", h);
       into.appendChild(u);
     };
     put("turret2-base", g);
+    // The barrel hinges at the DOME, not at the gear. It turned about the anchor
+    // (111,124), which is the gear ring at the centre of the angle-port cell, and
+    // that is 0.6 x 0.54 tiles from where the art actually joins the two -- so the
+    // barrel hung off the panel with a visible gap. Tom, 2026-08-20: "the turret is
+    // still not based on the right part".
+    //
+    // Measured off art_LaserTurret2, not guessed. The barrel's butt quad is
+    // (137.5,76.1) (129.4,96.8) (149.0,107.5) (163.9,94.0), centroid (144.95,93.56);
+    // the panel's peak sits on the top edge between (111,91.73) and (172.43,91.73),
+    // midpoint (141.7,91.73). The two agree to 3 units, which is what says the butt
+    // IS the hinge. Offset from the anchor: (+33.95, -30.44).
     const barrel = document.createElementNS(ns, "g");
-    put("turret2-barrel", barrel);
-    g.appendChild(barrel);
+    const hinge = document.createElementNS(ns, "g");
+    hinge.setAttribute("transform", `translate(${TURRET_PIVOT[0]} ${TURRET_PIVOT[1]})`);
+    put("turret2-barrel", barrel, TURRET_PIVOT[0], TURRET_PIVOT[1]);
+    hinge.appendChild(barrel);
+    g.appendChild(hinge);
     g.barrel = barrel;
     return g;
   }
@@ -7925,7 +7947,9 @@ const _cogPath = function _cogPath(){return(
 // drawn "1.0" and a bearing of 12.4375 as "12.4" -- the first is noise and the
 // second is the useful case, so the rule is per-value rather than a fixed dp.
 const _fmtPort = function _fmtPort(){return(
-(v) => Number.isInteger(v) ? String(v)
+(v) => v == null || Number.isNaN(v) ? "\u2013"
+     : !Number.isFinite(v) ? (v > 0 ? "\u221e" : "-\u221e")
+     : Number.isInteger(v) ? String(v)
      : Math.abs(v) >= 10 ? v.toFixed(0) : v.toFixed(1)
 )};
 
@@ -8178,7 +8202,12 @@ const _shipNode = function _shipNode(componentNode, portNode, opNode, PORT_TYPE,
         `rotate(${((c.turret ?? 0) - ART_TURRET_DEG).toFixed(1)})`);
       texts.forEach(({kind, port, n, cell, fed}) => {
         const v = kind === "out" ? c.out[port] : c.in[port];
-        const hide = c.hp <= 0 || v == null || Number.isNaN(v);
+        // A port is a SOCKET and it is drawn whether or not anything is in it. It
+        // used to vanish on a null or NaN, which meant a Radar with no target had
+        // no visible outputs at all -- Tom, 2026-08-20: "The radar has no clear
+        // output connectors" -- and connect mode chequered a ring around nothing.
+        // 63-ports.avif has a disc on every port of the aiming ship.
+        const hide = c.hp <= 0;
         n.glow.style.display = n.face.style.display = hide ? "none" : "";
         if (hide) return;
         n.set(v, fed);
@@ -8498,7 +8527,8 @@ export default function define(runtime, observer) {
 
   $def("_title", "title", ["md"], _title);
   $def("_teamFilter", "teamFilter", [], _teamFilter);
-  $def("_componentNode", "componentNode", ["SYMBOL_FOR", "SYMBOLS", "TILE"], _componentNode);
+  $def("_TURRET_PIVOT", "TURRET_PIVOT", [], _TURRET_PIVOT);
+  $def("_componentNode", "componentNode", ["SYMBOL_FOR", "SYMBOLS", "TILE", "TURRET_PIVOT"], _componentNode);
   $def("_ART_TURRET_DEG", "ART_TURRET_DEG", [], _ART_TURRET_DEG);
   $def("_CONN_COLOURS", "CONN_COLOURS", [], _CONN_COLOURS);
   $def("_connColour", "connColour", ["CONN_COLOURS"], _connColour);
@@ -10506,7 +10536,13 @@ const _viewof_game = function _viewof_game(
     view.focus = ghostCells.length
       ? ghostCells.map(([x, y]) => S.player.worldOf({px: x, py: y}))
       : !busy && S.state === "playing" && m.zone ? [[m.zone.x, m.zone.y]] : [];
-    view.framed = busy || S.state === "build" ? [S.player] : null;
+    // ALWAYS your ship. `framed = null` means the camera has to contain every ship
+    // in the world, so `connection`'s two rivals and `avoiding`'s three mines pulled
+    // it open until the hull was a few pixels across. Tom, annotating this cell on
+    // 2026-08-20: "the zoom follows the oppents so I can't use the UI after a few
+    // seconds". The enemies stay visible because minSpan is per-mission and already
+    // sized to the fight -- Aim's spawn ring is 18 tiles and its span is 56.
+    view.framed = [S.player];
     view.minSpan = busy ? 10 : S.state === "playing" ? (m.span ?? 40) : 16;
     view.pad = busy ? 2.2 : 6;
     // snap, not ease: in the editor a click has to hit the connector the player
