@@ -5196,6 +5196,379 @@ export default function define(runtime, observer) {
   return main;
 }</script>
 
+<script id="@tomlarkworthy/corepox-duel" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// Corepox duel: two ships, one outcome, callable from anywhere.
+//
+// There were three copies of "run a match" before this -- `simulate` in the engine,
+// `runMatch` in the lab, and `tools/corepox-match.ts` -- and they disagreed on who
+// counts as alive. `simulate` used `Ship.alive` (a powered Brain), which reports a
+// brainless device dead on the first tick, so a ProximityMine "lost" every match it
+// was in before it had done anything. This module takes the lab's rule: a ship that
+// ARRIVED with a Brain needs one, and a ship that never had one is alive while it
+// has parts.
+
+const _title = function _title(md){return(
+md`# Corepox duel
+
+Two ships, a background and an outcome, with no UI attached. \`runDuel\` is headless and returns a
+verdict; \`newDuel\`/\`stepDuel\` are the same match one tick at a time so a caller can drive it;
+\`duelView\` puts it on screen. The map's encounters and a multiplayer session are both meant to be
+callers of these three, not reimplementations of them.
+
+\`\`\`js
+runDuel({
+  a: {spec: SHIPS.rocketCore, control: "auto"},   // "auto" | "wired" | "human"
+  b: {spec: SHIPS.proximityMine},                 // default "wired": it flies its own program
+  placement: {separation: 18, bearing: 30},       // tiles, degrees; or give x/y/a per ship
+  mode: "elimination",                            // elimination | attrition | survival
+  limit: 60                                       // seconds
+})
+\`\`\``
+)};
+
+// A mode decides, each tick, whether the match is over. null means keep going.
+// Every one of them is total at the time limit -- a mode that can return null
+// forever would hang a caller that trusts it.
+const _DUEL_MODES = function _DUEL_MODES(){return(
+{
+  elimination: {
+    label: "elimination", desc: "last side standing; a draw if both survive the limit",
+    decide: (D) => D.aliveA && D.aliveB ? (D.timeUp ? "draw" : null)
+                 : D.aliveA ? "a" : D.aliveB ? "b" : "draw"
+  },
+  attrition: {
+    label: "attrition", desc: "as elimination, but at the limit the bigger survivor wins",
+    decide: (D) => {
+      if (!D.aliveA || !D.aliveB) return D.aliveA ? "a" : D.aliveB ? "b" : "draw";
+      if (!D.timeUp) return null;
+      const la = D.a.live.length, lb = D.b.live.length;
+      return la === lb ? "draw" : la > lb ? "a" : "b";
+    }
+  },
+  survival: {
+    label: "survival", desc: "A only has to still be there at the limit",
+    decide: (D) => !D.aliveA ? "b" : D.timeUp ? "a" : null
+  }
+}
+)};
+
+// The lab's rule, not Ship.alive -- see the note at the top of this module.
+const _duelAlive = function _duelAlive(){return(
+(ship, hadBrain) => ship.live.length > 0 &&
+  (!hadBrain || ship.live.some(c => c.type === "Brain"))
+)};
+
+// Relative placement: a separation and a bearing, both of which a caller can hold
+// fixed across a season so a rematch is the same fight. Explicit x/y/a on either
+// side wins over it, which is what the mission editor needs.
+const _duelPlacement = function _duelPlacement(geom){return(
+({separation = 18, bearing = 0, faceEachOther = true} = {}, a = {}, b = {}) => {
+  const [ux, uy] = geom.unit(bearing), h = separation / 2;
+  const pa = {x: a.x ?? -ux * h, y: a.y ?? -uy * h};
+  const pb = {x: b.x ??  ux * h, y: b.y ??  uy * h};
+  pa.a = a.a ?? (faceEachOther ? geom.bearing(pa.x, pa.y, pb.x, pb.y) : 0);
+  pb.a = b.a ?? (faceEachOther ? geom.bearing(pb.x, pb.y, pa.x, pa.y) : 180);
+  return {a: pa, b: pb};
+}
+)};
+
+// The stock opponent: close to `standoff` and hold the nose on the target. It is
+// deliberately dumb -- it exists so an unwired corpus hull can be a credible enemy
+// without hand-authoring a control program for each of the 892 of them.
+const _chaseCmd = function _chaseCmd(geom){return(
+(self, foe, {standoff = 6, fireWithin = 26, fireArc = 25} = {}) => {
+  if (!foe || !foe.live.length) return {target: null, face: null, fire: false};
+  const d = Math.hypot(foe.x - self.x, foe.y - self.y);
+  const brg = geom.bearing(self.x, self.y, foe.x, foe.y);
+  const [ux, uy] = geom.unit(brg);
+  // aim short of the target rather than at it, or the pilot flies into contact and
+  // spends the match trying to stop on top of something that is moving
+  const k = Math.max(0, d - standoff);
+  return {target: [self.x + ux * k, self.y + uy * k], face: brg,
+          fire: d < fireWithin && Math.abs(geom.norm(brg - self.a)) < fireArc};
+}
+)};
+
+const _newDuel = function _newDuel(Ship, World, loadShipSpec, duelPlacement, DUEL_MODES, DUEL_BACKDROP){return(
+(cfg = {}) => {
+  const {mode = "elimination", limit = 60, seed = 1} = cfg;
+  const M = typeof mode === "string" ? DUEL_MODES[mode] : mode;
+  if (!M) throw new Error("corepox-duel: unknown mode " + mode);
+  const load = (s) => {
+    if (!s) throw new Error("corepox-duel: both sides need a spec");
+    // accept a raw spec or one already through the loader; loadShipSpec is
+    // idempotent on its own output and expands Composites, which raw specs do not
+    return loadShipSpec(s).spec;
+  };
+  const p = duelPlacement(cfg.placement, cfg.a ?? {}, cfg.b ?? {});
+  const mk = (side, o) => {
+    const s = new Ship(load(o.spec), {team: o.team ?? side, ...p[side]});
+    s.vx = o.vx ?? 0; s.vy = o.vy ?? 0;
+    return s;
+  };
+  const a = mk("a", cfg.a ?? {}), b = mk("b", cfg.b ?? {});
+  return {
+    cfg, mode: M, limit, seed,
+    world: new World([a, b]), a, b,
+    control: {a: cfg.a?.control ?? "wired", b: cfg.b?.control ?? "wired"},
+    // a `human` side reads its intent from here; a UI or a network peer writes it
+    cmd: {a: {target: null, face: null, drive: null, fire: false},
+          b: {target: null, face: null, drive: null, fire: false}},
+    memo: {a: {}, b: {}},
+    hadBrain: {a: a.comps.some(c => c.type === "Brain"),
+               b: b.comps.some(c => c.type === "Brain")},
+    backdrop: cfg.backdrop === false ? false
+      : {...DUEL_BACKDROP, ...(cfg.backdrop ?? {}),
+         sky: {...DUEL_BACKDROP.sky, seed, ...(cfg.backdrop?.sky ?? {})},
+         body: {...DUEL_BACKDROP.body, seed: seed * 3 + 1, ...(cfg.backdrop?.body ?? {})}},
+    outcome: null
+  };
+}
+)};
+
+const _stepDuel = function _stepDuel(pilot, chaseCmd, duelAlive){return(
+(D) => {
+  if (D.outcome) return D.outcome;
+  for (const side of ["a", "b"]) {
+    const c = D.control[side];
+    if (c === "wired") continue;
+    const self = D[side], foe = D[side === "a" ? "b" : "a"];
+    const cmd = c === "auto" ? (D.cmd[side] = chaseCmd(self, foe, D.cfg.ai)) : D.cmd[side];
+    pilot(self, cmd, D.memo[side]);
+  }
+  D.world.step();
+  D.aliveA = duelAlive(D.a, D.hadBrain.a);
+  D.aliveB = duelAlive(D.b, D.hadBrain.b);
+  D.timeUp = D.world.t >= D.limit;
+  return (D.outcome = D.mode.decide(D) ?? null) ?? "playing";
+}
+)};
+
+const _runDuel = function _runDuel(newDuel, stepDuel, DT){return(
+(cfg = {}) => {
+  const D = newDuel(cfg);
+  const cap = Math.ceil((cfg.limit ?? 60) / DT) + 2;
+  let out = "playing";
+  for (let i = 0; i < cap && out === "playing"; i++) out = stepDuel(D);
+  return {winner: out === "playing" ? "draw" : out,
+          seconds: +D.world.t.toFixed(2), ticks: D.world.tick,
+          a: {live: D.a.live.length, alive: !!D.aliveA},
+          b: {live: D.b.live.length, alive: !!D.aliveB}, duel: D};
+}
+)};
+
+const _DUEL_BACKDROP = function _DUEL_BACKDROP(){return(
+{
+ "sky": {
+  "kind": "nebula",
+  "seed": 7.0,
+  "bg": "#02040a",
+  "bgInner": "#0b1428",
+  "cloudScale": 11.0,
+  "stretch": 1.35,
+  "octaves": 5.0,
+  "knee": 0.42,
+  "cloudBlur": 3.2,
+  "coverage": 0.4,
+  "cloudA": 0.95,
+  "cloudB": 0.78,
+  "hueA": "#6633dd",
+  "hueB": "#19b3a8",
+  "dust": 0.4,
+  "filaments": 34.0,
+  "filamentHue": "#ff3ea5",
+  "filamentWidth": 1.6,
+  "filamentBow": 0.34,
+  "filamentGlow": 2.4,
+  "filamentOpacity": 0.34,
+  "galaxies": 9.0
+ },
+ "stars": {
+  "seed": 7.0,
+  "stars": 620.0,
+  "starExp": 3.2,
+  "starSize": 1.0,
+  "softness": 0.45,
+  "warm": 0.07,
+  "bright": 3.0,
+  "brightSize": 10.0,
+  "spikeLen": 12.8
+ },
+ "parallax": {
+  "seed": 21.0,
+  "layers": 4.0,
+  "perLayer": 160.0,
+  "starSize": 1.1,
+  "depthScale": 1.1,
+  "starExp": 3.0,
+  "softness": 0.45,
+  "warm": 0.07,
+  "speed": 1.0,
+  "animate": true
+ },
+ "body": {
+  "kind": "facet",
+  "seed": 3.0,
+  "R": 150.0,
+  "detail": 16.0,
+  "tilt": 21.0,
+  "roll": -16.0,
+  "spin": 0.18,
+  "swirl": 0.5,
+  "color": "#8fd0ff",
+  "rim": "#3fd6c8",
+  "animate": true
+ },
+ "comp": {
+  "height": 620.0,
+  "showSky": true,
+  "showParallax": false,
+  "showStars": true,
+  "showBody": true,
+  "bodyX": 0.3,
+  "bodyY": 0.55,
+  "bodyScale": 1.0,
+  "animate": true
+ }
+}
+)};
+
+// The view is a thin shell: a backdrop behind, the shared battlefield on top, and a
+// scoreboard. It owns no rules -- everything it shows comes from stepDuel.
+const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, htl, DT){return(
+(cfg = {}, {height = 520, span = 46, speed = 1, onEnd} = {}) => {
+  const D = cfg.world ? cfg : newDuel(cfg);
+  const root = htl.html`<div style="position:relative;border-radius:8px;overflow:hidden;
+    background:#04050a;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
+  let bg = null;
+  if (D.backdrop) {
+    bg = backdrop({...D.backdrop, comp: {...D.backdrop.comp, W: 1400, height}});
+    bg.style.cssText = "position:absolute;inset:0;width:100%;height:100%";
+    bg.setAttribute("preserveAspectRatio", "xMidYMid slice");
+    root.append(bg);
+  }
+  const view = battlefield(D.world, {span, height, width: 900});
+  view.svg.style.background = "transparent";
+  // battlefield paints its own starfield first; two star layers over a nebula reads
+  // as noise, so the backdrop replaces it rather than sitting under it
+  if (bg && view.svg.firstElementChild?.tagName === "g") view.svg.firstElementChild.style.display = "none";
+  view.svg.style.position = "relative";
+  root.append(view.svg);
+  const hud = htl.html`<div style="position:absolute;left:10px;top:8px;display:flex;gap:14px;
+    pointer-events:none;text-shadow:0 1px 3px #000"></div>`;
+  root.append(hud);
+
+  let raf = 0, acc = 0, last = 0, stopped = false;
+  const paint = () => {
+    const w = (s, n, col) => `<span style="color:${col}">${s} ${n}</span>`;
+    hud.innerHTML =
+      w("A", D.a.live.length, D.aliveA === false ? "#ff6b6b" : "#8ef0c0") +
+      w("&nbsp;&middot;&nbsp;B", D.b.live.length, D.aliveB === false ? "#ff6b6b" : "#ffc42e") +
+      `<span style="color:#6f8299">&nbsp;&middot;&nbsp;${D.world.t.toFixed(1)}s / ${D.limit}s` +
+      (D.outcome ? ` &middot; ${D.outcome.toUpperCase()}` : "") + `</span>`;
+  };
+  const loop = (now) => {
+    if (stopped) return;
+    raf = requestAnimationFrame(loop);
+    acc += Math.min(0.1, (now - last) / 1000) * speed; last = now;
+    while (acc >= DT) { acc -= DT; if (!D.outcome) stepDuel(D); }
+    if (bg) bg.update(now / 1000);
+    view.draw(); paint();
+    if (D.outcome && onEnd) { onEnd(D.outcome, D); onEnd = null; }
+  };
+  last = performance.now();
+  raf = requestAnimationFrame(loop);
+  root.duel = D;
+  root.stop = () => { stopped = true; cancelAnimationFrame(raf); };
+  root.value = D;
+  return root;
+}
+)};
+
+const _viewof_duelDemo = function _viewof_duelDemo(SHIPS, DUEL_MODES, duelView, htl, invalidation){
+  const names = Object.keys(SHIPS);
+  let cur = null;
+  // A default that is an actual fight: both sides shoot, and it runs ~10s rather
+  // than resolving on the first tick. Picked off a full pairwise sweep of SHIPS
+  // (tools/scratch/duel-matrix.ts) -- most pairs draw, which is the same finding
+  // the lab's arena recorded, and a demo that draws shows nothing.
+  let cfg = {a: "manualAim", b: "gunBoat", control: "auto", mode: "elimination", seed: 4};
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;
+    font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
+  const bar = htl.html`<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"></div>`;
+  const stage = htl.html`<div></div>`;
+  root.append(bar, stage);
+  const pick = (key, opts) => {
+    const s = htl.html`<select style="background:#0d1117;color:#dbe6f2;border:1px solid #2a3646;
+      border-radius:4px;padding:3px 6px;font:inherit">${opts.map(o =>
+        htl.html`<option selected=${cfg[key] === o}>${o}</option>`)}</select>`;
+    s.onchange = () => { cfg[key] = s.value; go(); };
+    return s;
+  };
+  const go = () => {
+    cur?.stop();
+    cur = duelView({
+      seed: cfg.seed, mode: cfg.mode, limit: 45,
+      a: {spec: SHIPS[cfg.a], control: cfg.control},
+      b: {spec: SHIPS[cfg.b]},
+      placement: {separation: 20, bearing: 25}
+    }, {height: 460});
+    stage.replaceChildren(cur);
+    root.value = cur.duel;
+  };
+  bar.append(pick("a", names), pick("b", names), pick("control", ["auto", "wired"]),
+             pick("mode", Object.keys(DUEL_MODES)),
+             htl.html`<button onclick=${() => { cfg.seed++; go(); }} style="background:#132033;
+               color:#8ef0c0;border:1px solid #2d4a3d;border-radius:4px;padding:3px 10px;
+               font:inherit;cursor:pointer">rematch</button>`);
+  invalidation.then(() => cur?.stop());
+  go();
+  return root;
+};
+const _duelDemo = (G, _) => G.input(_);
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  main.define("module @tomlarkworthy/corepox-engine",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-render",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-render.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-backdrops",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-backdrops.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-missions",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
+  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
+    (_, v) => v.import("battlefield", _));
+  main.define("backdrop", ["module @tomlarkworthy/corepox-backdrops", "@variable"],
+    (_, v) => v.import("backdrop", _));
+  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
+    (_, v) => v.import("SHIPS", _));
+
+  $def("_title", "title", ["md"], _title);
+  main.variable(observer("viewof duelDemo")).define("viewof duelDemo",
+    ["SHIPS","DUEL_MODES","duelView","htl","invalidation"], _viewof_duelDemo).pid = "_viewof_duelDemo";
+  main.variable(observer("duelDemo")).define("duelDemo",
+    ["Generators","viewof duelDemo"], _duelDemo).pid = "_duelDemo";
+  $def("_runDuel", "runDuel", ["newDuel","stepDuel","DT"], _runDuel);
+  $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
+  $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive"], _stepDuel);
+  $def("_duelView", "duelView", ["newDuel","stepDuel","backdrop","battlefield","htl","DT"], _duelView);
+  $def("_DUEL_MODES", "DUEL_MODES", [], _DUEL_MODES);
+  $def("_duelAlive", "duelAlive", [], _duelAlive);
+  $def("_duelPlacement", "duelPlacement", ["geom"], _duelPlacement);
+  $def("_chaseCmd", "chaseCmd", ["geom"], _chaseCmd);
+  $def("_DUEL_BACKDROP", "DUEL_BACKDROP", [], _DUEL_BACKDROP);
+  return main;
+}</script>
+
 <!-- Bootloader -->
 <script id="bootconf.json"
         type="text/plain"
@@ -5230,7 +5603,8 @@ export default function define(runtime, observer) {
     "@tomlarkworthy/corepox-shipyard",
     "@tomlarkworthy/corepox-lab",
     "@tomlarkworthy/corepox-backdrops",
-    "@tomlarkworthy/corepox-map"
+    "@tomlarkworthy/corepox-map",
+    "@tomlarkworthy/corepox-duel"
   ],
   "hash": "#view=R100(S70(@tomlarkworthy/corepox-game),S30(@tomlarkworthy/claude-code-pairing))",
   "headless": true,
@@ -9550,6 +9924,29 @@ const _BOX_5x7 = function _BOX_5x7(){return(
 Array.from({length: 35}, (_, i) => [(i / 7 | 0) - 2, i % 7 - 3])
 )};
 
+// The campaign list, as it was read out of level0 (see
+// knowledge/corepox-extracted-design.md, "The campaign, read from the shipped
+// build"). There are TWO campaigns, and the port used to show one flat list of
+// twelve, which said that SideShooter and TwinTurrets shipped in the arc. They did
+// not: they are scenes in the repo with objective text and no campaign slot, and
+// the port promoted them. They are labelled here rather than hidden, because a
+// player can still play them and a reader should still be told what they are.
+//
+// `minPlayerRating` is a real field on Campaign and its value has NOT been read --
+// it is an int, and the string extractor that recovered the rest only recovers
+// strings. Do not invent one.
+const _CAMPAIGNS = function _CAMPAIGNS(){return(
+[
+  {name: "tutorial", shipped: true,
+   missions: ["PlaceBrain", "Cocoon", "ConnectionLite", "ManualAim", "Connection",
+              "Aim", "Avoid"]},
+  {name: "Advanced Steering", shipped: true,
+   missions: ["FollowCourse", "FollowCourseAdvanced", "FollowBoss"]},
+  {name: "not in a campaign", shipped: false,
+   missions: ["SideShooter", "TwinTurrets"]}
+]
+)};
+
 const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
 [
   // Everything below shipped in InitialCampaign.prefab, in this order. Two more
@@ -9923,23 +10320,46 @@ const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
     // again -- radar bearing to the left engine and, negated against a Constant,
     // to the right -- with the auto-aiming LaserTurret2 on top instead of a fixed
     // Lazer, because a fixed gun on a ship that steers by bearing never lines up:
-    // every fixed-Lazer hull tried killed nothing in 240s, while this one takes a
-    // core in 41s and loses no parts (tools/corepox-boss-search.ts).
-    // The Constant is the whole difference between arriving and not: at 0 it never
-    // closes and at 100 it overshoots past the Gun Boat and keeps going. 30 and 50
-    // both work; 50 is quicker.
+    // every fixed-Lazer hull tried killed nothing in 240s.
+    //
+    // REBUILT 2026-08-20 when connectivity moved from tile distance to joints. The
+    // old hull (radar [-2,-2], engines [-2,-3]/[2,-3], Constant [1,0], 41s) loaded
+    // as THREE islands under the joint rule -- JOINTS.Radar is the aft edge only,
+    // so a radar parked beside the core is not attached to it, and neither engine's
+    // forward face met a Binary joint. It never reached the boss, and the campaign
+    // gate timed out. Two searches could not repair the old shape:
+    // corepox-boss-search.ts found 490 joint-bound layouts in 4,898,880 and its best
+    // killed nothing, and corepox-boss-rebuild.ts (which adds rotation) fared no
+    // better with the turret and radar competing for the same faces.
+    //
+    // What works is a chain, because under joints every part must reach a face that
+    // will have it. The Constant below the core is load-bearing twice over -- it is
+    // the thrust source AND the only thing the radar can hang off, by its aft-right
+    // corner slot at (-0.5,-1.25):
+    //
+    //   Brain[0,0] -- turret[0,1]      core north face
+    //   Brain      -- Constant[0,-1]   core south face
+    //   Constant   -- Radar[-2,-1]     radar corner slot, one point of contact
+    //   Constant   -- Binary[0,-2]     binary north face
+    //   Radar      -- Engine[-2,-2]    radar aft edge
+    //   Binary     -- Engine[1,-3]     binary aft edge
+    //
+    // 7 parts, same count as the old hull, 14 of 20 power, and it takes a core in
+    // 18.6s against the old 41s. Constant at 100 here rather than 50: 70 takes 19.5s
+    // and 50 takes 40.6s, the reverse of the old hull's ordering, because the engines
+    // now sit asymmetrically and the ship arrives on a different arc.
     solution: {components: [{type: "Brain", pos: [0, 0]},
-      {type: "LaserTurret2", pos: [0, 1]}, {type: "Radar", pos: [-2, -2]},
-      {type: "Binary", pos: [2, -1], param: "MINUS"},
-      {type: "Engine", pos: [-2, -3]}, {type: "Engine", pos: [2, -3]},
-      {type: "Constant", pos: [1, 0], param: "50"}],
+      {type: "LaserTurret2", pos: [0, 1]}, {type: "Radar", pos: [-2, -1]},
+      {type: "Constant", pos: [0, -1], param: "100"},
+      {type: "Binary", pos: [0, -2], param: "MINUS"},
+      {type: "Engine", pos: [-2, -2]}, {type: "Engine", pos: [1, -3]}],
       connections: [
-        {from: [-2, -2], fromPort: "bearing", to: [0, 1], toPort: "angle"},
-        {from: [-2, -2], fromPort: "dist", to: [0, 1], toPort: "fire"},
-        {from: [-2, -2], fromPort: "bearing", to: [-2, -3], toPort: "in"},
-        {from: [-2, -2], fromPort: "bearing", to: [2, -1], toPort: "b"},
-        {from: [1, 0], fromPort: "out", to: [2, -1], toPort: "a"},
-        {from: [2, -1], fromPort: "out", to: [2, -3], toPort: "in"}]},
+        {from: [-2, -1], fromPort: "bearing", to: [0, 1], toPort: "angle"},
+        {from: [-2, -1], fromPort: "dist", to: [0, 1], toPort: "fire"},
+        {from: [-2, -1], fromPort: "bearing", to: [-2, -2], toPort: "in"},
+        {from: [-2, -1], fromPort: "bearing", to: [0, -2], toPort: "b"},
+        {from: [0, -1], fromPort: "out", to: [0, -2], toPort: "a"},
+        {from: [0, -2], fromPort: "out", to: [1, -3], toPort: "in"}]},
     spoils: [{type: "Orb", n: 1}, {type: "Binary", n: 1}],
     span: 110
   },
@@ -10029,6 +10449,7 @@ export default function define(runtime, observer) {
   $def("_SHIPS", "SHIPS", [], _SHIPS);
   $def("_BOX_5x7", "BOX_5x7", [], _BOX_5x7);
   $def("_MISSIONS", "MISSIONS", ["SHIPS", "BOX_5x7"], _MISSIONS);
+  $def("_CAMPAIGNS", "CAMPAIGNS", [], _CAMPAIGNS);
   return main;
 }</script><!--/-->
 
@@ -10745,6 +11166,10 @@ const _newSession = function _newSession(Ship, World){return(
   const initialParams = new Map(player.comps.map(c => [c, c.param]));
   return {
     mission, player, world, initialParams,
+    // The pilot's intent, live from the start: the four `live` missions never call
+    // play(), so initialising this there left their keyboard dead while the mouse
+    // worked -- the click path creates S.cmd on demand and the key path cannot.
+    cmd: {target: null, face: null, drive: null, fire: false},
     inventory: (mission.inventory ?? []).map(i => ({...i})),
     spawned: 0, spawnT: 0,
     killed: {},                       // enemy components destroyed, by type
@@ -10891,7 +11316,7 @@ const _MENU_ACTIONS = function _MENU_ACTIONS(){return(
 )};
 
 const _viewof_game = function _viewof_game(
-    MISSIONS, newSession, evaluateObjectives, stepSession, battlefield, objectiveHtml,
+    MISSIONS, CAMPAIGNS, newSession, evaluateObjectives, stepSession, battlefield, objectiveHtml,
     componentNode, INFO, MENU_ACTIONS, TYPES, PORTS, TILE, htl, invalidation) {
   let mi = 0, S = newSession(MISSIONS[0]);
   let pilotDrag = null;                       // world point the current drag started on
@@ -10910,17 +11335,45 @@ const _viewof_game = function _viewof_game(
   let wire = null;            // {from:{px,py,cell,port}, to:{...}|null}
   let panel = "none";         // "none" | "build" | "menu" | "info"
   let clock = null, raf = null, stop = false;
-  const fireKey = (down) => (ev) => {
-    if (ev.key !== "f" && ev.key !== "F") return;
-    if (S.state === "playing" && S.cmd) S.cmd.fire = down;
+  // WASD drives; F fires. Keys were on `window` and unguarded, which in a lopepage
+  // layout meant typing "f" in another pane's editor fired the guns -- so anything
+  // with a caret in it swallows the key first.
+  const held = new Set();
+  const typing = () => {
+    const e = document.activeElement;
+    return !!e && (e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName) ||
+                   !!e.closest?.(".cm-editor"));
   };
-  const kd = fireKey(true), ku = fireKey(false);
+  const DRIVE = {w: [1, 0], s: [-1, 0], a: [0, -1], d: [0, 1]};
+  const applyDrive = () => {
+    if (!S.cmd) return;
+    let thrust = 0, yaw = 0;
+    for (const k of held) { const v = DRIVE[k]; if (v) { thrust += v[0]; yaw += v[1]; } }
+    // a key press is a direct command and overrides where you last clicked,
+    // otherwise the two demands fight for the same nozzles
+    if (thrust || yaw) { S.cmd.drive = {thrust, yaw}; S.cmd.target = null; }
+    else S.cmd.drive = null;
+  };
+  const gameKey = (down) => (ev) => {
+    if (S.state !== "playing" || !S.cmd || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const k = ev.key.toLowerCase();
+    if (k !== "f" && !DRIVE[k]) return;
+    if (down && typing()) return;
+    if (down) held.add(k); else held.delete(k);
+    if (k === "f") S.cmd.fire = down;
+    else { applyDrive(); ev.preventDefault(); }
+  };
+  const kd = gameKey(true), ku = gameKey(false);
+  // a key held while the window loses focus never sees its keyup
+  const blur = () => { held.clear(); if (S.cmd) { S.cmd.drive = null; S.cmd.fire = false; } };
+  window.addEventListener("blur", blur);
   window.addEventListener("keydown", kd);
   window.addEventListener("keyup", ku);
   invalidation.then(() => {
     stop = true; if (raf) cancelAnimationFrame(raf);
     window.removeEventListener("keydown", kd);
     window.removeEventListener("keyup", ku);
+    window.removeEventListener("blur", blur);
   });
 
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;
@@ -11320,7 +11773,8 @@ const _viewof_game = function _viewof_game(
     S.state = "playing";
     picked = null; wire = null;
     S.enemyWas = new Map();
-    S.cmd = {target: null, face: null, fire: false};
+    S.cmd = {target: null, face: null, drive: null, fire: false};
+    held.clear();
     const tick = () => {
       if (stop || S.state !== "playing") return;
       for (let i = 0; i < 2; i++) {
@@ -11677,17 +12131,41 @@ const _viewof_game = function _viewof_game(
     return panelBox(c.type.toUpperCase(), kids, () => { sel = null; act = null; panel = "none"; render(); });
   };
 
+  // The dropdown is grouped by CAMPAIGN, because there are two of them and a flat
+  // list of twelve said that SideShooter and TwinTurrets shipped in the arc. Any
+  // mission CAMPAIGNS does not mention still appears, in a trailing group -- a
+  // mission that silently vanished from the picker would be worse than an
+  // unlabelled one. Option values stay the GLOBAL index, so nothing that drives
+  // the select by number has to know campaigns exist.
+  const groups = () => {
+    const seen = new Set();
+    const out = CAMPAIGNS.map(c => ({name: c.name, items: c.missions
+      .map(id => MISSIONS.findIndex(x => x.id === id))
+      .filter(i => i >= 0 && (seen.add(i), true))}));
+    const rest = MISSIONS.map((_, i) => i).filter(i => !seen.has(i));
+    if (rest.length) out.push({name: "unlisted", items: rest});
+    return out.filter(g => g.items.length);
+  };
+  const campaignOf = (i) => {
+    for (const g of groups()) { const k = g.items.indexOf(i);
+      if (k >= 0) return {name: g.name, k, n: g.items.length}; }
+    return {name: "unlisted", k: 0, n: 1};
+  };
+
   // ---- render ---------------------------------------------------------------
   const render = () => {
     const m = MISSIONS[mi];
+    const camp = campaignOf(mi);
     head.textContent = "";
-    head.append(htl.html`<span style="color:#5b6b7d">${mi + 1}/${MISSIONS.length}</span>`);
+    head.append(htl.html`<span style="color:#5b6b7d">${camp.name} ${camp.k + 1}/${camp.n}</span>`);
     head.append(htl.html`<b style="font-size:15px">${m.title}</b>`);
     head.append(htl.html`<span style="color:#8b9bb0;flex:1">${m.brief}</span>`);
-    head.append(htl.html`<select onchange=${(e) => reset(+e.target.value)} style="
+    head.append(htl.html`<select onchange=${(e) => { e.target.blur(); reset(+e.target.value); }} style="
       font:12px ui-monospace,monospace;background:#0d1420;color:#8b9bb0;
       border:1px solid #26364a;border-radius:4px;padding:4px 6px">
-      ${MISSIONS.map((x, i) => htl.html`<option value=${i} selected=${i === mi}>${i + 1}. ${x.title}</option>`)}
+      ${groups().map(g => htl.html`<optgroup label=${g.name}>
+        ${g.items.map(i => htl.html`<option value=${i} selected=${i === mi}>${MISSIONS[i].title}</option>`)}
+      </optgroup>`)}
     </select>`);
 
     // Keyed on the SESSION, not the mission. `battlefield` closes over the world it
@@ -11709,11 +12187,14 @@ const _viewof_game = function _viewof_game(
       // to be pointing on arrival. Both are intents -- stepSession hands them to
       // the allocator, which decides what the hull can actually do about it.
       view.svg.addEventListener("pointerdown", (ev) => {
-        if (S.state !== "playing" || ev.button !== 0) return;
+        if (ev.button !== 0) return;
+        if (typing()) document.activeElement.blur();
+        if (S.state !== "playing") return;
         const [lx, ly] = localTile(ev);
         if (S.player.at(lx, ly)?.hp > 0) return;      // tapping your own hull is an edit
         pilotDrag = worldTile(ev);
-        S.cmd = {...(S.cmd ?? {}), target: pilotDrag, face: null};
+        S.cmd = {...(S.cmd ?? {}), target: pilotDrag, face: null, drive: null};
+        held.clear();
         view.panLock = true;
         view.svg.setPointerCapture(ev.pointerId);
       });
@@ -11849,7 +12330,7 @@ export default function define(runtime, observer) {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
   main.variable(observer("viewof game")).define("viewof game",
-    ["MISSIONS","newSession","evaluateObjectives","stepSession","battlefield","objectiveHtml",
+    ["MISSIONS","CAMPAIGNS","newSession","evaluateObjectives","stepSession","battlefield","objectiveHtml",
      "componentNode","INFO","MENU_ACTIONS","TYPES","PORTS","TILE","htl","invalidation"],
     _viewof_game).pid = "_viewof_game";
   main.variable(observer("game")).define("game", ["Generators", "viewof game"],
@@ -11868,8 +12349,9 @@ export default function define(runtime, observer) {
     main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
   main.define("TILE", ["module @tomlarkworthy/corepox-assets", "@variable"],
     (_, v) => v.import("TILE", _));
-  main.define("MISSIONS", ["module @tomlarkworthy/corepox-missions", "@variable"],
-    (_, v) => v.import("MISSIONS", _));
+  for (const n of ["MISSIONS", "CAMPAIGNS"])
+    main.define(n, ["module @tomlarkworthy/corepox-missions", "@variable"],
+      (_, v) => v.import(n, _));
 
   $def("_title", "title", ["md"], _title);
   $def("_objectiveHtml", "objectiveHtml", ["htl"], _objectiveHtml);
@@ -15721,7 +16203,7 @@ const _SENSOR = function _SENSOR(){return(
 {Radar: [0.5, 1.5]}
 )};
 
-const _Ship = function _Ship(NEIGHBOURS, TYPES, DIRS, rotTile, geom, DT, UNITS, applyOverrides, constantParam, SENSOR){return(
+const _Ship = function _Ship(NEIGHBOURS, JOINTS, TYPES, DIRS, rotTile, geom, DT, UNITS, applyOverrides, constantParam, SENSOR){return(
 class Ship {
   static SUPPLY = 20;   // power per Brain
   constructor(spec, {team = "a", x = 0, y = 0, a = 0} = {}) {
@@ -15846,7 +16328,78 @@ class Ship {
     this.power = budget;
   }
 
+  // Where a component's joints sit, in ship tile units. A joint is a POINT on a
+  // cell boundary -- two slots per side, eight around a 1x1, which is what
+  // CoordDir8 encodes. Metrics.cs:258 offset_x/offset_y give the eight offsets
+  // literally, and they are these:
+  //
+  //   UP_LEFT  (-0.25, 0.5)   LEFT_UP   (-0.5,  0.25)   DOWN_LEFT  (-0.25,-0.5)
+  //   UP_RIGHT ( 0.25, 0.5)   LEFT_DOWN (-0.5, -0.25)   DOWN_RIGHT ( 0.25,-0.5)
+  //                           RIGHT_UP  ( 0.5,  0.25)   RIGHT_DOWN ( 0.5, -0.25)
+  //
+  // so slot 0 is the half nearer the smaller coordinate, which is what JOINTS is
+  // written to and what corepox-components draws. Being a point, it rotates with
+  // the component through the same rotTile the tiles go through.
+  jointsOf(c) {
+    const tbl = JOINTS[c.type];
+    if (!tbl) return [];
+    const out = [];
+    for (const key in tbl) {
+      const cell = key.split(",").map(Number);
+      const [rx, ry] = rotTile(cell, c.dir);
+      for (const side in tbl[key])
+        for (const slot of tbl[key][side]) {
+          const a = slot === 0 ? -0.25 : 0.25;
+          const o = side === "N" ? [a, 0.5] : side === "S" ? [a, -0.5]
+                  : side === "E" ? [0.5, a] : [-0.5, a];
+          const [ox, oy] = rotTile(o, c.dir);
+          out.push([c.px + rx + ox, c.py + ry + oy]);
+        }
+    }
+    return out;
+  }
+
+  // Connectivity over JOINTS, which is what the original does: Connectivity.cs:99
+  // disjointSets -> connected() -> adjacent(), which walks a component's joints and
+  // looks up `outgoing.opposing()`. Metrics.cs:361 defines opposing() as the SAME
+  // POINT reached from the neighbouring cell -- UP_LEFT at (x,y) mates DOWN_LEFT at
+  // (x,y+1) -- so two components are bound when their joint points coincide, and
+  // only then. Bodies one empty cell apart are not bound however long the drawn
+  // stalks look; there is no gap rule in the original and this had one until the
+  // C# was read.
+  //
+  // Components can touch and NOT be bound, which is the point, and the thing tile
+  // distance cannot express.
   islands() {
+    const meet = new Map();
+    for (const c of this.live)
+      for (const [x, y] of this.jointsOf(c)) {
+        const k = (x * 4) + ":" + (y * 4);
+        if (!meet.has(k)) meet.set(k, []);
+        meet.get(k).push(c);
+      }
+    const bond = new Map(this.live.map(c => [c.i, []]));
+    for (const grp of meet.values())
+      for (const a of grp) for (const b of grp) if (a !== b) bond.get(a.i).push(b);
+
+    const out = [], seen = new Set();
+    for (const start of this.live) {
+      if (seen.has(start.i)) continue;
+      const grp = [], q = [start]; seen.add(start.i);
+      while (q.length) {
+        const c = q.pop(); grp.push(c);
+        for (const n of bond.get(c.i))
+          if (!seen.has(n.i)) { seen.add(n.i); q.push(n); }
+      }
+      out.push(grp);
+    }
+    return out;
+  }
+
+  // The rule this replaced: pure tile distance, reach 2, no joints involved. Kept
+  // so the two can be measured against each other (tools/corepox-joint-rule.ts)
+  // rather than the switch being argued about.
+  islandsByDistance() {
     const at = new Map(), out = [], seen = new Set();
     for (const c of this.live) for (const [tx, ty] of c.tiles) at.set(tx + "," + ty, c);
     for (const start of this.live) {
@@ -16394,9 +16947,22 @@ const _flightModel = function _flightModel(geom, UNITS){return(
 }
 )};
 
-// pilot(ship, {target, face, fire}) -- writes engine throttles for one tick.
+// Guns are not part of the allocation: a fixed Lazer points where the hull points,
+// so its trigger carries no aiming decision. A LaserTurret2 has an aim, and the aim
+// is what a wire is for -- the pilot never writes a turret port (Tom, 2026-08-20).
+const _fireGuns = function _fireGuns(){return(
+(ship, cmd) => {
+  if (cmd.fire === undefined) return;
+  for (const c of ship.live)
+    if ((c.type === "Lazer" || c.type === "Explosive") && c.powered &&
+        !ship.conns.some(k => k.to[0] === c.px && k.to[1] === c.py))
+      c.in.in = cmd.fire ? 100 : 0;
+}
+)};
+
+// pilot(ship, {target, face, drive, fire}) -- writes engine throttles for one tick.
 // `memo` is per-ship scratch the caller owns; it latches the turn direction.
-const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, geom, UNITS){return(
+const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, fireGuns, geom, UNITS){return(
 (ship, cmd = {}, memo = {}, A = pilotActuators(ship)) => {
   for (const a of A) a.c.in.in = 0;
   if (!A.length) return {residual: 0, err: 0, model: null, throttles: []};
@@ -16404,6 +16970,30 @@ const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, geom,
   const G = {vel: 2.4, rate: 3.2, torque: 8};
   const R = flightModel(A);
   let bx = 0, by = 0, want = cmd.face ?? ship.a;
+
+  // Direct drive (WASD). Same allocator, different demand: instead of deriving a
+  // wrench from a waypoint the caller names one outright, as a fraction of what
+  // this hull can produce. thrust and yaw are each -1..1, and each is scaled by
+  // the authority the build actually has in that direction -- so a hull with no
+  // reverse ignores S and one with no yaw ignores A/D, which is the same "the
+  // failure is the build's" property the waypoint mode has.
+  if (cmd.drive) {
+    const {thrust = 0, yaw = 0} = cmd.drive;
+    let tp = 0, tn = 0, along = 0;
+    for (const a of A) {
+      tp += Math.max(0, a.t); tn += Math.max(0, -a.t);
+      along += Math.max(0, a.ux * R.axis[0] * Math.sign(thrust || 1) +
+                          a.uy * R.axis[1] * Math.sign(thrust || 1));
+    }
+    const b = [R.axis[0] * thrust * along, R.axis[1] * thrust * along,
+               yaw * (yaw >= 0 ? tp : tn)];
+    // torque weight drops to 2: under direct drive both demands are the player's
+    // and starving thrust to serve a held turn key reads as an unresponsive ship
+    const out = pilotAllocate(A, b, [1, 1, 2]);
+    A.forEach((a, i) => { a.c.in.in = out.f[i] * 100; });
+    fireGuns(ship, cmd);
+    return {residual: out.residual, err: 0, model: R, throttles: out.f};
+  }
 
   if (cmd.target && R.vmax > 1e-6) {
     const ex = cmd.target[0] - ship.x, ey = cmd.target[1] - ship.y;
@@ -16442,14 +17032,7 @@ const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, geom,
   const out = pilotAllocate(A, [bx, by, alpha], [1, 1, G.torque]);
   A.forEach((a, i) => { a.c.in.in = out.f[i] * 100; });
 
-  // Guns are not part of the allocation: a fixed Lazer points where the hull
-  // points, and a turret has its own servo, so both are direct writes.
-  if (cmd.fire !== undefined)
-    for (const c of ship.live)
-      if ((c.type === "Lazer" || c.type === "Explosive") && c.powered &&
-          !ship.conns.some(k => k.to[0] === c.px && k.to[1] === c.py))
-        c.in.in = cmd.fire ? 100 : 0;
-
+  fireGuns(ship, cmd);
   return {residual: out.residual, err, model: R, throttles: out.f};
 }
 )};
@@ -16478,13 +17061,14 @@ export default function define(runtime, observer) {
   $def("_rotTile", "rotTile", [], _rotTile);
   $def("_NEIGHBOURS", "NEIGHBOURS", [], _NEIGHBOURS);
   $def("_SENSOR", "SENSOR", [], _SENSOR);
-  $def("_Ship", "Ship", ["NEIGHBOURS","TYPES","DIRS","rotTile","geom","DT","UNITS","applyOverrides","constantParam","SENSOR"], _Ship);
+  $def("_Ship", "Ship", ["NEIGHBOURS","JOINTS","TYPES","DIRS","rotTile","geom","DT","UNITS","applyOverrides","constantParam","SENSOR"], _Ship);
   $def("_World", "World", ["BINOPS","geom","DT","UNITS"], _World);
   $def("_simulate", "simulate", ["World","Ship"], _simulate);
   $def("_pilotActuators", "pilotActuators", ["geom"], _pilotActuators);
   $def("_pilotAllocate", "pilotAllocate", [], _pilotAllocate);
   $def("_flightModel", "flightModel", ["geom","UNITS"], _flightModel);
-  $def("_pilot", "pilot", ["pilotActuators","pilotAllocate","flightModel","geom","UNITS"], _pilot);
+  $def("_fireGuns", "fireGuns", [], _fireGuns);
+  $def("_pilot", "pilot", ["pilotActuators","pilotAllocate","flightModel","fireGuns","geom","UNITS"], _pilot);
   return main;
 }</script><!--/-->
 
