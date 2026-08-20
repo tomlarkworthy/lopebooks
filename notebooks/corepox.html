@@ -5488,23 +5488,72 @@ const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, h
 }
 )};
 
-const _viewof_duelDemo = function _viewof_duelDemo(SHIPS, DUEL_MODES, duelView, htl, invalidation){
-  const names = Object.keys(SHIPS);
+// The corpus is the roster. 2191 designs were exported from the shipped game and
+// 1755 of them build in this engine -- the other 436 name a component it does not
+// implement (LazerHardpoint x278, BrautenbourgsFirst x154, DevouringLove x4,
+// measured by tools/corepox-corpus-load.ts). The picker cannot label them by name:
+// 1488 of the 1755 are called "Brain", the editor's default, and only 222 distinct
+// names exist in the whole set (tools/scratch/corpus-roster.ts, 2026-08-20). What
+// separates two designs a person might pick between is the shape and the history,
+// so the label carries parts / guns / engines and matches played, ordered by the
+// last of those: 20849 recorded matches means a ship people actually flew.
+const _duelRoster = function _duelRoster(SHIPS,CORPUS,TYPES,TYPE_ALIAS){return(
+(() => {
+  const byKey = new Map(), groups = [];
+  const add = (label, items) => {
+    items.forEach(e => byKey.set(e.key, e));
+    groups.push({label: `${label} (${items.length})`, items});
+  };
+  add("missions", Object.entries(SHIPS).map(([name, spec]) => ({key: name, label: name, spec})));
+
+  const GUN = /Lazer|Laser|Explosive|Missile|Turret|Spike/i;
+  add("corpus, by matches played", Object.entries(CORPUS.ships)
+    .filter(([, s]) => !s.components.some(c => !TYPES[TYPE_ALIAS(c.type)]))
+    .map(([id, s]) => ({
+      id, spec: s,
+      parts: s.components.length,
+      guns: s.components.filter(c => GUN.test(c.type)).length,
+      eng: s.components.filter(c => /Engine/i.test(c.type)).length,
+      matches: CORPUS.ratings[id]?.n ?? 0
+    }))
+    .sort((a, b) => b.matches - a.matches)
+    .map((r, i) => ({
+      key: r.id, spec: r.spec,
+      label: `${i + 1}. ${(r.spec.name || "?")} — ${r.parts}p ${r.guns}g ${r.eng}e · ${r.matches}m`
+    })));
+  return {groups, byKey};
+})()
+)};
+
+const _viewof_duelDemo = function _viewof_duelDemo(duelRoster, DUEL_MODES, duelView, htl, invalidation){
   let cur = null;
-  // A default that is an actual fight: both sides shoot, and it runs ~10s rather
-  // than resolving on the first tick. Picked off a full pairwise sweep of SHIPS
-  // (tools/scratch/duel-matrix.ts) -- most pairs draw, which is the same finding
-  // the lab's arena recorded, and a demo that draws shows nothing.
-  let cfg = {a: "manualAim", b: "gunBoat", control: "auto", mode: "elimination", seed: 4};
+  // The two most-played designs in the corpus, by rank rather than by id so the
+  // default survives a re-export. They are a real fight: decisive at 20.5s under
+  // seed 4 (tools/scratch/duel-corpus.ts, 2026-08-20). The former default,
+  // manualAim vs gunBoat, now draws at the 45s limit -- gunBoat only started
+  // shooting once loadShipSpec stopped rewriting its `fire` wire to `angle`.
+  const rank = (i) => duelRoster.groups[1].items[i].key;
+  let cfg = {a: rank(0), b: rank(1), control: "auto", mode: "elimination", seed: 4};
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;
     font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
   const bar = htl.html`<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"></div>`;
   const stage = htl.html`<div></div>`;
   root.append(bar, stage);
+  const sel = (extra = "") => htl.html`<select style="background:#0d1117;color:#dbe6f2;
+    border:1px solid #2a3646;border-radius:4px;padding:3px 6px;font:inherit;${extra}"></select>`;
   const pick = (key, opts) => {
-    const s = htl.html`<select style="background:#0d1117;color:#dbe6f2;border:1px solid #2a3646;
-      border-radius:4px;padding:3px 6px;font:inherit">${opts.map(o =>
-        htl.html`<option selected=${cfg[key] === o}>${o}</option>`)}</select>`;
+    const s = sel();
+    s.append(...opts.map(o => htl.html`<option value=${o} selected=${cfg[key] === o}>${o}</option>`));
+    s.onchange = () => { cfg[key] = s.value; go(); };
+    return s;
+  };
+  // 1755 options per side, so the value is the key and the text is the label --
+  // the ids are opaque hashes and the names are 1488-way ambiguous.
+  const ship = (key) => {
+    const s = sel("max-width:20em");
+    s.append(...duelRoster.groups.map(g => htl.html`<optgroup label=${g.label}>${
+      g.items.map(e => htl.html`<option value=${e.key} selected=${cfg[key] === e.key}>${e.label}</option>`)
+    }</optgroup>`));
     s.onchange = () => { cfg[key] = s.value; go(); };
     return s;
   };
@@ -5512,14 +5561,14 @@ const _viewof_duelDemo = function _viewof_duelDemo(SHIPS, DUEL_MODES, duelView, 
     cur?.stop();
     cur = duelView({
       seed: cfg.seed, mode: cfg.mode, limit: 45,
-      a: {spec: SHIPS[cfg.a], control: cfg.control},
-      b: {spec: SHIPS[cfg.b]},
+      a: {spec: duelRoster.byKey.get(cfg.a).spec, control: cfg.control},
+      b: {spec: duelRoster.byKey.get(cfg.b).spec},
       placement: {separation: 20, bearing: 25}
     }, {height: 460});
     stage.replaceChildren(cur);
     root.value = cur.duel;
   };
-  bar.append(pick("a", names), pick("b", names), pick("control", ["auto", "wired"]),
+  bar.append(ship("a"), ship("b"), pick("control", ["auto", "wired"]),
              pick("mode", Object.keys(DUEL_MODES)),
              htl.html`<button onclick=${() => { cfg.seed++; go(); }} style="background:#132033;
                color:#8ef0c0;border:1px solid #2d4a3d;border-radius:4px;padding:3px 10px;
@@ -5543,20 +5592,25 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-backdrops.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-missions",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
-  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec"])
+  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec", "TYPES", "TYPE_ALIAS"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
     (_, v) => v.import("battlefield", _));
   main.define("backdrop", ["module @tomlarkworthy/corepox-backdrops", "@variable"],
     (_, v) => v.import("backdrop", _));
+  main.define("module @tomlarkworthy/corepox-shipyard",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-shipyard.js?v=4")).default));
   main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
     (_, v) => v.import("SHIPS", _));
+  main.define("CORPUS", ["module @tomlarkworthy/corepox-shipyard", "@variable"],
+    (_, v) => v.import("CORPUS", _));
 
   $def("_title", "title", ["md"], _title);
   main.variable(observer("viewof duelDemo")).define("viewof duelDemo",
-    ["SHIPS","DUEL_MODES","duelView","htl","invalidation"], _viewof_duelDemo).pid = "_viewof_duelDemo";
+    ["duelRoster","DUEL_MODES","duelView","htl","invalidation"], _viewof_duelDemo).pid = "_viewof_duelDemo";
   main.variable(observer("duelDemo")).define("duelDemo",
     ["Generators","viewof duelDemo"], _duelDemo).pid = "_duelDemo";
+  $def("_duelRoster", "duelRoster", ["SHIPS","CORPUS","TYPES","TYPE_ALIAS"], _duelRoster);
   $def("_runDuel", "runDuel", ["newDuel","stepDuel","DT"], _runDuel);
   $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
   $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive"], _stepDuel);
@@ -7200,8 +7254,7 @@ const _shipEditor = function _shipEditor(
       }, m === "erase" ? "#ff6b5a" : "#5ef2a0"));
     bar.append(htl.html`<span style="flex:1"></span>`);
     bar.append(htl.html`<span style="color:#5b6b7d">${ship.comps.length} parts ·
-      ${ship.conns.length} wires · pwr ${ship.comps.reduce((n, c) =>
-        n + (TYPES[c.type]?.pwr ?? 0), 0)}</span>`);
+      ${ship.conns.length} wires</span>`);
     bar.append(btn("clear", false, () => rebuild([], []), "#ff6b5a"));
 
     tray.textContent = "";
@@ -9127,7 +9180,6 @@ const _shipNode = function _shipNode(componentNode, portNode, opNode, PORT_TYPE,
       const lx = (c.px - ship.cx) * TILE, ly = -(c.py - ship.cy) * TILE;
       holder.setAttribute("transform", `translate(${lx.toFixed(1)} ${ly.toFixed(1)}) rotate(${c.dir})`);
       holder.style.display = c.hp > 0 ? "" : "none";
-      holder.style.opacity = c.powered ? 1 : 0.35;
       if (op) op.setAttribute("transform", `rotate(${(-(ship.a + c.dir)).toFixed(2)})`);
       if (barrel) barrel.setAttribute("transform",
         `rotate(${((c.turret ?? 0) - ART_TURRET_DEG).toFixed(1)})`);
@@ -9952,10 +10004,10 @@ const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
   // Everything below shipped in InitialCampaign.prefab, in this order. Two more
   // scenes exist with full objective text in Objectives.textByScene -- SideShooter
   // and TwinTurrets -- but the campaign list does not name them, so they are kept
-  // after the seven as bonus levels rather than promoted into the arc. Three
-  // further scenes (FollowBoss, FollowCourse, FollowCourseAdvanced) have neither
-  // objective text nor a campaign slot; one of their composites is called
-  // "UnfinishedOrbDrone", which is a fair summary.
+  // after the seven as bonus levels rather than promoted into the arc. The three
+  // Follow* scenes have no objective text, but they DO have a campaign slot: they
+  // are `Advanced Steering`, which the level0 read found after this comment was
+  // first written. See CAMPAIGNS above.
   //
   // `intro` is the mission's cutscene, verbatim, from data/corepox/cutscenes.yaml
   // -- the whole shipped script, all 9 scenes and 11 frames, pulled out of the
@@ -10235,7 +10287,16 @@ const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
            connections: SHIPS.unfinishedOrbDrone_hull.connections},
     // liveMode 1: the clock is already running when you arrive, the same as Avoid.
     // So this is wiring under fire, not a build phase.
-    inventory: [{type: "Brain", n: 1}],
+    // The BUILD menu is the override quantity MINUS what the ship already carries:
+    // UIState.buildOptions counts loose components by name (composite members do
+    // not count, `candidate.composite == null`) and drops the item entirely when
+    // placedQty >= quantity. tools/corepox-inventory-offered.py resolves every
+    // item and applies the rule; three of the port's inventories offered a part
+    // the shipped game never offers, and they are cut below.
+    // FollowCourse's override is `composite UnfinishedOrbDrone x1, Brain x1` and
+    // the ship IS an UnfinishedOrbDrone composite with a loose Brain, so BOTH are
+    // already placed and the menu is empty. Two wires, nothing to build.
+    inventory: [],
     envelope: BOX_5x7,
     allow: {build: true, connect: true, modify: true},
     // Brautenbourgs First at (-2.55, -11.52) facing 149.36 degrees, straight off
@@ -10260,12 +10321,14 @@ const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
     span: 40
   },
   {
-    id: "FollowCourseAdvanced", live: true, title: "Zero negates something",
+    id: "FollowCourseAdvanced", live: true, title: "Zero Negates Something",
     brief: "One eighty times where the target is, and zero minus that for the " +
            "other side. Six wires, and the clock is already running.",
     intro: ["I MUST LEARN HOW TO SURVIVE, IN ORDER TO SURVIVE"],
     ship: SHIPS.orbDroneChassis_hull,
-    inventory: [{type: "Brain", n: 1}, {type: "Constant", n: 2}],
+    // `Brain x1, composite UnwiredOrbDrone x1, Constant x2`, and the chassis
+    // already carries a loose Brain and two loose Constants. Empty menu again.
+    inventory: [],
     envelope: BOX_5x7,
     allow: {build: true, connect: true, modify: true},
     // Brautenbourgs First at (15.16, -16.09) facing 226.62, minus the player's
@@ -10289,18 +10352,23 @@ const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
     span: 52
   },
   {
-    id: "FollowBoss", live: false, title: "Boss: the Gun Boat",
+    // "Boss: The Assassin" is the campaign's displayName, read out of level0. The
+    // port called this "Boss: the Gun Boat" after the enemy composite, which is a
+    // ship name (SHIPS.gunBoat) and not the mission's.
+    id: "FollowBoss", live: false, title: "Boss: The Assassin",
     brief: "A core, a crate and three things on the horizon. Nothing here tells " +
            "you what to build.",
     // One Brain at the origin. That is the whole ship. liveMode 0 and buildOnce 1:
     // unlike the other two you get a build phase, and the scene means you to get
-    // exactly one. buildOnce is NOT modelled here -- nothing stops you rebuilding
-    // between attempts.
+    // exactly one. This is the ONLY scene of the twelve that sets buildOnce.
     ship: {name: "core", components: [{type: "Brain", pos: [0, 0]}], connections: []},
-    // Nine item types, straight off the scene's InventoryOverride.
+    buildOnce: true,
+    // Nine item types in the scene's InventoryOverride; eight are offered. The
+    // ninth is `Brain x1` and the ship is a Brain, so placedQty 1 >= quantity 1
+    // (tools/corepox-inventory-offered.py).
     inventory: [{type: "Engine", n: 10}, {type: "Binary", n: 4}, {type: "Constant", n: 4},
                 {type: "Radar", n: 2}, {type: "Lazer", n: 2}, {type: "LaserTurret2", n: 2},
-                {type: "Orb", n: 2}, {type: "Armour", n: 2}, {type: "Brain", n: 1}],
+                {type: "Orb", n: 2}, {type: "Armour", n: 2}],
     envelope: BOX_5x7,
     allow: {build: true, connect: true, modify: true, rotate: true},
     // Spike due west at 47 tiles, Spike due south at 47, the Gun Boat 41 tiles off
@@ -11172,6 +11240,7 @@ const _newSession = function _newSession(Ship, World){return(
     cmd: {target: null, face: null, drive: null, fire: false},
     inventory: (mission.inventory ?? []).map(i => ({...i})),
     spawned: 0, spawnT: 0,
+    hasPlayed: false,                 // buildOnce reads this; see `stock`
     killed: {},                       // enemy components destroyed, by type
     enemyWas: new Map(),              // last seen live count per enemy ship
     lastDamage: 0, hadBrain: null,
@@ -11298,7 +11367,7 @@ const _INFO = function _INFO(){return(
   Lazer:        "Fires straight ahead while its input is non-zero.",
   LaserTurret2: "Turns to the angle on its input and fires along it.",
   Explosive:    "Detonates when its input goes positive. Takes the ship with it.",
-  Orb:          "Stores power for the components that draw more than the core makes.",
+  Orb:          "Massive damage to whatever it touches, and it blocks incoming lazer fire.",
   Hyperdrive:   "Jumps the ship when its input goes positive."
 }
 )};
@@ -11319,6 +11388,7 @@ const _viewof_game = function _viewof_game(
     MISSIONS, CAMPAIGNS, newSession, evaluateObjectives, stepSession, battlefield, objectiveHtml,
     componentNode, INFO, MENU_ACTIONS, TYPES, PORTS, TILE, htl, invalidation) {
   let mi = 0, S = newSession(MISSIONS[0]);
+  const kept = new Map();            // buildOnce: mission id -> the ship you took in
   let pilotDrag = null;                       // world point the current drag started on
   // same convention as geom.bearing: 0 is up, clockwise positive
   const geomBearing = (dx, dy) => Math.atan2(dx, -dy) * 180 / Math.PI;
@@ -11707,9 +11777,8 @@ const _viewof_game = function _viewof_game(
   };
 
   // ---- what the mission allows ----------------------------------------------
-  // Editing is allowed while the match runs. MissionController leaves buildOnce
-  // false for every campaign mission, so the build UI is never hidden after play,
-  // and the four live missions never have a build phase at all.
+  // Editing is allowed while the match runs: eleven of the twelve scenes leave
+  // buildOnce 0, and the four live ones never have a build phase at all.
   const editable = () => S.state === "build" || S.state === "playing";
   const allow = () => S.mission.allow ?? {};
   const canDo = (id, c) => {
@@ -11724,7 +11793,14 @@ const _viewof_game = function _viewof_game(
     if (id === "delete") return !!A.build;
     return false;
   };
-  const stock = () => S.inventory.filter(i => i.n > 0);
+  // buildOnce (FollowBoss, and only FollowBoss) hides the BUILD button once you
+  // have pressed play, and nothing else: UIState.hasBuildBuildOptions is
+  // `settings.buildOnce && settings.hasPlayed` and its one caller is
+  // `setBottomRight(... ? UIAction.Build : null)`. Move, rotate, delete and wire
+  // are options on the Selected menu and stay available -- the scene's settings
+  // leave no_building/no_removing/no_connection_creation all 0.
+  const stock = () =>
+    S.mission.buildOnce && S.hasPlayed ? [] : S.inventory.filter(i => i.n > 0);
 
   // ---- input ----------------------------------------------------------------
   const clickTile = (px, py) => {
@@ -11771,6 +11847,17 @@ const _viewof_game = function _viewof_game(
   const play = () => {
     if (S.state !== "build") return;
     S.state = "playing";
+    S.hasPlayed = true;
+    // MissionController.call saves the ship on every change while !hasPlayed, and
+    // MissionResponse.retry restarts the scene with that json -- so on a buildOnce
+    // mission the build you took into the fight is what a retry gives you back.
+    // Snapshotting here is the same thing: this is the last edit before play.
+    // The inventory rides along because a retry re-applies InventoryOverride and
+    // then subtracts what is already on the ship (UIState.buildOptions counts
+    // placedQty per model), which is the same number this session is holding.
+    if (S.mission.buildOnce)
+      kept.set(S.mission.id, {ship: specOf(S.player),
+                              inventory: S.inventory.map(i => ({...i}))});
     picked = null; wire = null;
     S.enemyWas = new Map();
     S.cmd = {target: null, face: null, drive: null, fire: false};
@@ -11840,7 +11927,9 @@ const _viewof_game = function _viewof_game(
   const reset = (idx = mi, showIntro = idx !== mi) => {
     if (raf) cancelAnimationFrame(raf);
     if (scene) { scene.remove(); scene = null; }
-    mi = idx; S = newSession(MISSIONS[mi]);
+    mi = idx;
+    const m0 = MISSIONS[mi];
+    S = newSession(m0.buildOnce && kept.has(m0.id) ? {...m0, ...kept.get(m0.id)} : m0);
     picked = null; wire = null; sel = null; act = null; panel = "none";
     view?.resetView?.();         // a hand-panned camera does not carry to the next mission
     render();
@@ -12068,7 +12157,6 @@ const _viewof_game = function _viewof_game(
     <div style="display:flex;gap:14px;align-items:center">${icon(infoType, 64)}
       <div style="color:#dbe6f2">${INFO[infoType] ?? "No notes."}</div></div>
     <div style="margin-top:10px;color:#5b6b7d">hp ${TYPES[infoType]?.hp} ·
-      power ${TYPES[infoType]?.pwr} ·
       in ${(TYPES[infoType]?.ins ?? []).join(", ") || "—"} ·
       out ${(TYPES[infoType]?.outs ?? []).join(", ") || "—"}</div></div>`,
     () => { panel = sel ? "menu" : "none"; act = null; render(); });
@@ -12319,7 +12407,8 @@ const _viewof_game = function _viewof_game(
              // A cutscene covers the board, so anything driving the game has to
              // get past it the way a player does.
              intro: () => scene, skipIntro: () => { while (scene) scene.next(); },
-             play: () => { play(); }};
+             play: () => { play(); }, restart: () => { reset(mi); },
+             stock: () => stock().map(i => ({...i}))};
 
   reset(0, true);
   return root;
@@ -15841,31 +15930,31 @@ const _TYPES = function _TYPES(){return(
 // a shell -- which matches Tom's memory of Armour being good. The earlier "no
 // player used Armour" reading came from the wrong dump (S1.3, retracted).
 {
-  Brain:        {hp: 20, pwr: 0,  tiles: [[0,0]], ins: [],                    outs: []},
-  Constant:     {hp: 25, pwr: 1,  tiles: [[0,0]], ins: [],                    outs: ["out"]},
+  Brain:        {hp: 20,  tiles: [[0,0]], ins: [],                    outs: []},
+  Constant:     {hp: 25,  tiles: [[0,0]], ins: [],                    outs: ["out"]},
   // T-tetromino. Corpus spacing: two Binaries never sit within +-3 cells (vs
   // Constants at 513 pairs one cell apart), and the T anchor here is the sharp
   // minimum of the overlap search (4.3% vs 17.3% for the next best).
-  Binary:       {hp: 25, pwr: 1,  tiles: [[-1,0],[0,0],[1,0],[0,-1]],
+  Binary:       {hp: 25,  tiles: [[-1,0],[0,0],[1,0],[0,-1]],
                  ins: ["a","b"], outs: ["out"]},
   // 2x3. Overlap search minimum is sharp: 1.5% at this anchor, 42.7% next.
-  Radar:        {hp: 25, pwr: 2,  tiles: [[0,0],[1,0],[0,1],[1,1],[0,2],[1,2]],
+  Radar:        {hp: 25,  tiles: [[0,0],[1,0],[0,1],[1,1],[0,2],[1,2]],
                  ins: [], outs: ["dist","bearing"]},
   // 2x1, nozzle behind (Tom). Local-frame corpus shadow agrees: two same-dir
   // Engines never sit 1 apart along their own axis (0 pairs) but do at 2 (17),
   // while 624 sit side by side. Direction from overlap: -y 22.9% vs +y 54.5%.
-  Engine:       {hp: 50, pwr: 2,  tiles: [[0,0],[0,-1]], ins: ["in"], outs: []},
+  Engine:       {hp: 50,  tiles: [[0,0],[0,-1]], ins: ["in"], outs: []},
   // 3x1, barrel forward (Tom). Shadow: blocked at +-1 AND +-2 along its own axis,
   // open at +-3, 884 side by side. Direction from overlap: +y 5.8% vs -y 53.7%.
-  Lazer:        {hp: 75, pwr: 4,  tiles: [[0,0],[0,1],[0,2]], ins: ["in"], outs: []},
-  Explosive:    {hp: 5, pwr: 1,   tiles: [[0,0]], ins: ["in"],                outs: []},
+  Lazer:        {hp: 75,  tiles: [[0,0],[0,1],[0,2]], ins: ["in"], outs: []},
+  Explosive:    {hp: 5,   tiles: [[0,0]], ins: ["in"],                outs: []},
   // 2x2 (Tom). Corpus-consistent: this anchor costs +0.56pp of overlap over 1x1
   // (13.68% vs 13.12%) where every other 2x2 anchor and 3x3 cost more. Tom also
   // reports two connectors on one side; Descriptions.cs gives Orb no input or
   // output semantics, so they are not modelled.
-  Orb:          {hp: 75, pwr: 2,  tiles: [[0,0],[1,0],[0,1],[1,1]],
+  Orb:          {hp: 75,  tiles: [[0,0],[1,0],[0,1],[1,1]],
                  ins: [], outs: []},
-  Armour:       {hp: 100, pwr: 0, tiles: [[0,0]], ins: [],                    outs: []},
+  Armour:       {hp: 100, tiles: [[0,0]], ins: [],                    outs: []},
   // 12 cells, verbatim from TurretFn.Awake() -- the SHIPPED occupancy, with the
   // ASCII in that comment matching cell for cell. LaserTurret2.prefab serialises
   // only 10 (no y=3 row) and is the stale one: Awake() runs after deserialisation
@@ -15880,7 +15969,7 @@ const _TYPES = function _TYPES(){return(
   // rest is the arc the gun sweeps, which the prefab reserves so nothing can be
   // built into it. pivot is the centre of the 2x2 over the base and the row above
   // (Tom: "the rotation point is in the middle if it was a 2x2").
-  LaserTurret2: {hp: 50, pwr: 6, pivot: [0.5, 0.5],
+  LaserTurret2: {hp: 50, pivot: [0.5, 0.5],
                  tiles: [[-1,1],[-1,2],[0,1],[0,2],[1,1],[1,2],[2,1],[2,2],
                          [0,0],[1,0],[0,3],[1,3]],
                  ins: ["fire","angle"], outs: []},
@@ -15893,10 +15982,10 @@ const _TYPES = function _TYPES(){return(
   // stem's forward row, not its aft-left corner. Confirmed twice over -- the
   // sprite is 4.13 x 4.92 tiles against this 4 x 5 bounding box, and its pivot
   // lands on cell (0,0) to within 0.1 of a tile (tools/corepox-anchor-truth.ts).
-  Hyperdrive:   {hp: 200, pwr: 4, ins: ["in"], outs: [],
+  Hyperdrive:   {hp: 200, ins: ["in"], outs: [],
                  tiles: [[-2,2],[-1,2],[0,2],[1,2],[-2,1],[-1,1],[0,1],[1,1],
                          [-1,0],[0,0],[-1,-1],[0,-1],[-1,-2],[0,-2]]},
-  Composite:    {hp: 25, pwr: 1,  tiles: [[0,0]], ins: [],                    outs: []}
+  Composite:    {hp: 25,  tiles: [[0,0]], ins: [],                    outs: []}
 }
 )};
 
@@ -16137,10 +16226,19 @@ const _loadShipSpec = function _loadShipSpec(PORTS, PORT_ALT, TYPE_ALIAS){return
     return null;
   };
   const conns = [], dropped = [];
+  // A spec that NAMES its ports is authoritative; cell resolution exists for the
+  // recovered corpus, where the cell is all there is. Re-deriving a declared name
+  // is destructive when two ports of one component are addressed through the same
+  // cell: gunBoat wires radar `dist` to its turret's `fire` through cell (1,4),
+  // which is the turret's ANGLE cell, so both of its wires came out pointing at
+  // `angle` and the gun never fired (0 beams loaded vs 52 raw, 6s against a
+  // stationary target). Only a name the component actually has is kept.
+  const keep = (want, c, kind) => (want && PORTS[c.type]?.[kind]?.[want]) ? want : null;
   for (const k of raw.connections ?? []) {
     const a = find(k.from, "out"), b = find(k.to, "in");
     if (!a || !b) { dropped.push(k); continue; }
-    conns.push({from: a.c.pos, fromPort: a.name, to: b.c.pos, toPort: b.name});
+    conns.push({from: a.c.pos, fromPort: keep(k.fromPort, a.c, "outs") ?? a.name,
+                to: b.c.pos,   toPort:   keep(k.toPort,   b.c, "ins")  ?? b.name});
   }
   return {spec: {...raw, connections: conns}, dropped};
 }
@@ -16205,7 +16303,6 @@ const _SENSOR = function _SENSOR(){return(
 
 const _Ship = function _Ship(NEIGHBOURS, JOINTS, TYPES, DIRS, rotTile, geom, DT, UNITS, applyOverrides, constantParam, SENSOR){return(
 class Ship {
-  static SUPPLY = 20;   // power per Brain
   constructor(spec, {team = "a", x = 0, y = 0, a = 0} = {}) {
     this.team = team; this.name = spec.name ?? "ship";
     this.x = x; this.y = y; this.a = a;
@@ -16219,7 +16316,7 @@ class Ship {
         hp: c.hp ?? T.hp, param: constantParam(c), out: applyOverrides(c, T.outs),
         // kept so a rebuilt ship can be written back out: a saved connector value
         // is ship state, and the editor rebuilds the whole ship on every edit
-        overrides: c.overrides, in: applyOverrides(c, T.ins), t: 0, powered: true,
+        overrides: c.overrides, in: applyOverrides(c, T.ins), t: 0,
         tiles: T.tiles.map(t => { const [rx, ry] = rotTile(t, dir);
                                   return [c.pos[0] + rx, c.pos[1] + ry]; })
       };
@@ -16285,47 +16382,7 @@ class Ship {
       this.x += dcx * cs + dcy * sn;
       this.y += dcx * sn - dcy * cs;
     }
-    this.powerUp();
-    this.alive = live.some(c => c.type === "Brain" && c.powered);
-  }
-
-  // 4-connected flood fill over occupied tiles. Anything not reachable from a
-  // Brain keeps its mass but stops computing -- the fragment is dead weight.
-  // NOTE: a real split would give each island its own rigid body; not done yet.
-  // Power is a BUDGET, not just connectivity. Each Brain supplies SUPPLY; every
-  // component draws TYPES[t].pwr. The flood runs breadth-first from the Brains and
-  // pays in hop order, so a component nearer a Brain is powered first -- placement
-  // is priority, and losing a Brain browns out the far end of the ship.
-  // Added 2026-08-18: without a budget, guns cost nothing and more guns always won
-  // (11/36/58/67/78% up an 8-gun ladder). See plan/corepox-design.md S1.3.
-  powerUp() {
-    const at = new Map();
-    for (const c of this.live) for (const [tx, ty] of c.tiles) at.set(tx + "," + ty, c);
-    for (const c of this.comps) c.powered = false;
-    const brains = this.live.filter(c => c.type === "Brain");
-    // No Brain means no core to ration from: a dumb device is fully live, and
-    // every mine the campaign uses (ProximityMine, delayBomb) is one.
-    if (!brains.length) { for (const c of this.live) c.powered = true; this.power = 0; return; }
-    let budget = brains.length * Ship.SUPPLY;
-    let q = brains.slice();
-    const seen = new Set(q.map(c => c.i));
-    while (q.length) {
-      const next = [];
-      // stable within a hop: nearest-to-origin first, then declaration order
-      q.sort((a, b) => (a.px*a.px + a.py*a.py) - (b.px*b.px + b.py*b.py) || a.i - b.i);
-      for (const c of q) {
-        const cost = TYPES[c.type].pwr ?? 1;
-        if (cost > budget) continue;                 // browned out; keeps its mass
-        budget -= cost; c.powered = true;
-        for (const [tx, ty] of c.tiles)
-          for (const [dx, dy] of NEIGHBOURS) {
-            const n = at.get((tx + dx) + "," + (ty + dy));
-            if (n && !seen.has(n.i)) { seen.add(n.i); next.push(n); }
-          }
-      }
-      q = next;
-    }
-    this.power = budget;
+    this.alive = live.some(c => c.type === "Brain");
   }
 
   // Where a component's joints sit, in ship tile units. A joint is a POINT on a
@@ -16481,7 +16538,7 @@ class Ship {
   propagate() {
     for (const k of this.conns) {
       const s = this.at(k.from[0], k.from[1]), d = this.at(k.to[0], k.to[1]);
-      if (!s || !d || s.hp <= 0 || d.hp <= 0 || !s.powered || !d.powered) continue;
+      if (!s || !d || s.hp <= 0 || d.hp <= 0) continue;
       const sp = k.fromPort ?? TYPES[s.type].outs[0];
       const dp = k.toPort   ?? TYPES[d.type].ins[0];
       if (sp && dp) d.in[dp] = s.out[sp];
@@ -16808,7 +16865,7 @@ class World {
       ship.propagate();
       for (const i of ship.order) {
         const c = ship.comps[i];
-        if (c.hp > 0 && c.powered) this.evaluate(ship, c);
+        if (c.hp > 0) this.evaluate(ship, c);
       }
       ship.integrate();
     }
@@ -16878,13 +16935,12 @@ battle in the browser and verify a ladder result outside it.`
 // failure belongs to the build.
 
 // One column per Engine the pilot may command: [ax, ay, alpha] at full throttle,
-// ship frame. Three filters, each of which cost a wrong answer to find:
+// ship frame. Two filters, each of which cost a wrong answer to find:
 //   own island -- the Brain pilots what it is attached to and nothing else
-//   powered    -- World.evaluate skips an unpowered engine, so commanding one
-//                 puts thrust on a dead nozzle and the ship sits still
 //   unwired    -- Ship.propagate writes only ports that carry a connection, so a
 //                 directly set in.in survives the tick; a wired engine is a
 //                 program's, not the pilot's
+// There was a third, `powered`, until the power budget was removed on 2026-08-20.
 const _pilotActuators = function _pilotActuators(geom){return(
 (ship, {all = false} = {}) => {
   const withBrain = ship.islands().filter(g => g.some(c => c.type === "Brain" && c.hp > 0));
@@ -16892,7 +16948,7 @@ const _pilotActuators = function _pilotActuators(geom){return(
   const grp = withBrain.reduce((a, b) => (b.length > a.length ? b : a));
   const cols = [];
   for (const c of grp) {
-    if (c.type !== "Engine" || !c.powered) continue;
+    if (c.type !== "Engine") continue;
     if (!all && ship.conns.some(k => k.to[0] === c.px && k.to[1] === c.py)) continue;
     const lx = c.px - ship.cx, ly = -(c.py - ship.cy);
     const [dx, dy] = geom.unit(c.dir);
@@ -16954,7 +17010,7 @@ const _fireGuns = function _fireGuns(){return(
 (ship, cmd) => {
   if (cmd.fire === undefined) return;
   for (const c of ship.live)
-    if ((c.type === "Lazer" || c.type === "Explosive") && c.powered &&
+    if ((c.type === "Lazer" || c.type === "Explosive") &&
         !ship.conns.some(k => k.to[0] === c.px && k.to[1] === c.py))
       c.in.in = cmd.fire ? 100 : 0;
 }
@@ -17475,7 +17531,7 @@ Object.fromEntries(Object.keys(TYPES).map(type => [type, {
     outs: Object.fromEntries(Object.entries(PORTS[type]?.outs ?? {}).map(([k, v]) => [k, [...v]])),
     ins:  Object.fromEntries(Object.entries(PORTS[type]?.ins  ?? {}).map(([k, v]) => [k, [...v]]))
   },
-  pwr: TYPES[type].pwr, hp: TYPES[type].hp
+  hp: TYPES[type].hp
 }]))
 )};
 
@@ -17635,7 +17691,7 @@ const _section = function _section(CPX, SYMBOL_FOR, TYPES, htl){return(
   color:${CPX.colour[type] ?? "#8899aa"}">${type}
   <span style="font:400 12px ui-monospace,monospace;color:${CPX.dim};margin-left:10px">
     ${TYPES[type].tiles.length} cell${TYPES[type].tiles.length === 1 ? "" : "s"}
-    · pwr ${TYPES[type].pwr} · hp ${TYPES[type].hp}
+    · hp ${TYPES[type].hp}
     · ${SYMBOL_FOR[type] ? "art " + SYMBOL_FOR[type][0] : "no art recovered"}
   </span></h2>`
 )};
@@ -18047,7 +18103,7 @@ const _componentTables = function _componentTables(tbl_Brain, tbl_Constant, tbl_
 
 const _componentTable = function _componentTable(componentTables, htl, CPX){return(
 htl.html`<table style="border-collapse:collapse;font:12px ui-monospace,monospace;color:#dbe6f2">
-  <thead><tr>${["type","cells","joints","outputs","inputs","pwr","hp"].map(h =>
+  <thead><tr>${["type","cells","joints","outputs","inputs","hp"].map(h =>
     htl.html`<th style="text-align:left;padding:4px 12px 4px 0;border-bottom:1px solid ${CPX.rule};
       color:${CPX.dim};font-weight:400">${h}</th>`)}</tr></thead>
   <tbody>${Object.entries(componentTables).map(([type, t]) => {
@@ -18059,7 +18115,6 @@ htl.html`<table style="border-collapse:collapse;font:12px ui-monospace,monospace
       <td style="padding:3px 12px 3px 0;text-align:right;color:${nj ? CPX.live : "#5a3f3f"}">${nj}</td>
       <td style="padding:3px 12px 3px 0;color:${CPX.wire}">${fmt(t.ports.outs)}</td>
       <td style="padding:3px 12px 3px 0;color:${CPX.sink}">${fmt(t.ports.ins)}</td>
-      <td style="padding:3px 12px 3px 0;text-align:right">${t.pwr}</td>
       <td style="padding:3px 12px 3px 0;text-align:right">${t.hp}</td>
     </tr>`;
   })}</tbody>
