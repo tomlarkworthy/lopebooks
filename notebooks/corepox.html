@@ -5489,15 +5489,16 @@ const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, h
 )};
 
 // The corpus is the roster. 2191 designs were exported from the shipped game and
-// 1755 of them build in this engine -- the other 436 name a component it does not
-// implement (LazerHardpoint x278, BrautenbourgsFirst x154, DevouringLove x4,
-// measured by tools/corepox-corpus-load.ts). The picker cannot label them by name:
-// 1488 of the 1755 are called "Brain", the editor's default, and only 222 distinct
-// names exist in the whole set (tools/scratch/corpus-roster.ts, 2026-08-20). What
+// 2187 of them build in this engine; the 4 that do not name DevouringLove, a prefab
+// no extraction recovered (tools/corepox-corpus-load.ts, 2026-08-20 -- it was 1755
+// before RELICS taught the loader to splice a prefab a design only NAMES).
+// The picker cannot label them by name:
+// 1488 of them are called "Brain", the editor's default, and only 222 distinct
+// names exist in the loadable set (tools/scratch/corpus-roster.ts, 2026-08-20). What
 // separates two designs a person might pick between is the shape and the history,
 // so the label carries parts / guns / engines and matches played, ordered by the
 // last of those: 20849 recorded matches means a ship people actually flew.
-const _duelRoster = function _duelRoster(SHIPS,CORPUS,TYPES,TYPE_ALIAS){return(
+const _duelRoster = function _duelRoster(SHIPS,CORPUS,TYPES,TYPE_ALIAS,RELICS){return(
 (() => {
   const byKey = new Map(), groups = [];
   const add = (label, items) => {
@@ -5507,15 +5508,24 @@ const _duelRoster = function _duelRoster(SHIPS,CORPUS,TYPES,TYPE_ALIAS){return(
   add("missions", Object.entries(SHIPS).map(([name, spec]) => ({key: name, label: name, spec})));
 
   const GUN = /Lazer|Laser|Explosive|Missile|Turret|Spike/i;
+  // Counted through the relic table, not off the raw list: a design whose only
+  // component is a LazerHardpoint would otherwise read "1p 0g 0e" when what it
+  // builds is a turret, a radar and eight armour plates. None of the four shipped
+  // relics contains another, so one level of expansion is exact here.
+  const parts = (s) => s.components.flatMap(c => {
+    const t = TYPE_ALIAS(c.type);
+    return RELICS[t]?.components.map(x => x.type) ?? [t];
+  });
   add("corpus, by matches played", Object.entries(CORPUS.ships)
-    .filter(([, s]) => !s.components.some(c => !TYPES[TYPE_ALIAS(c.type)]))
-    .map(([id, s]) => ({
-      id, spec: s,
-      parts: s.components.length,
-      guns: s.components.filter(c => GUN.test(c.type)).length,
-      eng: s.components.filter(c => /Engine/i.test(c.type)).length,
-      matches: CORPUS.ratings[id]?.n ?? 0
-    }))
+    .filter(([, s]) => !s.components.some(c => { const t = TYPE_ALIAS(c.type);
+                                               return !TYPES[t] && !RELICS[t]; }))
+    .map(([id, s]) => {
+      const P = parts(s);
+      return {id, spec: s, parts: P.length,
+              guns: P.filter(t => GUN.test(t)).length,
+              eng: P.filter(t => /Engine/i.test(t)).length,
+              matches: CORPUS.ratings[id]?.n ?? 0};
+    })
     .sort((a, b) => b.matches - a.matches)
     .map((r, i) => ({
       key: r.id, spec: r.spec,
@@ -5592,7 +5602,7 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-backdrops.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-missions",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
-  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec", "TYPES", "TYPE_ALIAS"])
+  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec", "TYPES", "TYPE_ALIAS", "RELICS"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
     (_, v) => v.import("battlefield", _));
@@ -5610,7 +5620,7 @@ export default function define(runtime, observer) {
     ["duelRoster","DUEL_MODES","duelView","htl","invalidation"], _viewof_duelDemo).pid = "_viewof_duelDemo";
   main.variable(observer("duelDemo")).define("duelDemo",
     ["Generators","viewof duelDemo"], _duelDemo).pid = "_duelDemo";
-  $def("_duelRoster", "duelRoster", ["SHIPS","CORPUS","TYPES","TYPE_ALIAS"], _duelRoster);
+  $def("_duelRoster", "duelRoster", ["SHIPS","CORPUS","TYPES","TYPE_ALIAS","RELICS"], _duelRoster);
   $def("_runDuel", "runDuel", ["newDuel","stepDuel","DT"], _runDuel);
   $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
   $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive"], _stepDuel);
@@ -7384,21 +7394,21 @@ const _CORPUS = async function _CORPUS(corpusGz,FileAttachment,unpackCorpus)
 // 20849 recorded matches is a ship people actually flew, and one with 0 is a
 // design that was saved and never used.
 //
-// `blocked` is the honest part. 436 of the 2191 designs name a component this
-// engine does not implement -- LazerHardpoint (278), BrautenbourgsFirst (154),
-// DevouringLove (4) -- and `new Ship` throws on them. Measured by
-// tools/corepox-corpus-load.ts, which builds every design the way the arena
-// does. Checking the type table is cheap; constructing 2191 ships at boot to
-// find out is not, so the row carries the reason and a picker can say so before
-// the person picks it.
-const _corpusIndex = function _corpusIndex(CORPUS,TYPES,TYPE_ALIAS){return(
+// `blocked` is the honest part, and RELICS shrank it. A design may NAME a prefab
+// instead of carrying it inline; once loadShipSpec splices those, 2187 of the 2191
+// designs construct and the only survivor is DevouringLove, on 4 designs, whose
+// definition no extraction recovered (tools/corepox-corpus-load.ts, 2026-08-20 --
+// was 1755 of 2191 before the relic table). Checking the type table is cheap;
+// constructing 2191 ships at boot to find out is not, so the row carries the
+// reason and a picker can say so before the person picks it.
+const _corpusIndex = function _corpusIndex(CORPUS,TYPES,TYPE_ALIAS,RELICS){return(
 Object.entries(CORPUS.ships).map(([id, s]) => ({
   id, name: s.name || id,
   parts: s.components.length, wires: s.connections.length,
   rating: CORPUS.ratings[id]?.rating ?? 0,
   matches: CORPUS.ratings[id]?.n ?? 0,
   blocked: [...new Set(s.components.map(c => TYPE_ALIAS(c.type))
-                        .filter(t => !TYPES[t]))].sort()
+                        .filter(t => !TYPES[t] && !RELICS[t]))].sort()
 })).sort((a, b) => a.blocked.length - b.blocked.length ||
                    b.matches - a.matches || b.rating - a.rating)
 )};
@@ -7416,7 +7426,7 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-missions",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
-  for (const n of ["Ship", "World", "TYPES", "PORTS", "TYPE_ALIAS"])
+  for (const n of ["Ship", "World", "TYPES", "PORTS", "TYPE_ALIAS", "RELICS"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
     (_, v) => v.import("battlefield", _));
@@ -7437,7 +7447,7 @@ export default function define(runtime, observer) {
   $def("_unpackCorpus", "unpackCorpus", [], _unpackCorpus);
   $def("_corpusGz", "corpusGz", ["Response","DecompressionStream"], _corpusGz);
   $def("_CORPUS", "CORPUS", ["corpusGz","FileAttachment","unpackCorpus"], _CORPUS);
-  $def("_corpusIndex", "corpusIndex", ["CORPUS","TYPES","TYPE_ALIAS"], _corpusIndex);
+  $def("_corpusIndex", "corpusIndex", ["CORPUS","TYPES","TYPE_ALIAS","RELICS"], _corpusIndex);
   $def("_portsOfShip", "portsOfShip", ["PORTS"], _portsOfShip);
   $def("_specOfShip", "specOfShip", [], _specOfShip);
   $def("_shipSource", "shipSource", [], _shipSource);
@@ -11044,14 +11054,15 @@ const _viewof_arena = function _viewof_arena(
     // 1.3% of corpus wires do not resolve and some designs throw outright, so a
     // pick that cannot be built has to say so rather than take the cell down.
     // Say WHICH component is missing rather than relaying "unknown component X"
-    // from four frames down. 436 of 2191 designs are blocked this way.
+    // from four frames down. 4 of 2191 designs are blocked this way, down from 436
+    // once RELICS let the loader splice a named prefab (2026-08-20).
     for (const [src, id] of [[srcA, a], [srcB, b]]) {
       const blk = src === "corpus" ? rowOf.get(id)?.blocked ?? [] : [];
       if (blk.length) {
         world = null; stage.textContent = ""; renderBar();
         out.textContent = `${id.slice(0, 8)} needs ${blk.join(", ")}, which this engine ` +
-          `does not implement — 436 of the 2191 designs are blocked on ` +
-          `LazerHardpoint, BrautenbourgsFirst or DevouringLove`;
+          `does not implement — 4 of the 2191 designs are blocked, all on ` +
+          `DevouringLove, whose definition no extraction recovered`;
         return;
       }
     }
@@ -15892,6 +15903,15 @@ const _UNITS = function _UNITS(){return(
   // rate EMIT * magnitude * dt, magnitude 0..100 -- 2 a tick at full thrust.
   EXHAUST_SPEED: 1 / 0.64, EXHAUST_BACK: 1.6, EXHAUST_DMG: 1, EXHAUST_RATE: 1,
   RAM_DMG: 5,                                    // Ship.cs:586, per contact per tick
+  // The Orb is MeleeFn: FixedUpdate calls `damageArea.GetContacts` and damages
+  // EVERY ShipComponent touching the trigger by `damageAmount`, at 50Hz -- which
+  // is this engine's tick, DT is already 0.02. Both numbers are off Orb.prefab
+  // (tools/corepox-orb-melee-probe.py): damageAmount 5, and the `weapon` child
+  // carries a CircleCollider2D of radius 1.1 at local (0.96, 0.96) under a root
+  // at localScale 0.33. So 1.1 * 0.33 = 0.363 world units, and the circle sits
+  // 0.96 * 0.33 = 0.317 world units diagonally off the pivot -- 0.495 tiles,
+  // which is the centre of the Orb's own 2x2 to within a rounding.
+  ORB_R: 1.1 * 0.33 / 0.64, ORB_DMG: 5,
   // HIT_R is measured: a component occupies one tile, so its box has a half
   // extent of 0.5. BEAM_R is NOT measured -- the beam's collider is a scaled
   // sprite in a binary prefab (shaft.localScale = (length,1,1), length=100) and
@@ -16172,8 +16192,95 @@ const _TYPE_ALIAS = function _TYPE_ALIAS(TYPES){return(
 }
 )};
 
-const _loadShipSpec = function _loadShipSpec(PORTS, PORT_ALT, TYPE_ALIAS){return(
-(raw) => {
+// Relics: prefabs a design may name INSTEAD of carrying inline. 436 of the 2191
+// corpus designs were unbuildable without this table -- `new Ship` threw on an
+// unknown component -- and they are named, not defined: LazerHardpoint on 417
+// designs, BrautenbourgsFirst on 225, DevouringLove on 4
+// (tools/scratch/unimpl.ts, 2026-08-20).
+//
+// These four are the shipped definitions, lifted verbatim out of the corpus pack's
+// own `relics` field rather than re-recovered. tools/corepox-relic-parity.ts
+// compares this table to the pack field by field and fails on any drift; it is a
+// copy because the pack is a shipyard FileAttachment and the shipyard imports the
+// engine, so the engine cannot read it.
+//
+// DevouringLove is NOT here. No definition of it survived any extraction, so its
+// 4 designs stay blocked, and a picker that filters on TYPES still has to.
+//
+// corepox-missions carries its own hand-recovered `braitenbergRelic` and
+// `lazerHardpoint` for mission setup. They are the same parts (checked
+// 2026-08-20, missions.js:189) but they are mission content, not loader data.
+const _RELICS = function _RELICS(){return(
+{
+  BrautenbourgsFirst: {
+    id: "BrautenbourgsFirst", name: "Brautenbourgs First",
+    components: [
+      {"type":"Engine","pos":[-1,0],"dir":"up","hp":50},
+      {"type":"Radar","pos":[0,1],"dir":"up","hp":50},
+      {"type":"Engine","pos":[4,0],"dir":"up","hp":50},
+      {"type":"Binary","pos":[2,0],"dir":"down","param":"MINUS","hp":100},
+      {"type":"Constant","pos":[0,0],"dir":"up","hp":50}],
+    connections: [
+      {"from":[2,1],"to":[4,0]},
+      {"from":[0,0],"to":[3,0]},
+      {"from":[1,1],"to":[1,0]},
+      {"from":[1,1],"to":[-1,0]}]
+  },
+  LazerHardpoint: {
+    id: "LazerHardpoint", name: "Lazer Turret Hardpoint",
+    components: [
+      {"type":"LaserTurret2","pos":[0,2],"dir":"up"},
+      {"type":"Radar","pos":[0,-1],"dir":"up"},
+      {"type":"Armour","pos":[2,-1],"dir":"up"},
+      {"type":"Armour","pos":[2,0],"dir":"up"},
+      {"type":"Armour","pos":[2,1],"dir":"up"},
+      {"type":"Armour","pos":[-1,-1],"dir":"up"},
+      {"type":"Armour","pos":[-1,0],"dir":"up"},
+      {"type":"Armour","pos":[-1,1],"dir":"up"},
+      {"type":"Armour","pos":[2,2],"dir":"up"},
+      {"type":"Armour","pos":[-1,2],"dir":"up"}],
+    connections: [
+      {"from":[1,-1],"to":[0,2]},
+      {"from":[0,-1],"to":[1,2]}]
+  },
+  Minidrone: {
+    id: "Minidrone", name: "Mini Drone",
+    components: [
+      {"type":"Radar","pos":[0,-1],"dir":"down"},
+      {"type":"Engine","pos":[-2,-1],"dir":"up"},
+      {"type":"Engine","pos":[1,-1],"dir":"up"},
+      {"type":"Constant","pos":[-1,0],"dir":"up","param":"25"}],
+    connections: [
+      {"from":[-1,0],"to":[-2,-1]},
+      {"from":[-1,-1],"to":[1,-1]}]
+  },
+  WeaponStation: {
+    id: "WeaponStation", name: "Weapon Station",
+    components: [
+      {"type":"Engine","pos":[-1,-1],"dir":"right"},
+      {"type":"Engine","pos":[2,-1],"dir":"left"},
+      {"type":"Radar","pos":[0,-1],"dir":"up"},
+      {"type":"Binary","pos":[0,-2],"dir":"up","param":"MINUS"},
+      {"type":"Constant","pos":[2,-2],"dir":"up","param":"0"},
+      {"type":"Armour","pos":[0,2],"dir":"up"},
+      {"type":"Armour","pos":[1,2],"dir":"up"},
+      {"type":"Armour","pos":[2,2],"dir":"up"},
+      {"type":"Armour","pos":[-1,2],"dir":"up"},
+      {"type":"Explosive","pos":[-1,1],"dir":"up"},
+      {"type":"Explosive","pos":[-1,0],"dir":"up"},
+      {"type":"Explosive","pos":[2,1],"dir":"up"},
+      {"type":"Explosive","pos":[2,0],"dir":"up"}],
+    connections: [
+      {"from":[1,-1],"to":[1,-2]},
+      {"from":[0,-3],"to":[-1,-1]},
+      {"from":[1,-1],"to":[2,-1]},
+      {"from":[2,-2],"to":[-1,-2]}]
+  }
+}
+)};
+
+const _loadShipSpec = function _loadShipSpec(PORTS, PORT_ALT, TYPE_ALIAS, RELICS){return(
+(raw, relics = RELICS) => {
   raw = {...raw, components: (raw.components ?? []).map(
     c => ({...c, type: TYPE_ALIAS(c.type)}))};
   // A Composite is a sub-ship, and every instance carries its whole definition
@@ -16188,23 +16295,38 @@ const _loadShipSpec = function _loadShipSpec(PORTS, PORT_ALT, TYPE_ALIAS){return
                down: (x, y) => [-x, -y], left: (x, y) => [-y, x]};
     const TURN = {up: 0, right: 90, down: 180, left: 270};
     const NAME = ["up", "right", "down", "left"];
-    const out = [], extra = [];
-    for (const c of raw.components) {
-      if (c.type !== "Composite") { out.push(c); continue; }
-      let sub = null;
-      try { sub = typeof c.param === "string" ? JSON.parse(c.param) : c.param; } catch {}
-      if (!sub?.components) { out.push(c); continue; }
-      const r = R[c.dir ?? "up"] ?? R.up, t = TURN[c.dir ?? "up"] ?? 0;
-      const map = ([x, y]) => { const [a, b] = r(x, y);
-        return [c.pos[0] + a, c.pos[1] + b]; };
-      for (const sc of sub.components)
-        out.push({...sc, pos: map(sc.pos),
-          dir: NAME[(((TURN[sc.dir ?? "up"] ?? 0) + t) / 90) % 4]});
-      for (const k of sub.connections ?? [])
-        extra.push({from: map(k.from), to: map(k.to)});
+    // A sub-ship arrives two ways: a Composite carries its definition inline in
+    // `param`, a relic names one in the table. Same splice either way.
+    const subOf = (c) => {
+      if (c.type === "Composite") {
+        try { const s = typeof c.param === "string" ? JSON.parse(c.param) : c.param;
+              return s?.components ? s : null; } catch { return null; }
+      }
+      const r = (relics ?? {})[c.type];
+      return r?.components ? r : null;
+    };
+    // Bounded rather than single-pass: a relic may itself hold a Composite or
+    // another relic. The cap is also what stops a relic that names itself.
+    for (let depth = 0; depth < 4; depth++) {
+      const out = [], extra = [];
+      let spliced = false;
+      for (const c of raw.components) {
+        const sub = subOf(c);
+        if (!sub) { out.push(c); continue; }
+        spliced = true;
+        const r = R[c.dir ?? "up"] ?? R.up, t = TURN[c.dir ?? "up"] ?? 0;
+        const map = ([x, y]) => { const [a, b] = r(x, y);
+          return [c.pos[0] + a, c.pos[1] + b]; };
+        for (const sc of sub.components)
+          out.push({...sc, type: TYPE_ALIAS(sc.type), pos: map(sc.pos),
+            dir: NAME[(((TURN[sc.dir ?? "up"] ?? 0) + t) / 90) % 4]});
+        for (const k of sub.connections ?? [])
+          extra.push({from: map(k.from), to: map(k.to)});
+      }
+      raw = {...raw, components: out,
+             connections: [...(raw.connections ?? []), ...extra]};
+      if (!spliced) break;
     }
-    raw = {...raw, components: out,
-           connections: [...(raw.connections ?? []), ...extra]};
   }
   // world cell -> component-local, so this is the INVERSE of rotTile. Both this
   // and the splice above had it forwards, which is invisible for up/down and
@@ -16555,6 +16677,26 @@ class Ship {
   // own centre. The original did this too (Ship.cs:592 maybeSplit) -- a severed
   // fragment must fly off, not ride along as dead weight.
   detach(grp) {
+    // A split does not move anything. The ship comes apart; the PARTS stay exactly
+    // where they were, and each body leaves with the velocity that body's centre of
+    // mass already had. Ship.cs:498 split() does it in three moves:
+    //
+    //   newGameObject.transform.position = this.transform.position;   // parts stay put
+    //   body.centerOfMass = cm0;                                      // sample against the OLD centre
+    //   v1 = GetRelativePointVelocity(body.centerOfMass);             // parent, at its new centre
+    //   v2 = GetRelativePointVelocity(newBody.centerOfMass);          // fragment, at its centre
+    //   newBody.angularVelocity = w0; body.angularVelocity = w0;
+    //
+    // Copying the transform is enough in Unity because a transform origin is not a
+    // centre of mass. Here it is -- ship.x,y IS the centre of mass, which is why
+    // reindex has to move the origin when a part dies -- so the fragment has to be
+    // placed at ITS centre of mass, in the parent's frame. Setting f.x = this.x
+    // instead teleported it: 2.1 tiles for a cut bar and 4.25 for a carrier
+    // releasing a drone eight tiles forward, and 145% of the ship's linear momentum
+    // invented out of nothing under spin. tools/corepox-split-inertia.ts holds it.
+    //
+    // Angular velocity goes to both bodies unchanged. That does not conserve
+    // angular momentum and it is what the original does, so it is what this does.
     const keep = new Set(grp.map(c => c.i));
     const spec = {name: this.name + "-frag", components: grp.map(c => ({
       // c.dir is DEGREES on a live component, not a name -- reading c.dirName here
@@ -16562,13 +16704,26 @@ class Ship {
       type: c.type, pos: [c.px, c.py], dir: DIRS.name(c.dir), param: c.param, hp: c.hp
     })), connections: this.conns.filter(k =>
       keep.has(this.at(k.from[0], k.from[1])?.i) && keep.has(this.at(k.to[0], k.to[1])?.i))};
-    const f = new Ship(spec, {team: this.team, x: this.x, y: this.y, a: this.a});
-    const [ox, oy] = this.worldOf(grp[0]);
-    const [vx, vy] = this.velAt(ox, oy);
-    f.x = this.x; f.y = this.y; f.vx = vx; f.vy = vy; f.w = this.w;
-    for (const c of grp) this.damage(c, c.hp);        // remove from the parent
+    const f = new Ship(spec, {team: this.team, a: this.a});
+
+    // the pre-split body, kept because damage() below moves this.x,y and this.cx,cy
+    const ox = this.x, oy = this.y, vx0 = this.vx, vy0 = this.vy, w0 = this.w;
+    const at0 = (wx, wy) => {
+      const rx = wx - ox, ry = wy - oy, wr = w0 * geom.D;
+      return [vx0 - wr * ry, vy0 + wr * rx];
+    };
+    // the fragment's centre of mass is a point in the parent, so place it like one
+    const sn = Math.sin(this.a * geom.D), cs = Math.cos(this.a * geom.D);
+    const lx = f.cx - this.cx, ly = -(f.cy - this.cy);
+    f.x = ox + lx * cs - ly * sn; f.y = oy + lx * sn + ly * cs;
+    [f.vx, f.vy] = at0(f.x, f.y);
+    f.w = w0;
+
+    for (const c of grp) this.damage(c, c.hp);       // reindex moves this.x,y to the new centre
+    if (this.live.length) [this.vx, this.vy] = at0(this.x, this.y);
     return f;
   }
+
 
   integrate() {
     const drag = 1 / (1 + 1.0 * DT);
@@ -16872,14 +17027,38 @@ class World {
     // Weapons are particles now, so this is where every one of them lands --
     // beams, shrapnel and exhaust alike, on friend and foe.
     this.stepParticles();
-    // Orb: contact damage to anything touching
+    // Orb: contact damage to EVERYTHING touching, which is what MeleeFn does.
+    //
+    // This used to test `worldOf(c)` -- the component's ORIGIN tile -- against the
+    // single nearest enemy at 1.2 tiles for 1 damage. Three errors compounding: the
+    // damage circle sat half a tile off in both axes because the Orb is 2x2 and its
+    // trigger is centred on the square, not on the origin tile; only one component
+    // could ever be hit however many were inside; and it hit for a fifth of the
+    // real amount. Tom, 2026-08-20: "The orb doesn't seem to do damage when it is
+    // overlapping an enemy" -- an enemy against the far corner sat 1.4 tiles from
+    // the origin tile and so outside the old test entirely.
+    //
+    // Targets are modelled the way the particle path models them (one HIT_R disc at
+    // the component's origin tile), so a beam and an Orb agree about what they are
+    // touching.
     for (const s of this.ships) {
       if (!s.live.length) continue;
       for (const c of s.live) {
         if (c.type !== "Orb") continue;
-        const [wx, wy] = s.worldOf(c);
-        const n = this.nearestEnemy(s, wx, wy);
-        if (n && n.d < 1.2) n.ship.damage(n.comp, 1);
+        // c.tiles are absolute ship cells and already rotated by c.dir, so their
+        // centroid is the trigger's cell whichever way the Orb is turned.
+        const n = c.tiles.length;
+        const [ox, oy] = s.worldOf({
+          px: c.tiles.reduce((a, t) => a + t[0], 0) / n,
+          py: c.tiles.reduce((a, t) => a + t[1], 0) / n});
+        const R = UNITS.ORB_R + UNITS.HIT_R;
+        for (const e of this.ships) {
+          if (e.team === s.team || !e.live.length) continue;
+          for (const t of e.live) {
+            const [px, py] = e.worldOf(t);
+            if ((px - ox) ** 2 + (py - oy) ** 2 <= R * R) e.damage(t, UNITS.ORB_DMG);
+          }
+        }
       }
     }
     this.collide();
@@ -17111,7 +17290,8 @@ export default function define(runtime, observer) {
   $def("_PORTS", "PORTS", [], _PORTS);
   $def("_PORT_ALT", "PORT_ALT", [], _PORT_ALT);
   $def("_TYPE_ALIAS", "TYPE_ALIAS", ["TYPES"], _TYPE_ALIAS);
-  $def("_loadShipSpec", "loadShipSpec", ["PORTS","PORT_ALT","TYPE_ALIAS"], _loadShipSpec);
+  $def("_RELICS", "RELICS", [], _RELICS);
+  $def("_loadShipSpec", "loadShipSpec", ["PORTS","PORT_ALT","TYPE_ALIAS","RELICS"], _loadShipSpec);
   $def("_geom", "geom", [], _geom);
   $def("_constantParam", "constantParam", [], _constantParam);
   $def("_rotTile", "rotTile", [], _rotTile);
