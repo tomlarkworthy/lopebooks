@@ -4760,8 +4760,11 @@ const _cpmKinds = function _NODE_KINDS() {return ({
                kind: "reach the beacon", desc: "A beacon under a countdown. Reach it, hold position while it transfers, leave before the clock ends.",
                r1: "+ 45 scrap", r2: "+ crew"},
   mining:     {label: "MINING",     colour: "#ffc42e", family: "economy",
-               kind: "cut the seam", desc: "Ore bodies, a quota, and a timer. Pure throughput — how much can your ship break in the window.",
-               r1: "+ 120 scrap", r2: "+ ore"},
+               kind: "cut the seam", desc: "Asteroids with parts buried in them, and a clock. Break the plates around a piece until it comes loose, then fly into it. No quota — you keep what you carry off.",
+               // No posted number, because there is no fixed reward: a mining node
+               // pays the haul. Every other kind posts one and corepox-encounter-check
+               // holds it to what ENCOUNTER_RULES actually pays.
+               r1: "scrap = what you cut", r2: "+ ore, as parts"},
   shop:       {label: "SHOP",       colour: "#ffc42e", family: "economy",
                kind: "trader", desc: "Parts, one artifact, and a refit bay. Prices move with how far into the run you are.",
                r1: "buy parts", r2: "sell salvage"},
@@ -5517,6 +5520,65 @@ const _DUEL_BACKDROP = function _DUEL_BACKDROP(){return(
 }
 )};
 
+// ---------------------------------------------------------------------------
+// Manual piloting
+// ---------------------------------------------------------------------------
+
+// The input half of `control: "human"`, which corepox-duel declares but gives a view
+// no way to drive. WASD writes a drive command, a click writes a waypoint, and the
+// two are exclusive -- pressing a key clears the waypoint, because a ship obeying
+// both at once reads as a ship ignoring you.
+//
+// Keys are taken on the WINDOW, not the board, so the player does not have to click
+// the battle first; the guard is a focused input, which is what makes a select or a
+// text field usable on the same page.
+const _humanControl = function _humanControl(){return(
+// `side` names which of a duel's two command slots to write. A state that has only
+// ONE ship under command -- the mining field -- passes null and gets `D.cmd` itself,
+// which is what keeps this one control layer usable by both.
+(host, D, side = "a") => {
+  const DRIVE = {w: [1, 0], s: [-1, 0], a: [0, -1], d: [0, 1]};
+  const held = new Set();
+  const cmd = () => (side == null ? D.cmd : D.cmd[side]);
+  const typing = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? "");
+  const apply = () => {
+    let thrust = 0, yaw = 0;
+    for (const k of held) { thrust += DRIVE[k][0]; yaw += DRIVE[k][1]; }
+    const c = cmd();
+    c.drive = (thrust || yaw) ? {thrust: Math.max(-1, Math.min(1, thrust)),
+                                yaw: Math.max(-1, Math.min(1, yaw))} : null;
+    if (c.drive) { c.target = null; c.face = null; }
+  };
+  const key = (down) => (ev) => {
+    if (typing()) return;
+    const k = ev.key.toLowerCase();
+    if (k === " ") { cmd().fire = down; ev.preventDefault(); return; }
+    if (!DRIVE[k]) return;
+    ev.preventDefault();
+    down ? held.add(k) : held.delete(k);
+    apply();
+  };
+  const kd = key(true), ku = key(false);
+  const blur = () => { held.clear(); apply(); cmd().fire = false; };
+  addEventListener("keydown", kd); addEventListener("keyup", ku);
+  addEventListener("blur", blur);
+  const svg = host.view?.svg;
+  const point = (ev) => {
+    if (!host.view) return;
+    held.clear();
+    const c = cmd();
+    c.drive = null;
+    c.target = host.view.tileAt(ev);       // the view's own map, never re-derived
+    c.face = null;
+  };
+  svg?.addEventListener("pointerdown", point);
+  return {stop: () => { removeEventListener("keydown", kd); removeEventListener("keyup", ku);
+                        removeEventListener("blur", blur); svg?.removeEventListener("pointerdown", point);
+                        blur(); },
+          held};
+}
+)};
+
 // The view is a thin shell: a backdrop behind, the shared battlefield on top, and a
 // scoreboard. It owns no rules -- everything it shows comes from stepDuel.
 const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, htl, DT){return(
@@ -5664,6 +5726,7 @@ export default function define(runtime, observer) {
   $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
   $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive"], _stepDuel);
   $def("_duelView", "duelView", ["newDuel","stepDuel","backdrop","battlefield","htl","DT"], _duelView);
+  $def("_humanControl", "humanControl", [], _humanControl);
   $def("_DUEL_MODES", "DUEL_MODES", [], _DUEL_MODES);
   $def("_duelAlive", "duelAlive", [], _duelAlive);
   $def("_duelPlacement", "duelPlacement", ["geom"], _duelPlacement);
@@ -5810,7 +5873,12 @@ const _ENCOUNTER_RULES = function _ENCOUNTER_RULES(){return(
   race:       {battle: false, scrap: 50},
   debris:     {battle: false, scrap: 35},
   rescue:     {battle: false, scrap: 45},
-  mining:     {battle: false, scrap: 120},
+  // Mining pays what was actually dug, so it posts no fixed `scrap` -- the haul
+  // replaces the rolled spoils rather than adding to them. `field` is handed
+  // straight to newMining, so the four free parameters are tuned per node kind.
+  mining:     {battle: false, mine: true, scrap: 0,
+               field: {duration: 60, density: 1.0, radius: 34,
+                       rockVolume: 8, oreVolume: 2, rockHp: 20}},
   shop:       {battle: false, scrap: 0},
   repair:     {battle: false, scrap: 0},
   unknown:    {battle: false, scrap: 0}
@@ -5897,8 +5965,10 @@ const _survivingHull = function _survivingHull(specOfShip){return(
 )};
 
 const _applySpoils = function _applySpoils(encounterSpoils){return(
-(camp, node, verdict, ship = null) => {
-  const s = encounterSpoils(node, verdict, camp);
+(camp, node, verdict, ship = null, haul = null) => {
+  // A node that is PLAYED for its reward reports one. Rolling spoils for a mining
+  // run would pay the same 120 whether the seam was worked or drifted past.
+  const s = haul ?? encounterSpoils(node, verdict, camp);
   const parts = {...camp.parts};
   for (const [t, n] of Object.entries(s.parts)) parts[t] = (parts[t] ?? 0) + n;
   return {...camp,
@@ -5916,10 +5986,24 @@ const _applySpoils = function _applySpoils(encounterSpoils){return(
 
 // The whole node without a screen: same foe, same rules, same spoils. This is what a
 // test drives and what an AI opponent would call; encounterView is this plus pixels.
-const _runEncounter = function _runEncounter(runDuel, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode){return(
+const _runEncounter = function _runEncounter(runDuel, runMining, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode){return(
 (node0, camp, {control = "auto", seed = null} = {}) => {
   const node = resolveNode(node0, camp);
   const R = ENCOUNTER_RULES[node.kind] ?? {battle: false, scrap: 0};
+  // Mining runs headless the same way a duel does, so the same node played on
+  // screen and played by a script pays the same thing. Without this branch the
+  // headless path resolved a seam as a stop, which is a reward of 0 whatever hull
+  // went in -- and a check written against it would have passed on a broken field.
+  if (R.mine) {
+    const m = runMining({...(R.field ?? {}), ship: camp.ship,
+                         seed: (seed ?? camp.seed) + node.id.length, control});
+    const verdict = m.outcome === "wrecked" ? "loss" : "win";
+    const hull = verdict === "loss" ? camp.ship
+               : survivingHull(m.mining.player, camp.ship.name ?? "hull");
+    return {verdict, foe: null, battle: null, mining: m,
+            campaign: applySpoils(camp, node, verdict, hull,
+                                  {scrap: m.scrap, parts: {...m.collected}})};
+  }
   if (!R.battle) return {verdict: "win", battle: null, foe: null,
                          campaign: applySpoils(camp, node, "win")};
   const foe = encounterFoe(node, camp);
@@ -5932,62 +6016,6 @@ const _runEncounter = function _runEncounter(runDuel, encounterFoe, ENCOUNTER_RU
   const hull = verdict === "loss" ? camp.ship
              : survivingHull(r.duel.a, camp.ship.name ?? "hull");
   return {verdict, foe, battle: r, campaign: applySpoils(camp, node, verdict, hull)};
-}
-)};
-
-// ---------------------------------------------------------------------------
-// Manual piloting
-// ---------------------------------------------------------------------------
-
-// The input half of `control: "human"`, which corepox-duel declares but gives a view
-// no way to drive. WASD writes a drive command, a click writes a waypoint, and the
-// two are exclusive -- pressing a key clears the waypoint, because a ship obeying
-// both at once reads as a ship ignoring you.
-//
-// Keys are taken on the WINDOW, not the board, so the player does not have to click
-// the battle first; the guard is a focused input, which is what makes a select or a
-// text field usable on the same page.
-const _humanControl = function _humanControl(){return(
-(host, D, side = "a") => {
-  const DRIVE = {w: [1, 0], s: [-1, 0], a: [0, -1], d: [0, 1]};
-  const held = new Set();
-  const cmd = () => D.cmd[side];
-  const typing = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? "");
-  const apply = () => {
-    let thrust = 0, yaw = 0;
-    for (const k of held) { thrust += DRIVE[k][0]; yaw += DRIVE[k][1]; }
-    const c = cmd();
-    c.drive = (thrust || yaw) ? {thrust: Math.max(-1, Math.min(1, thrust)),
-                                yaw: Math.max(-1, Math.min(1, yaw))} : null;
-    if (c.drive) { c.target = null; c.face = null; }
-  };
-  const key = (down) => (ev) => {
-    if (typing()) return;
-    const k = ev.key.toLowerCase();
-    if (k === " ") { cmd().fire = down; ev.preventDefault(); return; }
-    if (!DRIVE[k]) return;
-    ev.preventDefault();
-    down ? held.add(k) : held.delete(k);
-    apply();
-  };
-  const kd = key(true), ku = key(false);
-  const blur = () => { held.clear(); apply(); cmd().fire = false; };
-  addEventListener("keydown", kd); addEventListener("keyup", ku);
-  addEventListener("blur", blur);
-  const svg = host.view?.svg;
-  const point = (ev) => {
-    if (!host.view) return;
-    held.clear();
-    const c = cmd();
-    c.drive = null;
-    c.target = host.view.tileAt(ev);       // the view's own map, never re-derived
-    c.face = null;
-  };
-  svg?.addEventListener("pointerdown", point);
-  return {stop: () => { removeEventListener("keydown", kd); removeEventListener("keyup", ku);
-                        removeEventListener("blur", blur); svg?.removeEventListener("pointerdown", point);
-                        blur(); },
-          held};
 }
 )};
 
@@ -6009,22 +6037,66 @@ const _encChip = function _encChip(htl){return(
 // The refit bench. shipEditor does the building; this reconciles what came out of it
 // against the hold and refuses an overdraft by reloading the last affordable design,
 // which is the only way to say no to an editor that does not know about counts.
+// The ship you are about to fight, drawn from the same spec the battle will load.
+// encounterFoe is a pure function of (node, camp.seed), NOT of your hull, so the
+// preview cannot disagree with what turns up -- refitting between the two calls
+// changes nothing about the answer.
+//
+// It reuses the board's own shipNode rather than growing a second way to draw a
+// ship, which also means the team tint is the tint it will wear in the fight.
+const _foePreview = function _foePreview(Ship, loadShipSpec, shipNode, TILE, htl){return(
+(spec, {height = 120, team = "b"} = {}) => {
+  // .spec, not the loader's return: loadShipSpec answers {spec, …} and handing the
+  // wrapper to Ship builds a hull with no components at all -- it renders as an
+  // empty box with a viewBox of "Infinity Infinity 1 1", which is what the first
+  // version of this drew.
+  const ship = new Ship(loadShipSpec(spec).spec, {team, x: 0, y: 0, a: 0});
+  const {node} = shipNode(ship);
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const c of ship.comps) for (const [tx, ty] of c.tiles) {
+    x0 = Math.min(x0, tx); x1 = Math.max(x1, tx);
+    y0 = Math.min(y0, ty); y1 = Math.max(y1, ty);
+  }
+  // Half a tile for the footprint, and a little more because a turret's sweep and
+  // an engine's bell are drawn outside the cells they occupy.
+  const pad = 0.75;
+  const L = (x0 - ship.cx - pad) * TILE, R = (x1 - ship.cx + pad) * TILE;
+  const T = -(y1 - ship.cy + pad) * TILE, B = -(y0 - ship.cy - pad) * TILE;
+  const w = Math.max(1, R - L), h = Math.max(1, B - T);
+  const svg = htl.svg`<svg viewBox="${L} ${T} ${w} ${h}"
+    height=${height} width=${Math.round(height * w / h)}
+    style="display:block;overflow:visible"></svg>`;
+  svg.append(node);
+  return svg;
+}
+)};
+
 const _refitBench = function _refitBench(shipEditor, refitCheck, applyRefit, encChip, encCss, TYPES, htl){return(
 // 320, not 380: shipEditor's board takes `height` as one half of an ASPECT RATIO
 // against a 900px width, so at a 1200px-wide map the board renders 1200*h/900. At
 // 380 the bench came to 681px inside a 675px layer and the last row was clipped
 // (tools/scratch/layer-probe.mjs). 320 leaves the whole bench on screen.
-(camp, {onCommit, height = 400, span = 6, pad = 2} = {}) => {
+(camp, {onCommit, height = 400, span = 6, pad = 2, foe = null} = {}) => {
   let state = camp, last = structuredClone(camp.ship);
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;${encCss}"></div>`;
   const hold = htl.html`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>`;
   const warn = htl.html`<div style="min-height:18px;color:#ff8a8a;font:11.5px ui-monospace,monospace"></div>`;
   const host = htl.html`<div></div>`;
-  const foot = htl.html`<div style="display:flex;gap:8px;align-items:center"></div>`;
-  root.append(hold, host, warn, foot);
+  // ABOVE the board, not below it. LAUNCH used to sit under the ship editor, and
+  // the editor's board is as tall as the layer -- so on the map the only control
+  // that ends the phase was off the bottom of the screen and nothing said it was
+  // there. Tom, 2026-08-21: "I've made the ship but how do I start the mission in
+  // a duel encounter."
+  const foot = htl.html`<div style="display:flex;gap:8px;align-items:center;margin-left:auto"></div>`;
+  const bar = htl.html`<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"></div>`;
+  bar.append(hold, foot);
+  root.append(bar, host, warn);
 
+  // Opens on the SELECTION, not on a mode: a player taps a part and its menu says
+  // what can be done to it, which is the shipped board's interaction and the one
+  // corepox-game already uses. The mode bar is still there for building.
   const ed = shipEditor(camp.ship, {name: camp.ship.name ?? "hull", height, span, pad,
-    types: Object.keys(TYPES).filter(t => t !== "Composite")});
+    mode: "select", types: Object.keys(TYPES).filter(t => t !== "Composite")});
   host.append(ed);
 
   const paint = () => {
@@ -6053,8 +6125,20 @@ const _refitBench = function _refitBench(shipEditor, refitCheck, applyRefit, enc
     font:12px ui-monospace,monospace;padding:5px 14px;border-radius:4px;cursor:pointer;
     border:1px solid ${hue};background:${hue}22;color:${hue}">${label}</button>`;
   foot.append(
-    btn("LAUNCH ▶", "#8ef0c0", () => onCommit?.(applyRefit(state, ed.value))),
-    btn("revert", "#5b6b7d", () => { ed.load(camp.ship); last = structuredClone(camp.ship); paint(); }));
+    btn("revert", "#5b6b7d", () => { ed.load(camp.ship); last = structuredClone(camp.ship); paint(); }),
+    btn("LAUNCH ▶", "#8ef0c0", () => onCommit?.(applyRefit(state, ed.value))));
+  // What you are about to fight, on the bench beside your own hull. It was only
+  // ever shown once the battle had started, which is one phase too late to be of
+  // any use -- the whole point of a refit is choosing against a known opponent.
+  if (foe)
+    root.insertBefore(htl.html`<div style="display:flex;gap:14px;align-items:center;
+      align-self:flex-start;padding:8px 14px;border:1px solid #3a2530;border-radius:8px;
+      background:#140d12">
+      <div style="display:flex;flex-direction:column;gap:2px;font:11px ui-monospace,monospace">
+        <span style="color:#ff8a8a;letter-spacing:.14em">AGAINST</span>
+        <span style="color:#e8ecf5">${foe.label}</span>
+        <span style="color:#5b6b7d">${foe.parts} parts</span>
+      </div>${foe.node}</div>`, host);
   paint();
   root.value = ed.value;
   return Object.assign(root, {editor: ed, campaign: () => state});
@@ -6064,7 +6148,7 @@ const _refitBench = function _refitBench(shipEditor, refitCheck, applyRefit, enc
 // The node, end to end. Three phases in one element, because the run's state has to
 // survive the transitions and a caller that had to re-mount between them would lose
 // it. `onDone` gets the campaign the run continues with.
-const _encounterView = function _encounterView(refitBench, duelView, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode, humanControl, encChip, encCss, htl, invalidation){return(
+const _encounterView = function _encounterView(refitBench, foePreview, duelView, miningView, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode, humanControl, encChip, encCss, htl, invalidation){return(
 (node0, camp, {onDone, height = 460, control = "human"} = {}) => {
   const node = resolveNode(node0, camp);
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:10px;${encCss}"></div>`;
@@ -6086,19 +6170,49 @@ const _encounterView = function _encounterView(refitBench, duelView, encounterFo
 
   const refit = () => {
     title("refit — spend the hold, then launch");
-    const bench = refitBench(camp, {onCommit: (next) => { camp = next; battle(); }});
+    // Only a fight has an opponent to show; a mining seam and a plain node do not.
+    const f = R.battle && !R.mine ? encounterFoe(node, camp) : null;
+    const bench = refitBench(camp, {foe: f && {...f, node: foePreview(f.spec)},
+                                    onCommit: (next) => { camp = next; battle(); }});
     body.replaceChildren(bench);
   };
 
+  // The control picker is the same widget for a duel and for a seam, so it is one
+  // function -- the two differed only in which run it restarted.
+  const picker = (restart) => htl.html`<select onchange=${(e) => {
+    e.target.blur(); mode = e.target.value; restart(); }}
+    style="background:#0d1117;color:#dbe6f2;border:1px solid #2a3646;border-radius:4px;
+    padding:3px 6px;font:inherit">${["human", "auto", "wired"].map(m =>
+      htl.html`<option value=${m} selected=${m === mode}>${m}</option>`)}</select>`;
+
+  const mine = () => {
+    const F = R.field ?? {};
+    title(`mining — ${F.duration ?? 60}s on the seam`);
+    head.append(picker(mine));
+    live?.stop?.(); human?.stop?.();
+    const v = miningView({...F, ship: camp.ship, seed: camp.seed + node.id.length,
+                          control: mode}, {height, onEnd: (out, M) => {
+      human?.stop?.();
+      // "wrecked" is a loss the same way a lost duel is: the hull is gone. Running
+      // the clock out is a win whatever the haul -- an empty hold is its own penalty.
+      const verdict = out === "wrecked" ? "loss" : "win";
+      done(verdict, verdict === "loss" ? camp.ship
+                  : survivingHull(M.player, camp.ship.name ?? "hull"),
+           {scrap: M.scrap, parts: {...M.collected}});
+    }});
+    live = v; human = mode === "human" ? humanControl(v, v.mining, null) : null;
+    body.replaceChildren(v,
+      htl.html`<div style="margin-top:6px;color:#5b6b7d;font:11.5px ui-monospace,monospace">${
+        mode === "human" ? "WASD to fly · space to shoot · click the field for a waypoint · break the rock, then touch what falls out"
+                         : mode === "auto" ? "the robot pilot works the seam" : "the ship runs its own wiring"}</div>`);
+  };
+
   const battle = () => {
+    if (R.mine) return mine();
     if (!R.battle) return done("win", camp.ship);
     const foe = encounterFoe(node, camp);
     title(`battle — ${R.mode} vs ${foe.label} (${foe.parts} parts)`);
-    const pickCtl = htl.html`<select onchange=${(e) => { e.target.blur(); mode = e.target.value; battle(); }}
-      style="background:#0d1117;color:#dbe6f2;border:1px solid #2a3646;border-radius:4px;
-      padding:3px 6px;font:inherit">${["human", "auto", "wired"].map(m =>
-        htl.html`<option value=${m} selected=${m === mode}>${m}</option>`)}</select>`;
-    head.append(pickCtl);
+    head.append(picker(battle));
     live?.stop?.(); human?.stop?.();
     const v = duelView({
       mode: R.mode, limit: R.limit, seed: camp.seed,
@@ -6117,8 +6231,8 @@ const _encounterView = function _encounterView(refitBench, duelView, encounterFo
                          : mode === "auto" ? "the robot pilot has it" : "the ship runs its own wiring"}</div>`);
   };
 
-  const done = (verdict, hull) => {
-    camp = applySpoils(camp, node, verdict, hull);
+  const done = (verdict, hull, haul = null) => {
+    camp = applySpoils(camp, node, verdict, hull, haul);
     const s = camp.log[camp.log.length - 1];
     title(verdict === "win" ? "spoils" : verdict === "loss" ? "destroyed" : "stalemate");
     body.replaceChildren(htl.html`<div style="display:flex;flex-direction:column;gap:8px;
@@ -6143,15 +6257,30 @@ const _encounterView = function _encounterView(refitBench, duelView, encounterFo
 }
 )};
 
-const _viewof_encounterDemo = function _viewof_encounterDemo(SHIPS, newCampaign, encounterView, htl){
-  const node = {id: "n2-1", kind: "duel", col: 2, name: "DUEL"};
-  const root = htl.html`<div></div>`;
-  const camp = newCampaign({seed: 7, ship: SHIPS.wiredCore, scrap: 214,
-                            parts: {Engine: 3, Lazer: 2, Armour: 4, Constant: 2, Radar: 1}});
-  const v = encounterView(node, camp, {control: "human",
-    onDone: (c) => { root.value = c; root.dispatchEvent(new CustomEvent("input", {bubbles: true})); }});
-  root.append(v);
-  root.value = camp;
+// The demo picks the node KIND, because walking the map to a mining node to see a
+// mining node is not a way to test one.
+const _viewof_encounterDemo = function _viewof_encounterDemo(SHIPS, ENCOUNTER_RULES, newCampaign, encounterView, htl, invalidation){
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px"></div>`;
+  const stage = htl.html`<div></div>`;
+  let cur = null;
+  invalidation.then(() => cur?.stop?.());
+  const go = (kind) => {
+    cur?.stop?.();
+    const node = {id: "n2-1", kind, col: 2, name: kind.toUpperCase()};
+    const camp = newCampaign({seed: 7, ship: SHIPS.wiredCore, scrap: 214,
+                              parts: {Engine: 3, Lazer: 2, Armour: 4, Constant: 2, Radar: 1}});
+    cur = encounterView(node, camp, {control: "human",
+      onDone: (c) => { root.value = c; root.dispatchEvent(new CustomEvent("input", {bubbles: true})); }});
+    stage.replaceChildren(cur);
+    root.value = camp;
+  };
+  const pick = htl.html`<select onchange=${(e) => { e.target.blur(); go(e.target.value); }}
+    style="background:#0d1117;color:#dbe6f2;border:1px solid #2a3646;border-radius:4px;
+    padding:3px 6px;font:12px ui-monospace,monospace">${Object.keys(ENCOUNTER_RULES).map(k =>
+      htl.html`<option value=${k}>${k}</option>`)}</select>`;
+  root.append(htl.html`<label style="display:flex;gap:8px;align-items:center;color:#8b9bb0;
+    font:12px ui-monospace,monospace">node kind${pick}</label>`, stage);
+  go("duel");
   return root;
 };
 const _encounterDemo = (G, _) => G.input(_);
@@ -6162,17 +6291,21 @@ export default function define(runtime, observer) {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
   for (const m of ["corepox-engine", "corepox-render", "corepox-shipyard",
-                   "corepox-missions", "corepox-duel"])
+                   "corepox-missions", "corepox-duel", "corepox-mining"])
     main.define("module @tomlarkworthy/" + m,
       async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
   for (const n of ["Ship", "World", "geom", "DT", "TYPES", "TYPE_ALIAS", "RELICS", "loadShipSpec"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["shipNode", "TILE"])
+    main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
   for (const n of ["shipEditor", "specOfShip", "CORPUS"])
     main.define(n, ["module @tomlarkworthy/corepox-shipyard", "@variable"], (_, v) => v.import(n, _));
-  for (const n of ["runDuel", "duelView", "newDuel", "stepDuel"])
+  for (const n of ["runDuel", "duelView", "newDuel", "stepDuel", "humanControl"])
     main.define(n, ["module @tomlarkworthy/corepox-duel", "@variable"], (_, v) => v.import(n, _));
   main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
     (_, v) => v.import("SHIPS", _));
+  for (const n of ["miningView", "runMining"])
+    main.define(n, ["module @tomlarkworthy/corepox-mining", "@variable"], (_, v) => v.import(n, _));
 
   $def("_title", "title", ["md"], _title);
   $def("_PART_COST", "PART_COST", [], _PART_COST);
@@ -6191,19 +6324,426 @@ export default function define(runtime, observer) {
   $def("_survivingHull", "survivingHull", ["specOfShip"], _survivingHull);
   $def("_applySpoils", "applySpoils", ["encounterSpoils"], _applySpoils);
   $def("_runEncounter", "runEncounter",
-       ["runDuel","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull","resolveNode"], _runEncounter);
-  $def("_humanControl", "humanControl", [], _humanControl);
+       ["runDuel","runMining","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull","resolveNode"], _runEncounter);
   $def("_encCss", "encCss", [], _encCss);
   $def("_encChip", "encChip", ["htl"], _encChip);
+  $def("_foePreview", "foePreview", ["Ship","loadShipSpec","shipNode","TILE","htl"], _foePreview);
   $def("_refitBench", "refitBench",
        ["shipEditor","refitCheck","applyRefit","encChip","encCss","TYPES","htl"], _refitBench);
   $def("_encounterView", "encounterView",
-       ["refitBench","duelView","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull",
+       ["refitBench","foePreview","duelView","miningView","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull",
         "resolveNode","humanControl","encChip","encCss","htl","invalidation"], _encounterView);
   main.variable(observer("viewof encounterDemo")).define("viewof encounterDemo",
-    ["SHIPS","newCampaign","encounterView","htl"], _viewof_encounterDemo).pid = "_viewof_encounterDemo";
+    ["SHIPS","ENCOUNTER_RULES","newCampaign","encounterView","htl","invalidation"], _viewof_encounterDemo).pid = "_viewof_encounterDemo";
   main.variable(observer("encounterDemo")).define("encounterDemo",
     ["Generators","viewof encounterDemo"], _encounterDemo).pid = "_encounterDemo";
+  return main;
+}</script>
+
+<script id="@tomlarkworthy/corepox-mining" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// Corepox mining: a timed field of asteroids that break into smaller asteroids,
+// with the ore embedded in them as real components.
+//
+// Nothing here is a new physics. An asteroid is a Ship made of Armour, so
+// `World.splitDetached` already turns a rock cut through the middle into two
+// rocks -- the same code that severs a ship's wing. Ore is a real component
+// buried in that rock, so freeing it is `splitDetached` again: break the plates
+// around an Engine and the Engine becomes its own one-part ship, drifting, which
+// is the thing you fly into to collect. `collide` already makes ramming a rock
+// hurt, and beams already hit whatever they enter without a team check.
+//
+// The three free parameters are the field: how many rocks (`density`), how big a
+// rock is (`rockVolume`), and how much of it is ore (`oreVolume`).
+
+const _title = function _title(md){return(
+md`# Corepox mining
+
+A quota, a clock, and a field of rock. Shoot a rock and it splits; break the plates around
+a buried part and it comes loose; fly into a loose part to take it.
+
+\`\`\`js
+runMining({
+  ship: SHIPS.wiredCore,
+  seed: 3,
+  duration: 60,        // seconds on the clock
+  density: 1.0,        // rocks per 400 square tiles of field
+  rockVolume: 8,       // plates per rock
+  oreVolume: 2,        // ore parts buried in each rock
+  radius: 34           // field radius, tiles
+})
+\`\`\``
+)};
+
+// What can be buried in a rock, and what a piece is worth in scrap when it is
+// carried home. Weighted the same way the duel's salvage roll is -- the cheap
+// parts are what a seam mostly yields, or a single node hands over a turret.
+const _MINING_ORE = function _MINING_ORE(){return(
+// No Armour. Rock IS Armour, and `loosePiece` is defined as a fragment with no
+// Armour left in it -- an Armour "ore" could therefore never come loose, so it
+// would be a seam that can never pay (caught before it shipped, but only because
+// the definition and the table were read side by side).
+{Constant: 5, Engine: 20, Radar: 25, Lazer: 30, Explosive: 18,
+ Binary: 12, Orb: 35, LaserTurret2: 55}
+)};
+
+const _minRng = function _minRng(){return(
+(s) => { let x = (s | 0) || 1; return () => (x = (x * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; }
+)};
+
+// One rock, as a spec. A random walk lays down a connected blob of Armour, then
+// the ore replaces cells that are NOT on the rim (two or more neighbours, deepest
+// first). Depth is the whole mechanic: an ore cell with one neighbour is its own
+// island the moment that plate dies, so the rock would shed its cargo for free.
+const _rockSpec = function _rockSpec(){return(
+(r, {rockVolume = 8, oreVolume = 2, rockHp = 20,
+     ore = ["Constant", "Engine"], name = "rock"} = {}) => {
+  const cells = [[0, 0]], seen = new Set(["0,0"]);
+  while (cells.length < Math.max(1, rockVolume)) {
+    const [bx, by] = cells[Math.floor(r() * cells.length)];
+    const [dx, dy] = [[1, 0], [-1, 0], [0, 1], [0, -1]][Math.floor(r() * 4)];
+    const k = (bx + dx) + "," + (by + dy);
+    if (seen.has(k)) continue;
+    seen.add(k); cells.push([bx + dx, by + dy]);
+  }
+  const has = (x, y) => seen.has(x + "," + y);
+  const nbrs = ([x, y]) => [[1,0],[-1,0],[0,1],[0,-1]]
+    .filter(([dx, dy]) => has(x + dx, y + dy)).length;
+  // Ore goes where it has to be DUG OUT, which means "not a leaf", not "fully
+  // enclosed". Insisting on four neighbours grew the rock to find room -- a 9-cell
+  // random walk has one interior cell, so oreVolume 2 either dropped a piece or
+  // rockVolume stopped meaning anything (measured: rockVolume 4 and 8 both landed
+  // on 107 parts in the field). A cell with two neighbours already costs two plates
+  // to free, which is the mechanic. Fully-interior cells are still preferred.
+  const rank = cells.slice(1).map(c => [c, nbrs(c)])
+    .filter(([, n]) => n >= 2)
+    .sort((a, b) => b[1] - a[1]);
+  const pool = rank.length ? rank.map(([c]) => c) : cells.slice(1);
+  // Deepest first (pool is sorted by neighbour count), with the tie broken at
+  // random so two rocks of the same shape do not bury their ore in the same cell.
+  const bag = pool.slice(0, Math.max(oreVolume * 3, oreVolume));
+  for (let i = bag.length - 1; i > 0; i--) {
+    const j = Math.floor(r() * (i + 1)); [bag[i], bag[j]] = [bag[j], bag[i]];
+  }
+  const picked = bag.slice(0, Math.min(oreVolume, bag.length));
+  const oreAt = new Map(picked.map(c => [c.join(","), ore[Math.floor(r() * ore.length)]]));
+  // Rock is SOFTER than armour plate, and it has to be. A LaserTurret2 fires once
+  // a second for 5 (UNITS.BEAM_CYCLE, BEAM_DMG), so a 100 hp plate is 20 seconds of
+  // one gun and an 8-plate rock is most of three minutes: measured, every armed
+  // mission ship collected nothing at all in 90 seconds
+  // (tools/scratch/mine-ships.ts). `rockHp` is the fourth free parameter and it is
+  // the one that decides whether a seam is workable in the time on the clock.
+  // Ore keeps its own type's hp -- a buried Engine is a real Engine.
+  return {name, components: cells.map(([x, y]) => {
+    const t = oreAt.get(x + "," + y);
+    return t ? {type: t, pos: [x, y], dir: "up"}
+             : {type: "Armour", pos: [x, y], dir: "up", hp: rockHp};
+  }), connections: []};
+}
+)};
+
+// A hull that can actually work a seam, and the reason the mission ships cannot.
+// A LaserTurret2 clamps to +/-90 of the hull's facing, so a ship with no free
+// engine can only mine what is already in front of it: laserpost sat still for 60s
+// with its turret commanded to -138 degrees, pinned at the stop, firing into empty
+// space and taking 1215 rock hp to 1215 (tools/scratch/mine-trace.ts). Two unwired
+// engines are what let the pilot turn, and a fixed Lazer fires wherever the hull
+// points. This is the loadout a REFIT before a mining node is for.
+const _MINER = function _MINER(){return(
+{name: "miner", components: [
+  {type: "Brain", pos: [0, 0]},
+  {type: "Engine", pos: [-1, -1]}, {type: "Engine", pos: [1, -1]},
+  {type: "Constant", pos: [0, -1], param: "100"},
+  {type: "Lazer", pos: [0, 1]}, {type: "Lazer", pos: [-1, 1]}, {type: "Lazer", pos: [1, 1]}],
+ connections: [{from: [0, -1], fromPort: "out", to: [0, 1], toPort: "in"},
+               {from: [0, -1], fromPort: "out", to: [-1, 1], toPort: "in"},
+               {from: [0, -1], fromPort: "out", to: [1, 1], toPort: "in"}]}
+)};
+
+const _MINING_DEFAULTS = function _MINING_DEFAULTS(){return(
+{seed: 3, duration: 60, radius: 34, density: 1.0, rockVolume: 8, oreVolume: 2, rockHp: 20,
+ control: "auto",
+ ore: ["Constant", "Constant", "Engine", "Engine", "Radar", "Lazer"], drift: 1.6}
+)};
+
+// `density` is rocks per 400 square tiles, which is a 20x20 patch -- a number a
+// person can picture, unlike "rocks per square tile". The field is a disc of
+// `radius` with the player at the centre, and rocks are kept off the middle so the
+// clock does not start with a collision.
+const _newMining = function _newMining(Ship, World, loadShipSpec, rockSpec, MINING_DEFAULTS, minRng, MINING_ORE){return(
+(cfg = {}) => {
+  const C = {...MINING_DEFAULTS, ...cfg};
+  const r = minRng(C.seed * 7717 + 13);
+  const player = new Ship(loadShipSpec(C.ship).spec, {team: "player", x: 0, y: 0, a: 0});
+  const world = new World([player]);
+  const n = Math.max(1, Math.round(C.density * Math.PI * C.radius * C.radius / 400));
+  // Rejection-sampled, not just scattered: two rocks dropped on the same spot are
+  // in contact, and `collide` charges them 5 a tick for it, so a field that looked
+  // untouched had already shed a body before the clock started (measured: 9 rocks,
+  // 10 bodies at t=0). The reach is generous because a rock is a blob of unknown
+  // radius, and the placement gives up rather than loop.
+  const placed = [];
+  const gap = 2 + Math.sqrt(Math.max(1, C.rockVolume));
+  for (let i = 0; i < n; i++) {
+    let x = 0, y = 0, tries = 0;
+    do {
+      const a = r() * 360, d = 8 + Math.sqrt(r()) * (C.radius - 8);
+      x = Math.sin(a * Math.PI / 180) * d; y = -Math.cos(a * Math.PI / 180) * d;
+    } while (++tries < 40 &&
+             placed.some(q => (q[0] - x) ** 2 + (q[1] - y) ** 2 < (gap * 2) ** 2));
+    placed.push([x, y]);
+    const s = new Ship(loadShipSpec(rockSpec(r, C)).spec, {team: "rock", a: r() * 360, x, y});
+    s.vx = (r() - 0.5) * C.drift; s.vy = (r() - 0.5) * C.drift;
+    s.w = (r() - 0.5) * 40;
+    world.add(s);
+  }
+  return {cfg: C, world, player, rocks: n, t: 0, limit: C.duration,
+          control: C.control ?? "auto",
+          collected: {}, scrap: 0, mined: 0, outcome: null,
+          hadParts: player.live.length,
+          cmd: {target: null, face: null, drive: null, fire: false},
+          memo: {}, ORE: MINING_ORE};
+}
+)};
+
+// The robot miner: fly at the nearest rock, stop short of ramming it, and shoot.
+// It is the mining answer to the duel's `chaseCmd` and it is deliberately dumb --
+// it exists so `control: "auto"` and a headless run are not a ship sitting still,
+// not so that mining plays itself well.
+const _minerCmd = function _minerCmd(geom, loosePiece){return(
+(M, {standoff = 4, fireArc = 40} = {}) => {
+  const me = M.player;
+  let best = null, bd = Infinity, loose = null, ld = Infinity;
+  for (const s of M.world.ships) {
+    if (s === me || !s.live.length) continue;
+    for (const c of s.live) {
+      const [px, py] = s.worldOf(c);
+      const d2 = (px - me.x) ** 2 + (py - me.y) ** 2;
+      if (loosePiece(s)) { if (d2 < ld) { ld = d2; loose = [px, py]; } }
+      else if (d2 < bd) { bd = d2; best = [px, py]; }
+    }
+  }
+  // Ore first: a piece left drifting is the whole point of breaking the rock.
+  if (loose) return {target: loose, face: null, drive: null, fire: false};
+  if (!best) return {target: null, face: null, drive: null, fire: false};
+  const d = Math.sqrt(bd);
+  const bearing = geom.bearing(me.x, me.y, best[0], best[1]);
+  const off = Math.abs(geom.norm(bearing - me.a));
+  return {
+    // Hold at `standoff`: closing all the way is `collide`, which costs hull.
+    // `face` is an ANGLE (pilot does `cmd.face ?? ship.a`), not the point -- handing
+    // it the [x,y] made `want` an array, so `geom.norm(want - ship.a)` was NaN and
+    // the allocator asked for no torque at all. The miner drifted and shot forward:
+    // 180 shots, 4 hits, 20 damage in 60s (tools/scratch/mine-beam.ts).
+    target: d > standoff ? best : null,
+    face: bearing,
+    drive: null,
+    fire: off < fireArc
+  };
+}
+)};
+
+// A loose piece is a rock ship with no Armour left in it -- every plate gone, only
+// the buried parts still there. That is the definition, not a flag: it falls out
+// of what `splitDetached` produced and cannot disagree with what is on screen.
+const _loosePiece = function _loosePiece(){return(
+(s) => s.live.length > 0 && s.live.length <= 3 && !s.live.some(c => c.type === "Armour")
+)};
+
+// Collection is a contact test, run BEFORE the world steps: `collide` would
+// otherwise charge 5 damage a tick for touching the thing you are picking up.
+const _collectAt = function _collectAt(loosePiece){return(
+(M, reach = 1.4) => {
+  const got = [];
+  for (const s of [...M.world.ships]) {
+    if (s === M.player || !loosePiece(s)) continue;
+    let touch = false;
+    for (const c of s.live) { const t = s.worldTiles(c);
+      for (const [px, py] of t) {
+        for (const pc of M.player.live) for (const [qx, qy] of M.player.worldTiles(pc))
+          if ((px - qx) ** 2 + (py - qy) ** 2 <= reach * reach) { touch = true; break; }
+        if (touch) break;
+      }
+      if (touch) break;
+    }
+    if (!touch) continue;
+    for (const c of s.live) {
+      M.collected[c.type] = (M.collected[c.type] ?? 0) + 1;
+      M.scrap += M.ORE[c.type] ?? 5;
+      got.push(c.type);
+    }
+    M.world.ships.splice(M.world.ships.indexOf(s), 1);
+  }
+  return got;
+}
+)};
+
+// One tick. The order matters and each step says why.
+const _stepMining = function _stepMining(pilot, collectAt, minerCmd){return(
+(M) => {
+  if (M.outcome) return M.outcome;
+  M.picked = collectAt(M);                       // before collide() charges for the touch
+  if (M.control === "auto") M.cmd = minerCmd(M);
+  if (M.control !== "wired" && M.cmd) pilot(M.player, M.cmd, M.memo);
+  M.world.step();
+  M.world.splitDetached();                       // a rock cut in two becomes two rocks
+  M.t = M.world.t;
+  const alive = M.player.live.length > 0 &&
+                M.player.live.some(c => c.type === "Brain");
+  if (!alive) return (M.outcome = "wrecked");
+  if (M.t >= M.limit) return (M.outcome = "time");
+  return "playing";
+}
+)};
+
+const _runMining = function _runMining(newMining, stepMining, DT){return(
+(cfg = {}) => {
+  const M = newMining(cfg);
+  const cap = Math.ceil((M.limit) / DT) + 2;
+  let out = "playing";
+  for (let i = 0; i < cap && out === "playing"; i++) out = stepMining(M);
+  return {outcome: M.outcome ?? "time", seconds: +M.world.t.toFixed(2),
+          collected: M.collected, scrap: M.scrap,
+          rocks: M.rocks, rocksLeft: M.world.ships.filter(s => s !== M.player).length,
+          parts: M.player.live.length, mining: M};
+}
+)};
+
+// The view. Same shell as duelView -- backdrop, the shared battlefield, a HUD --
+// and it owns no rules: everything on screen comes out of stepMining.
+const _miningView = function _miningView(newMining, stepMining, backdrop, battlefield, DUEL_BACKDROP, htl, DT){return(
+(cfg = {}, {height = 460, span = 40, speed = 1, onEnd} = {}) => {
+  const M = cfg.world ? cfg : newMining(cfg);
+  const root = htl.html`<div style="position:relative;border-radius:8px;overflow:hidden;
+    background:#04050a;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
+  const bd = cfg.backdrop === false ? null
+    : {...DUEL_BACKDROP, sky: {...DUEL_BACKDROP.sky, seed: M.cfg.seed},
+       body: {...DUEL_BACKDROP.body, seed: M.cfg.seed * 3 + 1}};
+  let bg = null;
+  if (bd) {
+    bg = backdrop({...bd, comp: {...bd.comp, W: 1400, height}});
+    bg.style.cssText = "position:absolute;inset:0;width:100%;height:100%";
+    bg.setAttribute("preserveAspectRatio", "xMidYMid slice");
+    root.append(bg);
+  }
+  const view = battlefield(M.world, {span, height, width: 900});
+  view.svg.style.background = "transparent";
+  if (bg && view.svg.firstElementChild?.tagName === "g") view.svg.firstElementChild.style.display = "none";
+  view.svg.style.position = "relative";
+  // Follow the PLAYER, not the whole field: framing every rock zooms out until the
+  // ship is a dot, which is the same defect the refit bench had.
+  view.framed = [M.player];
+  root.append(view.svg);
+  const hud = htl.html`<div style="position:absolute;left:10px;top:8px;display:flex;gap:14px;
+    pointer-events:none;text-shadow:0 1px 3px #000"></div>`;
+  root.append(hud);
+
+  let raf = 0, acc = 0, last = 0, stopped = false;
+  const paint = () => {
+    const ore = Object.entries(M.collected).map(([t, n]) => `${t} ${n}`).join(" · ");
+    hud.innerHTML =
+      `<span style="color:#ffc42e">◆ ${M.scrap}</span>` +
+      `<span style="color:#7fd4ff">${ore || "no ore yet"}</span>` +
+      `<span style="color:${M.limit - M.t < 10 ? "#ff6b6b" : "#6f8299"}">` +
+      `${Math.max(0, M.limit - M.t).toFixed(1)}s left</span>` +
+      (M.outcome ? `<span style="color:#8ef0c0">${M.outcome.toUpperCase()}</span>` : "");
+  };
+  const loop = (now) => {
+    if (stopped) return;
+    raf = requestAnimationFrame(loop);
+    acc += Math.min(0.1, (now - last) / 1000) * speed; last = now;
+    while (acc >= DT) { acc -= DT; if (!M.outcome) stepMining(M); }
+    if (bg) bg.update(now / 1000);
+    view.framed = [M.player];
+    view.draw(); paint();
+    if (M.outcome && onEnd) { onEnd(M.outcome, M); onEnd = null; }
+  };
+  last = performance.now();
+  raf = requestAnimationFrame(loop);
+  root.mining = M;
+  root.view = view;
+  root.stop = () => { stopped = true; cancelAnimationFrame(raf); };
+  root.value = M;
+  return root;
+}
+)};
+
+const _viewof_miningDemo = function _viewof_miningDemo(MINER, miningView, humanControl, htl, invalidation){
+  let cfg = {seed: 3, duration: 60, density: 1.0, rockVolume: 8, oreVolume: 2};
+  let cur = null, human = null;
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;
+    font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
+  const bar = htl.html`<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center"></div>`;
+  const stage = htl.html`<div></div>`;
+  root.append(bar, stage,
+    htl.html`<div style="color:#5b6b7d">WASD to fly · space to shoot · click for a waypoint —
+      break the plates around a buried part, then fly into it</div>`);
+  const knob = (key, min, max, step) => {
+    const out = htl.html`<span style="color:#dbe6f2;width:3em;display:inline-block">${cfg[key]}</span>`;
+    const s = htl.html`<input type="range" min=${min} max=${max} step=${step} value=${cfg[key]}
+      style="width:110px" oninput=${(e) => { cfg[key] = +e.target.value; out.textContent = cfg[key]; }}
+      onchange=${() => go()}>`;
+    return htl.html`<label style="display:flex;gap:6px;align-items:center;color:#8b9bb0">${key}${s}${out}</label>`;
+  };
+  const go = () => {
+    cur?.stop(); human?.stop();
+    cur = miningView({...cfg, ship: MINER, control: "human"}, {height: 460});
+    human = humanControl(cur, cur.mining, null);
+    stage.replaceChildren(cur);
+    root.value = cur.mining;
+  };
+  bar.append(knob("density", 0.2, 3, 0.1), knob("rockVolume", 3, 20, 1),
+             knob("oreVolume", 0, 5, 1), knob("duration", 20, 180, 10),
+             htl.html`<button onclick=${() => { cfg.seed++; go(); }} style="background:#132033;
+               color:#8ef0c0;border:1px solid #2d4a3d;border-radius:4px;padding:3px 10px;
+               font:inherit;cursor:pointer">new field</button>`);
+  invalidation.then(() => { cur?.stop(); human?.stop(); });
+  go();
+  return root;
+};
+const _miningDemo = (G, _) => G.input(_);
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  for (const m of ["corepox-engine", "corepox-render", "corepox-backdrops",
+                   "corepox-missions", "corepox-duel"])
+    main.define("module @tomlarkworthy/" + m,
+      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
+  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec", "TYPES"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
+    (_, v) => v.import("battlefield", _));
+  main.define("backdrop", ["module @tomlarkworthy/corepox-backdrops", "@variable"],
+    (_, v) => v.import("backdrop", _));
+  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
+    (_, v) => v.import("SHIPS", _));
+  for (const n of ["DUEL_BACKDROP", "humanControl"])
+    main.define(n, ["module @tomlarkworthy/corepox-duel", "@variable"], (_, v) => v.import(n, _));
+
+  $def("_title", "title", ["md"], _title);
+  $def("_MINING_ORE", "MINING_ORE", [], _MINING_ORE);
+  $def("_MINER", "MINER", [], _MINER);
+  $def("_MINING_DEFAULTS", "MINING_DEFAULTS", [], _MINING_DEFAULTS);
+  $def("_minRng", "minRng", [], _minRng);
+  $def("_rockSpec", "rockSpec", [], _rockSpec);
+  $def("_newMining", "newMining",
+       ["Ship","World","loadShipSpec","rockSpec","MINING_DEFAULTS","minRng","MINING_ORE"], _newMining);
+  $def("_minerCmd", "minerCmd", ["geom","loosePiece"], _minerCmd);
+  $def("_loosePiece", "loosePiece", [], _loosePiece);
+  $def("_collectAt", "collectAt", ["loosePiece"], _collectAt);
+  $def("_stepMining", "stepMining", ["pilot","collectAt","minerCmd"], _stepMining);
+  $def("_runMining", "runMining", ["newMining","stepMining","DT"], _runMining);
+  $def("_miningView", "miningView",
+       ["newMining","stepMining","backdrop","battlefield","DUEL_BACKDROP","htl","DT"], _miningView);
+  main.variable(observer("viewof miningDemo")).define("viewof miningDemo",
+    ["MINER","miningView","humanControl","htl","invalidation"], _viewof_miningDemo).pid = "_viewof_miningDemo";
+  main.variable(observer("miningDemo")).define("miningDemo",
+    ["Generators","viewof miningDemo"], _miningDemo).pid = "_miningDemo";
   return main;
 }</script>
 
@@ -6242,7 +6782,8 @@ export default function define(runtime, observer) {
     "@tomlarkworthy/corepox-backdrops",
     "@tomlarkworthy/corepox-map",
     "@tomlarkworthy/corepox-duel",
-    "@tomlarkworthy/corepox-duel-encounter"
+    "@tomlarkworthy/corepox-duel-encounter",
+    "@tomlarkworthy/corepox-mining"
   ],
   "hash": "#view=R100(S70(@tomlarkworthy/corepox-game),S30(@tomlarkworthy/claude-code-pairing))",
   "headless": true,
@@ -7648,7 +8189,8 @@ const _shipSource = function _shipSource(){return(
 const _shipEditor = function _shipEditor(
     Ship, World, TYPES, battlefield, TILE, portsOfShip, specOfShip, loadShipSpec,
     htl, invalidation){return(
-(spec0, {name = "ship", types = null, height = 420, span = 14, pad = 6} = {}) => {
+(spec0, {name = "ship", types = null, height = 420, span = 14, pad = 6,
+         mode: mode0 = "build"} = {}) => {
   const PALETTE = types ?? Object.keys(TYPES).filter(t => t !== "Composite");
   // Every spec entering the editor goes through the loader, never straight to
   // `new Ship`. Corpus designs are the reason: they NAME relics rather than
@@ -7662,7 +8204,7 @@ const _shipEditor = function _shipEditor(
     raw ?? {name, components: [], connections: []})).spec;
   let ship = new Ship(load1(spec0), {team: "player", x: 0, y: 0, a: 0});
   const world = new World([ship]);
-  let mode = "build", picked = PALETTE[0], wireFrom = null, selected = null;
+  let mode = mode0, picked = PALETTE[0], wireFrom = null, selected = null, menuWire = false;
 
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;
     font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
@@ -7746,6 +8288,26 @@ const _shipEditor = function _shipEditor(
     return [wx * TILE, wy * TILE];
   };
 
+  // The two spec edits the mode bar and the selection menu both perform. Written
+  // once so the menu cannot drift from the mode.
+  const doRotate = (c) => {
+    const S = specOfShip(ship, name);
+    const t = S.components.find(x => x.pos[0] === c.px && x.pos[1] === c.py);
+    const o = ["up", "right", "down", "left"];
+    if (t) t.dir = o[(o.indexOf(t.dir ?? "up") + 1) % 4];
+    rebuild(S.components, S.connections);
+  };
+  const doErase = (c) => {
+    const S = specOfShip(ship, name);
+    // A wire whose end is gone would be dropped by loadShipSpec anyway; drop it
+    // here so the emitted spec never carries a connection to nothing.
+    const comps = S.components.filter(x => !(x.pos[0] === c.px && x.pos[1] === c.py));
+    const live = new Set(comps.map(x => x.pos.join(",")));
+    const conns = S.connections.filter(k => live.has(k.from.join(",")) && live.has(k.to.join(",")));
+    selected = null;
+    rebuild(comps, conns);
+  };
+
   const clickTile = (px, py) => {
     const S = specOfShip(ship, name);
     if (mode === "build") {
@@ -7757,20 +8319,20 @@ const _shipEditor = function _shipEditor(
       rebuild(S.components, S.connections);
     } else if (mode === "erase") {
       const c = compAt(px, py);
-      if (!c) return;
-      // A wire whose end is gone would be dropped by loadShipSpec anyway; drop it
-      // here so the emitted spec never carries a connection to nothing.
-      const comps = S.components.filter(x => !(x.pos[0] === c.px && x.pos[1] === c.py));
-      const live = new Set(comps.map(x => x.pos.join(",")));
-      const conns = S.connections.filter(k => live.has(k.from.join(",")) && live.has(k.to.join(",")));
-      rebuild(comps, conns);
+      if (c) doErase(c);
     } else if (mode === "rotate") {
       const c = compAt(px, py);
-      if (!c) return;
-      const t = S.components.find(x => x.pos[0] === c.px && x.pos[1] === c.py);
-      const o = ["up", "right", "down", "left"];
-      if (t) t.dir = o[(o.indexOf(t.dir ?? "up") + 1) % 4];
-      rebuild(S.components, S.connections);
+      if (c) doRotate(c);
+    } else if (mode === "select") {
+      // The shipped board has no modes -- it has a SELECTION whose menu says what
+      // can be done to it (corepox-game.js:217, from the shipped UI). This is that
+      // interaction, kept as one mode among the others rather than replacing them:
+      // Tom, 2026-08-21, on the refit bench -- "I am unable to access the component
+      // menu to make connections". The modes are still there for a caller that
+      // wants them; the bench opens here.
+      const c = compAt(px, py);
+      selected = c ? {px: c.px, py: c.py} : null;
+      render();
     } else if (mode === "connect") {
       const here = portsAt(px, py);
       if (!here.length) { wireFrom = null; render(); return; }
@@ -7786,6 +8348,9 @@ const _shipEditor = function _shipEditor(
           conns.push({from: [...wireFrom.anchor], fromPort: wireFrom.port,
                       to: [...i.anchor], toPort: i.name});
           wireFrom = null;
+          // Back to the menu, not left in connect: the wire was asked for from a
+          // component, so that component is still what the player is working on.
+          if (menuWire) { menuWire = false; mode = "select"; }
           rebuild(S.components, conns);
           return;
         }
@@ -7856,7 +8421,7 @@ const _shipEditor = function _shipEditor(
     // snap, not ease: a click has to land on the connector that is on screen now
     view.draw(true); paint();
     bar.textContent = "";
-    for (const m of ["build", "connect", "rotate", "modify", "erase"])
+    for (const m of ["select", "build", "connect", "rotate", "modify", "erase"])
       bar.append(btn(m, mode === m, () => {
         mode = m; wireFrom = null; if (m !== "modify") selected = null; render();
       }, m === "erase" ? "#ff6b5a" : "#5ef2a0"));
@@ -7874,6 +8439,28 @@ const _shipEditor = function _shipEditor(
       tray.append(htl.html`<span style="color:#5b6b7d">${wireFrom
         ? `wiring from ${wireFrom.anchor} (${wireFrom.port}) — click an input`
         : "click an output, then an input"}</span>`);
+    } else if (mode === "select") {
+      const c = selected && ship.at(selected.px, selected.py);
+      if (!c) tray.append(htl.html`<span style="color:#5b6b7d">click a part to select it</span>`);
+      else {
+        const outs = portsOfShip(ship).filter(q => q.kind === "out" &&
+          q.c.px === c.px && q.c.py === c.py);
+        tray.append(htl.html`<span style="color:#8b9bb0">${c.type} at ${c.px},${c.py}</span>`);
+        tray.append(btn("rotate", false, () => doRotate(c)));
+        // Priming wireFrom is what makes "wire" one click instead of three: the
+        // editor is already in the state the connect mode would be in after the
+        // player found the output dot on their own.
+        for (const q of outs)
+          tray.append(btn(outs.length > 1 ? `wire ${q.name} →` : "wire →", false, () => {
+            wireFrom = {anchor: q.anchor, cell: [q.px, q.py], port: q.name};
+            mode = "connect"; menuWire = true; render();
+          }, "#8fd0ff"));
+        if (c.type === "Constant" || c.type === "Binary")
+          tray.append(htl.html`<input value=${c.param ?? ""} onchange=${(e) => setParam(e.target.value)}
+            style="font:12px ui-monospace,monospace;background:#0d1420;color:#dbe6f2;
+            border:1px solid #26364a;border-radius:4px;padding:4px 8px;width:8em">`);
+        tray.append(btn("remove", false, () => doErase(c), "#ff6b5a"));
+      }
     } else if (mode === "modify" && selected) {
       const c = ship.at(selected.px, selected.py);
       tray.append(htl.html`<span style="color:#5b6b7d">${c.type} at ${selected.px},${selected.py}</span>
@@ -7893,6 +8480,7 @@ const _shipEditor = function _shipEditor(
   // with, so a test never re-derives it.
   return Object.assign(root, {
     qa: {tileToView, localTile, ship: () => ship, mode: () => mode, svg: () => view.svg,
+         selected: () => selected,
          ports: () => portsOfShip(ship).map(q => ({kind: q.kind, name: q.name,
                         px: q.px, py: q.py, type: q.c.type, anchor: q.anchor}))},
     load: (spec) => { const s = load1(spec);
