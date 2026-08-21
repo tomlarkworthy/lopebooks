@@ -5146,7 +5146,7 @@ const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapSc
   const bar = html`<div style="display:flex;justify-content:flex-end;margin-bottom:8px"></div>`;
   bar.append(closeBtn);
   const closeLayer = () => { open?.stop?.(); open = null; layer.style.display = "none";
-                             layer.replaceChildren(); };
+                             layer.replaceChildren(); layerMin = 0; fit(); };
   closeBtn.onclick = () => { closeLayer(); fire(); };
   invalidation.then(closeLayer);
   // An encounter opens with no way out -- the fight is the commitment. The exit is
@@ -5161,6 +5161,10 @@ const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapSc
     closeBtn.textContent = "close";
     layer.replaceChildren(bar, el);
     layer.style.display = "block";
+    requestAnimationFrame(() => {
+      layerMin = Math.min(900, (el.scrollHeight || 0) + bar.offsetHeight + 40);
+      fit();
+    });
     layer.scrollTop = 0;              // the editor's board mounts scrolled otherwise
   };
 
@@ -5198,10 +5202,16 @@ const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapSc
   const fire = () => { draw(); root.dispatchEvent(new CustomEvent("input")); };
 
   // the board is authored at 1600x900; fit it to whatever column it lands in
+  // The board sets the height, EXCEPT while an encounter is open: the bench is a
+  // toolbar, a hold row and a ship board stacked, and on a narrow column that is
+  // taller than the scaled map. Growing the host is better than letting the layer
+  // scroll, because the mode bar is the part that scrolls away and it is the part
+  // that has to be seen.
+  let layerMin = 0;
   const fit = () => {
     const k = Math.min(1, (root.clientWidth || W) / W);
     stage.style.transform = `scale(${k})`;
-    root.style.height = Math.round(H * k) + "px";
+    root.style.height = Math.round(Math.max(H * k, layerMin)) + "px";
   };
   const ro = new ResizeObserver(fit);
   ro.observe(root);
@@ -6004,7 +6014,7 @@ const _refitBench = function _refitBench(shipEditor, refitCheck, applyRefit, enc
 // against a 900px width, so at a 1200px-wide map the board renders 1200*h/900. At
 // 380 the bench came to 681px inside a 675px layer and the last row was clipped
 // (tools/scratch/layer-probe.mjs). 320 leaves the whole bench on screen.
-(camp, {onCommit, height = 320, span = 16} = {}) => {
+(camp, {onCommit, height = 400, span = 6, pad = 2} = {}) => {
   let state = camp, last = structuredClone(camp.ship);
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;${encCss}"></div>`;
   const hold = htl.html`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>`;
@@ -6013,7 +6023,7 @@ const _refitBench = function _refitBench(shipEditor, refitCheck, applyRefit, enc
   const foot = htl.html`<div style="display:flex;gap:8px;align-items:center"></div>`;
   root.append(hold, host, warn, foot);
 
-  const ed = shipEditor(camp.ship, {name: camp.ship.name ?? "hull", height, span,
+  const ed = shipEditor(camp.ship, {name: camp.ship.name ?? "hull", height, span, pad,
     types: Object.keys(TYPES).filter(t => t !== "Composite")});
   host.append(ed);
 
@@ -7638,7 +7648,7 @@ const _shipSource = function _shipSource(){return(
 const _shipEditor = function _shipEditor(
     Ship, World, TYPES, battlefield, TILE, portsOfShip, specOfShip, loadShipSpec,
     htl, invalidation){return(
-(spec0, {name = "ship", types = null, height = 420, span = 14} = {}) => {
+(spec0, {name = "ship", types = null, height = 420, span = 14, pad = 6} = {}) => {
   const PALETTE = types ?? Object.keys(TYPES).filter(t => t !== "Composite");
   // Every spec entering the editor goes through the loader, never straight to
   // `new Ship`. Corpus designs are the reason: they NAME relics rather than
@@ -7675,6 +7685,13 @@ const _shipEditor = function _shipEditor(
   // whole tile out and, on a tall page, off the bottom of the window entirely.
   const view = battlefield(world, {span, width: 900, height, follow: true});
   view.minSpan = span;
+  // `pad` is the knob that actually sets the zoom here: frame() collects ONE point
+  // per ship (its origin cell), so the whole board span comes from the margin. At
+  // the default 6 a 3-part hull renders ~130px tall on a 414px board -- the connect
+  // affordances are dots and Tom could not see them at all
+  // (tools/screenshots/bench-connect.png, 2026-08-21). Left at 6 by default so the
+  // shipyard's own view does not move; the refit bench passes its own.
+  view.pad = pad;
   const ns = "http://www.w3.org/2000/svg";
   const overlay = document.createElementNS(ns, "g");
   view.svg.appendChild(overlay);
@@ -7829,6 +7846,13 @@ const _shipEditor = function _shipEditor(
   };
 
   const render = () => {
+    // Frame the HULL, not the origin. battlefield's frame() collects one point per
+    // ship -- its origin cell -- so with nothing else to see the whole board span
+    // came from `pad`, and a 3-part ship rendered ~130px tall on a 414px board with
+    // its connect dots too small to aim at (tools/screenshots/bench-connect.png,
+    // 2026-08-21). Feeding every occupied tile through `focus`, which frame()
+    // already honours, makes the margin a margin again.
+    view.focus = ship.comps.flatMap(c => c.tiles.map(t => ship.worldOf({px: t[0], py: t[1]})));
     // snap, not ease: a click has to land on the connector that is on screen now
     view.draw(true); paint();
     bar.textContent = "";
@@ -9826,11 +9850,30 @@ const _shipNode = function _shipNode(componentNode, portNode, opNode, PORT_TYPE,
       return {kind, port, n, cell,
               fed: kind === "out" || fed.has(`${cell[0]},${cell[1]},${port}`)};
     });
-    parts.push({c, holder, texts, op, barrel: art.barrel});
+    parts.push({c, holder, texts, op, barrel: art.barrel,
+                hp: c.hp, maxHp: T.hp, lit: false, until: 0, faded: -1});
   }
 
   const at = (px, py) => [(px - ship.cx) * TILE, -(py - ship.cy) * TILE];
+  // What a hit looks like. ShipComponent.damage() ends with
+  // StartCoroutine("displayDamage"), and displayDamage is six lines:
+  //
+  //     material.shader = Shaders.highlight;
+  //     yield return new WaitForSeconds(.1f);
+  //     material.shader = Shaders.normal;
+  //     spriteRenderer.color = new Color(1, 1, 1, (float) this.hp / stats.maxHp);
+  //
+  // so a hit does TWO things and the port had neither: a tenth of a second of flat
+  // highlight, and a permanent alpha of hp/maxHp. Tom, 2026-08-21: "a component
+  // should flash when damaged, so it's clear it is happening."
+  //
+  // `Sprites/Highlight` is a Unity built-in and is not in the decompile, so the
+  // flat white is inferred from the name, not read. FLASH_MS is read: 0.1s.
+  // brightness(0) invert(1) is the SVG equivalent -- every opaque pixel goes white
+  // and alpha is untouched, which is what a flat highlight colour does to a sprite.
+  const FLASH_MS = 100;
   const update = () => {
+    const now = performance.now();
     for (const {k, n} of links) {
       const a = portCell(ship, k.from, k.fromPort, "out");
       const b = portCell(ship, k.to, k.toPort, "in");
@@ -9842,10 +9885,26 @@ const _shipNode = function _shipNode(componentNode, portNode, opNode, PORT_TYPE,
     root.setAttribute("transform",
       `translate(${(ship.x * TILE).toFixed(1)} ${(ship.y * TILE).toFixed(1)}) ` +
       `rotate(${ship.a.toFixed(2)})`);
-    for (const {c, holder, texts, op, barrel} of parts) {
+    for (const p of parts) {
+      const {c, holder, texts, op, barrel} = p;
       const lx = (c.px - ship.cx) * TILE, ly = -(c.py - ship.cy) * TILE;
       holder.setAttribute("transform", `translate(${lx.toFixed(1)} ${ly.toFixed(1)}) rotate(${c.dir})`);
       holder.style.display = c.hp > 0 ? "" : "none";
+      if (c.hp < p.hp) p.until = c.hp > 0 ? now + FLASH_MS : 0;   // dead parts do not glow
+      p.hp = c.hp;
+      // Written only when it CHANGES: a filter is a repaint, and this runs for
+      // every component of every ship every frame.
+      const lit = p.until > now;
+      if (lit !== p.lit) {
+        p.lit = lit;
+        holder.style.filter = lit ? "brightness(0) invert(1)" : "";
+      }
+      // Damage is cumulative and it shows. Floored at 0.35 rather than the
+      // original's bare hp/maxHp: these drawings are neon line art on black, where
+      // the sprites were filled, and below about a third a part stops reading as
+      // damaged and starts reading as gone.
+      const fade = Math.max(0.35, c.hp / p.maxHp);
+      if (fade !== p.faded) { p.faded = fade; holder.style.opacity = fade.toFixed(3); }
       if (op) op.setAttribute("transform", `rotate(${(-(ship.a + c.dir)).toFixed(2)})`);
       if (barrel) barrel.setAttribute("transform",
         `rotate(${((c.turret ?? 0) - ART_TURRET_DEG).toFixed(1)})`);
