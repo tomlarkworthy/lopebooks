@@ -5492,12 +5492,17 @@ const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, h
 // 2187 of them build in this engine; the 4 that do not name DevouringLove, a prefab
 // no extraction recovered (tools/corepox-corpus-load.ts, 2026-08-20 -- it was 1755
 // before RELICS taught the loader to splice a prefab a design only NAMES).
-// The picker cannot label them by name:
-// 1488 of them are called "Brain", the editor's default, and only 222 distinct
-// names exist in the loadable set (tools/scratch/corpus-roster.ts, 2026-08-20). What
-// separates two designs a person might pick between is the shape and the history,
-// so the label carries parts / guns / engines and matches played, ordered by the
-// last of those: 20849 recorded matches means a ship people actually flew.
+// The picker labels a design by its ID, because the name does not identify one:
+// only 60 of the 2191 designs are called anything other than "Brain", the editor's
+// default (tools/scratch/cid-prefix.ts, 2026-08-21). Tom's reason is that the label
+// has to be sayable -- "hard to communicate what ship I am talking about as nearly
+// everything in CORPUS is called Brain".
+//
+// Eight characters is enough to be unique and short enough to read out: 2178 of the
+// ids are 32-hex, the other 13 are integers 0-12, and a 7-char prefix already
+// separates all 2191 (a 6-char one collides once). It is also what the lab already
+// prints. The rest of the label is shape and history -- parts / guns / engines, and
+// matches played, which is the sort: 20849 recorded matches means a ship people flew.
 const _duelRoster = function _duelRoster(SHIPS,CORPUS,TYPES,TYPE_ALIAS,RELICS){return(
 (() => {
   const byKey = new Map(), groups = [];
@@ -5527,9 +5532,10 @@ const _duelRoster = function _duelRoster(SHIPS,CORPUS,TYPES,TYPE_ALIAS,RELICS){r
               matches: CORPUS.ratings[id]?.n ?? 0};
     })
     .sort((a, b) => b.matches - a.matches)
-    .map((r, i) => ({
+    .map(r => ({
       key: r.id, spec: r.spec,
-      label: `${i + 1}. ${(r.spec.name || "?")} — ${r.parts}p ${r.guns}g ${r.eng}e · ${r.matches}m`
+      label: `${r.id.slice(0, 8)} · ${r.parts}p ${r.guns}g ${r.eng}e · ${r.matches}m` +
+             (r.spec.name && r.spec.name !== "Brain" ? ` · ${r.spec.name}` : "")
     })));
   return {groups, byKey};
 })()
@@ -9394,16 +9400,36 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
     // sit on the hull, tiles away from what they describe. Draw the sightline the
     // engine actually used -- `c.lock` is set where bearing and dist are computed,
     // so this cannot disagree with the values printed on the component.
+    //
+    // The shipped trace is a drawn object, not a debug overlay, and these numbers are
+    // its numbers. Radar.prefab's `radar_trace` is a SpriteRenderer with m_DrawMode 2
+    // (Tiled), m_Size (0.19, 10), parented to the `arrow` that rotates onto the target
+    // at local (0, 0.64); RadarFn sets size.y = nearest.distance - 0.64. So it starts
+    // ONE TILE out from the sensor and ends on the target. The sprite itself
+    // (data/corepox/sprites/radar_trace.png, 57x60 at 300ppu = 0.19 x 0.2 world units)
+    // is opaque on rows 15..44 -- a 50% duty cycle -- with core ink across 38 of its 57
+    // columns at (230,230,104) and a faint halo (peak alpha 28/255) either side.
+    // In tiles: dash period 0.3125, core width 0.198, halo width 0.297.
     locks.textContent = "";
+    const dash = (0.15625 * TILE).toFixed(2);
     for (const s of world.ships) for (const c of s.live) {
       if (c.type !== "Radar" || !c.lock) continue;
       const [ax, ay, bx, by] = c.lock;
-      const l = document.createElementNS(ns, "line");
-      l.setAttribute("x1", (ax * TILE).toFixed(1)); l.setAttribute("y1", (ay * TILE).toFixed(1));
-      l.setAttribute("x2", (bx * TILE).toFixed(1)); l.setAttribute("y2", (by * TILE).toFixed(1));
-      l.setAttribute("stroke", "#4dd47a"); l.setAttribute("stroke-width", 2);
-      l.setAttribute("stroke-dasharray", "10 12"); l.setAttribute("opacity", 0.3);
-      locks.appendChild(l);
+      const d = Math.hypot(bx - ax, by - ay);
+      if (d <= 1) continue;                          // target is inside the stand-off
+      const x1 = ((ax + (bx - ax) / d) * TILE).toFixed(1);
+      const y1 = ((ay + (by - ay) / d) * TILE).toFixed(1);
+      const x2 = (bx * TILE).toFixed(1), y2 = (by * TILE).toFixed(1);
+      for (const [w, op] of [[0.297, 0.18], [0.198, 0.85]]) {
+        const l = document.createElementNS(ns, "line");
+        l.setAttribute("x1", x1); l.setAttribute("y1", y1);
+        l.setAttribute("x2", x2); l.setAttribute("y2", y2);
+        l.setAttribute("stroke", "#e6e668");
+        l.setAttribute("stroke-width", (w * TILE).toFixed(1));
+        l.setAttribute("stroke-dasharray", `${dash} ${dash}`);
+        l.setAttribute("opacity", op);
+        locks.appendChild(l);
+      }
     }
     // One string per lane, one setAttribute per lane, whatever the particle count.
     // See the lane comment where these were built for the measurement.
@@ -9958,8 +9984,17 @@ const _SHIPS = function _SHIPS(){return(
     {type: "LaserTurret2", pos: [1, 4]}, {type: "Constant", pos: [2, 1], param: "180"},
     {type: "Engine", pos: [0, 4], dir: "right"}, {type: "Armour", pos: [2, 3]},
     {type: "Brain", pos: [2, 2]}],
+    // Both wires leave the Radar, and both must be addressed to its ANCHOR [0,1].
+    // A mission spec goes straight to `new Ship`, and Ship.at(x, y) matches
+    // `c.px === x && c.py === y` -- the anchor, not the footprint. The recovered
+    // corpus is cell-addressed and `loadShipSpec` normalises it; MISSIONS never
+    // goes through that path. `from: [1, 1]` is the Radar's bearing CELL, so the
+    // wire resolved to nothing and was dropped in silence: the turret fired (the
+    // dist wire was on the anchor and did land) but never turned, which is what
+    // Tom saw. The port names are what disambiguate the two.
+    // tools/corepox-wire-anchors.ts checks every wire in MISSIONS for this.
     connections: [
-      {from: [1, 1], fromPort: "bearing", to: [1, 4], toPort: "angle"},
+      {from: [0, 1], fromPort: "bearing", to: [1, 4], toPort: "angle"},
       {from: [0, 1], fromPort: "dist", to: [1, 4], toPort: "fire"}]},
 
   lazerHardpoint: {id: "LazerHardpoint", name: "Lazer Turret Hardpoint", components: [
@@ -10495,20 +10530,23 @@ const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
       {kind: "destroy", team: "enemy", type: "Brain", n: 2, text: "destroy [!enemy cores]"},
       {kind: "defend", type: "Brain", text: "defend your [core]"}
     ],
-    // Found by tools/corepox-solve.ts, not by hand. Re-solved 2026-08-19 twice: once
-    // after the posts' fire_input override was restored, and again after the posts
-    // moved onto their scene placement, which brought them from ~22 tiles out to
-    // 9.6 and made the old build lose in 1.4s. 19 of 140 legal builds still win and
-    // this is the quickest at 9.7s. The engine moved from behind the core to the
-    // right flank -- at this range the answer is to get off the line between the
-    // two posts, not to charge down it.
+    // Found by tools/corepox-solve.ts, not by hand. Re-solved three times, each
+    // after a change to what the level actually simulates: 2026-08-19 when the
+    // posts' fire_input override was restored, again the same day when they moved
+    // onto their scene placement (from ~22 tiles out to 9.6, which made the build
+    // before that lose in 1.4s), and 2026-08-21 when component footprints became
+    // solid. That last one is the harshest -- winning builds fell from 19 of 140
+    // to 1 of 140, because every ship is now the size of its whole footprint to
+    // every beam, the posts included. The one that survives puts the engine
+    // BEHIND the core at [0,-1]; the flank mount that used to win at 9.7s now
+    // loses at 57.1s. Win in 26.5s.
     solution: {components: [{type: "Brain", pos: [0, 0]},
       {type: "Lazer", pos: [0, 1], overrides: [{name: "input", value: 1}]},
-      {type: "Explosive", pos: [1, 0]}, {type: "Engine", pos: [2, 0]},
+      {type: "Explosive", pos: [1, 0]}, {type: "Engine", pos: [0, -1]},
       {type: "Constant", pos: [-2, 0], param: "100"},
       {type: "Armour", pos: [-1, 0]}, {type: "Armour", pos: [1, -1]},
       {type: "Armour", pos: [-1, -1]}, {type: "Armour", pos: [1, 1]}],
-      connections: [{from: [-2, 0], fromPort: "out", to: [2, 0], toPort: "in"},
+      connections: [{from: [-2, 0], fromPort: "out", to: [0, -1], toPort: "in"},
                     {from: [-2, 0], fromPort: "out", to: [0, 1], toPort: "in"}]},
     spoils: [],
     span: 62
