@@ -12582,9 +12582,14 @@ export default function define(runtime, observer) {
 const _title = function _title(md){return(
 md`# Corepox
 
-Tap a component to open its menu; the wrench builds; **play** starts the clock. Objectives tick as
-the simulation resolves them. The flow is the shipped game's, recorded in
-\`knowledge/corepox-shipped-ui-observed.md\` from the retail APK on 2026-08-20.`
+Drag a part off the shelf onto a ghost; drag a **lime** port to another port to wire it; drag an
+**orange** disc to scrub its value, far out for coarse and near for fine. Editing pauses a running
+match — the clock chip top right says which of the three pause states you are in. \`PHONE\` switches
+to the 390x844 layout.
+
+The board is "Shipyard Concepts" (imported 2026-08-21); the pause states and the menu flow it
+replaces are the shipped game's, recorded in \`knowledge/corepox-shipped-ui-observed.md\` and
+\`plan/corepox-ux.md\`.`
 )};
 
 // Objective text in the original carried Unity rich-text colour tags. Same idea,
@@ -12775,7 +12780,7 @@ const _MENU_ACTIONS = function _MENU_ACTIONS(){return(
 
 const _viewof_game = function _viewof_game(
     MISSIONS, CAMPAIGNS, newSession, evaluateObjectives, stepSession, battlefield, objectiveHtml,
-    componentNode, INFO, MENU_ACTIONS, TYPES, PORTS, TILE, htl, invalidation) {
+    componentNode, INFO, MENU_ACTIONS, TYPES, PORTS, TILE, DT, htl, invalidation) {
   let mi = 0, S = newSession(MISSIONS[0]);
   const kept = new Map();            // buildOnce: mission id -> the ship you took in
   let pilotDrag = null;                       // world point the current drag started on
@@ -12788,12 +12793,31 @@ const _viewof_game = function _viewof_game(
   // player choose a verb before choosing a noun, which is backwards from the game
   // and is most of why the port "is currently not very good"
   // (knowledge/corepox-shipped-ui-observed.md, "Selecting a component").
-  let picked = null;          // build option chosen, waiting for a ghost tap
+  //
+  // Rebuilt again on 2026-08-21 against "Shipyard Concepts" (Claude Design project
+  // f9a1c3c2, turns 7 and 8), imported with the claude_design MCP. That design
+  // deletes the centre panels entirely: the board is never covered, the build
+  // options live in a shelf along the bottom, and the verbs on a selection are
+  // anchored to the thing they act on. What replaces the taps is one press table,
+  // routed on what is under the finger -- see `pointerdown` below.
+  let picked = null;          // shelf chip armed; STICKY -- survives a placement
   let sel = null;             // {px, py} of the selected component's anchor
   let act = null;             // null | "connect" | "move" | "cut" | "info"
   let wire = null;            // {from:{px,py,cell,port}, to:{...}|null}
-  let panel = "none";         // "none" | "build" | "menu" | "info"
+  let panel = "none";         // "none" | "cut" | "info"   (no build/menu panel now)
   let clock = null, raf = null, stop = false;
+  // Turn 8 is a 390x844 portrait phone, and it is a different ARRANGEMENT of the
+  // same board rather than a media query on this one -- the shelf moves above a
+  // thumb bar, the objectives collapse to the one that is live, and the board is
+  // portrait. A toggle rather than a width test, because this renders into
+  // whatever width a lopepage column happens to be and a narrow column is not a
+  // phone. Tom asked for it as a toggle so both can be tested from one page.
+  let layout = "desktop";     // "desktop" | "mobile"
+  const isM = () => layout === "mobile";
+  // The one live board gesture, whatever started it. `space` is the pan modifier:
+  // while it is held nothing claims the pointer and the camera's own drag-to-pan
+  // gets it, which is the design's "two fingers - middle - space" row.
+  let drag = null, hoverCell = null, space = false;
   // WASD drives; F fires. Keys were on `window` and unguarded, which in a lopepage
   // layout meant typing "f" in another pane's editor fired the guns -- so anything
   // with a caret in it swallows the key first.
@@ -12814,7 +12838,21 @@ const _viewof_game = function _viewof_game(
     else S.cmd.drive = null;
   };
   const gameKey = (down) => (ev) => {
-    if (S.state !== "playing" || !S.cmd || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    // Space is the pan modifier from the design's press table, and Escape drops
+    // whatever the board is holding. Both are board-wide, so they run before the
+    // playing-only flight keys.
+    if (ev.key === " " || ev.code === "Space") {
+      if (down && typing()) return;
+      space = down;
+      if (down) ev.preventDefault();
+      return;
+    }
+    if (down && ev.key === "Escape" && !typing()) {
+      picked = null; act = null; wire = null; sel = null; panel = "none";
+      render(); return;
+    }
+    if (S.state !== "playing" || !S.cmd) return;
     const k = ev.key.toLowerCase();
     if (k !== "f" && !DRIVE[k]) return;
     if (down && typing()) return;
@@ -12824,7 +12862,7 @@ const _viewof_game = function _viewof_game(
   };
   const kd = gameKey(true), ku = gameKey(false);
   // a key held while the window loses focus never sees its keyup
-  const blur = () => { held.clear(); if (S.cmd) { S.cmd.drive = null; S.cmd.fire = false; } };
+  const blur = () => { held.clear(); space = false; if (S.cmd) { S.cmd.drive = null; S.cmd.fire = false; } };
   window.addEventListener("blur", blur);
   window.addEventListener("keydown", kd);
   window.addEventListener("keyup", ku);
@@ -12842,18 +12880,31 @@ const _viewof_game = function _viewof_game(
   root.append(head, stage);
 
   // ---- chrome ---------------------------------------------------------------
-  const YEL = "#ffd23f";
+  // The design's palette, read off "Shipyard Concepts" turns 7a/8a. It is not the
+  // old HUD's: the ground goes darker and flatter, and every hue now MEANS one
+  // thing, which is what makes the press table legible without a legend --
+  // lime is a port, orange is a value you can scrub, warm orange is your own hull,
+  // green is a thing you may commit, cyan is the clock, red is theirs.
+  const C = {ink: "#e8ecf5", dim: "rgba(232,236,245,.42)", faint: "rgba(232,236,245,.28)",
+             cyan: "#4fd8e8", green: "#56e39f", lime: "#8fe64a", amber: "#ffc42e",
+             orange: "#ff9a3c", hull: "#ffb066", red: "#ff5c72", purple: "#c46bff",
+             panel: "rgba(6,8,14,.94)", line: "rgba(255,255,255,.1)"};
+  // No webfont: JetBrains Mono is the design's face and is named first, but a
+  // lopecode notebook is a single file with no network, so the stack has to land
+  // on something the machine already has.
+  const MONO = "'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace";
+  const YEL = C.amber;
   const round = (extra) => `border-radius:999px;${extra ?? ""}`;
   // The board's own buttons are circular pads pinned to the corners, which is
   // where the shipped game keeps play, restart and the wrench.
-  const pad = (glyph, click, hue, title, size = 46) => htl.html`<button title=${title}
+  const pad = (glyph, click, hue, title, size = 42) => htl.html`<button title=${title}
     onclick=${click} style="width:${size}px;height:${size}px;${round()}
-    border:2px solid ${hue};background:#0b1119dd;color:${hue};cursor:pointer;
-    font:${Math.round(size * 0.44)}px/1 ui-monospace,monospace;display:flex;
-    align-items:center;justify-content:center;box-shadow:0 0 12px ${hue}55">${glyph}</button>`;
-  const chip = (text, hue = YEL) => htl.html`<div style="${round()}padding:4px 12px;
-    border:1.5px solid ${hue};background:#0b1119e6;color:${hue};font-size:12px;
-    white-space:nowrap">${text}</div>`;
+    border:1px solid ${hue}8c;background:rgba(6,8,14,.9);color:${hue};cursor:pointer;
+    font:${Math.round(size * 0.42)}px/1 ${MONO};display:flex;pointer-events:auto;
+    align-items:center;justify-content:center">${glyph}</button>`;
+  const chip = (text, hue = YEL) => htl.html`<div style="${round()}padding:5px 13px;
+    border:1px solid ${hue}66;background:rgba(6,8,14,.9);color:${hue};
+    font:600 10px ${MONO};letter-spacing:.1em;white-space:nowrap">${text}</div>`;
 
   // ---- the intro cutscene ---------------------------------------------------
   // CutsceneController is one screen and one behaviour: a profile portrait, and
@@ -12955,6 +13006,53 @@ const _viewof_game = function _viewof_game(
     return [wx * TILE, wy * TILE];
   };
 
+  // ---- pause ----------------------------------------------------------------
+  // Pause is a game mechanic here, not a convenience, and it is recovered rather
+  // than invented: Unity's Controller.pause() branches on uiSettings.kinematicPauses
+  // into a HARD pause (Time.timeScale = 0) or a KINEMATIC one (every body
+  // isKinematic, the clock still running), and either way ShipComponent.damage()
+  // no-ops for the duration. Tom, 2026-08-21: "There is no pause, and there was
+  // one, I think in some modes building should pause". Written up in
+  // plan/corepox-ux.md S4 and knowledge/corepox-extracted-design.md.
+  //
+  // World.step() already separates the two halves the mechanic needs -- propagate +
+  // evaluate is the PROGRAM, integrate/particles/collide/split is the BODIES -- so
+  // the kinematic step is those first two calls and nothing else, and no engine
+  // change was required to get it.
+  const kinematicStep = () => {
+    const w = S.world, np = w.particles.length;
+    for (const ship of w.ships) {
+      if (!ship.live.length) continue;
+      // isKinematic has to freeze VELOCITY, not just position. Ship.force writes
+      // straight to vx/vy/w rather than into an accumulator that integrate()
+      // drains, so skipping integrate alone leaves an engine building speed for
+      // the whole pause and firing the ship across the board the instant it
+      // resumes. Measured 2026-08-21: Avoid lost at t=10.5s off a correct 5-part
+      // 3-wire build that the same gate had won before the pause existed
+      // (tools/corepox-qa-campaign.ts).
+      const v = [ship.vx, ship.vy, ship.w];
+      ship.propagate();
+      for (const i of ship.order) {
+        const c = ship.comps[i];
+        // ShipComponent.damage() no-ops under a pause, and detonate() is the only
+        // damage an evaluate can do on its own. Skipping Explosive IS that no-op;
+        // without it a charged bomb kills your ship while you are invulnerable.
+        if (c.hp > 0 && c.type !== "Explosive") w.evaluate(ship, c);
+      }
+      [ship.vx, ship.vy, ship.w] = v;
+    }
+    // evaluate() is also where a weapon emits, and nothing consumes those while
+    // frozen, so a Lazer holding its input through a long pause would grow the
+    // array without bound. Truncate to what was there before the program ran.
+    w.particles.length = np;
+    w.beams = w.particles.filter(b => b.kind === "beam");
+    w.t += DT;                                   // the clock keeps running
+  };
+  // Entering a pause is a SIDE EFFECT of an edit and never a button pressed first
+  // -- that is the shipped flow, and it is why the design shows the clock as a
+  // chip that reports rather than a control that is reached for.
+  const editPause = () => { if (S.state === "playing") S.paused = true; };
+
   // ---- editing --------------------------------------------------------------
   const occupied = (px, py) => S.player.comps.some(c =>
     c.tiles.some(t => t[0] === px && t[1] === py));
@@ -13026,14 +13124,21 @@ const _viewof_game = function _viewof_game(
     const item = S.inventory.find(i => i.type === picked);
     if (!item || item.n <= 0) return;
     item.n--;
+    editPause();
     S.player = rebuild([...specOf(S.player).components,
                         {type: picked, pos: [px, py], dir: "up"}],
                        specOf(S.player).connections);
-    picked = null; panel = "none";
+    // The chip STAYS armed. Turn 7c's PLACE claim is "3 taps / part -> 1", and
+    // clearing the pick here is exactly what made it three: open the panel, choose
+    // the part, tap the ghost, then do all three again for the next one. It
+    // disarms when the stack runs out, and on Escape.
+    if (item.n <= 0) picked = null;
+    panel = "none";
   };
   const commitMove = (px, py) => {
     const c = S.player.at(sel.px, sel.py);
     if (!c) return;
+    editPause();
     const comps = specOf(S.player).components;
     const t = comps.find(x => x.pos[0] === c.px && x.pos[1] === c.py);
     if (!t) return;
@@ -13049,11 +13154,12 @@ const _viewof_game = function _viewof_game(
       to:   k.to[0]   === from[0] && k.to[1]   === from[1]
         ? [k.to[0] + d[0], k.to[1] + d[1]] : k.to}));
     S.player = rebuild(comps, conns);
-    sel = {px, py}; act = null; panel = "menu";
+    sel = {px, py}; act = null; panel = "none";
   };
   const doRotate = () => {
     const c = S.player.at(sel.px, sel.py);
     if (!c) return;
+    editPause();
     const comps = specOf(S.player).components;
     const t = comps.find(x => x.pos[0] === c.px && x.pos[1] === c.py);
     const o = ["up","right","down","left"];
@@ -13063,6 +13169,7 @@ const _viewof_game = function _viewof_game(
   const doDelete = () => {
     const c = S.player.at(sel.px, sel.py);
     if (!c) return;
+    editPause();
     const comps = specOf(S.player).components
       .filter(x => !(x.pos[0] === c.px && x.pos[1] === c.py));
     const cells = c.tiles.map(t => `${t[0]},${t[1]}`);
@@ -13081,12 +13188,22 @@ const _viewof_game = function _viewof_game(
       cells.includes(`${k.to[0]},${k.to[1]}`));
   };
   const cutConn = (k) => {
+    editPause();
     const conns = specOf(S.player).connections.filter(x =>
       !(x.from[0] === k.from[0] && x.from[1] === k.from[1] && x.fromPort === k.fromPort &&
         x.to[0] === k.to[0] && x.to[1] === k.to[1] && x.toPort === k.toPort));
     S.player = rebuild(specOf(S.player).components, conns);
-    if (!connsOf(S.player.at(sel.px, sel.py) ?? {tiles: []}).length) { act = null; panel = "menu"; }
+    if (!connsOf(S.player.at(sel.px, sel.py) ?? {tiles: []}).length) { act = null; panel = "none"; }
   };
+
+  // Which components carry a value disc on the board, and what the disc does when
+  // you touch it. Constant is the only thing in the game a player puts a NUMBER
+  // into and it cost 12 taps to reach 100 (tools/corepox-tap-count.ts); a Binary's
+  // operator is an enum of six, which is a tap and not a scrub.
+  const DISCS = {Constant: "num", Binary: "enum"};
+  const BINOPS = ["PLUS","MINUS","TIMES","DIVIDE","LT","GT"];
+  const OPGLYPH = {PLUS: "+", MINUS: "\u2212", TIMES: "\u00d7", DIVIDE: "\u00f7",
+                   LT: "<", GT: ">"};
 
   // A connector belongs to a CELL, not to a component. Resolving by anchor and
   // taking ports[0] meant a Binary's `b`, a Radar's `dist` and a turret's `fire`
@@ -13155,6 +13272,7 @@ const _viewof_game = function _viewof_game(
   };
   const commitWire = () => {
     if (!wire?.to) return;
+    editPause();
     const a = wire.from.kind === "out" ? wire.from : wire.to;
     const b = wire.from.kind === "out" ? wire.to : wire.from;
     // one wire per input: a second source would just be overwritten each tick
@@ -13163,6 +13281,247 @@ const _viewof_game = function _viewof_game(
     conns.push({from: [a.px, a.py], fromPort: a.port, to: [b.px, b.py], toPort: b.port});
     S.player = rebuild(specOf(S.player).components, conns);
     wire = null; act = null; sel = null; panel = "none";
+  };
+
+  // ---- the press table (design turn 7b) -------------------------------------
+  // What a press MEANS is decided once, by what is under it at pointerdown:
+  //
+  //   a port          drag -> wire to wherever you release    tap -> select
+  //   a value disc    drag -> scrub, fine near / coarse far   tap -> cycle the enum
+  //   your own hull   drag -> move that part to a legal cell  tap -> select
+  //   a shelf chip    drag -> carry it out and place          tap -> stick it
+  //   empty / enemy   drag -> fly there facing the drag       tap -> fly there
+  //   space held      pan, always
+  //
+  // There is no verb to choose first, and that is the whole redesign: the board
+  // this replaces made the player pick a target, read a menu, pick a verb and then
+  // act, and every count in plan/corepox-ux.md S6 is paid at that step.
+  const portRef = (q) => ({px: q.c.px, py: q.c.py, cell: [q.px, q.py],
+                           port: q.name, kind: q.kind});
+  // ---- where a port actually IS, on screen -----------------------------------
+  // PORTS addresses CELLS, and two different things both break the assumption that
+  // a cell is one target:
+  //
+  //   1. A Constant is one cell, and its value disc wants the middle of it. Routing
+  //      at tile resolution gave the whole tile to the port and the disc could
+  //      never be pressed at all -- one full scrub drag moved the value 100 -> 100
+  //      (tools/corepox-board-shots.ts, 2026-08-21).
+  //   2. Two ports can land on the SAME cell. FollowCourse has one: the Binary at
+  //      (-1,-1) is turned 90 degrees, which puts its `out` on (0,-1) -- and (0,-1)
+  //      is also where the Radar's `dist` is. The old modal flow hid this, because
+  //      tapping `connect` on a component scoped the legal set to that component.
+  //      A modeless board has no such scope, so it wired the wrong one silently:
+  //      six attempts at `-1,-1.out -> 3,-2.in` all built `0,-1.dist -> 3,-2.in`.
+  //
+  // So a port is drawn at a POINT, not at a cell, and the press resolves to the
+  // nearest point rather than to a tile. Ports that would collide fan apart toward
+  // their own component's anchor; one that has no direction to fan along (its cell
+  // IS the anchor) falls back to the way the component faces.
+  const DISC_R = 0.32, PORT_R = 0.42;
+  const facingOffset = (q) => {
+    const d = ((Math.round((q.c.dir ?? 0) / 90) % 4 + 4) % 4) * 90;
+    const th = (S.player.a + d + (q.kind === "out" ? 0 : 180)) * Math.PI / 180;
+    return [Math.sin(th) * TILE * 0.36, -Math.cos(th) * TILE * 0.36];
+  };
+  const drawnPorts = () => {
+    const all = allPorts();
+    const byCell = new Map();
+    for (const q of all) {
+      const k = `${q.px},${q.py}`;
+      if (!byCell.has(k)) byCell.set(k, []);
+      byCell.get(k).push(q);
+    }
+    const out = [];
+    for (const q of all) {
+      const [vx, vy] = tileToView(q.px, q.py);
+      const shared = byCell.get(`${q.px},${q.py}`).length > 1;
+      const onDisc = DISCS[q.c.type] && q.px === q.c.px && q.py === q.c.py;
+      let ox = 0, oy = 0;
+      if (shared || onDisc) {
+        const [ax, ay] = tileToView(q.c.px, q.c.py);
+        const dx = ax - vx, dy = ay - vy, L = Math.hypot(dx, dy);
+        [ox, oy] = L > 1 ? [dx / L * TILE * 0.32, dy / L * TILE * 0.32] : facingOffset(q);
+      }
+      out.push({...q, vx: vx + ox, vy: vy + oy});
+    }
+    return out;
+  };
+  const discNear = (ev) => {
+    if (!allow().modify) return null;
+    const [wx, wy] = worldTile(ev);
+    for (const c of S.player.live) {
+      if (!DISCS[c.type]) continue;
+      const [ax, ay] = S.player.worldOf({px: c.px, py: c.py});
+      if (Math.hypot(wx - ax, wy - ay) < DISC_R) return c;
+    }
+    return null;
+  };
+  const portNear = (ev) => {
+    const [wx, wy] = worldTile(ev);
+    let best = null, bd = PORT_R;
+    for (const q of drawnPorts()) {
+      const d = Math.hypot(wx - q.vx / TILE, wy - q.vy / TILE);
+      if (d < bd) { bd = d; best = q; }
+    }
+    return best;
+  };
+  // A wire endpoint names a COMPONENT and a PORT, never a cell, so it resolves
+  // even when two ports share the cell it was drawn on.
+  const refPos = (ref) => {
+    const q = drawnPorts().find(x => x.c.px === ref.px && x.c.py === ref.py &&
+                                     x.name === ref.port && x.kind === ref.kind);
+    return q ? [q.vx, q.vy] : tileToView(ref.cell[0], ref.cell[1]);
+  };
+  const armGesture = (g, ev, lock) => {
+    drag = {...g, x0: ev.clientX, y0: ev.clientY, moved: false};
+    if (lock) { view.panLock = true; try { view.svg.setPointerCapture(ev.pointerId); } catch {} }
+    window.addEventListener("pointermove", gestureMove);
+    window.addEventListener("pointerup", gestureUp);
+    window.addEventListener("pointercancel", gestureUp);
+  };
+  const startGesture = (ev) => {
+    if (ev.button !== 0 || scene || drag) return;
+    if (typing()) document.activeElement.blur();
+    if (space) return;                        // space+drag belongs to the camera
+    const [px, py] = localTile(ev);
+    const A = allow(), edit = editable();
+    // An armed chip outranks everything: while a part is held, a tap on a ghost
+    // places it and a tap anywhere else puts it back.
+    if (edit && picked) {
+      const legal = legalCells(picked);
+      if (legal.some(([x, y]) => x === px && y === py))
+        return armGesture({kind: "place", type: picked, legal}, ev, true);
+    }
+    const d = edit ? discNear(ev) : null;
+    if (d) {
+      const start = DISCS[d.type] === "num" ? (Number(d.param) || 0) : 0;
+      const [wx, wy] = worldTile(ev);
+      return armGesture({kind: "scrub", px: d.px, py: d.py, mode: DISCS[d.type], val: start,
+                         lastx: wx, lasty: wy, rate: 1}, ev, true);
+    }
+    const q = edit && A.connect ? portNear(ev) : null;
+    if (q) {
+      // Only the OTHER polarity, and never on the same part: a wire from an out to
+      // an in on its own component is the one thing a drag cannot mean.
+      const sinks = drawnPorts().filter(x => x.kind !== q.kind && x.c !== q.c);
+      act = "connect"; wire = {from: portRef(q), to: null};
+      return armGesture({kind: "wire", px: q.c.px, py: q.c.py, from: portRef(q), sinks,
+                         at: worldTile(ev), hit: null}, ev, true);
+    }
+    const c = compAt(px, py);
+    if (c) {
+      // A hull press only takes the pointer when a MOVE is actually on offer;
+      // otherwise a drag across your own ship still pans, which is what a player
+      // who is only looking around expects.
+      const legal = edit && A.build ? legalCells(c.type, c) : [];
+      return armGesture({kind: "hull", px: c.px, py: c.py, legal}, ev, legal.length > 1);
+    }
+    if (S.state === "playing") {
+      const at = worldTile(ev);
+      S.cmd = {...(S.cmd ?? {}), target: at, face: null, drive: null};
+      held.clear();
+      return armGesture({kind: "fly", at}, ev, true);
+    }
+    armGesture({kind: "empty"}, ev, false);
+  };
+  const gestureMove = (ev) => {
+    if (!drag) return;
+    if (!drag.moved && Math.hypot(ev.clientX - drag.x0, ev.clientY - drag.y0) < 5) return;
+    drag.moved = true;
+    if (drag.kind === "place" || drag.kind === "hull") {
+      const [px, py] = localTile(ev);
+      hoverCell = drag.legal.some(([x, y]) => x === px && y === py) ? [px, py] : null;
+    } else if (drag.kind === "wire") {
+      drag.at = worldTile(ev);
+      const [wx, wy] = drag.at;
+      let best = null, bd = PORT_R;
+      for (const q of drag.sinks) {
+        const d = Math.hypot(wx - q.vx / TILE, wy - q.vy / TILE);
+        if (d < bd) { bd = d; best = q; }
+      }
+      drag.hit = best;
+    } else if (drag.kind === "scrub") {
+      if (drag.mode !== "num") return;
+      const c = S.player.at(drag.px, drag.py);
+      if (!c) return;
+      const [wx, wy] = worldTile(ev);
+      const [ax, ay] = S.player.worldOf({px: drag.px, py: drag.py});
+      // Fine near, coarse far, and the value INTEGRATES the movement: pull out to
+      // a coarse rate, run up, come back in to fine, and both passes are kept. A
+      // rate read off the current offset instead would snap the value back to the
+      // fine reading the instant the finger returned, which is the obvious
+      // implementation and the wrong one.
+      // Calibrated against the EDITING camera, not the battle one. The board is
+      // framed at minSpan 10 while you are building (see `camera`), and the first
+      // ramp was written for a 34-tile board: a full-height drag out and up moved
+      // a Constant 0 -> 4, because nothing on a 10-tile board is ever 3 tiles from
+      // anything (tools/scratch/scrub-probe.ts, 14 samples). The dead zone keeps
+      // the disc's own neighbourhood at one unit per tile so a nudge is still a
+      // nudge.
+      const rate = Math.pow(10, Math.max(0,
+        Math.min(2, (Math.hypot(wx - ax, wy - ay) - 0.6) / 1.7)));
+      drag.val -= (wy - drag.lasty) * rate;
+      drag.lastx = wx; drag.lasty = wy; drag.rate = rate;
+      setParam(Math.round(drag.val), c);
+      return;                                   // setParam renders
+    } else if (drag.kind === "fly") {
+      const [x, y] = worldTile(ev);
+      const dx = x - drag.at[0], dy = y - drag.at[1];
+      if (S.cmd) S.cmd.face = Math.hypot(dx, dy) > 1.5 ? geomBearing(dx, dy) : null;
+      return;
+    }
+    render();
+  };
+  const gestureUp = (ev) => {
+    const g = drag;
+    drag = null; hoverCell = null; view.panLock = false;
+    window.removeEventListener("pointermove", gestureMove);
+    window.removeEventListener("pointerup", gestureUp);
+    window.removeEventListener("pointercancel", gestureUp);
+    if (!g) return;
+    const [px, py] = localTile(ev);
+    if (g.kind === "place") {
+      if (g.legal.some(([x, y]) => x === px && y === py)) { picked = g.type; commitBuild(px, py); }
+      else if (g.fromChip && !g.moved) picked = g.was === g.type ? null : g.type;
+      else if (!g.fromChip) picked = null;
+    } else if (g.kind === "hull") {
+      if (g.moved && g.legal.some(([x, y]) => x === px && y === py)) {
+        sel = {px: g.px, py: g.py}; commitMove(px, py); act = null;
+      } else if (!g.moved) { sel = {px: g.px, py: g.py}; act = null; panel = "none"; }
+    } else if (g.kind === "wire") {
+      finishWire(g, ev, px, py);
+    } else if (g.kind === "scrub") {
+      if (!g.moved && g.mode === "enum") {
+        const c = S.player.at(g.px, g.py);
+        if (c) setParam(BINOPS[(BINOPS.indexOf(c.param) + 1) % BINOPS.length], c);
+      }
+      if (!g.moved && g.mode === "num") { sel = {px: g.px, py: g.py}; panel = "none"; }
+    } else if (g.kind === "empty" && !g.moved) {
+      sel = null; act = null; wire = null; panel = "none";
+    }
+    render();
+  };
+  // Release commits, which is turn 7c's "5 taps / wire -> 1". The confirm tick is
+  // not deleted, it is narrowed to the case that earned it: a release that missed
+  // every port but sits within one cell of exactly one legal sink. An exact hit
+  // was never ambiguous and now never asks.
+  const finishWire = (g, ev, px, py) => {
+    const [wx, wy] = worldTile(ev);
+    const dist = (q) => Math.hypot(wx - q.vx / TILE, wy - q.vy / TILE);
+    const ranked = [...g.sinks].sort((a, z) => dist(a) - dist(z));
+    const exact = ranked[0] && dist(ranked[0]) < PORT_R ? ranked[0] : null;
+    if (exact) { wire = {from: g.from, to: portRef(exact)}; commitWire(); return; }
+    if (!g.moved) {                             // a tap on a port selects its part
+      const c = compAt(g.px, g.py);
+      wire = null; act = null;
+      if (c) { sel = {px: c.px, py: c.py}; panel = "none"; }
+      return;
+    }
+    // Not on a port, but within a cell of exactly one: the ambiguous release the
+    // confirm tick still exists for.
+    const near = ranked.filter(q => dist(q) < 1.2);
+    if (near.length === 1) { wire = {from: g.from, to: portRef(near[0])}; act = "connect"; }
+    else { wire = null; act = null; }
   };
 
   // ---- what the mission allows ----------------------------------------------
@@ -13202,7 +13561,7 @@ const _viewof_game = function _viewof_game(
     if (act === "move") {
       const c = S.player.at(sel.px, sel.py);
       if (c && legalCells(c.type, c).some(([x, y]) => x === px && y === py)) commitMove(px, py);
-      else { act = null; panel = "menu"; }
+      else { act = null; panel = "none"; }
       render(); return;
     }
     if (act === "connect") {
@@ -13211,7 +13570,7 @@ const _viewof_game = function _viewof_game(
       if (wire && !wire.to && wire.from.cell[0] === px && wire.from.cell[1] === py) return;
       const hit = legalPorts().find(q => q.px === px && q.py === py);
       if (!hit) { if (wire && !wire.auto) wire = null;
-                  else { wire = null; act = null; panel = "menu"; } }
+                  else { wire = null; act = null; panel = "none"; } }
       else if (!wire) wire = {from: {px: hit.c.px, py: hit.c.py, cell: [px, py],
                                      port: hit.name, kind: hit.kind}, to: null};
       else wire = {...wire, to: {px: hit.c.px, py: hit.c.py, cell: [px, py],
@@ -13219,14 +13578,18 @@ const _viewof_game = function _viewof_game(
       render(); return;
     }
     const c = compAt(px, py);
-    if (c) { sel = {px: c.px, py: c.py}; act = null; panel = "menu"; }
+    if (c) { sel = {px: c.px, py: c.py}; act = null; panel = "none"; }
     else { sel = null; act = null; panel = "none"; }
     render();
   };
 
-  const setParam = (v) => {
+  // `rebuild` replaces every component object, so a scrub that runs across many
+  // frames cannot hold a reference to one -- it holds the anchor and re-resolves.
+  const setParam = (v, c = sel && S.player.at(sel.px, sel.py)) => {
+    if (!c) return;
+    editPause();
     const comps = specOf(S.player).components;
-    const t = comps.find(x => x.pos[0] === sel.px && x.pos[1] === sel.py);
+    const t = comps.find(x => x.pos[0] === c.px && x.pos[1] === c.py);
     if (t) t.param = String(v);
     S.player = rebuild(comps, specOf(S.player).connections);
     render();
@@ -13247,13 +13610,17 @@ const _viewof_game = function _viewof_game(
     if (S.mission.buildOnce)
       kept.set(S.mission.id, {ship: specOf(S.player),
                               inventory: S.inventory.map(i => ({...i}))});
-    picked = null; wire = null;
+    picked = null; wire = null; drag = null; S.paused = false;
     S.enemyWas = new Map();
     S.cmd = {target: null, face: null, drive: null, fire: false};
     held.clear();
     const tick = () => {
       if (stop || S.state !== "playing") return;
       for (let i = 0; i < 2; i++) {
+        // Paused: the program runs, the bodies do not, and the objectives are not
+        // even asked -- a win or a loss must not land on a frozen board, which is
+        // the same invulnerability the C# gets from damage() no-opping.
+        if (S.paused) { kinematicStep(); continue; }
         const objs = evaluateObjectives(S);
         const r = stepSession(S, objs);
         if (r !== "playing") { S.state = r; break; }
@@ -13320,6 +13687,7 @@ const _viewof_game = function _viewof_game(
     const m0 = MISSIONS[mi];
     S = newSession(m0.buildOnce && kept.has(m0.id) ? {...m0, ...kept.get(m0.id)} : m0);
     picked = null; wire = null; sel = null; act = null; panel = "none";
+    drag = null; hoverCell = null;
     view?.resetView?.();         // a hand-panned camera does not carry to the next mission
     render();
     // liveMode: no build phase and no Play button, the clock is already running.
@@ -13330,7 +13698,7 @@ const _viewof_game = function _viewof_game(
   };
 
   // ---- painting the board ---------------------------------------------------
-  let overlay = null, hud = null, corners = {};
+  let overlay = null, hud = null, corners = {}, shelf = null, verbNode = null, phoneHead = null;
   const ns = "http://www.w3.org/2000/svg";
   const add = (into, n, at) => { const e = document.createElementNS(ns, n);
     for (const [k, v] of Object.entries(at)) e.setAttribute(k, v);
@@ -13439,38 +13807,56 @@ const _viewof_game = function _viewof_game(
 
     if (!editable()) return;
 
-    // Ghosts: the real component, drawn faint at every legal anchor. Dashed empty
-    // squares with a plus in them said "something goes here"; they did not say
-    // WHAT, and the shipped panel-then-ghost flow does
-    // (data/corepox/shipped-ui/19-armour-place.avif).
-    const ghostType = picked ?? (act === "move" ? S.player.at(sel.px, sel.py)?.type : null);
+    // Ghosts: the real component drawn faint at every legal anchor, with the cell
+    // under the finger picked out solid. A place drag and a move drag paint the
+    // same thing because they ask the same question -- which cells will take this.
+    const moveDrag = drag?.kind === "hull" && drag.legal.length > 1 ? drag : null;
+    const ghostType = drag?.kind === "place" ? drag.type
+                    : moveDrag ? S.player.at(moveDrag.px, moveDrag.py)?.type
+                    : picked ?? (act === "move" ? S.player.at(sel.px, sel.py)?.type : null);
+    const ghostIgnore = moveDrag ? S.player.at(moveDrag.px, moveDrag.py)
+                      : act === "move" ? S.player.at(sel.px, sel.py) : null;
     if (ghostType) {
-      const ignore = act === "move" ? S.player.at(sel.px, sel.py) : null;
-      for (const [gx, gy] of legalCells(ghostType, ignore)) {
-        if (ignore && gx === ignore.px && gy === ignore.py) continue;
+      for (const [gx, gy] of legalCells(ghostType, ghostIgnore)) {
+        if (ghostIgnore && gx === ghostIgnore.px && gy === ghostIgnore.py) continue;
+        const on = hoverCell && hoverCell[0] === gx && hoverCell[1] === gy;
         const [vx, vy] = tileToView(gx, gy);
         const holder = add(overlay, "g", {
           transform: `translate(${vx.toFixed(1)} ${vy.toFixed(1)}) rotate(${S.player.a.toFixed(2)})`,
-          opacity: 0.45});
+          opacity: on ? 0.95 : 0.42});
         holder.appendChild(componentNode({type: ghostType}));
         for (const t of TYPES[ghostType]?.tiles ?? [[0, 0]]) {
           const [tx, ty] = [t[0] * TILE, -t[1] * TILE];
           add(holder, "rect", {x: tx - TILE / 2, y: ty - TILE / 2, width: TILE,
-            height: TILE, rx: 5, fill: "#5ef2a018", stroke: "#5ef2a0",
-            "stroke-width": 2, "stroke-dasharray": "7 6"});
+            height: TILE, rx: 5, fill: on ? C.green + "2e" : C.green + "14",
+            stroke: C.green, "stroke-width": on ? 3 : 2,
+            ...(on ? {} : {"stroke-dasharray": "7 6"})});
         }
       }
     }
 
-    if (act === "connect") {
-      const legal = new Set(legalPorts().map(q => `${q.px},${q.py}`));
-      for (const q of allPorts()) {
-        const [vx, vy] = tileToView(q.px, q.py);
-        const ok = legal.has(`${q.px},${q.py}`);
-        // A chequered ring, as shipped: eight arc segments alternating black and
-        // white around the port. Illegal ports go flat grey.
-        if (!ok) { add(overlay, "circle", {cx: vx, cy: vy, r: TILE * 0.30, fill: "none",
-          stroke: "#5b6b7d", "stroke-width": 4, opacity: 0.5}); continue; }
+    // Ports are permanent furniture now, not something a mode reveals: a lime dot
+    // on every connector cell, all the time. That is what makes "press a port and
+    // drag" discoverable without a connect button to press first.
+    const wiring = drag?.kind === "wire" ? drag : null;
+    if (allow().connect) {
+      const sinks = wiring ? new Set(wiring.sinks.map(q => `${q.c.px},${q.c.py}/${q.name}`)) : null;
+      for (const q of drawnPorts()) {
+        const [vx, vy] = [q.vx, q.vy];
+        if (!wiring) {
+          add(overlay, "circle", {cx: vx, cy: vy, r: TILE * 0.13, fill: C.lime,
+                                  opacity: 0.85});
+          add(overlay, "circle", {cx: vx, cy: vy, r: TILE * 0.26, fill: "none",
+            stroke: C.lime, "stroke-width": 2, opacity: 0.35});
+          continue;
+        }
+        // Mid-drag the board answers one question only -- where may this land --
+        // so the legal sinks chequer, as shipped, and everything else goes flat.
+        if (!sinks.has(`${q.c.px},${q.c.py}/${q.name}`)) {
+          add(overlay, "circle", {cx: vx, cy: vy, r: TILE * 0.26, fill: "none",
+            stroke: "#5b6b7d", "stroke-width": 4, opacity: 0.45});
+          continue;
+        }
         const r = TILE * 0.30, seg = Math.PI / 4;
         for (let i = 0; i < 8; i++) {
           const a0 = i * seg, a1 = a0 + seg;
@@ -13479,34 +13865,74 @@ const _viewof_game = function _viewof_game(
             fill: "none", stroke: i % 2 ? "#ffffff" : "#101820", "stroke-width": 5});
         }
       }
-      if (wire) {
-        const [ax, ay] = tileToView(wire.from.cell[0], wire.from.cell[1]);
-        add(overlay, "circle", {cx: ax, cy: ay, r: TILE * 0.42, fill: "none",
-                                stroke: "#ffd23f", "stroke-width": 3});
-        if (wire.to) {
-          const [bx, by] = tileToView(wire.to.cell[0], wire.to.cell[1]);
-          // The proposal is a PALE GREY BEZIER that bulges clear of the hull, not
-          // a straight line -- the shipped wire arcs outside the ship and the
-          // proposal previews that route (data/corepox/shipped-ui/63-ports.avif).
-          const mx = (ax + bx) / 2, my = (ay + by) / 2;
-          const dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy) || 1;
-          const cx = mx - dy / L * L * 0.30, cy = my + dx / L * L * 0.30;
-          add(overlay, "path", {d: `M${ax},${ay}Q${cx.toFixed(1)},${cy.toFixed(1)} ${bx},${by}`,
-            fill: "none", stroke: "#c8d2dc", "stroke-width": 5, opacity: 0.75,
-            "stroke-linecap": "round"});
-          add(overlay, "circle", {cx: bx, cy: by, r: TILE * 0.42, fill: "none",
-                                  stroke: "#c8d2dc", "stroke-width": 3});
-        } else {
-          const [vx, vy] = tileToView(wire.from.cell[0], wire.from.cell[1]);
-          boardChip(overlay, "DRAG", vx, vy, 0, -TILE * 1.7);
+    }
+
+    // The wire under the finger. It follows the POINTER rather than snapping to a
+    // cell, so the arc is the answer to "where is this going" at every moment of
+    // the drag; it only turns green once a legal sink is actually under it.
+    const arc = (ax, ay, bx, by, stroke, w, op) => {
+      const mx = (ax + bx) / 2, my = (ay + by) / 2;
+      const dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy) || 1;
+      add(overlay, "path", {d: `M${ax.toFixed(1)},${ay.toFixed(1)}Q${(mx - dy * 0.30).toFixed(1)},${(my + dx * 0.30).toFixed(1)} ${bx.toFixed(1)},${by.toFixed(1)}`,
+        fill: "none", stroke, "stroke-width": w, opacity: op, "stroke-linecap": "round"});
+    };
+    if (wiring) {
+      const [ax, ay] = refPos(wiring.from);
+      const [bx, by] = wiring.hit ? [wiring.hit.vx, wiring.hit.vy]
+                                  : [wiring.at[0] * TILE, wiring.at[1] * TILE];
+      add(overlay, "circle", {cx: ax, cy: ay, r: TILE * 0.40, fill: "none",
+                              stroke: C.lime, "stroke-width": 3});
+      arc(ax, ay, bx, by, wiring.hit ? C.green : "#c8d2dc", 5, wiring.hit ? 0.95 : 0.7);
+      if (wiring.hit)
+        add(overlay, "circle", {cx: bx, cy: by, r: TILE * 0.40, fill: "none",
+                                stroke: C.green, "stroke-width": 3});
+    } else if (act === "connect" && wire?.to) {
+      // The narrowed confirm: the release was near one sink and not on it, so the
+      // proposal sits there in pale grey until the tick is pressed.
+      const [ax, ay] = refPos(wire.from);
+      const [bx, by] = refPos(wire.to);
+      arc(ax, ay, bx, by, "#c8d2dc", 5, 0.8);
+      for (const [x, y] of [[ax, ay], [bx, by]])
+        add(overlay, "circle", {cx: x, cy: y, r: TILE * 0.40, fill: "none",
+                                stroke: "#c8d2dc", "stroke-width": 3});
+    }
+
+    // Value discs. The disc IS the control -- there is no panel behind it and no
+    // menu to reach it through, which is turn 7c's "12 taps for 100 -> 1".
+    if (allow().modify) {
+      for (const c of S.player.live) {
+        const mode = DISCS[c.type];
+        if (!mode) continue;
+        const [vx, vy] = tileToView(c.px, c.py);
+        const live = drag?.kind === "scrub" && drag.px === c.px && drag.py === c.py;
+        const r = TILE * (live ? 0.42 : 0.34);
+        add(overlay, "circle", {cx: vx, cy: vy, r, fill: "#120a04e8",
+          stroke: C.orange, "stroke-width": live ? 3.5 : 2.5});
+        const txt = mode === "num" ? String(Number(c.param) || 0)
+                                   : (OPGLYPH[c.param] ?? "?");
+        const t = add(overlay, "text", {x: vx, y: vy + r * 0.36, fill: C.orange,
+          "text-anchor": "middle", "font-family": MONO,
+          "font-size": (r * (txt.length > 3 ? 0.78 : 1.05)).toFixed(1),
+          "font-weight": 700});
+        t.textContent = txt;
+        if (live) {
+          // The step the finger is currently buying. Without it a coarse drag
+          // looks like the value has run away on its own.
+          const lab = add(overlay, "text", {x: vx, y: vy - r - 8, fill: C.orange,
+            "text-anchor": "middle", "font-family": MONO, "font-size": TILE * 0.26,
+            opacity: 0.9});
+          lab.textContent = "\u00b1" + Math.max(1, Math.round(drag.rate));
         }
       }
-    } else if (sel && !picked) {
+    }
+
+    placeVerbBar();
+    if (sel && !picked && !drag) {
       const c = S.player.at(sel.px, sel.py);
       for (const t of c?.tiles ?? []) {
         const [vx, vy] = tileToView(t[0], t[1]);
         add(overlay, "rect", {x: vx - TILE / 2, y: vy - TILE / 2, width: TILE,
-          height: TILE, rx: 5, fill: "none", stroke: "#ffd23f", "stroke-width": 3});
+          height: TILE, rx: 5, fill: "none", stroke: C.hull, "stroke-width": 3});
       }
     }
   };
@@ -13516,37 +13942,46 @@ const _viewof_game = function _viewof_game(
     if (!hud) return;
     const objs = evaluateObjectives(S);
     hud.textContent = "";
-    for (const o of objs) {
-      // `defend` is a constraint, not a goal: it reads done from the first frame
-      // because the core is still there, and ticking it at t=0 told the player
-      // they had finished something they had not started.
+    // Done is struck through in green with a tick; the one still open carries an
+    // amber ring and a pulsing dot. On the phone there is room for exactly one, so
+    // it shows the first that is not done -- the objective you are actually on.
+    const mob = isM();
+    const shown = mob ? [objs.find(o => o.failed) ?? objs.find(o => !o.done) ?? objs[objs.length - 1]]
+                      : objs;
+    for (const o of shown.filter(Boolean)) {
       const hold = o.kind === "defend" && !o.failed;
-      const state = o.failed ? "fail" : hold ? "hold" : o.done ? "done" : "todo";
-      const ring = {fail: "#ff6b5a", hold: "#8fd0ff", done: "#5ef2a0", todo: "#3d5063"}[state];
-      const fill = {fail: "#ff6b5a", hold: "transparent", done: "#5ef2a0", todo: "transparent"}[state];
-      const mark = state === "fail" ? "✕" : state === "done" ? "✓" : "";
-      hud.append(htl.html`<div style="display:flex;gap:9px;align-items:center;
-        border-radius:999px;padding:4px 14px 4px 5px;background:#0d2a1de6;
-        border:1.5px solid ${state === "fail" ? "#ff6b5a55" : "#5ef2a044"}">
-        <span style="width:20px;height:20px;border-radius:50%;flex:none;
-          border:2px solid ${ring};background:${fill};color:#06210f;font-size:13px;
-          display:flex;align-items:center;justify-content:center;font-weight:700">${mark}</span>
-        <span style="color:#e8f4ec">${objectiveHtml(o.text)}</span></div>`);
+      const st = o.failed ? "fail" : hold ? "hold" : o.done ? "done" : "todo";
+      const hue = {fail: C.red, hold: C.cyan, done: C.green, todo: C.amber}[st];
+      const mark = st === "fail" ? "✕" : st === "done" ? "✓" : "";
+      hud.append(htl.html`<div style="display:flex;gap:8px;align-items:center;flex:none;
+        border-radius:999px;padding:${mob ? "5px 9px" : "5px 14px 5px 6px"};
+        background:rgba(6,8,14,.9);border:1px solid ${hue}${st === "todo" ? "73" : "3d"};
+        max-width:100%">
+        ${st === "done" || st === "fail"
+          ? htl.html`<span style="width:16px;height:16px;border-radius:50%;flex:none;
+              background:${hue};color:#04070a;font:700 11px ${MONO};display:flex;
+              align-items:center;justify-content:center">${mark}</span>`
+          : htl.html`<span style="width:7px;height:7px;border-radius:50%;flex:none;
+              margin:0 4px;background:${hue};box-shadow:0 0 6px ${hue}"></span>`}
+        <span style="font:500 ${mob ? 9.5 : 11}px ${MONO};color:${C.ink};
+          white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+          ${st === "done" ? `text-decoration:line-through;color:${C.green};opacity:.75` : ""}"
+          >${objectiveHtml(o.text)}</span></div>`);
     }
   };
 
   // ---- panels ---------------------------------------------------------------
   const panelBox = (title, kids, onCancel) => htl.html`<div style="
-    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);min-width:320px;
-    max-width:min(560px,90%);max-height:88%;overflow:auto;background:#0a0f17f2;
-    border:2px solid #2a3a4e;border-radius:12px;padding:14px 16px;
-    box-shadow:0 10px 40px #000b">
-    <div style="color:${YEL};font-size:14px;letter-spacing:2px;margin-bottom:10px">${title}</div>
+    position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);min-width:280px;
+    max-width:min(520px,88%);max-height:80%;overflow:auto;background:rgba(6,8,14,.97);
+    border:1px solid ${C.line};border-radius:14px;padding:14px 16px;pointer-events:auto;
+    font:12px ${MONO};box-shadow:0 10px 40px #000b">
+    <div style="color:${C.amber};font-size:11px;letter-spacing:.18em;margin-bottom:10px">${title}</div>
     ${kids}
     ${onCancel ? htl.html`<div style="display:flex;justify-content:flex-end;margin-top:12px">
-      <button onclick=${onCancel} style="font:12px ui-monospace,monospace;padding:6px 16px;
-        border-radius:6px;border:1.5px solid #ff6b5a;background:transparent;color:#ff6b5a;
-        cursor:pointer;letter-spacing:1.5px">CANCEL</button></div>` : ""}
+      <button onclick=${onCancel} style="font:600 10px ${MONO};padding:6px 16px;
+        border-radius:999px;border:1px solid ${C.red}88;background:transparent;color:${C.red};
+        cursor:pointer;letter-spacing:.12em">CLOSE</button></div>` : ""}
   </div>`;
   // An icon of the component itself, for the build rows and the menu header. The
   // shipped panel leads every row with the drawing, which is the only thing that
@@ -13566,86 +14001,181 @@ const _viewof_game = function _viewof_game(
     s.appendChild(componentNode({type}));
     return s;
   };
-  const buildPanel = () => panelBox("CHOOSE BUILD OPTION",
-    stock().map(i => htl.html`<div onclick=${() => { picked = i.type; panel = "none"; sel = null; render(); }}
-      style="display:flex;gap:12px;align-items:center;padding:8px 10px;margin-bottom:8px;
-      border-radius:8px;background:#111a26;cursor:pointer;border:1px solid #22303f">
-      ${icon(i.type)}
-      <div style="flex:1;padding:4px 14px;border:1.5px solid #ff6b5a;border-radius:4px;
-        color:${YEL};letter-spacing:1.5px">${i.type.toUpperCase()}</div>
-      <div style="color:#8b9bb0">x${i.n}</div>
-      <button title=${INFO[i.type] ?? ""} onclick=${(e) => { e.stopPropagation();
-          sel = null; act = "info"; panel = "info"; infoType = i.type; render(); }}
-        style="width:26px;height:26px;border-radius:50%;border:1.5px solid ${YEL};
-        background:transparent;color:${YEL};cursor:pointer;font:13px ui-monospace,monospace">i</button>
-    </div>`),
-    () => { panel = "none"; render(); });
   let infoType = null;
   const infoPanel = () => panelBox(infoType.toUpperCase(), htl.html`<div>
     <div style="display:flex;gap:14px;align-items:center">${icon(infoType, 64)}
-      <div style="color:#dbe6f2">${INFO[infoType] ?? "No notes."}</div></div>
-    <div style="margin-top:10px;color:#5b6b7d">hp ${TYPES[infoType]?.hp} ·
+      <div style="color:${C.ink}">${INFO[infoType] ?? "No notes."}</div></div>
+    <div style="margin-top:10px;color:${C.dim}">hp ${TYPES[infoType]?.hp} ·
       in ${(TYPES[infoType]?.ins ?? []).join(", ") || "—"} ·
       out ${(TYPES[infoType]?.outs ?? []).join(", ") || "—"}</div></div>`,
-    () => { panel = sel ? "menu" : "none"; act = null; render(); });
-  const menuPanel = () => {
-    const c = S.player.at(sel.px, sel.py);
-    if (!c) { panel = "none"; sel = null; return htl.html`<span></span>`; }
-    if (act === "cut")
-      return panelBox(`CUT — ${c.type.toUpperCase()}`,
-        connsOf(c).map(k => htl.html`<div onclick=${() => { cutConn(k); render(); }}
-          style="display:flex;gap:10px;padding:7px 10px;margin-bottom:6px;border-radius:6px;
-          background:#111a26;border:1px solid #22303f;cursor:pointer;color:#dbe6f2">
-          <span style="color:#8fd0ff">✂</span>
-          <span>${k.from.join(",")} ${k.fromPort} → ${k.to.join(",")} ${k.toPort}</span>
-        </div>`),
-        () => { act = null; panel = "menu"; render(); });
-    const grid = htl.html`<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"></div>`;
-    for (const a of MENU_ACTIONS) {
-      const on = canDo(a.id, c);
-      grid.append(htl.html`<button ${on ? {} : {disabled: true}} onclick=${() => {
+    () => { panel = "none"; act = null; render(); });
+  const cutPanel = () => {
+    const c = sel && S.player.at(sel.px, sel.py);
+    if (!c) { panel = "none"; return htl.html`<span></span>`; }
+    return panelBox(`CUT — ${c.type.toUpperCase()}`,
+      connsOf(c).map(k => htl.html`<div onclick=${() => { cutConn(k); render(); }}
+        style="display:flex;gap:10px;padding:7px 10px;margin-bottom:6px;border-radius:8px;
+        background:rgba(255,255,255,.03);border:1px solid ${C.line};cursor:pointer;color:${C.ink}">
+        <span style="color:${C.red}">✂</span>
+        <span>${k.from.join(",")} ${k.fromPort} → ${k.to.join(",")} ${k.toPort}</span>
+      </div>`),
+      () => { act = null; panel = "none"; render(); });
+  };
+
+  // ---- the shelf ------------------------------------------------------------
+  // What replaces CHOOSE BUILD OPTION. The design's rule is that the board is
+  // never covered, so the parts you can place live along the bottom edge and a
+  // chip is either carried out with a drag or stuck with a tap. A stuck chip stays
+  // stuck through a placement, which is where the tap saving comes from.
+  const chipNode = (i, w) => {
+    const on = picked === i.type;
+    const el = htl.html`<div title=${INFO[i.type] ?? i.type} data-part=${i.type}
+      style="flex:none;width:${w}px;
+      padding:${w > 80 ? 9 : 7}px 4px 6px;border-radius:10px;position:relative;cursor:grab;
+      border:1px solid ${on ? "rgba(86,227,159,.65)" : C.line};
+      background:${on ? "rgba(86,227,159,.1)" : "rgba(255,255,255,.02)"};
+      display:flex;flex-direction:column;align-items:center;gap:4px;touch-action:none">
+      ${on ? htl.html`<div style="position:absolute;left:5px;top:5px;width:5px;height:5px;
+        border-radius:50%;background:${C.green};box-shadow:0 0 6px ${C.green}"></div>` : ""}
+      <div style="position:absolute;top:4px;right:6px;font:700 ${w > 80 ? 9 : 8}px ${MONO};
+        color:${C.ink}">×${i.n}</div>
+      ${icon(i.type, w > 80 ? 38 : 30)}
+      <div style="font:${on ? 700 : 500} ${w > 80 ? 9 : 8}px ${MONO};
+        color:${on ? C.green : C.dim}">${i.type}</div></div>`;
+    // The chip's press is the same gesture as a press on a ghost -- it just starts
+    // somewhere the board cannot see. The window listeners in armGesture are what
+    // let it cross the boundary.
+    el.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0 || !editable()) return;
+      ev.preventDefault();
+      // `was` is read BEFORE the press arms the chip. Arming first and then
+      // toggling against `picked` made every tap a no-op: the chip stuck and
+      // un-stuck inside the same click.
+      armGesture({kind: "place", type: i.type, legal: legalCells(i.type),
+                  fromChip: true, was: picked}, ev, false);
+      picked = i.type;
+      render();
+    });
+    return el;
+  };
+  const shelfNode = () => {
+    const items = stock();
+    if (!items.length) return null;
+    const m = isM();
+    const box = htl.html`<div style="position:absolute;left:0;right:0;
+      bottom:${m ? 88 : 0}px;height:${m ? 110 : 116}px;border-top:1px solid ${C.line};
+      background:${C.panel};padding:${m ? "9px 12px" : "10px 16px"};display:flex;
+      flex-direction:column;gap:7px;z-index:6"></div>`;
+    const head2 = htl.html`<div style="display:flex;align-items:center;justify-content:space-between">
+      <span style="font:700 ${m ? 8.5 : 9}px ${MONO};letter-spacing:.16em;color:${C.dim}">
+        HOLD ${picked ? "· " + picked.toUpperCase() : ""}</span>
+      <span style="font:400 8px ${MONO};color:${C.faint}">tap to stick · drag to place</span></div>`;
+    const row = htl.html`<div style="display:flex;gap:7px;overflow-x:auto;align-items:stretch"></div>`;
+    for (const i of items) row.append(chipNode(i, m ? 66 : 96));
+    if (!m) {
+      // The desktop shelf has room to say what the chips do. On the phone the same
+      // three lines are one line in the header, because 390px does not.
+      row.append(htl.html`<div style="flex:1;min-width:150px;display:flex;
+        flex-direction:column;justify-content:center;gap:3px;padding-left:14px;
+        font:400 9px ${MONO};color:${C.faint};white-space:nowrap">
+        <span>drag out · or tap to stick</span>
+        <span>stays picked after placing</span>
+        <span>esc puts it back</span></div>`);
+    }
+    box.append(head2, row);
+    return box;
+  };
+
+  // ---- verbs, anchored to what they act on ----------------------------------
+  // Where a tile lands in the STAGE's pixel box. The board is an svg with its own
+  // viewBox and the chrome is absolutely positioned HTML, so the two spaces have
+  // to be reconciled at every paint rather than once.
+  const tileToStage = (px, py) => {
+    const [vx, vy] = tileToView(px, py);
+    const r = view.svg.getBoundingClientRect(), sr = stage.getBoundingClientRect();
+    const vb = view.svg.viewBox.baseVal;
+    return [(vx - vb.x) / vb.width * r.width + r.left - sr.left,
+            (vy - vb.y) / vb.height * r.height + r.top - sr.top];
+  };
+  // connect and move are gone from this list on purpose: both are now drags off
+  // the thing itself, so offering them as buttons would be offering a second way
+  // to do what the board already does, and the count in plan/corepox-ux.md S6 is
+  // paid at exactly that second way.
+  const VERBS = MENU_ACTIONS.filter(a => a.id !== "connect" && a.id !== "move");
+  // Placed on every frame, not once when it is built: `view.draw` eases the
+  // viewBox while a match runs, so a bar positioned at render time slides off the
+  // component it is anchored to over the next second.
+  const placeVerbBar = () => {
+    const bar = verbNode;
+    if (!bar || !bar.isConnected || !bar.dataset.px) return;
+    const [x, y] = tileToStage(+bar.dataset.px, +bar.dataset.py);
+    const w = bar.offsetWidth, h = bar.offsetHeight;
+    const sr = stage.getBoundingClientRect();
+    const floor = sr.height - (stock().length ? (isM() ? 206 : 124) : (isM() ? 96 : 8));
+    let top = y - h - 34;
+    if (top < 6) top = Math.min(y + 34, floor - h);
+    bar.style.left = Math.max(6, Math.min(x - w / 2, sr.width - w - 6)) + "px";
+    bar.style.top = Math.max(6, Math.min(top, floor - h)) + "px";
+  };
+  const verbBar = () => {
+    const c = sel && S.player.at(sel.px, sel.py);
+    if (!c || drag || picked) return null;
+    const on = VERBS.filter(a => canDo(a.id, c));
+    const bits = [];
+    for (const a of on) {
+      const hue = a.id === "delete" ? C.red : a.id === "info" ? C.amber : C.green;
+      bits.push(htl.html`<button title=${a.label} data-verb=${a.id} onclick=${() => {
           if (a.id === "info") { infoType = c.type; panel = "info"; }
           else if (a.id === "rotate") doRotate();
           else if (a.id === "delete") doDelete();
-          else if (a.id === "move") { act = "move"; panel = "none"; }
-          else if (a.id === "connect") { armConnect(); }
-          else if (a.id === "cut") { act = "cut"; }
+          else if (a.id === "cut") { act = "cut"; panel = "cut"; }
           render();
-        }} style="display:flex;flex-direction:column;align-items:center;gap:3px;
-        padding:9px 4px;border-radius:8px;cursor:${on ? "pointer" : "default"};
-        border:1.5px solid ${on ? a.hue : "#4a2028"};background:${on ? a.hue + "18" : "#12090c"};
-        color:${on ? a.hue : "#5a3a40"};font:11px ui-monospace,monospace">
-        <span style="font-size:19px;line-height:1">${a.glyph}</span>${a.label}</button>`);
+        }} style="display:flex;align-items:center;gap:6px;padding:6px 11px;border-radius:999px;
+        border:1px solid ${hue}88;background:rgba(6,8,14,.9);color:${hue};cursor:pointer;
+        font:600 10px ${MONO};letter-spacing:.08em">
+        <span style="font-size:14px;line-height:1">${a.glyph}</span>${a.label.toUpperCase()}</button>`);
     }
-    const kids = [grid];
-    // The stepper. A Constant is the only thing in the game the player TYPES into,
-    // and the shipped menu gives it two wide pads either side of the value
-    // (data/corepox/shipped-ui/43-const-menu.avif) -- not a text field. It steps by
-    // 1 and the value propagates while the menu is still open.
-    if (allow().modify && (c.type === "Constant" || c.type === "Binary") && c.type === "Constant") {
-      const step = (d) => setParam((Number(c.param) || 0) + d);
-      kids.push(htl.html`<div style="display:flex;gap:8px;align-items:stretch;margin-top:12px">
-        ${[-10, -1].map(d => htl.html`<button onclick=${() => step(d)} style="flex:1;
-          border-radius:8px;border:1.5px solid #3d5063;background:#1a2432;color:#dbe6f2;
-          cursor:pointer;font:14px ui-monospace,monospace">${d}</button>`)}
-        <div style="min-width:5em;text-align:center;padding:9px 12px;border-radius:8px;
-          background:#08170f;border:1.5px solid #5ef2a0;color:#5ef2a0;font-size:17px">${
-          c.param === "" || c.param == null ? "0" : c.param}</div>
-        ${[1, 10].map(d => htl.html`<button onclick=${() => step(d)} style="flex:1;
-          border-radius:8px;border:1.5px solid #3d5063;background:#1a2432;color:#dbe6f2;
-          cursor:pointer;font:14px ui-monospace,monospace">+${d}</button>`)}
-      </div>`);
+    // The last digit. The disc does 0 -> 137 in one drag; these are for the one
+    // that drag left you a unit short of, which is the case turn 7c keeps them for.
+    if (allow().modify && c.type === "Constant") {
+      const step = (d) => setParam((Number(c.param) || 0) + d, c);
+      bits.push(htl.html`<div style="display:flex;align-items:center;gap:4px">
+        ${[-1, 1].map(d => htl.html`<button onclick=${() => step(d)} style="width:26px;height:26px;
+          border-radius:50%;border:1px solid ${C.orange}88;background:rgba(6,8,14,.9);
+          color:${C.orange};cursor:pointer;font:13px ${MONO}">${d < 0 ? "−" : "+"}</button>`)}</div>`);
     }
-    if (c.type === "Binary" && allow().modify)
-      kids.push(htl.html`<div style="display:flex;gap:6px;margin-top:12px">
-        ${["PLUS","MINUS","TIMES","DIVIDE","LT","GT"].map(op => htl.html`<button
-          onclick=${() => setParam(op)} style="flex:1;padding:7px 0;border-radius:6px;
-          border:1.5px solid ${c.param === op ? "#c060ff" : "#3d5063"};
-          background:${c.param === op ? "#c060ff22" : "transparent"};
-          color:${c.param === op ? "#c060ff" : "#8b9bb0"};cursor:pointer;
-          font:11px ui-monospace,monospace">${op}</button>`)}</div>`);
-    return panelBox(c.type.toUpperCase(), kids, () => { sel = null; act = null; panel = "none"; render(); });
+    if (allow().modify && c.type === "Binary")
+      bits.push(htl.html`<div style="display:flex;gap:3px">
+        ${BINOPS.map(op => htl.html`<button onclick=${() => setParam(op, c)}
+          style="padding:4px 6px;border-radius:6px;cursor:pointer;font:600 10px ${MONO};
+          border:1px solid ${c.param === op ? C.purple : C.line};
+          background:${c.param === op ? "rgba(196,107,255,.15)" : "transparent"};
+          color:${c.param === op ? C.purple : C.dim}">${OPGLYPH[op]}</button>`)}</div>`);
+    if (!bits.length) return null;
+    const bar = htl.html`<div style="position:absolute;display:flex;gap:6px;align-items:center;
+      padding:5px;border-radius:999px;background:rgba(6,8,14,.86);border:1px solid ${C.line};
+      white-space:nowrap;z-index:7;pointer-events:auto">${bits}</div>`;
+    bar.dataset.px = c.px; bar.dataset.py = c.py;
+    verbNode = bar;
+    // Its own width decides whether it has to be pushed back inside the board, and
+    // it has no width until it is in the DOM.
+    queueMicrotask(placeVerbBar);
+    return bar;
   };
+
+  // ---- the clock ------------------------------------------------------------
+  // Three modes, and they are the shipped ones. The chip REPORTS: in a live match
+  // the player cannot reach a pause without committing to an edit, which is the
+  // mechanic, so there is no pause button to press -- only a resume.
+  const CLOCK = {
+    build:     {word: "HARD",      hue: "#ffc42e", sub: "clock stopped · build freely"},
+    kinematic: {word: "KINEMATIC", hue: "#4fd8e8", sub: "program runs · ships frozen · no damage"},
+    live:      {word: "LIVE",      hue: "#56e39f", sub: "clock runs · damage lands"},
+    win:       {word: "VICTORY",   hue: "#ffc42e", sub: "objectives resolved"},
+    loss:      {word: "DEFEAT",    hue: "#ff5c72", sub: "restart to try again"}
+  };
+  const clockMode = () => S.state === "win" ? "win" : S.state === "loss" ? "loss"
+    : S.state === "build" ? "build" : S.paused ? "kinematic" : "live";
 
   // The dropdown is grouped by CAMPAIGN, because there are two of them and a flat
   // list of twelve said that SideShooter and TwinTurrets shipped in the arc. Any
@@ -13672,91 +14202,121 @@ const _viewof_game = function _viewof_game(
   const render = () => {
     const m = MISSIONS[mi];
     const camp = campaignOf(mi);
+    const mob = isM();
     head.textContent = "";
-    head.append(htl.html`<span style="color:#5b6b7d">${camp.name} ${camp.k + 1}/${camp.n}</span>`);
-    head.append(htl.html`<b style="font-size:15px">${m.title}</b>`);
-    head.append(htl.html`<span style="color:#8b9bb0;flex:1">${m.brief}</span>`);
+    head.append(htl.html`<span style="color:${C.faint}">${camp.name} ${camp.k + 1}/${camp.n}</span>`);
+    head.append(htl.html`<b style="font-size:15px;color:${C.ink}">${m.title}</b>`);
+    head.append(htl.html`<span style="color:${C.dim};flex:1">${m.brief}</span>`);
+    // The layout toggle. Tom asked for the phone version as something he can flip
+    // to from the same page rather than a second notebook, so it is a control on
+    // the mission bar and not a media query -- and the board is rebuilt when it
+    // flips, because the two layouts have different aspect ratios.
+    head.append(htl.html`<button onclick=${() => {
+        layout = mob ? "desktop" : "mobile"; sel = null; picked = null; act = null;
+        panel = "none"; render();
+      }} style="font:11px ${MONO};letter-spacing:.1em;background:transparent;
+      border:1px solid ${mob ? C.cyan : C.line};border-radius:999px;padding:4px 12px;
+      color:${mob ? C.cyan : C.dim};cursor:pointer">${mob ? "PHONE" : "DESKTOP"}</button>`);
     head.append(htl.html`<select onchange=${(e) => { e.target.blur(); reset(+e.target.value); }} style="
-      font:12px ui-monospace,monospace;background:#0d1420;color:#8b9bb0;
-      border:1px solid #26364a;border-radius:4px;padding:4px 6px">
+      font:12px ${MONO};background:#0d1420;color:${C.dim};
+      border:1px solid ${C.line};border-radius:4px;padding:4px 6px">
       ${groups().map(g => htl.html`<optgroup label=${g.name}>
         ${g.items.map(i => htl.html`<option value=${i} selected=${i === mi}>${MISSIONS[i].title}</option>`)}
       </optgroup>`)}
     </select>`);
 
-    // Keyed on the SESSION, not the mission. `battlefield` closes over the world it
-    // was handed, so retrying a mission built a fresh world and kept drawing the
-    // old one -- the objectives reset, the play area did not.
-    if (!view || view.sess !== S) {
+    // Keyed on the SESSION and on the LAYOUT. `battlefield` closes over the world
+    // it was handed, so retrying a mission built a fresh world and kept drawing the
+    // old one; and the phone board is portrait, which is an aspect ratio the svg
+    // fixes at construction.
+    if (!view || view.sess !== S || view.lay !== layout) {
       stage.textContent = "";
-      view = battlefield(S.world, {span: m.span ?? 40});
-      view.sess = S;
+      // 390 x 546 puts the board's bottom edge exactly on the shelf's top edge
+      // (844 - 88 - 110 = 646, and the board starts at 100). The design's own mock
+      // leaves 46px of dead ground between them; on a real phone that band reads
+      // as a rendering fault rather than as space.
+      view = battlefield(S.world, mob ? {span: m.span ?? 40, width: 390, height: 546}
+                                      : {span: m.span ?? 40});
+      view.sess = S; view.lay = layout;
       overlay = document.createElementNS(ns, "g");
       view.svg.appendChild(overlay);
-      view.svg.addEventListener("click", (ev) => {
-        if (view.dragging) return;   // that click was a pan, not a tap
-        const [px, py] = localTile(ev); clickTile(px, py);
-      });
-      // Drag is the shipped connect gesture; tap-tap works too, because a tap is
-      // a drag of zero length and the port under the finger is the same either way.
-      // Flying. A tap names where to go; a drag names where to go and which way
-      // to be pointing on arrival. Both are intents -- stepSession hands them to
-      // the allocator, which decides what the hull can actually do about it.
-      view.svg.addEventListener("pointerdown", (ev) => {
-        if (ev.button !== 0) return;
-        if (typing()) document.activeElement.blur();
-        if (S.state !== "playing") return;
-        const [lx, ly] = localTile(ev);
-        if (S.player.at(lx, ly)?.hp > 0) return;      // tapping your own hull is an edit
-        pilotDrag = worldTile(ev);
-        S.cmd = {...(S.cmd ?? {}), target: pilotDrag, face: null, drive: null};
-        held.clear();
-        view.panLock = true;
-        view.svg.setPointerCapture(ev.pointerId);
-      });
-      view.svg.addEventListener("pointermove", (ev) => {
-        if (!pilotDrag) return;
-        const [x, y] = worldTile(ev);
-        const dx = x - pilotDrag[0], dy = y - pilotDrag[1];
-        S.cmd.face = Math.hypot(dx, dy) > 1.5 ? geomBearing(dx, dy) : null;
-      });
-      view.svg.addEventListener("pointerup", () => {
-        if (!pilotDrag) return;
-        pilotDrag = null; view.panLock = false;
-      });
-      view.svg.addEventListener("pointerdown", (ev) => {
-        if (act !== "connect") return;
-        const [px, py] = localTile(ev);
-        // a drag that starts on a port is a wire, not a pan; the camera reads
-        // panLock on the first MOVE, which is after this handler has run
-        if (legalPorts().some(q => q.px === px && q.py === py))
-          view.svg.dragging = view.panLock = true;
-      });
-      view.svg.addEventListener("pointerup", (ev) => {
-        view.panLock = false;
-        if (!view.svg.dragging) return;
-        view.svg.dragging = false;
-        const [px, py] = localTile(ev);
-        if (wire && !wire.to && !(wire.from.cell[0] === px && wire.from.cell[1] === py)) {
-          const hit = legalPorts().find(q => q.px === px && q.py === py);
-          if (hit) { wire = {...wire, to: {px: hit.c.px, py: hit.c.py, cell: [px, py],
-                                           port: hit.name, kind: hit.kind}}; render(); }
-        }
-      });
+      // One entry point. Everything the board can be asked to do is decided in
+      // startGesture from what is under the press, and the gesture then runs on
+      // WINDOW listeners so it survives the finger leaving the svg -- a place drag
+      // that starts on a shelf chip is the same code path as one that starts on a
+      // ghost.
+      view.svg.addEventListener("pointerdown", startGesture);
       view.svg.style.cursor = "crosshair";
+      view.svg.style.touchAction = "none";
       stage.append(view.svg);
-      hud = htl.html`<div style="position:absolute;left:12px;top:10px;display:flex;
-        flex-direction:column;gap:6px;pointer-events:none;max-width:46%"></div>`;
+      hud = htl.html`<div style="position:absolute;pointer-events:none"></div>`;
       corners = {
-        tr: htl.html`<div style="position:absolute;right:12px;top:10px;display:flex;gap:8px"></div>`,
-        bl: htl.html`<div style="position:absolute;left:12px;bottom:12px;display:flex;
-          gap:10px;align-items:center"></div>`,
-        br: htl.html`<div style="position:absolute;right:12px;bottom:12px;display:flex;
-          gap:10px;align-items:center"></div>`,
+        tr: htl.html`<div style="position:absolute;display:flex;gap:8px;align-items:center"></div>`,
+        bl: htl.html`<div style="position:absolute;display:flex;gap:10px;align-items:center"></div>`,
+        br: htl.html`<div style="position:absolute;display:flex;gap:10px;align-items:center"></div>`,
         mid: htl.html`<div style="position:absolute;inset:0;pointer-events:none"></div>`
       };
       stage.append(hud, corners.tr, corners.bl, corners.br, corners.mid);
     }
+    // The phone is drawn as a phone: a 390x844 device box with the board inset
+    // below a 56px mission header, because a layout meant for a thumb cannot be
+    // judged in a 900px column.
+    // The shelf gets its OWN band, it does not float over the board. An absolutely
+    // positioned child is placed against the padding box, so a bottom padding of
+    // the shelf's height puts the shelf exactly in it and leaves the svg the
+    // content box above.
+    //
+    // It overlaid the board first, which is how the design's mock reads, and on a
+    // mission whose ship sits low in frame the overlay ate the ship: FollowBoss's
+    // last wire could not be started because the Binary's out port was drawn at
+    // page y=687 and the shelf covered 584-700 (tools/scratch/followboss-wire.ts,
+    // 2026-08-21 -- the press resolved to no port, no component and no selection).
+    // On the phone the shelf already had its own band, which is why only the
+    // desktop layout could lose a port.
+    stage.style.cssText = mob
+      ? `position:relative;width:390px;height:844px;margin:0 auto;border-radius:34px;
+         background:#04050a;border:1px solid rgba(255,255,255,.14);overflow:hidden;
+         box-shadow:0 0 40px rgba(0,0,0,.6)`
+      : `position:relative${stock().length ? ";padding-bottom:116px" : ""}`;
+    view.svg.style.position = mob ? "absolute" : "static";
+    if (mob) { view.svg.style.left = "0"; view.svg.style.top = "100px";
+               view.svg.style.width = "390px"; }
+    else { view.svg.style.left = view.svg.style.top = ""; view.svg.style.width = "100%"; }
+    phoneHead?.remove(); phoneHead = null;
+    if (mob) {
+      // One node for both bands so a re-render replaces them rather than stacking
+      // a new pair on top of the last. The status strip is not decoration: without
+      // it the objective pill sits against the device bezel and the board reads as
+      // starting at the very top of the screen.
+      phoneHead = htl.html`<div style="position:absolute;left:0;right:0;top:0;height:100px;
+        pointer-events:none">
+        <div style="position:absolute;left:0;right:0;top:0;height:44px;display:flex;
+          align-items:center;justify-content:space-between;padding:0 22px;
+          font:500 10px ${MONO};color:${C.faint}"><span>corepox</span><span>▮▮▮</span></div>
+        <div style="position:absolute;left:0;right:0;top:44px;height:56px;
+          border-bottom:1px solid ${C.line};display:flex;align-items:center;padding:0 14px">
+          <span style="font:700 11px ${MONO};letter-spacing:.16em;
+            color:${m.live ? C.red : C.amber}">${m.title.slice(0, 9).toUpperCase()}</span>
+        </div></div>`;
+      stage.append(phoneHead);
+    }
+    hud.style.cssText = mob
+      ? "position:absolute;left:100px;right:76px;top:44px;height:56px;display:flex;" +
+        "align-items:center;pointer-events:none;overflow:hidden"
+      : "position:absolute;left:20px;top:18px;display:flex;flex-direction:column;" +
+        "gap:6px;pointer-events:none;max-width:46%;z-index:5";
+    corners.tr.style.cssText = mob
+      ? "position:absolute;right:14px;top:44px;height:56px;display:flex;gap:8px;align-items:center"
+      : "position:absolute;right:20px;top:18px;display:flex;gap:10px;align-items:center;z-index:5";
+    corners.bl.style.cssText = mob
+      ? "position:absolute;left:16px;bottom:26px;height:62px;display:flex;gap:9px;align-items:center"
+      : `position:absolute;left:20px;bottom:${stock().length ? 132 : 20}px;display:flex;
+         gap:10px;align-items:center;z-index:5`;
+    corners.br.style.cssText = mob
+      ? "position:absolute;right:16px;bottom:26px;height:62px;display:flex;gap:9px;align-items:center"
+      : `position:absolute;right:20px;bottom:${stock().length ? 132 : 20}px;display:flex;
+         gap:10px;align-items:center;z-index:5`;
+
     camera();
     // snap, not ease: in the editor a click has to hit the connector the player
     // can see, so the viewBox must not move between paint and click
@@ -13764,53 +14324,98 @@ const _viewof_game = function _viewof_game(
 
     for (const k of ["tr", "bl", "br"]) corners[k].textContent = "";
     corners.mid.textContent = "";
-    // Drag-to-pan has no undo of its own, and a camera parked on empty space looks
-    // like the ship is gone. The pad only exists once the view has actually been
-    // moved, so it is never a control the player has to learn.
-    if (view?.moved?.())
-      corners.tr.append(pad("⌖", () => { view.resetView(); render(); }, "#8fd0ff", "recentre", 40));
-    if (S.state !== "build") corners.tr.append(pad("↺", () => reset(mi), "#ff8f6d", "restart", 40));
+    shelf?.remove(); shelf = shelfNode();
+    if (shelf) stage.append(shelf);
 
-    if (S.state === "build") corners.bl.append(pad("▶", play, "#5ef2a0", "play", 52));
-    else if (S.state === "playing") {
-      clock = htl.html`<span style="color:#8fd0ff">${S.world.t.toFixed(1)}s</span>`;
-      corners.bl.append(chip(m.live ? "LIVE" : "RUNNING", "#8fd0ff"), clock);
+    // ---- the clock chip -----------------------------------------------------
+    const md = CLOCK[clockMode()];
+    clock = htl.html`<span style="font:400 ${mob ? 8 : 10}px ${MONO};color:${C.dim};
+      font-variant-numeric:tabular-nums">${S.world.t.toFixed(1)}s</span>`;
+    corners.tr.append(mob
+      ? htl.html`<div style="display:flex;flex-direction:column;align-items:flex-end">
+          <span style="font:700 8.5px ${MONO};letter-spacing:.1em;color:${md.hue}">${md.word}</span>
+          ${clock}</div>`
+      : htl.html`<div style="display:flex;align-items:center;gap:12px;padding:7px 14px;
+          border-radius:999px;background:${C.panel};border:1px solid ${C.line}">
+          <div style="display:flex;flex-direction:column;gap:2px">
+            <span style="font:700 10px ${MONO};letter-spacing:.16em;color:${md.hue}">${md.word}</span>
+            <span style="font:400 9px ${MONO};color:${C.faint}">${md.sub}</span></div>
+          <span style="width:1px;height:22px;background:${C.line}"></span>${clock}</div>`);
+    if (S.state !== "build") corners.tr.append(pad("↺", () => reset(mi), "#ff8f6d", "restart", mob ? 32 : 36));
+
+
+    // ---- the camera nub -----------------------------------------------------
+    // Two pads, and neither exists until it is needed: the recentre only once the
+    // camera has actually been moved, and the pan latch only where there is no
+    // second finger and no space bar to hold.
+    // On the phone they belong in the thumb bar, where the design puts them; on
+    // the desktop they float clear of the shelf as a nub.
+    const camPads = [];
+    if (mob || view.moved())
+      camPads.push(pad("✥", () => { space = !space; render(); },
+                       space ? C.amber : C.cyan, space ? "pan latched" : "pan", mob ? 46 : 42));
+    if (view.moved())
+      camPads.push(pad("⌖", () => { view.resetView(); render(); }, C.cyan, "recentre", mob ? 46 : 42));
+    if (mob) corners.bl.append(...camPads);
+    else if (camPads.length) {
+      const nub = htl.html`<div style="position:absolute;right:20px;bottom:${
+        stock().length ? 190 : 78}px;display:flex;flex-direction:column;gap:8px;z-index:5"></div>`;
+      nub.append(...camPads);
+      stage.append(nub);
     }
-    // The connect gesture is confirmed, not committed on release: the shipped
-    // proposal sits there as a pale curve until FINISH CONNECTING is tapped, and
-    // four capture attempts read as "the drag isn't registering" because of it.
+
+    // ---- start / resume -----------------------------------------------------
+    // Only ever a RESUME. A pause is entered by editing, never by pressing
+    // something, so there is nothing here that stops a live match.
+    const act1 = S.state === "build" ? {label: "LAUNCH", fn: play}
+              : S.state === "playing" && S.paused ? {label: "RESUME", fn: () => { S.paused = false; render(); }}
+              : null;
+    // Desktop puts it beside the clock as a bare 42px circle, which is where turn
+    // 7a has it -- the same chip tells you what state you are in and offers the
+    // only way out of it. The phone gets the labelled pill from turn 8a, because a
+    // thumb bar has the room and a bare glyph at the bottom of a phone reads as a
+    // media control.
+    if (act1) {
+      if (mob) corners.br.append(htl.html`<button onclick=${act1.fn}
+        style="display:flex;align-items:center;gap:11px;padding:0 20px;height:52px;
+        border-radius:26px;border:1.5px solid ${C.green};background:rgba(86,227,159,.12);
+        color:${C.green};cursor:pointer;font:700 11px ${MONO};letter-spacing:.14em">
+        <span style="font-size:19px;line-height:1">▶</span>${act1.label}</button>`);
+      else corners.tr.append(pad("▶", act1.fn, C.green, act1.label.toLowerCase(), 42));
+    }
+
+    // ---- what the current gesture is asking for -----------------------------
     if (act === "connect" && wire?.to) {
-      corners.bl.textContent = "";
-      corners.bl.append(pad("✓", () => { commitWire(); render(); }, "#5ef2a0", "finish connecting", 52),
-                        chip("FINISH CONNECTING", "#5ef2a0"));
-    } else if (act === "connect") {
-      corners.bl.append(chip("DRAG A PORT TO A PORT", "#8fd0ff"));
-      corners.bl.append(pad("✕", () => { act = null; wire = null; panel = "menu"; render(); },
-                            "#ff6b5a", "cancel", 40));
+      corners.bl.append(pad("✓", () => { commitWire(); render(); }, C.green, "finish connecting", 46),
+                        chip("RELEASE WAS NEAR TWO — CONFIRM", C.green));
+      corners.bl.append(pad("✕", () => { act = null; wire = null; render(); }, C.red, "cancel", 36));
+    } else if (picked && !mob) {
+      corners.bl.append(chip(`HOLDING ${picked.toUpperCase()} — DROP ON A GHOST`, C.green));
     }
-    if (picked) corners.bl.append(chip(`PLACE ${picked.toUpperCase()}`, YEL),
-      pad("✕", () => { picked = null; render(); }, "#ff6b5a", "cancel", 40));
 
-    if (editable() && stock().length && !picked && act == null)
-      corners.br.append(pad("⚒", () => { panel = "build"; sel = null; render(); }, YEL, "build"));
     if (S.state === "win") corners.br.append(pad("★", () => {
       if (mi + 1 < MISSIONS.length) reset(mi + 1);
-    }, "#5ef2a0", "next mission", 52));
+    }, C.green, "next mission", 46));
 
     if (S.state === "win" || S.state === "loss")
       corners.mid.append(htl.html`<div style="position:absolute;left:50%;top:22%;
         transform:translateX(-50%);text-align:center">
-        <div style="font-size:30px;letter-spacing:6px;color:${
-          S.state === "win" ? "#ffd23f" : "#ff6b5a"};text-shadow:0 0 22px currentColor">${
+        <div style="font:${mob ? 24 : 30}px ${MONO};letter-spacing:6px;color:${
+          S.state === "win" ? C.amber : C.red};text-shadow:0 0 22px currentColor">${
           S.state === "win" ? "VICTORY" : "DEFEAT"}</div>
-        <div style="color:#8b9bb0;margin-top:6px">${S.state === "win"
+        <div style="color:${C.dim};margin-top:6px;font:11px ${MONO}">${S.state === "win"
           ? (m.spoils ?? []).map(s => `${s.type} x${s.n}`).join("   ") || "no spoils"
           : "restart, top right"}</div></div>`);
 
-    if (panel === "build") corners.mid.append(buildPanel());
-    else if (panel === "info" && infoType) corners.mid.append(infoPanel());
-    else if (panel === "menu" && sel) corners.mid.append(menuPanel());
-    corners.mid.style.pointerEvents = panel === "none" ? "none" : "auto";
+    verbNode = null;
+    const bar = verbBar();
+    if (bar) corners.mid.append(bar);
+    if (panel === "info" && infoType) corners.mid.append(infoPanel());
+    else if (panel === "cut" && sel) corners.mid.append(cutPanel());
+    // `mid` spans the whole board, so it must NEVER take the pointer itself --
+    // each child opts in. Making the container auto because a panel is open put an
+    // invisible sheet over every gesture on the board behind it.
+    corners.mid.style.pointerEvents = "none";
 
     root.value = {mission: m.id, state: S.state, ship: specOf(S.player)};
   };
@@ -13829,14 +14434,38 @@ const _viewof_game = function _viewof_game(
                else if (id === "rotate") doRotate();
                else if (id === "delete") doDelete();
                else if (id === "move") { act = "move"; panel = "none"; }
-               else if (id === "cut") act = "cut";
+               else if (id === "cut") { act = "cut"; panel = "cut"; }
                render(); return true; },
              confirm: () => { commitWire(); render(); },
              // A cutscene covers the board, so anything driving the game has to
              // get past it the way a player does.
              intro: () => scene, skipIntro: () => { while (scene) scene.next(); },
              play: () => { play(); }, restart: () => { reset(mi); },
-             stock: () => stock().map(i => ({...i}))};
+             stock: () => stock().map(i => ({...i})),
+             // The redesign's own seams: the layout toggle, the pause, and the two
+             // gestures that replaced menus. A test that drives the board has to be
+             // able to reach all four or it is only testing the old flow.
+             layout: (l) => { if (l) { layout = l; sel = null; picked = null; render(); }
+                              return layout; },
+             paused: (p) => { if (p != null) { S.paused = !!p; render(); } return !!S.paused; },
+             setParam: (v, px, py) => setParam(v, S.player.at(px, py)),
+             // Where a port is DRAWN. Named by COMPONENT and PORT, never by cell:
+             // on a Constant the cell centre belongs to the value disc, and on
+             // FollowCourse two different components' ports share cell (0,-1).
+             portPoint: (anchor, name, kind) => {
+               const q = drawnPorts().find(x => x.c.px === anchor[0] && x.c.py === anchor[1] &&
+                                                x.name === name && x.kind === kind);
+               return q ? [q.vx, q.vy] : null;
+             },
+             wireDrag: (from, to) => {
+               const q0 = allPorts().find(q => q.px === from[0] && q.py === from[1]);
+               if (!q0) return false;
+               const sinks = allPorts().filter(x => x.kind !== q0.kind && x.c !== q0.c);
+               finishWire({kind: "wire", px: from[0], py: from[1], from: portRef(q0),
+                           sinks, moved: true}, to[0], to[1]);
+               render();
+               return !!S.player.conns.length;
+             }};
 
   reset(0, true);
   return root;
@@ -13848,7 +14477,7 @@ export default function define(runtime, observer) {
   };
   main.variable(observer("viewof game")).define("viewof game",
     ["MISSIONS","CAMPAIGNS","newSession","evaluateObjectives","stepSession","battlefield","objectiveHtml",
-     "componentNode","INFO","MENU_ACTIONS","TYPES","PORTS","TILE","htl","invalidation"],
+     "componentNode","INFO","MENU_ACTIONS","TYPES","PORTS","TILE","DT","htl","invalidation"],
     _viewof_game).pid = "_viewof_game";
   main.variable(observer("game")).define("game", ["Generators", "viewof game"],
     (G, _) => G.input(_)).pid = "_game";
