@@ -5104,10 +5104,20 @@ const _cpmParams = function _mapParams(Inputs) {
   return f;
 };
 const _cpmParamsv = (G, _) => G.input(_);
-const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapScene,mapTopBar,mapPanel,mapLegend,mapHazTags,invalidation) {
+const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapScene,mapTopBar,mapPanel,mapLegend,mapHazTags,newRunCampaign,encounterView,refitBench,applyRefit,partsOf,invalidation) {
   const W = 1600, H = 900;
   const run = genRun(mapParams);
-  const st = {at: run.start.id, visited: [], selected: null, scrap: 214, hull: 82, clock: "18:24"};
+  // The campaign is the run: the map draws it, the encounter changes it. `st` keeps
+  // only what is about the BOARD -- where you stand, what you have seen, what is
+  // selected -- and reads scrap and hull off the campaign, so the two cannot drift.
+  let camp = newRunCampaign(run.seed);
+  const hull0 = Object.values(partsOf(camp.ship)).reduce((a, b) => a + b, 0) || 1;
+  const st = {at: run.start.id, visited: [], selected: null, scrap: camp.scrap, hull: 100, clock: "18:24"};
+  const sync = () => {
+    st.scrap = camp.scrap;
+    const n = Object.values(partsOf(camp.ship)).reduce((a, b) => a + b, 0);
+    st.hull = Math.round(100 * n / hull0);
+  };
 
   const root = html`<div style="position:relative;width:100%;overflow:hidden;border-radius:12px;background:#04050a;color:#e8ecf5;user-select:none"></div>`;
   const stage = html`<div style="position:absolute;left:0;top:0;width:${W}px;height:${H}px;transform-origin:0 0"></div>`;
@@ -5120,7 +5130,38 @@ const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapSc
     stage.innerHTML = mapScene(run, st, S) + mapTopBar(run, st) + mapHazTags(run) +
       mapPanel(run, st, S) + mapLegend();
     root.value = {run, at: st.at, visited: st.visited.slice(), selected: st.selected,
-      scrap: st.scrap, hull: st.hull};
+      scrap: st.scrap, hull: st.hull, campaign: camp, over: st.over ?? null};
+  };
+
+  // The encounter is a full-bleed layer over the board rather than a route to a
+  // second view: the run's state lives in this element, and unmounting the map to
+  // fight would take it with it.
+  const layer = html`<div style="position:absolute;inset:0;z-index:5;display:none;
+    overflow:auto;padding:18px;background:rgba(4,5,10,.94);backdrop-filter:blur(6px)"></div>`;
+  root.append(layer);
+  let open = null;
+  const closeBtn = html`<button style="font:12px ui-monospace,monospace;padding:4px 12px;
+    border-radius:4px;cursor:pointer;border:1px solid #26364a;background:transparent;
+    color:#8b9bb0">close</button>`;
+  const bar = html`<div style="display:flex;justify-content:flex-end;margin-bottom:8px"></div>`;
+  bar.append(closeBtn);
+  const closeLayer = () => { open?.stop?.(); open = null; layer.style.display = "none";
+                             layer.replaceChildren(); };
+  closeBtn.onclick = () => { closeLayer(); fire(); };
+  invalidation.then(closeLayer);
+  // An encounter opens with no way out -- the fight is the commitment. The exit is
+  // put back the moment it resolves, which is also the only moment the board behind
+  // it has changed; without that the spoils panel is a dead end (measured: the
+  // layer stayed up with no button, tools/scratch/encounter-spoils.mjs).
+  const exitAs = (label) => { closeBtn.textContent = label; bar.style.display = "flex"; };
+  const showLayer = (el, {closable = true} = {}) => {
+    open?.stop?.();
+    open = el;
+    bar.style.display = closable ? "flex" : "none";
+    closeBtn.textContent = "close";
+    layer.replaceChildren(bar, el);
+    layer.style.display = "block";
+    layer.scrollTop = 0;              // the editor's board mounts scrolled otherwise
   };
 
   stage.addEventListener("click", (e) => {
@@ -5128,17 +5169,30 @@ const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapSc
     if (n) { st.selected = st.selected === n.dataset.node ? null : n.dataset.node; return fire(); }
     const a = e.target.closest("[data-act]");
     if (!a) return;
+    if (a.dataset.act === "yard") {
+      // The bench off the map is the same bench the encounter opens; it commits to
+      // the campaign directly because there is no battle after it.
+      return showLayer(refitBench(camp, {onCommit: (next) => {
+        camp = next; sync(); closeLayer(); fire();
+      }}));
+    }
     if (a.dataset.act === "jump") {
       const S = runStates(run, st);
       if (S.nodeState.get(st.selected) !== "reachable") return;
       const dest = S.byId.get(st.selected);
-      st.visited.push(st.at);
-      st.at = dest.id;
-      st.selected = null;
-      // placeholder economy — the real numbers come from the encounter, not the map
-      st.scrap += dest.kind === "mining" ? 45 : dest.kind === "shop" ? 0 : 18;
-      st.hull = Math.max(5, st.hull - (dest.hazard ? 9 : 4));
-      return fire();
+      // The jump is only committed when the node resolves. Arriving and dying are
+      // the same board move otherwise, and a lost run that had already advanced the
+      // marker would show you standing on a node you never took.
+      return showLayer(encounterView(dest, camp, {control: "human", onDone: (next, verdict) => {
+        camp = next;
+        st.visited.push(st.at);
+        st.at = dest.id;
+        st.selected = null;
+        sync();
+        if (verdict === "loss") st.over = "destroyed";
+        exitAs(verdict === "loss" ? "the run ends ▶" : "back to the map ▶");
+        fire();
+      }}), {closable: false});
     }
   });
   const fire = () => { draw(); root.dispatchEvent(new CustomEvent("input")); };
@@ -5152,6 +5206,7 @@ const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapSc
   const ro = new ResizeObserver(fit);
   ro.observe(root);
   invalidation.then(() => ro.disconnect());
+  sync();
   draw();
   fit();
   return root;
@@ -5172,11 +5227,19 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
+  main.define("module @tomlarkworthy/corepox-duel-encounter",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-duel-encounter.js?v=4")).default));
+  for (const n of ["newRunCampaign", "encounterView", "refitBench", "applyRefit", "partsOf"])
+    main.define(n, ["module @tomlarkworthy/corepox-duel-encounter", "@variable"],
+      (_, v) => v.import(n, _));
 
   $def("_cpmTitle", "title", ["md"], _cpmTitle);
   $def("_cpmParams", "viewof mapParams", ["Inputs"], _cpmParams);
   $def("_cpmParamsv", "mapParams", ["Generators","viewof mapParams"], _cpmParamsv);
-  $def("_cpmMap", "viewof galaxyMap", ["html","mapCss","mapParams","genRun","runStates","mapScene","mapTopBar","mapPanel","mapLegend","mapHazTags","invalidation"], _cpmMap);
+  main.variable(observer("viewof galaxyMap")).define("viewof galaxyMap",
+    ["html","mapCss","mapParams","genRun","runStates","mapScene","mapTopBar","mapPanel",
+     "mapLegend","mapHazTags","newRunCampaign","encounterView","refitBench","applyRefit",
+     "partsOf","invalidation"], _cpmMap).pid = "_cpmMap";
   $def("_cpmMapv", "galaxyMap", ["Generators","viewof galaxyMap"], _cpmMapv);
   $def("_cpmNotes", "notes", ["md"], _cpmNotes);
   $def("_cpmKinds", "NODE_KINDS", [], _cpmKinds);
@@ -5482,63 +5545,11 @@ const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, h
   last = performance.now();
   raf = requestAnimationFrame(loop);
   root.duel = D;
+  root.view = view;              // a human-control layer needs its tileAt
   root.stop = () => { stopped = true; cancelAnimationFrame(raf); };
   root.value = D;
   return root;
 }
-)};
-
-// The corpus is the roster. 2191 designs were exported from the shipped game and
-// 2187 of them build in this engine; the 4 that do not name DevouringLove, a prefab
-// no extraction recovered (tools/corepox-corpus-load.ts, 2026-08-20 -- it was 1755
-// before RELICS taught the loader to splice a prefab a design only NAMES).
-// The picker labels a design by its ID, because the name does not identify one:
-// only 60 of the 2191 designs are called anything other than "Brain", the editor's
-// default (tools/scratch/cid-prefix.ts, 2026-08-21). Tom's reason is that the label
-// has to be sayable -- "hard to communicate what ship I am talking about as nearly
-// everything in CORPUS is called Brain".
-//
-// Eight characters is enough to be unique and short enough to read out: 2178 of the
-// ids are 32-hex, the other 13 are integers 0-12, and a 7-char prefix already
-// separates all 2191 (a 6-char one collides once). It is also what the lab already
-// prints. The rest of the label is shape and history -- parts / guns / engines, and
-// matches played, which is the sort: 20849 recorded matches means a ship people flew.
-const _duelRoster = function _duelRoster(SHIPS,CORPUS,TYPES,TYPE_ALIAS,RELICS){return(
-(() => {
-  const byKey = new Map(), groups = [];
-  const add = (label, items) => {
-    items.forEach(e => byKey.set(e.key, e));
-    groups.push({label: `${label} (${items.length})`, items});
-  };
-  add("missions", Object.entries(SHIPS).map(([name, spec]) => ({key: name, label: name, spec})));
-
-  const GUN = /Lazer|Laser|Explosive|Missile|Turret|Spike/i;
-  // Counted through the relic table, not off the raw list: a design whose only
-  // component is a LazerHardpoint would otherwise read "1p 0g 0e" when what it
-  // builds is a turret, a radar and eight armour plates. None of the four shipped
-  // relics contains another, so one level of expansion is exact here.
-  const parts = (s) => s.components.flatMap(c => {
-    const t = TYPE_ALIAS(c.type);
-    return RELICS[t]?.components.map(x => x.type) ?? [t];
-  });
-  add("corpus, by matches played", Object.entries(CORPUS.ships)
-    .filter(([, s]) => !s.components.some(c => { const t = TYPE_ALIAS(c.type);
-                                               return !TYPES[t] && !RELICS[t]; }))
-    .map(([id, s]) => {
-      const P = parts(s);
-      return {id, spec: s, parts: P.length,
-              guns: P.filter(t => GUN.test(t)).length,
-              eng: P.filter(t => /Engine/i.test(t)).length,
-              matches: CORPUS.ratings[id]?.n ?? 0};
-    })
-    .sort((a, b) => b.matches - a.matches)
-    .map(r => ({
-      key: r.id, spec: r.spec,
-      label: `${r.id.slice(0, 8)} · ${r.parts}p ${r.guns}g ${r.eng}e · ${r.matches}m` +
-             (r.spec.name && r.spec.name !== "Brain" ? ` · ${r.spec.name}` : "")
-    })));
-  return {groups, byKey};
-})()
 )};
 
 const _viewof_duelDemo = function _viewof_duelDemo(duelRoster, DUEL_MODES, duelView, htl, invalidation){
@@ -5620,13 +5631,17 @@ export default function define(runtime, observer) {
     (_, v) => v.import("SHIPS", _));
   main.define("CORPUS", ["module @tomlarkworthy/corepox-shipyard", "@variable"],
     (_, v) => v.import("CORPUS", _));
+  // Was defined here until 2026-08-21; the shipyard's "start from" picker needs the
+  // same list, and CORPUS lives there, so the roster moved down rather than being
+  // copied up. Imported under the old name so nothing else here had to change.
+  main.define("duelRoster", ["module @tomlarkworthy/corepox-shipyard", "@variable"],
+    (_, v) => v.import("shipRoster", "duelRoster", _));
 
   $def("_title", "title", ["md"], _title);
   main.variable(observer("viewof duelDemo")).define("viewof duelDemo",
     ["duelRoster","DUEL_MODES","duelView","htl","invalidation"], _viewof_duelDemo).pid = "_viewof_duelDemo";
   main.variable(observer("duelDemo")).define("duelDemo",
     ["Generators","viewof duelDemo"], _duelDemo).pid = "_duelDemo";
-  $def("_duelRoster", "duelRoster", ["SHIPS","CORPUS","TYPES","TYPE_ALIAS","RELICS"], _duelRoster);
   $def("_runDuel", "runDuel", ["newDuel","stepDuel","DT"], _runDuel);
   $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
   $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive"], _stepDuel);
@@ -5636,6 +5651,537 @@ export default function define(runtime, observer) {
   $def("_duelPlacement", "duelPlacement", ["geom"], _duelPlacement);
   $def("_chaseCmd", "chaseCmd", ["geom"], _chaseCmd);
   $def("_DUEL_BACKDROP", "DUEL_BACKDROP", [], _DUEL_BACKDROP);
+  return main;
+}</script>
+
+<script id="@tomlarkworthy/corepox-duel-encounter" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// Corepox duel encounter: the run's ship, the run's parts, and one fight.
+//
+// The map deals nodes and corepox-duel runs a match. This is the layer between
+// them, and it exists because a match needs three things the duel module has no
+// business owning: a ship the player may change first, an inventory that persists
+// across nodes so changing it costs something, and spoils that go back into that
+// inventory when the match ends.
+//
+// It grows no second build UI -- the bench wraps `shipEditor` from
+// corepox-shipyard and reconciles what the editor produced against the hold. The
+// editor knows about a palette, not about counts, so the accounting lives out here
+// where the campaign state is (a `stock` hook inside shipEditor would put campaign
+// rules into a module three other notebooks use for something else).
+
+const _title = function _title(md){return(
+md`# Corepox duel encounter
+
+One node of a run: **refit**, then **battle**, then **spoils**. The inventory is carried
+between nodes, so a part spent here is gone from the next fight, and a part lost in the
+battle is gone for good.
+
+\`\`\`js
+const camp = newCampaign({seed: 7, ship: SHIPS.wiredCore, scrap: 214,
+                          parts: {Engine: 3, Lazer: 2, Armour: 4}});
+encounterView(node, camp, {onDone: (r) => …})   // refit -> battle -> spoils, on screen
+runEncounter(node, camp, {control: "auto"})     // the same thing headless
+\`\`\`
+
+\`control: "human"\` gives the battle to the keyboard: **WASD** to fly, **space** to
+shoot, **click** to set a waypoint the autopilot drives to. \`"auto"\` hands the same
+ship to the robot pilot, and \`"wired"\` lets the ship run only the program its own
+wires describe.`
+)};
+
+// ---------------------------------------------------------------------------
+// Campaign state
+// ---------------------------------------------------------------------------
+
+// What a part is worth in scrap. Only the shop and the salvage roll read these;
+// the refit bench itself is free, because moving a part you already own between
+// the hold and the hull is not a transaction.
+const _PART_COST = function _PART_COST(){return(
+{Brain: 0, Constant: 5, Binary: 12, Radar: 25, Engine: 20, Lazer: 30,
+ Explosive: 18, Orb: 35, Armour: 10, LaserTurret2: 55, Hyperdrive: 60}
+)};
+
+// A spec's component census, counted THROUGH the relic table: a design whose only
+// component is a LazerHardpoint holds a turret, a radar and eight armour plates,
+// and an inventory that called that "1 part" would let it be rebuilt for free.
+const _partsOf = function _partsOf(TYPE_ALIAS, RELICS){return(
+(spec) => {
+  const out = {};
+  for (const c of spec?.components ?? []) {
+    const t = TYPE_ALIAS(c.type);
+    for (const x of RELICS[t]?.components.map(q => TYPE_ALIAS(q.type)) ?? [t])
+      out[x] = (out[x] ?? 0) + 1;
+  }
+  return out;
+}
+)};
+
+// `parts` is the HOLD -- spares, not what is bolted on. The hull is `ship`. The two
+// never double-count, which is what makes "you cannot afford that engine" decidable
+// without walking the spec twice.
+const _newCampaign = function _newCampaign(){return(
+({seed = 1, ship = null, scrap = 0, parts = {}, node = null} = {}) => ({
+  seed, scrap,
+  parts: {...parts},
+  ship: ship ? structuredClone(ship) : {name: "hull", components: [], connections: []},
+  visited: [], log: [], at: node, over: null
+})
+)};
+
+// Can this design be built out of the hull we have plus the hold? Returns what is
+// SHORT, per type, so the bench can say which part is missing rather than refusing
+// as a whole.
+const _refitCheck = function _refitCheck(partsOf){return(
+(camp, spec) => {
+  const have = partsOf(camp.ship), want = partsOf(spec), short = {};
+  for (const t of Object.keys(want)) {
+    const spare = (have[t] ?? 0) + (camp.parts[t] ?? 0) - want[t];
+    if (spare < 0) short[t] = -spare;
+  }
+  return {ok: !Object.keys(short).length, short,
+          // what the hold would hold afterwards
+          hold: Object.fromEntries([...new Set([...Object.keys(camp.parts),
+                                                ...Object.keys(have), ...Object.keys(want)])]
+            .map(t => [t, (camp.parts[t] ?? 0) + (have[t] ?? 0) - (want[t] ?? 0)])
+            .filter(([, n]) => n > 0))};
+}
+)};
+
+// Commit a refit: the hull becomes `spec` and the hold absorbs the difference.
+const _applyRefit = function _applyRefit(refitCheck){return(
+(camp, spec) => {
+  const c = refitCheck(camp, spec);
+  if (!c.ok) return {...camp, refused: c.short};
+  return {...camp, ship: structuredClone(spec), parts: c.hold, refused: null};
+}
+)};
+
+// The loadout a run starts with. A Brain, one Engine and a Constant is a hull that
+// flies and cannot shoot, so the first refit is a real decision rather than a
+// formality: the Lazer in the hold has to displace something or go somewhere that
+// costs steering. Kept here rather than in the map so a run is defined in one place.
+const _newRunCampaign = function _newRunCampaign(SHIPS, newCampaign){return(
+(seed = 41) => newCampaign({
+  seed, ship: SHIPS.wiredCore, scrap: 214,
+  parts: {Engine: 2, Lazer: 2, Armour: 4, Constant: 2, Radar: 1}
+})
+)};
+
+// ---------------------------------------------------------------------------
+// What a node is worth, and who is waiting there
+// ---------------------------------------------------------------------------
+
+// Keyed by the map's NODE_KINDS. `scrap` is the same number the map's panel already
+// prints as "+ 40 scrap" -- the map's string is the label, this is the value, and
+// tools/corepox-encounter-check.ts asserts the two agree so the panel cannot
+// promise one thing and the encounter pay another.
+//
+// `battle: false` is not a placeholder for "later". A RACE is a course and a MINING
+// node is a quota; neither is two ships shooting, so neither is a duel and this
+// module resolves them as a stop rather than pretending. Only the fight family and
+// the boss run a match today.
+const _ENCOUNTER_RULES = function _ENCOUNTER_RULES(){return(
+{
+  duel:       {battle: true,  mode: "elimination", limit: 60, sep: 22, scrap: 40,  band: 0},
+  escort:     {battle: true,  mode: "attrition",   limit: 60, sep: 26, scrap: 65,  band: 3},
+  infiltrate: {battle: true,  mode: "survival",    limit: 45, sep: 18, scrap: 90,  band: 6},
+  boss:       {battle: true,  mode: "elimination", limit: 90, sep: 30, scrap: 200, band: 12},
+  race:       {battle: false, scrap: 50},
+  debris:     {battle: false, scrap: 35},
+  rescue:     {battle: false, scrap: 45},
+  mining:     {battle: false, scrap: 120},
+  shop:       {battle: false, scrap: 0},
+  repair:     {battle: false, scrap: 0},
+  unknown:    {battle: false, scrap: 0}
+}
+)};
+
+// Same generator the map uses, so a node's foe is a function of the run seed and
+// the node id and nothing else -- reloading the page must not re-roll the fight.
+const _encRng = function _encRng(){return(
+(s) => { let x = (s | 0) || 1; return () => (x = (x * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; }
+)};
+
+const _hashId = function _hashId(){return(
+(s) => { let h = 2166136261; for (const ch of String(s)) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+         return h >>> 0; }
+)};
+
+// UNKNOWN is not a kind, it is a promise: the map's own text says "resolves on
+// arrival. Could be any of the above". Resolving it here rather than at generation
+// is what keeps that true -- the board cannot leak the answer through its icon.
+// Deterministic in the run seed and the node id, so it survives a reload.
+const _resolveNode = function _resolveNode(encRng, hashId){return(
+(node, camp) => {
+  if (node.kind !== "unknown") return node;
+  const POOL = ["duel", "duel", "escort", "debris", "mining", "rescue", "race", "infiltrate"];
+  const r = encRng(camp.seed * 1049 + hashId(node.id) * 3 + 5);
+  const kind = POOL[Math.floor(r() * POOL.length)];
+  return {...node, kind, wasUnknown: true};
+}
+)};
+
+// Who is waiting at a node. Drawn from the corpus by SIZE, not by rating: the run's
+// difficulty curve is "how much ship is pointed at you", and the corpus ratings are
+// from a different game's matchmaking. Armed designs only -- an unarmed hull cannot
+// end an elimination match and would hand every duel to the player on the clock.
+const _encounterFoe = function _encounterFoe(CORPUS, TYPES, TYPE_ALIAS, RELICS, ENCOUNTER_RULES, encRng, hashId, partsOf){return(
+(node, camp, {pool = null} = {}) => {
+  const R = ENCOUNTER_RULES[node.kind] ?? {};
+  const band = 5 + (node.col ?? 0) * 2 + (R.band ?? 0);
+  const GUN = /Lazer|Laser|Explosive|Orb|Turret/i;
+  const rows = pool ?? Object.entries(CORPUS.ships)
+    .filter(([, s]) => !s.components.some(c => { const t = TYPE_ALIAS(c.type);
+                                                return !TYPES[t] && !RELICS[t]; }))
+    .map(([id, s]) => { const P = partsOf(s);
+      const n = Object.values(P).reduce((a, b) => a + b, 0);
+      return {id, spec: s, parts: n,
+              armed: Object.keys(P).some(t => GUN.test(t))}; })
+    .filter(r => r.armed);
+  // nearest by size, then one of that neighbourhood at random -- a hard band edge
+  // makes every node in a column field the same three ships
+  const near = rows.slice().sort((a, b) =>
+    Math.abs(a.parts - band) - Math.abs(b.parts - band)).slice(0, 24);
+  const r = encRng(camp.seed * 7919 + hashId(node.id));
+  const pick = near[Math.floor(r() * near.length)] ?? rows[0];
+  return {id: pick.id, spec: pick.spec, parts: pick.parts, band, label: pick.id.slice(0, 8)};
+}
+)};
+
+// Spoils. Scrap is the node's posted rate; the part roll is one item weighted to the
+// cheap end, because a run that hands out a LaserTurret2 on the first duel has no
+// curve left. A loss pays nothing -- that is the whole tension of the inventory.
+const _encounterSpoils = function _encounterSpoils(ENCOUNTER_RULES, PART_COST, encRng, hashId){return(
+(node, verdict, camp) => {
+  if (verdict !== "win") return {scrap: 0, parts: {}};
+  const R = ENCOUNTER_RULES[node.kind] ?? {scrap: 20};
+  // A node that posts no reward pays none. Without this a SHOP -- which this module
+  // resolves as a stop, not a transaction -- handed out a free part every visit.
+  if (!R.scrap) return {scrap: 0, parts: {}};
+  const r = encRng(camp.seed * 31 + hashId(node.id) * 7 + 11);
+  const bag = Object.keys(PART_COST).filter(t => PART_COST[t] > 0);
+  const weight = (t) => 1 / Math.max(5, PART_COST[t]);
+  const total = bag.reduce((a, t) => a + weight(t), 0);
+  let x = r() * total, got = bag[0];
+  for (const t of bag) { x -= weight(t); if (x <= 0) { got = t; break; } }
+  return {scrap: R.scrap ?? 20, parts: {[got]: 1}};
+}
+)};
+
+// After the battle the hull IS the survivors. This is what makes a REFIT node worth
+// a stop and what makes the inventory consistent across the run: parts shot off are
+// not in the hold either, they are gone.
+const _survivingHull = function _survivingHull(specOfShip){return(
+(ship, name = "hull") => specOfShip(ship, name)
+)};
+
+const _applySpoils = function _applySpoils(encounterSpoils){return(
+(camp, node, verdict, ship = null) => {
+  const s = encounterSpoils(node, verdict, camp);
+  const parts = {...camp.parts};
+  for (const [t, n] of Object.entries(s.parts)) parts[t] = (parts[t] ?? 0) + n;
+  return {...camp,
+    scrap: camp.scrap + s.scrap, parts,
+    ship: ship ?? camp.ship,
+    visited: [...camp.visited, node.id], at: node.id,
+    over: verdict === "loss" ? "destroyed" : camp.over,
+    log: [...camp.log, {node: node.id, kind: node.kind, verdict, ...s}]};
+}
+)};
+
+// ---------------------------------------------------------------------------
+// Headless
+// ---------------------------------------------------------------------------
+
+// The whole node without a screen: same foe, same rules, same spoils. This is what a
+// test drives and what an AI opponent would call; encounterView is this plus pixels.
+const _runEncounter = function _runEncounter(runDuel, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode){return(
+(node0, camp, {control = "auto", seed = null} = {}) => {
+  const node = resolveNode(node0, camp);
+  const R = ENCOUNTER_RULES[node.kind] ?? {battle: false, scrap: 0};
+  if (!R.battle) return {verdict: "win", battle: null, foe: null,
+                         campaign: applySpoils(camp, node, "win")};
+  const foe = encounterFoe(node, camp);
+  const r = runDuel({
+    mode: R.mode, limit: R.limit, seed: seed ?? camp.seed,
+    a: {spec: camp.ship, control}, b: {spec: foe.spec},
+    placement: {separation: R.sep, bearing: 25}
+  });
+  const verdict = r.winner === "a" ? "win" : r.winner === "b" ? "loss" : "draw";
+  const hull = verdict === "loss" ? camp.ship
+             : survivingHull(r.duel.a, camp.ship.name ?? "hull");
+  return {verdict, foe, battle: r, campaign: applySpoils(camp, node, verdict, hull)};
+}
+)};
+
+// ---------------------------------------------------------------------------
+// Manual piloting
+// ---------------------------------------------------------------------------
+
+// The input half of `control: "human"`, which corepox-duel declares but gives a view
+// no way to drive. WASD writes a drive command, a click writes a waypoint, and the
+// two are exclusive -- pressing a key clears the waypoint, because a ship obeying
+// both at once reads as a ship ignoring you.
+//
+// Keys are taken on the WINDOW, not the board, so the player does not have to click
+// the battle first; the guard is a focused input, which is what makes a select or a
+// text field usable on the same page.
+const _humanControl = function _humanControl(){return(
+(host, D, side = "a") => {
+  const DRIVE = {w: [1, 0], s: [-1, 0], a: [0, -1], d: [0, 1]};
+  const held = new Set();
+  const cmd = () => D.cmd[side];
+  const typing = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? "");
+  const apply = () => {
+    let thrust = 0, yaw = 0;
+    for (const k of held) { thrust += DRIVE[k][0]; yaw += DRIVE[k][1]; }
+    const c = cmd();
+    c.drive = (thrust || yaw) ? {thrust: Math.max(-1, Math.min(1, thrust)),
+                                yaw: Math.max(-1, Math.min(1, yaw))} : null;
+    if (c.drive) { c.target = null; c.face = null; }
+  };
+  const key = (down) => (ev) => {
+    if (typing()) return;
+    const k = ev.key.toLowerCase();
+    if (k === " ") { cmd().fire = down; ev.preventDefault(); return; }
+    if (!DRIVE[k]) return;
+    ev.preventDefault();
+    down ? held.add(k) : held.delete(k);
+    apply();
+  };
+  const kd = key(true), ku = key(false);
+  const blur = () => { held.clear(); apply(); cmd().fire = false; };
+  addEventListener("keydown", kd); addEventListener("keyup", ku);
+  addEventListener("blur", blur);
+  const svg = host.view?.svg;
+  const point = (ev) => {
+    if (!host.view) return;
+    held.clear();
+    const c = cmd();
+    c.drive = null;
+    c.target = host.view.tileAt(ev);       // the view's own map, never re-derived
+    c.face = null;
+  };
+  svg?.addEventListener("pointerdown", point);
+  return {stop: () => { removeEventListener("keydown", kd); removeEventListener("keyup", ku);
+                        removeEventListener("blur", blur); svg?.removeEventListener("pointerdown", point);
+                        blur(); },
+          held};
+}
+)};
+
+// ---------------------------------------------------------------------------
+// Views
+// ---------------------------------------------------------------------------
+
+const _encCss = function _encCss(){return(
+`font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2`
+)};
+
+const _encChip = function _encChip(htl){return(
+(label, n, tone = "#8b9bb0") => htl.html`<span style="display:inline-flex;gap:6px;
+  align-items:center;padding:2px 8px;border-radius:999px;border:1px solid ${tone}44;
+  background:${tone}14;color:${tone};font:11.5px ui-monospace,monospace">${label}<b
+  style="font-weight:700">${n}</b></span>`
+)};
+
+// The refit bench. shipEditor does the building; this reconciles what came out of it
+// against the hold and refuses an overdraft by reloading the last affordable design,
+// which is the only way to say no to an editor that does not know about counts.
+const _refitBench = function _refitBench(shipEditor, refitCheck, applyRefit, encChip, encCss, TYPES, htl){return(
+(camp, {onCommit, height = 380, span = 16} = {}) => {
+  let state = camp, last = structuredClone(camp.ship);
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px;${encCss}"></div>`;
+  const hold = htl.html`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>`;
+  const warn = htl.html`<div style="min-height:18px;color:#ff8a8a;font:11.5px ui-monospace,monospace"></div>`;
+  const host = htl.html`<div></div>`;
+  const foot = htl.html`<div style="display:flex;gap:8px;align-items:center"></div>`;
+  root.append(hold, host, warn, foot);
+
+  const ed = shipEditor(camp.ship, {name: camp.ship.name ?? "hull", height, span,
+    types: Object.keys(TYPES).filter(t => t !== "Composite")});
+  host.append(ed);
+
+  const paint = () => {
+    const c = refitCheck(state, ed.value);
+    hold.replaceChildren(
+      htl.html`<span style="color:#5b6b7d">HOLD</span>`,
+      encChip("scrap", state.scrap, "#ffc42e"),
+      ...Object.entries(c.ok ? c.hold : state.parts).sort()
+        .map(([t, n]) => encChip(t, n, "#7fd4ff")),
+      ...(Object.keys(c.ok ? c.hold : state.parts).length ? []
+          : [htl.html`<span style="color:#5b6b7d">empty</span>`]));
+    warn.textContent = c.ok ? ""
+      : "short " + Object.entries(c.short).map(([t, n]) => `${t} x${n}`).join(", ") +
+        " — reverted to the last design you can afford";
+  };
+  ed.addEventListener("input", () => {
+    const c = refitCheck(state, ed.value);
+    if (!c.ok) { paint(); ed.load(last); return; }   // the overdraft never commits
+    last = structuredClone(ed.value);
+    paint();
+    root.value = ed.value;
+    root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
+  });
+
+  const btn = (label, hue, click) => htl.html`<button onclick=${click} style="
+    font:12px ui-monospace,monospace;padding:5px 14px;border-radius:4px;cursor:pointer;
+    border:1px solid ${hue};background:${hue}22;color:${hue}">${label}</button>`;
+  foot.append(
+    btn("LAUNCH ▶", "#8ef0c0", () => onCommit?.(applyRefit(state, ed.value))),
+    btn("revert", "#5b6b7d", () => { ed.load(camp.ship); last = structuredClone(camp.ship); paint(); }));
+  paint();
+  root.value = ed.value;
+  return Object.assign(root, {editor: ed, campaign: () => state});
+}
+)};
+
+// The node, end to end. Three phases in one element, because the run's state has to
+// survive the transitions and a caller that had to re-mount between them would lose
+// it. `onDone` gets the campaign the run continues with.
+const _encounterView = function _encounterView(refitBench, duelView, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode, humanControl, encChip, encCss, htl, invalidation){return(
+(node0, camp, {onDone, height = 460, control = "human"} = {}) => {
+  const node = resolveNode(node0, camp);
+  const root = htl.html`<div style="display:flex;flex-direction:column;gap:10px;${encCss}"></div>`;
+  const head = htl.html`<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"></div>`;
+  const body = htl.html`<div></div>`;
+  root.append(head, body);
+  let live = null, human = null, mode = control;
+  invalidation.then(() => { live?.stop?.(); human?.stop?.(); });
+
+  const R = ENCOUNTER_RULES[node.kind] ?? {battle: false, scrap: 0};
+  // Each phase is a different height, so a scroller left where the last one put it
+  // opens the next one part-way down. Reset the HOST's scroll, not the page's.
+  const title = (phase) => (root.parentElement && (root.parentElement.scrollTop = 0),
+    head.replaceChildren(
+    htl.html`<b style="letter-spacing:.12em;color:#e8ecf5">${
+      (node.wasUnknown ? "unknown → " + node.kind : node.name ?? node.kind).toUpperCase()}</b>`,
+    htl.html`<span style="color:#5b6b7d">${phase}</span>`,
+    encChip("scrap", camp.scrap, "#ffc42e")));
+
+  const refit = () => {
+    title("refit — spend the hold, then launch");
+    const bench = refitBench(camp, {onCommit: (next) => { camp = next; battle(); }});
+    body.replaceChildren(bench);
+  };
+
+  const battle = () => {
+    if (!R.battle) return done("win", camp.ship);
+    const foe = encounterFoe(node, camp);
+    title(`battle — ${R.mode} vs ${foe.label} (${foe.parts} parts)`);
+    const pickCtl = htl.html`<select onchange=${(e) => { e.target.blur(); mode = e.target.value; battle(); }}
+      style="background:#0d1117;color:#dbe6f2;border:1px solid #2a3646;border-radius:4px;
+      padding:3px 6px;font:inherit">${["human", "auto", "wired"].map(m =>
+        htl.html`<option value=${m} selected=${m === mode}>${m}</option>`)}</select>`;
+    head.append(pickCtl);
+    live?.stop?.(); human?.stop?.();
+    const v = duelView({
+      mode: R.mode, limit: R.limit, seed: camp.seed,
+      a: {spec: camp.ship, control: mode}, b: {spec: foe.spec},
+      placement: {separation: R.sep, bearing: 25}
+    }, {height, onEnd: (out, D) => {
+      human?.stop?.();
+      const verdict = out === "a" ? "win" : out === "b" ? "loss" : "draw";
+      done(verdict, verdict === "loss" ? camp.ship
+                  : survivingHull(D.a, camp.ship.name ?? "hull"));
+    }});
+    live = v; human = mode === "human" ? humanControl(v, v.duel, "a") : null;
+    body.replaceChildren(v,
+      htl.html`<div style="margin-top:6px;color:#5b6b7d;font:11.5px ui-monospace,monospace">${
+        mode === "human" ? "WASD to fly · space to shoot · click the board for a waypoint"
+                         : mode === "auto" ? "the robot pilot has it" : "the ship runs its own wiring"}</div>`);
+  };
+
+  const done = (verdict, hull) => {
+    camp = applySpoils(camp, node, verdict, hull);
+    const s = camp.log[camp.log.length - 1];
+    title(verdict === "win" ? "spoils" : verdict === "loss" ? "destroyed" : "stalemate");
+    body.replaceChildren(htl.html`<div style="display:flex;flex-direction:column;gap:8px;
+      padding:14px;border:1px solid #26364a;border-radius:8px;background:#0a0f18">
+      <div style="color:${verdict === "win" ? "#8ef0c0" : verdict === "loss" ? "#ff6b6b" : "#ffc42e"};
+        font:700 13px ui-monospace,monospace;letter-spacing:.1em">${verdict.toUpperCase()}</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">${[
+        encChip("scrap", "+" + s.scrap, "#ffc42e"),
+        ...Object.entries(s.parts).map(([t, n]) => encChip(t, "+" + n, "#7fd4ff")),
+        encChip("hull", (camp.ship.components ?? []).length + " parts", "#8b9bb0")]}</div>
+      <div style="color:#5b6b7d">${verdict === "loss"
+        ? "the hull is gone and so is the run"
+        : "the hull you leave with is the one that survived"}</div></div>`);
+    root.value = camp;
+    root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
+    onDone?.(camp, verdict);
+  };
+
+  refit();
+  root.value = camp;
+  return Object.assign(root, {campaign: () => camp, stop: () => { live?.stop?.(); human?.stop?.(); }});
+}
+)};
+
+const _viewof_encounterDemo = function _viewof_encounterDemo(SHIPS, newCampaign, encounterView, htl){
+  const node = {id: "n2-1", kind: "duel", col: 2, name: "DUEL"};
+  const root = htl.html`<div></div>`;
+  const camp = newCampaign({seed: 7, ship: SHIPS.wiredCore, scrap: 214,
+                            parts: {Engine: 3, Lazer: 2, Armour: 4, Constant: 2, Radar: 1}});
+  const v = encounterView(node, camp, {control: "human",
+    onDone: (c) => { root.value = c; root.dispatchEvent(new CustomEvent("input", {bubbles: true})); }});
+  root.append(v);
+  root.value = camp;
+  return root;
+};
+const _encounterDemo = (G, _) => G.input(_);
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  for (const m of ["corepox-engine", "corepox-render", "corepox-shipyard",
+                   "corepox-missions", "corepox-duel"])
+    main.define("module @tomlarkworthy/" + m,
+      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
+  for (const n of ["Ship", "World", "geom", "DT", "TYPES", "TYPE_ALIAS", "RELICS", "loadShipSpec"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["shipEditor", "specOfShip", "CORPUS"])
+    main.define(n, ["module @tomlarkworthy/corepox-shipyard", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["runDuel", "duelView", "newDuel", "stepDuel"])
+    main.define(n, ["module @tomlarkworthy/corepox-duel", "@variable"], (_, v) => v.import(n, _));
+  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
+    (_, v) => v.import("SHIPS", _));
+
+  $def("_title", "title", ["md"], _title);
+  $def("_PART_COST", "PART_COST", [], _PART_COST);
+  $def("_partsOf", "partsOf", ["TYPE_ALIAS","RELICS"], _partsOf);
+  $def("_newCampaign", "newCampaign", [], _newCampaign);
+  $def("_refitCheck", "refitCheck", ["partsOf"], _refitCheck);
+  $def("_applyRefit", "applyRefit", ["refitCheck"], _applyRefit);
+  $def("_newRunCampaign", "newRunCampaign", ["SHIPS","newCampaign"], _newRunCampaign);
+  $def("_ENCOUNTER_RULES", "ENCOUNTER_RULES", [], _ENCOUNTER_RULES);
+  $def("_encRng", "encRng", [], _encRng);
+  $def("_hashId", "hashId", [], _hashId);
+  $def("_resolveNode", "resolveNode", ["encRng","hashId"], _resolveNode);
+  $def("_encounterFoe", "encounterFoe",
+       ["CORPUS","TYPES","TYPE_ALIAS","RELICS","ENCOUNTER_RULES","encRng","hashId","partsOf"], _encounterFoe);
+  $def("_encounterSpoils", "encounterSpoils", ["ENCOUNTER_RULES","PART_COST","encRng","hashId"], _encounterSpoils);
+  $def("_survivingHull", "survivingHull", ["specOfShip"], _survivingHull);
+  $def("_applySpoils", "applySpoils", ["encounterSpoils"], _applySpoils);
+  $def("_runEncounter", "runEncounter",
+       ["runDuel","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull","resolveNode"], _runEncounter);
+  $def("_humanControl", "humanControl", [], _humanControl);
+  $def("_encCss", "encCss", [], _encCss);
+  $def("_encChip", "encChip", ["htl"], _encChip);
+  $def("_refitBench", "refitBench",
+       ["shipEditor","refitCheck","applyRefit","encChip","encCss","TYPES","htl"], _refitBench);
+  $def("_encounterView", "encounterView",
+       ["refitBench","duelView","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull",
+        "resolveNode","humanControl","encChip","encCss","htl","invalidation"], _encounterView);
+  main.variable(observer("viewof encounterDemo")).define("viewof encounterDemo",
+    ["SHIPS","newCampaign","encounterView","htl"], _viewof_encounterDemo).pid = "_viewof_encounterDemo";
+  main.variable(observer("encounterDemo")).define("encounterDemo",
+    ["Generators","viewof encounterDemo"], _encounterDemo).pid = "_encounterDemo";
   return main;
 }</script>
 
@@ -5673,7 +6219,8 @@ export default function define(runtime, observer) {
     "@tomlarkworthy/corepox-lab",
     "@tomlarkworthy/corepox-backdrops",
     "@tomlarkworthy/corepox-map",
-    "@tomlarkworthy/corepox-duel"
+    "@tomlarkworthy/corepox-duel",
+    "@tomlarkworthy/corepox-duel-encounter"
   ],
   "hash": "#view=R100(S70(@tomlarkworthy/corepox-game),S30(@tomlarkworthy/claude-code-pairing))",
   "headless": true,
@@ -7077,11 +7624,21 @@ const _shipSource = function _shipSource(){return(
 //     span           // how many tiles across the camera holds at minimum
 //   })
 const _shipEditor = function _shipEditor(
-    Ship, World, TYPES, battlefield, TILE, portsOfShip, specOfShip, htl, invalidation){return(
+    Ship, World, TYPES, battlefield, TILE, portsOfShip, specOfShip, loadShipSpec,
+    htl, invalidation){return(
 (spec0, {name = "ship", types = null, height = 420, span = 14} = {}) => {
   const PALETTE = types ?? Object.keys(TYPES).filter(t => t !== "Composite");
-  let ship = new Ship(structuredClone(spec0 ?? {name, components: [], connections: []}),
-                      {team: "player", x: 0, y: 0, a: 0});
+  // Every spec entering the editor goes through the loader, never straight to
+  // `new Ship`. Corpus designs are the reason: they NAME relics rather than
+  // carrying them (`LazerHardpoint` is 10 parts, not 1) and they address wires by
+  // CELL, while `Ship.at` matches the anchor only -- so an unloaded corpus design
+  // arrives with parts missing and wires silently dropped. `loadShipSpec` is
+  // idempotent, so an already-anchored mission spec is unaffected.
+  // Round-trip cost, stated where it bites: `specOfShip` writes back what is on
+  // the board, so a spliced relic saves as its parts and loses its name.
+  const load1 = (raw) => loadShipSpec(structuredClone(
+    raw ?? {name, components: [], connections: []})).spec;
+  let ship = new Ship(load1(spec0), {team: "player", x: 0, y: 0, a: 0});
   const world = new World([ship]);
   let mode = "build", picked = PALETTE[0], wireFrom = null, selected = null;
 
@@ -7302,41 +7859,50 @@ const _shipEditor = function _shipEditor(
     qa: {tileToView, localTile, ship: () => ship, mode: () => mode, svg: () => view.svg,
          ports: () => portsOfShip(ship).map(q => ({kind: q.kind, name: q.name,
                         px: q.px, py: q.py, type: q.c.type, anchor: q.anchor}))},
-    load: (spec) => { const s = structuredClone(spec);
+    load: (spec) => { const s = load1(spec);
                       rebuild(s.components ?? [], s.connections ?? []); }
   });
 }
 )};
 
-const _viewof_shipDesign = function _viewof_shipDesign(SHIPS, shipEditor, htl){
-  const names = Object.keys(SHIPS);
+const _viewof_shipDesign = function _viewof_shipDesign(shipRoster, shipEditor, htl){
+  const first = shipRoster.groups[0].items[0];
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:8px"></div>`;
   const pick = htl.html`<div style="display:flex;gap:8px;align-items:center;
     font:12px ui-monospace,monospace;color:#8b9bb0"></div>`;
   const host = htl.html`<div></div>`;
   root.append(pick, host);
-  const ed = shipEditor(SHIPS[names[0]], {name: names[0], span: 14});
+  const ed = shipEditor(first.spec, {name: first.label, span: 14});
   ed.addEventListener("input", () => {
     root.value = ed.value;
     root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
   });
   host.append(ed);
+  // The whole roster, not just the handful of authored ships: 2187 corpus designs
+  // sit under the mission ships in their own optgroup, sorted by matches played.
+  // A <select> rather than the arena's search box because a browser types-to-search
+  // inside an <optgroup> for free, and the duel already picks this way -- one
+  // widget, one label format, so a design has one name across the notebook.
+  // The 4 designs that name DevouringLove are absent: they cannot be built.
   pick.append(htl.html`<span>start from</span>`,
     htl.html`<select onchange=${(e) => {
-      ed.load(e.target.value === "" ? {components: [], connections: []} : SHIPS[e.target.value]);
+      const r = shipRoster.byKey.get(e.target.value);
+      ed.load(r ? r.spec : {components: [], connections: []});
     }} style="font:12px ui-monospace,monospace;background:#0d1420;color:#8b9bb0;
-      border:1px solid #26364a;border-radius:4px;padding:4px 6px">${
-      // One array, not a literal <option> after an interpolated list: htl appends
+      border:1px solid #26364a;border-radius:4px;padding:4px 6px;max-width:26em">${
+      // ONE array, never a literal <option> after an interpolated list: htl appends
       // interpolated nodes after the parsed markup, so a trailing literal option
       // came FIRST in the DOM and the board showed manualAim while the select
       // read "— empty —".
-      [...names, ""].map(n => htl.html`<option value=${n} selected=${n === names[0]}>${
-        n || "— empty —"}</option>`)}</select>`);
+      [...shipRoster.groups.map(g => htl.html`<optgroup label=${g.label}>${
+         g.items.map(e => htl.html`<option value=${e.key} selected=${e.key === first.key}
+           >${e.label}</option>`)}</optgroup>`),
+       htl.html`<option value="">— empty —</option>`]}</select>`);
   root.value = ed.value;
   // The editor's tile map, handed up. A test that drives this view must click the
   // cell the board is painted with, and re-deriving that map in the test is a copy
   // that drifts (tools/corepox-shipyard-shot.ts).
-  return Object.assign(root, {qa: ed.qa, editor: ed});
+  return Object.assign(root, {qa: ed.qa, editor: ed, roster: shipRoster});
 };
 
 const _shipDesignSource = function _shipDesignSource(shipDesign, shipSource, htl){return(
@@ -7406,6 +7972,68 @@ const _CORPUS = async function _CORPUS(corpusGz,FileAttachment,unpackCorpus)
 // was 1755 of 2191 before the relic table). Checking the type table is cheap;
 // constructing 2191 ships at boot to find out is not, so the row carries the
 // reason and a picker can say so before the person picks it.
+// The corpus is the roster, and it is the SAME roster the duel and the shipyard
+// pick from -- it lives here because CORPUS does. Moved out of corepox-duel
+// 2026-08-21 rather than copied: two pickers over 2191 designs that label them
+// differently is how "which ship is that" stops having one answer.
+//
+// The corpus is the roster. 2191 designs were exported from the shipped game and
+// 2187 of them build in this engine; the 4 that do not name DevouringLove, a prefab
+// no extraction recovered (tools/corepox-corpus-load.ts, 2026-08-20 -- it was 1755
+// before RELICS taught the loader to splice a prefab a design only NAMES).
+// The picker labels a design by its ID, because the name does not identify one:
+// only 60 of the 2191 designs are called anything other than "Brain", the editor's
+// default (tools/scratch/cid-prefix.ts, 2026-08-21). Tom's reason is that the label
+// has to be sayable -- "hard to communicate what ship I am talking about as nearly
+// everything in CORPUS is called Brain".
+//
+// Eight characters is enough to be unique and short enough to read out: 2178 of the
+// ids are 32-hex, the other 13 are integers 0-12, and a 7-char prefix already
+// separates all 2191 (a 6-char one collides once). It is also what the lab already
+// prints. The rest of the label is shape and history -- parts / guns / engines, and
+// matches played, which is the sort: 20849 recorded matches means a ship people flew.
+const _shipRoster = function _shipRoster(SHIPS,CORPUS,TYPES,TYPE_ALIAS,RELICS,loadShipSpec){return(
+(() => {
+  const byKey = new Map(), groups = [];
+  const add = (label, items) => {
+    items.forEach(e => byKey.set(e.key, e));
+    groups.push({label: `${label} (${items.length})`, items});
+  };
+  add("missions", Object.entries(SHIPS).map(([name, spec]) => ({key: name, label: name, spec})));
+
+  const GUN = /Lazer|Laser|Explosive|Missile|Turret|Spike/i;
+  // Counted through the LOADER, not off the raw list and not through a private
+  // re-expansion of it: a design whose only component is a LazerHardpoint would
+  // otherwise read "1p 0g 0e" when what it builds is a turret, a radar and eight
+  // armour plates. A hand-rolled one-level relic expansion lived here until
+  // 2026-08-21 and was wrong on 464 of the 2187 designs -- it expanded RELICS but
+  // not Composite, whose sub-ship is inline in `param`, so 9B1960D9 read 20p and
+  // built 41 (tools/corepox-roster-probe.ts). loadShipSpec handles both, to a
+  // bounded depth, and it is what the board will actually run.
+  // Cost, since the count is computed at boot for all 2191: 25-39ms for the whole
+  // corpus over three passes (tools/scratch/roster-cost.ts, 2026-08-21). It is
+  // constructing 2191 *Ships* that is expensive, not loading the specs.
+  const parts = (s) => loadShipSpec(s).spec.components.map(c => c.type);
+  add("corpus, by matches played", Object.entries(CORPUS.ships)
+    .filter(([, s]) => !s.components.some(c => { const t = TYPE_ALIAS(c.type);
+                                               return !TYPES[t] && !RELICS[t]; }))
+    .map(([id, s]) => {
+      const P = parts(s);
+      return {id, spec: s, parts: P.length,
+              guns: P.filter(t => GUN.test(t)).length,
+              eng: P.filter(t => /Engine/i.test(t)).length,
+              matches: CORPUS.ratings[id]?.n ?? 0};
+    })
+    .sort((a, b) => b.matches - a.matches)
+    .map(r => ({
+      key: r.id, spec: r.spec,
+      label: `${r.id.slice(0, 8)} · ${r.parts}p ${r.guns}g ${r.eng}e · ${r.matches}m` +
+             (r.spec.name && r.spec.name !== "Brain" ? ` · ${r.spec.name}` : "")
+    })));
+  return {groups, byKey};
+})()
+)};
+
 const _corpusIndex = function _corpusIndex(CORPUS,TYPES,TYPE_ALIAS,RELICS){return(
 Object.entries(CORPUS.ships).map(([id, s]) => ({
   id, name: s.name || id,
@@ -7431,7 +8059,7 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-missions",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
-  for (const n of ["Ship", "World", "TYPES", "PORTS", "TYPE_ALIAS", "RELICS"])
+  for (const n of ["Ship", "World", "TYPES", "PORTS", "TYPE_ALIAS", "RELICS", "loadShipSpec"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
     (_, v) => v.import("battlefield", _));
@@ -7453,14 +8081,17 @@ export default function define(runtime, observer) {
   $def("_corpusGz", "corpusGz", ["Response","DecompressionStream"], _corpusGz);
   $def("_CORPUS", "CORPUS", ["corpusGz","FileAttachment","unpackCorpus"], _CORPUS);
   $def("_corpusIndex", "corpusIndex", ["CORPUS","TYPES","TYPE_ALIAS","RELICS"], _corpusIndex);
+  $def("_shipRoster", "shipRoster",
+       ["SHIPS","CORPUS","TYPES","TYPE_ALIAS","RELICS","loadShipSpec"], _shipRoster);
   $def("_portsOfShip", "portsOfShip", ["PORTS"], _portsOfShip);
   $def("_specOfShip", "specOfShip", [], _specOfShip);
   $def("_shipSource", "shipSource", [], _shipSource);
   $def("_shipEditor", "shipEditor",
-       ["Ship","World","TYPES","battlefield","TILE","portsOfShip","specOfShip","htl","invalidation"],
+       ["Ship","World","TYPES","battlefield","TILE","portsOfShip","specOfShip",
+        "loadShipSpec","htl","invalidation"],
        _shipEditor);
   main.variable(observer("viewof shipDesign")).define("viewof shipDesign",
-    ["SHIPS","shipEditor","htl"], _viewof_shipDesign).pid = "_viewof_shipDesign";
+    ["shipRoster","shipEditor","htl"], _viewof_shipDesign).pid = "_viewof_shipDesign";
   main.variable(observer("shipDesign")).define("shipDesign",
     ["Generators", "viewof shipDesign"], (G, _) => G.input(_)).pid = "_shipDesign";
   $def("_shipDesignSource", "shipDesignSource",
@@ -9539,7 +10170,15 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   api.moved = () => api.pan[0] !== 0 || api.pan[1] !== 0 || api.zoom !== 1;
 
   draw();
-  return Object.assign(api, {svg, draw});
+  // The screen -> tile map, from this view's own viewBox. Exposed because every
+  // caller that takes a pointer needs it and re-deriving it is a copy that drifts
+  // from `frame()` the moment zoom or follow moves the box.
+  const tileAt = (ev) => {
+    const r = svg.getBoundingClientRect(), vb = svg.viewBox.baseVal;
+    return [(vb.x + (ev.clientX - r.left) / r.width * vb.width) / TILE,
+            (vb.y + (ev.clientY - r.top) / r.height * vb.height) / TILE];
+  };
+  return Object.assign(api, {svg, draw, tileAt});
 }
 )};
 
@@ -10460,18 +11099,53 @@ const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
     // 18.6s against the old 41s. Constant at 100 here rather than 50: 70 takes 19.5s
     // and 50 takes 40.6s, the reverse of the old hull's ordering, because the engines
     // now sit asymmetrically and the ship arrives on a different arc.
+    // REBUILT AGAIN 2026-08-21, when component footprints became solid. The chain
+    // above no longer wins, and not for want of time: it survives, lands 37 beams,
+    // and settles into a 22-tile orbit of the Gun Boat where the parallax miss
+    // stops the shots landing. The Gun Boat sits at 125 of 320 hp from t=45s to
+    // t=210s and moves no further (tools/corepox-boss-trace.ts). Every beam now stops on the
+    // outer hull it reaches first instead of picking the component nearest the
+    // beam line, and both Spikes lead with an Orb, which `Descriptions.cs` says
+    // "blocks incoming lazer fire" -- so the shielding is the design working, not
+    // the port failing.
+    //
+    // corepox-boss-rebuild.ts re-ran under the new physics with a **buildability**
+    // filter it did not have before: the shipped UI places a part facing UP and
+    // rotates it afterwards, so a rotated part needs somewhere to sit in its
+    // up-facing footprint at the moment it goes down. That rules out 35,301 of
+    // 36,685 joint-bound layouts -- 96% -- and it is not academic: the search's
+    // first answer put LaserTurret2 at [-2,-2] facing left, whose up-facing
+    // footprint covers the mission's own Brain at (0,0) in every build order.
+    // corepox-qa-campaign.ts caught that by clicking ("no menu at -2,-2", 5/7
+    // parts) after the headless gate had passed it.
+    //
+    // Buildability is not the end of it. The best layout the filter allows -- turret
+    // [1,0], Binary [-2,-3] turned right, Engine [2,-1] turned right, a 39.8s win --
+    // places fine and then strands the UI: the wire into the turned Binary's `a`
+    // gets "no confirm", and every menu after that fails to open, so its Constant
+    // and Binary never get their values. So the search was re-run UPRIGHT=1, with
+    // every part facing up. Every joint-bound layout under that constraint is
+    // buildable, and exactly one of them wins. The rotated-build failure is a lead
+    // about the shipped connect flow, not about this mission; it is logged in
+    // plan/corepox-tasks.md.
+    //
+    // Re-solved once more the same day when BEAM_R came down from 0.75 to 0.25
+    // (see UNITS in corepox-engine): 16 upright layouts, one winner, 34.1s. Same
+    // radar, turret and Constant as the 0.75 answer; the Binary and both Engines
+    // move.
     solution: {components: [{type: "Brain", pos: [0, 0]},
-      {type: "LaserTurret2", pos: [0, 1]}, {type: "Radar", pos: [-2, -1]},
-      {type: "Constant", pos: [0, -1], param: "100"},
-      {type: "Binary", pos: [0, -2], param: "MINUS"},
-      {type: "Engine", pos: [-2, -2]}, {type: "Engine", pos: [1, -3]}],
+      {type: "Radar", pos: [-2, 0]},
+      {type: "LaserTurret2", pos: [1, 0]},
+      {type: "Constant", pos: [-2, -1], param: "100"},
+      {type: "Binary", pos: [0, -1], param: "MINUS"},
+      {type: "Engine", pos: [-2, -2]}, {type: "Engine", pos: [1, -2]}],
       connections: [
-        {from: [-2, -1], fromPort: "bearing", to: [0, 1], toPort: "angle"},
-        {from: [-2, -1], fromPort: "dist", to: [0, 1], toPort: "fire"},
-        {from: [-2, -1], fromPort: "bearing", to: [-2, -2], toPort: "in"},
-        {from: [-2, -1], fromPort: "bearing", to: [0, -2], toPort: "b"},
-        {from: [0, -1], fromPort: "out", to: [0, -2], toPort: "a"},
-        {from: [0, -2], fromPort: "out", to: [1, -3], toPort: "in"}]},
+        {from: [-2, 0], fromPort: "bearing", to: [1, 0], toPort: "angle"},
+        {from: [-2, 0], fromPort: "dist", to: [1, 0], toPort: "fire"},
+        {from: [-2, 0], fromPort: "bearing", to: [-2, -2], toPort: "in"},
+        {from: [-2, 0], fromPort: "bearing", to: [0, -1], toPort: "b"},
+        {from: [-2, -1], fromPort: "out", to: [0, -1], toPort: "a"},
+        {from: [0, -1], fromPort: "out", to: [1, -2], toPort: "in"}]},
     spoils: [{type: "Orb", n: 1}, {type: "Binary", n: 1}],
     span: 110
   },
@@ -15963,16 +16637,50 @@ const _UNITS = function _UNITS(){return(
   // which is the centre of the Orb's own 2x2 to within a rounding.
   ORB_R: 1.1 * 0.33 / 0.64, ORB_DMG: 5,
   // HIT_R is measured: a component occupies one tile, so its box has a half
-  // extent of 0.5. BEAM_R is NOT measured -- the beam's collider is a scaled
-  // sprite in a binary prefab (shaft.localScale = (length,1,1), length=100) and
-  // the same numbers read either as a 1-world-unit beam or a 0.01-unit one. It is
-  // CHOSEN, from the one hard constraint available: a radar->turret wire is what
-  // Aim teaches, what its LazerHardpoint spoil is built around, and what 454 of
-  // the 4621 corpus wires do -- and with a bare point beam that wire only lands
-  // inside +-5 degrees of dead ahead (tools/corepox-parallax.ts). A turret aims
-  // along the line from the RADAR but fires from its own cell, so it misses by a
-  // fixed 3 tiles * sin(off-axis) no matter the range. 0.75 opens that to +-25.
-  BEAM_R: 0.75,
+  // extent of 0.5.
+  //
+  // BEAM_R was 0.75 tiles from 2026-08-18 to 2026-08-21 and that was a CHOSEN
+  // number, defended by an argument that turned out to be false. The argument:
+  // a radar->turret wire aims from the radar and fires from the turret, so it
+  // misses by 3 tiles * sin(off-axis); a wide beam widens that window; Aim exists
+  // to teach that wire. Aim wins with the beam at 0.75, 0.5, 0.25, 0.1 and 0 --
+  // 26.8s to 27.6s, every arm (tools/corepox-play-missions.ts). The window the
+  // width buys is real (+-10 degrees at 0.75, dead ahead at 0.1, measured by
+  // corepox-parallax.ts against a HELD-STILL target) and the mission does not
+  // need it, because the rocket closes head on.
+  //
+  // What 0.75 did buy was a beam 2.5 tiles across, which damages whatever sits
+  // one tile to the SIDE of the barrel. Tom, 2026-08-21, on corpus ship
+  // FD96E630: "self intersects with its own radar and dies, but that seems like
+  // a collision bounds bug". It was not the Radar's bounds: its Lazer at [3,1]
+  // fires up the x=3 column and the Radar's cells at x=2 are 1.0 tile away,
+  // inside HIT_R + 0.75.
+  //
+  // The prefab is binary, but one number in it is not ambiguous. DamageBeam.Awake
+  // scales the shaft by (length, 1, 1) with length = 100 and puts the beam's tail
+  // at -length/100, i.e. ONE world unit back. So a sprite stretched 100x in x
+  // spans 1 world unit: the sprite is 0.01 world units long at unit scale. Its y
+  // is not scaled at all, so the WIDTH is that sprite's own height -- of the order
+  // of a hundredth of its length unless the texture is a hundred times taller than
+  // it is wide, which no beam texture is. That argues small, and it does not give
+  // a number.
+  //
+  // Two behavioural constraints bracket it, and they are the whole justification:
+  //
+  //   BEAM_R < 0.5   a beam must not damage the component one tile to the SIDE of
+  //                  the barrel. HIT_R + BEAM_R has to stay under 1.0 for that.
+  //                  (FD96E630 above.)
+  //   BEAM_R > ~0.1  TwinTurrets has to stay solvable with the parts it hands the
+  //                  player. tools/corepox-solve.ts searches its 140 legal builds:
+  //                  0 of 140 win at 0, 1 of 140 at 0.25, the same 1 at 0.4 and at
+  //                  0.75. So the level cares that the beam is not a line, and
+  //                  cares about nothing above 0.25.
+  //
+  // 0.25 is the bottom of that bracket. It is still a fitted number and it is
+  // still the first thing to check if the collider is ever recovered -- but it is
+  // fitted to two things the game has to do, not to one thing it turns out not to
+  // need.
+  BEAM_R: 0.25,
   HIT_R: 0.5                  // a component is one tile across
 }
 )};
@@ -16490,7 +17198,11 @@ class Ship {
         // is ship state, and the editor rebuilds the whole ship on every edit
         overrides: c.overrides, in: applyOverrides(c, T.ins), t: 0,
         tiles: T.tiles.map(t => { const [rx, ry] = rotTile(t, dir);
-                                  return [c.pos[0] + rx, c.pos[1] + ry]; })
+                                  return [c.pos[0] + rx, c.pos[1] + ry]; }),
+        // Half-extent of the footprint about the anchor, for broad phase: the
+        // furthest cell centre plus that cell's own half tile. Rotation does not
+        // change a distance, so it comes off the unrotated table.
+        rad: Math.max(...T.tiles.map(([tx, ty]) => Math.hypot(tx, ty))) + 0.5
       };
     });
     this.conns = (spec.connections ?? []).map(k => ({...k}));
@@ -16670,6 +17382,22 @@ class Ship {
     const lx = c.px - this.cx, ly = -(c.py - this.cy);
     const s = Math.sin(this.a * geom.D), k = Math.cos(this.a * geom.D);
     return [this.x + lx * k - ly * s, this.y + lx * s + ly * k];
+  }
+
+  // Every occupied cell of a component, in world coordinates. worldOf returns
+  // only the ANCHOR, so anything that tested worldOf against a single radius was
+  // modelling a six-cell Radar as one disc -- an enemy could sit in four of those
+  // six cells and in three of an Orb's four with nothing to stop it, measured in
+  // tools/corepox-hitbox.ts. The original never had this problem: components
+  // carry a BoxCollider2D or PolygonCollider2D covering the whole part
+  // (fx/Placement.cs:30), and contacts resolve back to a CELL
+  // (Ship.cs:581 worldToCoord(contact.point) -> isOccupied).
+  worldTiles(c) {
+    const s = Math.sin(this.a * geom.D), k = Math.cos(this.a * geom.D);
+    return c.tiles.map(([tx, ty]) => {
+      const lx = tx - this.cx, ly = -(ty - this.cy);
+      return [this.x + lx * k - ly * s, this.y + lx * s + ly * k];
+    });
   }
 
   // worldOf gives the component's ORIGIN tile; a sensor may read from somewhere
@@ -16938,6 +17666,13 @@ class World {
 
   fire(ship, c, a, {ttl = UNITS.BEAM_TTL, muzzle = UNITS.BEAM_MUZZLE} = {}) {
     const [ux, uy] = geom.unit(a);
+    // NOT offset by TYPES[c.type].pivot, though TurretFn's emitParticle argues it
+    // should be: it TransformPoints (0, 1.8) off `lazer`, the rotating barrel,
+    // whose transform sits at the pivot. Tried 2026-08-21. Half a tile of lateral
+    // bias is enough to break the two missions built around the radar-to-turret
+    // wire -- Aim goes from a 24.7s win to a 25.1s loss, TwinTurrets to a 10.5s
+    // loss -- which says the pivot value, the radar's sensor offset, or both are
+    // wrong, and that is its own investigation rather than a line in this one.
     const [cx, cy] = ship.worldOf(c);
     this.emit(ship, c, "beam", cx + ux * muzzle, cy + uy * muzzle,
               ux * UNITS.BEAM_SPEED, uy * UNITS.BEAM_SPEED,
@@ -16990,21 +17725,48 @@ class World {
         tx = x0 - b.vx / sp * UNITS.BEAM_LEN; ty = y0 - b.vy / sp * UNITS.BEAM_LEN;
       }
       const sx = b.x - tx, sy = b.y - ty, ss = sx * sx + sy * sy;
-      let hit = null, best = Infinity;
+      const R = UNITS.HIT_R + (b.kind === "beam" ? UNITS.BEAM_R : 0);
+      let hit = null, bestT = Infinity, bestD2 = Infinity;
       for (const s of this.ships) {
         if (!s.live.length) continue;
         const ddx = s.x - b.x, ddy = s.y - b.y;
         if (ddx * ddx + ddy * ddy > 2500) continue;                  // broad phase
         for (const c of s.live) {
           if (c === b.comp) continue;                    // never its own emitter
-          const [px, py] = s.worldOf(c);
-          let t = ss ? ((px - tx) * sx + (py - ty) * sy) / ss : 0;
-          t = t < 0 ? 0 : t > 1 ? 1 : t;
-          const qx = tx + sx * t - px, qy = ty + sy * t - py;
-          const d2 = qx * qx + qy * qy;
-          const R = UNITS.HIT_R + (b.kind === "beam" ? UNITS.BEAM_R : 0);
-          if (d2 > R * R || d2 >= best) continue;
-          best = d2; hit = {s, c, px, py};
+          const [cx0, cy0] = s.worldOf(c);               // component broad phase
+          let ct = ss ? ((cx0 - tx) * sx + (cy0 - ty) * sy) / ss : 0;
+          ct = ct < 0 ? 0 : ct > 1 ? 1 : ct;
+          const cqx = tx + sx * ct - cx0, cqy = ty + sy * ct - cy0;
+          const rr = c.rad + R;
+          if (cqx * cqx + cqy * cqy > rr * rr) continue;
+          for (const [px, py] of s.worldTiles(c)) {
+            // Where the swept point ENTERS this cell's disc. The test used to be
+            // "closest approach to the component's anchor, nearest wins", which
+            // shot through hulls: a beam running down a Radar's outer cell column
+            // passes 1.0 tiles from the Radar's anchor and 0.0 from a Brain
+            // sheltering behind it, so the Brain took the shot
+            // (tools/corepox-hitbox.ts). The original cannot do that -- a beam is
+            // a physics trigger and damages the first collider it enters
+            // (behaviour/DamageBeam.cs:59).
+            const fx = tx - px, fy = ty - py;
+            const bq = fx * sx + fy * sy, cq = fx * fx + fy * fy - R * R;
+            let t0;
+            if (cq <= 0) t0 = 0;                         // the segment starts inside
+            else if (!ss) continue;                      // stationary, and outside
+            else {
+              const disc = bq * bq - ss * cq;
+              if (disc < 0) continue;                    // misses the cell entirely
+              t0 = (-bq - Math.sqrt(disc)) / ss;
+              if (t0 < 0 || t0 > 1) continue;            // not within this tick's travel
+            }
+            // Several cells can share an entry of 0 -- that is the case where the
+            // segment starts inside them, which is what a muzzle buried in its own
+            // hull looks like. Break the tie on distance rather than on whichever
+            // component happens to be listed first.
+            const gx = fx + sx * t0, gy = fy + sy * t0, d2 = gx * gx + gy * gy;
+            if (t0 > bestT || (t0 === bestT && d2 >= bestD2)) continue;
+            bestT = t0; bestD2 = d2; hit = {s, c, px: tx + sx * t0, py: ty + sy * t0};
+          }
         }
       }
       if (hit) {
@@ -17027,29 +17789,58 @@ class World {
       const A = live[i], B = live[j];
       const dx = B.x - A.x, dy = B.y - A.y;
       if (dx*dx + dy*dy > 900) continue;                       // broad phase
-      for (const ca of A.live) for (const cb of B.live) {
-        const [ax, ay] = A.worldOf(ca), [bx, by] = B.worldOf(cb);
+      // Damage is per component pair, the way Ship.OnCollisionStay2D damages the
+      // cell under every contact point. The IMPULSE is not: Unity resolves one
+      // collision between two rigid bodies however many colliders touch, and
+      // applying a full impulse and a full depenetration per pair multiplies both
+      // by the contact area -- which is what happens the moment footprints stop
+      // being single points and a flush hull registers six pairs instead of one.
+      let deep = null;
+      for (const ca of A.live) {
+       const [cax, cay] = A.worldOf(ca), ta = A.worldTiles(ca);
+       for (const cb of B.live) {
+        const [cbx, cby] = B.worldOf(cb);
+        const rr = ca.rad + cb.rad;                            // component broad phase
+        if ((cbx - cax) ** 2 + (cby - cay) ** 2 > rr * rr) continue;
+        // The CLOSEST pair of CELLS. Testing the two ANCHORS instead was the bug:
+        // a Radar is six cells and an Orb four, so most of both was empty space --
+        // tools/corepox-hitbox.ts measured 4 of 6 and 2 of 4 as passable.
+        let bd = Infinity, ax = 0, ay = 0, bx = 0, by = 0;
+        for (const [px, py] of ta) for (const [qx, qy] of B.worldTiles(cb)) {
+          const dd = (qx - px) ** 2 + (qy - py) ** 2;
+          if (dd < bd) { bd = dd; ax = px; ay = py; bx = qx; by = qy; }
+        }
+        const d = Math.sqrt(bd);
+        if (d > 1) continue;                                   // two unit cells, r 0.5 each
         let nx = bx - ax, ny = by - ay;
-        const d = Math.hypot(nx, ny);
-        if (d > 1 || d === 0) continue;                        // one tile across
-        nx /= d; ny /= d;
+        if (d === 0) {
+          // Dead-centre cells have no contact normal to read off. `continue`ing
+          // on that case is why EVERY anchor cell measured as passable: the probe
+          // parks the intruder exactly on a cell centre. Push along the line of
+          // ship centres instead.
+          const cd = Math.hypot(dx, dy);
+          nx = cd ? dx / cd : 1; ny = cd ? dy / cd : 0;
+        } else { nx /= d; ny /= d; }
         const [avx, avy] = A.velAt(ax, ay), [bvx, bvy] = B.velAt(bx, by);
         const rel = (bvx - avx) * nx + (bvy - avy) * ny;
         if (rel > 0) continue;                                 // separating
-        const mA = 1 / A.mass, mB = 1 / B.mass;
-        const jmag = -(1 + 0.2) * rel / (mA + mB);             // restitution 0.2
-        A.force(ax, ay, -nx * jmag / DT, -ny * jmag / DT);
-        B.force(bx, by,  nx * jmag / DT,  ny * jmag / DT);
         // Ship.OnCollisionStay2D: a flat 5 to the cell under each contact point,
         // EVERY frame the two stay in contact -- 250 dmg/s, not an impulse. It is
         // why a rocket that reaches you is fatal and why armour (100hp, 0.4s of
         // contact) buys time rather than immunity. The old impulse model
         // (jmag * 2) was invented and read as a much softer bump.
         A.damage(ca, UNITS.RAM_DMG); B.damage(cb, UNITS.RAM_DMG);
-        const push = (1 - d) * 0.5;                            // depenetrate
-        A.x -= nx * push; A.y -= ny * push;
-        B.x += nx * push; B.y += ny * push;
+        if (!deep || d < deep.d) deep = {d, nx, ny, ax, ay, bx, by, rel};
+       }
       }
+      if (!deep) continue;
+      const mA = 1 / A.mass, mB = 1 / B.mass;
+      const jmag = -(1 + 0.2) * deep.rel / (mA + mB);          // restitution 0.2
+      A.force(deep.ax, deep.ay, -deep.nx * jmag / DT, -deep.ny * jmag / DT);
+      B.force(deep.bx, deep.by,  deep.nx * jmag / DT,  deep.ny * jmag / DT);
+      const push = (1 - deep.d) * 0.5;                         // depenetrate
+      A.x -= deep.nx * push; A.y -= deep.ny * push;
+      B.x += deep.nx * push; B.y += deep.ny * push;
     }
   }
 
@@ -17088,26 +17879,35 @@ class World {
     // overlapping an enemy" -- an enemy against the far corner sat 1.4 tiles from
     // the origin tile and so outside the old test entirely.
     //
-    // Targets are modelled the way the particle path models them (one HIT_R disc at
-    // the component's origin tile), so a beam and an Orb agree about what they are
-    // touching.
+    // BOTH sides are modelled as an HIT_R disc on every occupied CELL, the same
+    // way the particle path and collide() model them. Measuring ORB_R from ONE
+    // point -- the centroid of the 2x2 -- is a radius of 1.067 tiles about a
+    // square whose own cell centres are already 0.707 out, so it stops 0.36 tiles
+    // short of its own edge. That was survivable only while hulls could
+    // interpenetrate: once footprints are solid, contact happens at a cell
+    // separation of 1.0 and a centre-measured Orb can never reach anything at all
+    // (tools/corepox-ram.ts: Orb into a Brain, both untouched, gap 2.01). Per
+    // cell, the reach is 1.067 from a cell centre against contact at 1.0 -- which
+    // is what "touching" means, and what MeleeFn's damageArea.GetContacts returns.
     for (const s of this.ships) {
       if (!s.live.length) continue;
       for (const c of s.live) {
         if (c.type !== "Orb") continue;
-        // c.tiles are absolute ship cells and already rotated by c.dir, so their
-        // centroid is the trigger's cell whichever way the Orb is turned.
-        const n = c.tiles.length;
-        const [ox, oy] = s.worldOf({
-          px: c.tiles.reduce((a, t) => a + t[0], 0) / n,
-          py: c.tiles.reduce((a, t) => a + t[1], 0) / n});
+        const mine = s.worldTiles(c);
         const R = UNITS.ORB_R + UNITS.HIT_R;
+        // NOT a team check. MeleeFn has none -- it damages every ShipComponent the
+        // trigger touches. What it cannot touch is its OWN ship: every component
+        // of a ship shares one Rigidbody2D, and Unity generates no contacts
+        // between colliders on the same body. So the exemption is the ship, and a
+        // friendly that drifts into your Orb takes 5 a tick like anyone else.
+        // Tom, 2026-08-21: "perhaps a component from the same team does not
+        // collide? That seems wrong as well".
         for (const e of this.ships) {
-          if (e.team === s.team || !e.live.length) continue;
-          for (const t of e.live) {
-            const [px, py] = e.worldOf(t);
-            if ((px - ox) ** 2 + (py - oy) ** 2 <= R * R) e.damage(t, UNITS.ORB_DMG);
-          }
+          if (e === s || !e.live.length) continue;
+          for (const t of e.live)
+            if (e.worldTiles(t).some(([px, py]) =>
+                  mine.some(([ox, oy]) => (px - ox) ** 2 + (py - oy) ** 2 <= R * R)))
+              e.damage(t, UNITS.ORB_DMG);         // once per component, not per cell
         }
       }
     }
