@@ -6033,23 +6033,61 @@ const _encounterFoe = function _encounterFoe(CORPUS, TYPES, TYPE_ALIAS, RELICS, 
 }
 )};
 
-// Spoils. Scrap is the node's posted rate; the part roll is one item weighted to the
-// cheap end, because a run that hands out a LaserTurret2 on the first duel has no
-// curve left. A loss pays nothing -- that is the whole tension of the inventory.
-const _encounterSpoils = function _encounterSpoils(ENCOUNTER_RULES, PART_COST, encRng, hashId){return(
-(node, verdict, camp) => {
-  if (verdict !== "win") return {scrap: 0, parts: {}};
+// Spoils. Scrap is the node's posted rate; the parts are an OFFER of several cards
+// of which the player takes one ("Shipyard Concepts" turn 11: "three cards, one pick,
+// the rest burn -- a decision you can regret, which is what makes it worth a popup at
+// all"). Every draw is weighted to the cheap end, because a run that hands out a
+// LaserTurret2 on the first duel has no curve left. A loss pays nothing -- that is
+// the whole tension of the inventory.
+//
+// Rarity and stack size come OUT of PART_COST rather than from a table beside it: a
+// second table would drift, and "what it is worth" is already the only ordering this
+// module has. Cheap parts arrive in stacks so a common card is a real alternative to
+// a rare one rather than a consolation.
+const _spoilsOffer = function _spoilsOffer(ENCOUNTER_RULES, PART_COST, encRng, hashId){return(
+(node, verdict, camp, {perfect = false} = {}) => {
+  if (verdict !== "win") return {scrap: 0, cards: []};
   const R = ENCOUNTER_RULES[node.kind] ?? {scrap: 20};
   // A node that posts no reward pays none. Without this a SHOP -- which this module
   // resolves as a stop, not a transaction -- handed out a free part every visit.
-  if (!R.scrap) return {scrap: 0, parts: {}};
+  if (!R.scrap) return {scrap: 0, cards: []};
+  const rarity = (t) => PART_COST[t] <= 12 ? "common" : PART_COST[t] <= 30 ? "uncommon" : "rare";
+  const stack = (t) => PART_COST[t] <= 10 ? 3 : PART_COST[t] <= 18 ? 2 : 1;
   const r = encRng(camp.seed * 31 + hashId(node.id) * 7 + 11);
   const bag = Object.keys(PART_COST).filter(t => PART_COST[t] > 0);
   const weight = (t) => 1 / Math.max(5, PART_COST[t]);
-  const total = bag.reduce((a, t) => a + weight(t), 0);
-  let x = r() * total, got = bag[0];
-  for (const t of bag) { x -= weight(t); if (x <= 0) { got = t; break; } }
-  return {scrap: R.scrap ?? 20, parts: {[got]: 1}};
+  const taken = new Set();
+  // The FIRST draw is the roll this used to make, from the same rng in the same
+  // order, so a run's first card is the part the old single-roll spoils paid.
+  const draw = (only = null) => {
+    const pool = bag.filter(t => !taken.has(t) && (!only || only.includes(rarity(t))));
+    if (!pool.length) return null;
+    const total = pool.reduce((a, t) => a + weight(t), 0);
+    let x = r() * total, got = pool[0];
+    for (const t of pool) { x -= weight(t); if (x <= 0) { got = t; break; } }
+    taken.add(got);
+    return {items: [{type: got, n: stack(got)}], rarity: rarity(got)};
+  };
+  const cards = [];
+  // PERFECT -- won without losing a cell -- is turn 11's fourth outcome: a fourth
+  // card, one of them uncommon or better.
+  const want = perfect ? 4 : 3;
+  while (cards.length < want - (perfect ? 1 : 0)) { const c = draw(); if (!c) break; cards.push(c); }
+  if (perfect) { const c = draw(["uncommon", "rare"]) ?? draw(); if (c) cards.push(c); }
+  return {scrap: R.scrap ?? 20, cards};
+}
+)};
+
+// The headless payment: the top card of the same offer. Defined THROUGH spoilsOffer
+// rather than beside it, so a script and a player cannot be paid by two different
+// rules -- what a tool banks is exactly what the popup would have banked had the
+// player taken the card it opens on.
+const _encounterSpoils = function _encounterSpoils(spoilsOffer){return(
+(node, verdict, camp) => {
+  const o = spoilsOffer(node, verdict, camp);
+  const top = o.cards[0];
+  return {scrap: o.scrap,
+          parts: top ? Object.fromEntries(top.items.map(i => [i.type, i.n])) : {}};
 }
 )};
 
@@ -6285,7 +6323,7 @@ const _refitBench = function _refitBench(shipEditor, refitCheck, applyRefit, enc
 // The node, end to end. Three phases in one element, because the run's state has to
 // survive the transitions and a caller that had to re-mount between them would lose
 // it. `onDone` gets the campaign the run continues with.
-const _encounterView = function _encounterView(refitBench, foePreview, duelView, miningView, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode, humanControl, encChip, encCss, htl, invalidation, stationView, partsOf){return(
+const _encounterView = function _encounterView(refitBench, foePreview, duelView, miningView, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode, humanControl, spoilsOffer, spoilsPopup, encChip, encCss, htl, invalidation, stationView, partsOf){return(
 (node0, camp, {onDone, height = 460, control = "human"} = {}) => {
   const node = resolveNode(node0, camp);
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:10px;${encCss}"></div>`;
@@ -6354,7 +6392,7 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
       // the pieces are recorded on the log line instead.
       done(verdict, verdict === "loss" ? camp.ship
                   : survivingHull(M.player, camp.ship.name ?? "hull"),
-           {scrap: M.scrap, parts: {}, ore: {...M.collected}});
+           {scrap: M.scrap, parts: {}, ore: {...M.collected}}, M.player);
     }});
     live = v; human = mode === "human" ? humanControl(v, v.mining, null) : null;
     body.replaceChildren(v,
@@ -6379,7 +6417,7 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
       human?.stop?.();
       const verdict = out === "a" ? "win" : out === "b" ? "loss" : "draw";
       done(verdict, verdict === "loss" ? camp.ship
-                  : survivingHull(D.a, camp.ship.name ?? "hull"));
+                  : survivingHull(D.a, camp.ship.name ?? "hull"), null, D.a);
     }});
     live = v; human = mode === "human" ? humanControl(v, v.duel, "a") : null;
     body.replaceChildren(v,
@@ -6388,40 +6426,87 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
                          : mode === "auto" ? "the robot pilot has it" : "the ship runs its own wiring"}</div>`);
   };
 
-  const done = (verdict, hull, haul = null) => {
-    camp = applySpoils(camp, node, verdict, hull, haul);
-    const s = camp.log[camp.log.length - 1];
-    // A visit is not a victory. `spent` marks the station branch, whose card reports
-    // the balance it leaves with -- "WIN +0 scrap" after shopping reads as a bug.
-    title(s.spent ? "undocked" : verdict === "win" ? "spoils"
-                  : verdict === "loss" ? "destroyed" : "stalemate");
-    if (s.spent) {
-      body.replaceChildren(htl.html`<div style="display:flex;flex-direction:column;gap:8px;
-        padding:14px;border:1px solid #26364a;border-radius:8px;background:#0a0f18">
-        <div style="color:#7fd4ff;font:700 13px ui-monospace,monospace;letter-spacing:.1em">UNDOCKED</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap">${[
-          encChip("scrap", camp.scrap, "#ffc42e"),
-          encChip("hull", (camp.ship.components ?? []).length + " parts", "#8b9bb0")]}</div>
-        <div style="color:#5b6b7d">the clamps let go</div></div>`);
+  // The node's last screen ("Shipyard Concepts" turn 11). It is `spoilsPopup` from
+  // corepox-board -- the SAME frame the mission campaign ends on -- because the
+  // design's claim is that a player learns one layout and reads the outcome from the
+  // colour and the noun, and a run layer with its own result card would break that
+  // for the one screen that appears most.
+  //
+  // The campaign is committed by the BUTTON, not by arriving here: the taken card is
+  // part of the spoils, so applySpoils cannot run until the choice is made. That
+  // makes the popup the only exit from a node, which is what turns the choice into a
+  // decision rather than a notification.
+  const done = (verdict, hull, haul = null, ship = null) => {
+    live?.stop?.(); human?.stop?.();
+    const before = camp;
+    const dead = (ship?.comps ?? []).filter(c => c.hp <= 0);
+    const lost = Object.entries(dead.reduce((a, c) => (a[c.type] = (a[c.type] ?? 0) + 1, a), {}))
+      .map(([type, n]) => ({type, n}));
+    // PERFECT is turn 11's fourth outcome. There are no objectives out here, so it
+    // is the hull that has to be untouched -- not a cell destroyed and not a cell
+    // scratched, which is a good deal rarer than surviving.
+    const perfect = verdict === "win" && !!ship && !dead.length &&
+                    ship.comps.every(c => !c.maxHp || c.hp >= c.maxHp);
+    // A station is a VISIT: it has already taken the money and there is nothing to
+    // roll. Mining pays its haul, and the haul replaces the roll rather than adding
+    // to it, so neither offers cards.
+    const offer = haul ? {scrap: haul.scrap ?? 0, cards: []}
+                       : spoilsOffer(node, verdict, before, {perfect});
+    const kind = (node.name ?? node.kind ?? "node").toUpperCase();
+    const commit = (card) => {
+      const parts = card ? Object.fromEntries(card.items.map(i => [i.type, i.n])) : {};
+      camp = applySpoils(camp, node, verdict, hull, {...(haul ?? {}), scrap: offer.scrap, parts});
+      const s = camp.log[camp.log.length - 1];
+      title(s.spent ? "undocked" : verdict === "win" ? "spoils"
+                    : verdict === "loss" ? "destroyed" : "stalemate");
+      pop.remove();
       root.value = camp;
       root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
-      return onDone?.(camp, verdict);
-    }
-    body.replaceChildren(htl.html`<div style="display:flex;flex-direction:column;gap:8px;
-      padding:14px;border:1px solid #26364a;border-radius:8px;background:#0a0f18">
-      <div style="color:${verdict === "win" ? "#8ef0c0" : verdict === "loss" ? "#ff6b6b" : "#ffc42e"};
-        font:700 13px ui-monospace,monospace;letter-spacing:.1em">${verdict.toUpperCase()}</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap">${[
-        encChip("scrap", "+" + s.scrap, "#ffc42e"),
-        ...Object.entries(s.parts).map(([t, n]) => encChip(t, "+" + n, "#7fd4ff")),
-        ...Object.entries(s.ore ?? {}).map(([t, n]) => encChip(t, "x" + n, "#ffc42e")),
-        encChip("hull", (camp.ship.components ?? []).length + " parts", "#8b9bb0")]}</div>
-      <div style="color:#5b6b7d">${verdict === "loss"
-        ? "the hull is gone and so is the run"
-        : "the hull you leave with is the one that survived"}</div></div>`);
-    root.value = camp;
-    root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
-    onDone?.(camp, verdict);
+      onDone?.(camp, verdict);
+    };
+    const pop = spoilsPopup({
+      verb: haul?.spent ? "UNDOCKED"
+          : verdict === "loss" ? "BROKEN UP"
+          : verdict === "draw" ? "SURVIVED"
+          : perfect ? "PERFECT" : kind + " CLEARED",
+      tone: haul?.spent ? "#7fd4ff" : verdict === "loss" ? "#ff5c72"
+          : verdict === "draw" ? "#ffc42e" : perfect ? "#c46bff" : "#56e39f",
+      meta: `${node.wasUnknown ? "unknown → " + node.kind : node.kind}` +
+            (node.col != null ? ` · column ${node.col}` : ""),
+      note: verdict === "loss" ? "the hull is gone and so is the run"
+          : lost.length ? `${lost.reduce((a, b) => a + b.n, 0)} component${
+              lost.reduce((a, b) => a + b.n, 0) > 1 ? "s" : ""} lost`
+          : "hull held",
+      summary: verdict === "loss"
+        ? "The hull is gone and so is the run. What it reached is on the left."
+        : verdict === "draw"
+        ? "The clock beat you both. Salvage only -- there is nothing to loot from a fight you left."
+        : haul?.spent ? "The clamps let go."
+        : "Banked. Nothing here was worth a choice.",
+      ship, lost,
+      hold: Object.entries(camp.parts).map(([type, n]) => ({type, n})),
+      ledger: [...(offer.scrap ? [["salvage", "+◆" + offer.scrap]] : []),
+               ...Object.entries(haul?.ore ?? {}).map(([t, n]) => [t.toLowerCase(), "×" + n, "#ffc42e"]),
+               ["hold", "◆" + (camp.scrap + offer.scrap), "#ffc42e"]],
+      cards: offer.cards,
+      hint: lost.length
+        ? `your hull is short ${dead.reduce((a, c) => a + c.tiles.length, 0)} cells — ` +
+          lost.map(l => l.type).join(", ") + " went with them"
+        : "",
+      takeLabel: verdict === "loss" ? "END RUN" : offer.cards.length ? "TAKE & JUMP" : "JUMP",
+      passLabel: "take nothing",
+      onDone: commit
+    });
+    // The head says what the popup is asking for while it is open; `commit` writes
+    // the settled one over it.
+    title(offer.cards.length ? "spoils — take one"
+        : verdict === "loss" ? "destroyed" : verdict === "draw" ? "stalemate" : "spoils");
+    body.appendChild(pop);
+    // The popup is absolute inside its host, so the host has to be the frame it
+    // covers -- without this it lays out against the page and lands wherever the
+    // encounter happens to be scrolled to.
+    body.style.position = "relative";
+    root.spoils = pop.qa;
   };
 
   // A station IS the refit bench, with prices on it. Opening the free bench first
@@ -6473,6 +6558,10 @@ export default function define(runtime, observer) {
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   for (const n of ["shipNode", "TILE"])
     main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
+  main.define("module @tomlarkworthy/corepox-board",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-board.js?v=4")).default));
+  main.define("spoilsPopup", ["module @tomlarkworthy/corepox-board", "@variable"],
+    (_, v) => v.import("spoilsPopup", _));
   for (const n of ["shipEditor", "specOfShip", "CORPUS"])
     main.define(n, ["module @tomlarkworthy/corepox-shipyard", "@variable"], (_, v) => v.import(n, _));
   for (const n of ["runDuel", "duelView", "newDuel", "stepDuel", "humanControl"])
@@ -6497,7 +6586,8 @@ export default function define(runtime, observer) {
   $def("_resolveNode", "resolveNode", ["encRng","hashId"], _resolveNode);
   $def("_encounterFoe", "encounterFoe",
        ["CORPUS","TYPES","TYPE_ALIAS","RELICS","ENCOUNTER_RULES","encRng","hashId","partsOf"], _encounterFoe);
-  $def("_encounterSpoils", "encounterSpoils", ["ENCOUNTER_RULES","PART_COST","encRng","hashId"], _encounterSpoils);
+  $def("_spoilsOffer", "spoilsOffer", ["ENCOUNTER_RULES","PART_COST","encRng","hashId"], _spoilsOffer);
+  $def("_encounterSpoils", "encounterSpoils", ["spoilsOffer"], _encounterSpoils);
   $def("_survivingHull", "survivingHull", ["specOfShip"], _survivingHull);
   $def("_applySpoils", "applySpoils", ["encounterSpoils"], _applySpoils);
   $def("_runEncounter", "runEncounter",
@@ -6510,7 +6600,7 @@ export default function define(runtime, observer) {
        ["shipEditor","refitCheck","applyRefit","encCss","TYPES","htl"], _refitBench);
   $def("_encounterView", "encounterView",
        ["refitBench","foePreview","duelView","miningView","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull",
-        "resolveNode","humanControl","encChip","encCss","htl","invalidation","stationView","partsOf"], _encounterView);
+        "resolveNode","humanControl","spoilsOffer","spoilsPopup","encChip","encCss","htl","invalidation","stationView","partsOf"], _encounterView);
   main.variable(observer("viewof encounterDemo")).define("viewof encounterDemo",
     ["SHIPS","ENCOUNTER_RULES","newCampaign","encounterView","htl","invalidation"], _viewof_encounterDemo).pid = "_viewof_encounterDemo";
   main.variable(observer("encounterDemo")).define("encounterDemo",
@@ -7331,6 +7421,16 @@ const _shipBoard = function _shipBoard(
     battlefield, componentNode, INFO, MENU_ACTIONS, PALETTE, partIcon, TYPES, PORTS, TILE, DT, htl, invalidation){return(
 (S0, opts = {}) => {
   let S = S0;
+  // The cells the session's own ship arrived on. A mission ENVELOPE is a fixed
+  // recorded list of anchors and it does not contain them -- 8 of the 12 missions
+  // ship parts outside their own envelope (tools/scratch/env-gap.ts, 2026-08-22:
+  // SideShooter has all three outside a 6-cell envelope, FollowCourse one, Cocoon
+  // one). So moving such a part off its cell left a hole nothing could fill, which
+  // is Tom's "after moving a component to leave a space, I cannot place a component
+  // back into that space". A cell the designer put a component on is a legal anchor
+  // by construction, so it joins the envelope.
+  const seedStart = () => { S.startCells = S.player.comps.map(c => [c.px, c.py]); };
+  seedStart();
   // same convention as geom.bearing: 0 is up, clockwise positive
   const geomBearing = (dx, dy) => Math.atan2(dx, -dy) * 180 / Math.PI;
   // The shipped board has no modes. It has a SELECTION, and the selection's menu
@@ -7375,8 +7475,15 @@ const _shipBoard = function _shipBoard(
     // playing-only flight keys.
     if (ev.key === " " || ev.code === "Space") {
       if (down && typing()) return;
-      space = down;
       if (down) ev.preventDefault();
+      // While the clock runs, space SHOOTS. The board's own briefing says so --
+      // "WASD to fly - space to shoot" in @tomlarkworthy/corepox-duel-encounter --
+      // and the key did nothing but latch the pan, reported by Tom 2026-08-22:
+      // "on missions the auto player does not shoot weapons when space is
+      // pressed". Panning during a match is still reachable, by the nub, the
+      // wheel and the middle button; F stays a synonym for fire.
+      if (S.state === "playing" && S.cmd) { S.cmd.fire = down; space = false; return; }
+      space = down;
       return;
     }
     if (down && ev.key === "Escape" && !typing()) {
@@ -7609,7 +7716,16 @@ const _shipBoard = function _shipBoard(
   };
   const legalCells = (type, ignore = null) => {
     const env = S.mission.envelope ?? [];
-    const tiles = TYPES[type]?.tiles ?? [[0, 0]];
+    // The footprint of the piece being placed, anchor-relative. TYPES carries the
+    // UNROTATED one, and a part already on the board may be turned -- so a move
+    // has to test the shape the part actually has. Reported by Tom 2026-08-22:
+    // "a rotated component does not compute its footprint rotated". A live
+    // component's own `tiles` are already rotated by the constructor, which is
+    // why this reads them off the part rather than re-deriving with rotTile.
+    // A part coming off the rail has no rotation yet (commitBuild writes
+    // dir: "up"), so TYPES is right for that case and only that case.
+    const tiles = ignore ? ignore.tiles.map(t => [t[0] - ignore.px, t[1] - ignore.py])
+                         : (TYPES[type]?.tiles ?? [[0, 0]]);
     const taken = (x, y) => S.player.comps.some(c =>
       c !== ignore && c.tiles.some(t => t[0] === x && t[1] === y));
     // The envelope constrains the ANCHOR, not the footprint. SideShooter's
@@ -7624,11 +7740,19 @@ const _shipBoard = function _shipBoard(
     // and not of the envelope, deliberately: keying off `envelope === undefined`
     // would silently turn a mission that ships an empty envelope (build nothing)
     // into one that builds anywhere.
+    // Only when the mission offers an envelope at all: `envelope: []` is a mission
+    // that forbids building (Connection, Aim, Avoid teach wiring), and unioning the
+    // start cells there would quietly turn it into one that allows it.
     const anchors = S.freeBuild ? freeAnchors(ignore)
-      : env.length ? env
+      : env.length ? [...env, ...(S.startCells ?? [])]
       : ignore ? [[ignore.px, ignore.py]] : [];
-    return anchors.filter(([x, y]) =>
-      !tiles.some(t => taken(x + t[0], y + t[1])));
+    const seen = new Set();
+    return anchors.filter(([x, y]) => {
+      const k = x + "," + y;
+      if (seen.has(k)) return false;            // env and startCells overlap
+      seen.add(k);
+      return !tiles.some(t => taken(x + t[0], y + t[1]));
+    });
   };
   const commitBuild = (px, py) => {
     const item = spendRow(picked);
@@ -7924,6 +8048,12 @@ const _shipBoard = function _shipBoard(
       const legal = legalCells(picked);
       if (legal.some(([x, y]) => x === px && y === py))
         return armGesture({kind: "place", type: picked, legal}, ev, true);
+      // Off a ghost: the player is reaching past the chip, so put it back. Only
+      // the ghost half of that rule was implemented -- the chip stayed armed
+      // through a hull tap, which selected the part and then hid its verb bar
+      // (Tom, 2026-08-22). The press then continues and means what it would have
+      // meant with nothing held.
+      picked = null; pickedRow = null;
     }
     const d = edit ? discNear(ev) : null;
     if (d) {
@@ -8735,7 +8865,12 @@ const _shipBoard = function _shipBoard(
   };
   const verbBar = () => {
     const c = sel && S.player.at(sel.px, sel.py);
-    if (!c || drag || picked) return null;
+    // Not gated on `picked` any more. Selecting a part now disarms the chip
+    // (see startGesture), so the two cannot both be live off a tap -- and while
+    // they could, the bar simply vanished: Tom, 2026-08-22, "if a component is
+    // selected for placement, you cannot access the rotation menu for anything,
+    // this feels off".
+    if (!c || drag) return null;
     const on = VERBS.filter(a => canDo(a.id, c));
     const bits = [];
     for (const a of on) {
@@ -9023,6 +9158,14 @@ const _shipBoard = function _shipBoard(
                else if (id === "cut") { act = "cut"; panel = "cut"; }
                render(); return true; },
              confirm: () => { commitWire(); render(); },
+             // The ghost set, as the press test sees it -- `legal(type)` for a
+             // part coming off the rail, `legalFor(px,py)` for moving the part
+             // already there. Both call legalCells, so a test asserting on them
+             // is asserting on what a tap will accept and not on a second copy
+             // of the rule.
+             legal: (type) => legalCells(type).map((a) => a.slice()),
+             legalFor: (px, py) => { const c = compAt(px, py);
+               return c ? legalCells(c.type, c).map((a) => a.slice()) : null; },
              stock: () => stock().map(i => ({...i})),
              // The redesign's own seams: the layout toggle, the pause, and the two
              // gestures that replaced menus. A test that drives the board has to be
@@ -9075,7 +9218,8 @@ const _shipBoard = function _shipBoard(
     // A host that swaps the session -- a retry, the next mission, a different
     // hull on the bench -- hands the board the new one rather than rebuilding it,
     // so the camera, the layout and the window listeners survive the change.
-    load: (next) => { S = next; picked = null; wire = null; sel = null; act = null;
+    load: (next) => { S = next; seedStart();
+                      picked = null; wire = null; sel = null; act = null;
                       panel = "none"; drag = null; hoverCell = null;
                       view?.resetView?.(); render(); },
     layout: (l) => qa.layout(l),
@@ -9277,9 +9421,13 @@ const _spoilsPopup = function _spoilsPopup(partIcon, damagePlate, INFO, TYPES, P
           lost.length ? "rebuild it from the hold, or fly it as it is" : "nothing to rebuild"}</div>
       </div></div></div>` : null;
 
+  // With neither objectives nor a hull to draw -- a RACE, a stop, a station -- the
+  // ledger is the whole left column, and pushing it to the bottom of a column sized
+  // for a damage plate leaves a hand's width of nothing above it.
+  const solo = !objBlock && !dmgBlock;
   const ledgerBlock = ledger.length || hold.length
-    ? htl.html`<div style="margin-top:auto;display:flex;flex-direction:column;gap:7px;
-        padding-top:14px;border-top:1px solid ${C.line}">
+    ? htl.html`<div style="${solo ? "" : "margin-top:auto;"}display:flex;flex-direction:column;gap:7px;
+        ${solo ? "" : "padding-top:14px;border-top:1px solid " + C.line}">
         ${ledger.map(([k, v, c]) => row(k, v, c ?? C.amber))}
         ${hold.length ? htl.html`<div style="display:flex;flex-wrap:wrap;gap:6px;padding-top:7px;
           border-top:1px dashed ${C.line}">${hold.map(h => htl.html`<span style="font:400 10px ${MONO};
@@ -9325,7 +9473,8 @@ const _spoilsPopup = function _spoilsPopup(partIcon, damagePlate, INFO, TYPES, P
       <span style="font:400 11px ${MONO};color:${C.faint}">${note}</span>
     </div>
     <div style="display:flex;flex-wrap:wrap;border-top:1px solid ${C.line}">
-      <div style="flex:1 1 340px;min-width:0;max-width:420px;padding:18px 22px 22px;
+      <div style="flex:${solo ? "0 1 280px" : "1 1 340px"};min-width:0;max-width:420px;
+        padding:18px 22px 22px;
         border-right:1px solid ${C.line};display:flex;flex-direction:column;gap:18px">
         ${[objBlock, dmgBlock, ledgerBlock].filter(Boolean)}
       </div>
@@ -20916,6 +21065,12 @@ class World {
   // Move every particle, then damage the first component its swept segment
   // crosses. A bolt covers 0.625 tiles a tick against a half-tile component, so
   // the test is against the segment, not the point, or fast shots tunnel.
+  // TUNING TARGET. 43% of the tick in an 8-ship melee of 203-part hulls, 13.26ms
+  // of a 28.69ms tick (measured 2026-08-22, `bun tools/corepox-melee-bench.ts`).
+  // Every particle is tested against every ship: 72228 particle x ship pairs a
+  // tick, and the per-component broad phase below calls worldOf, which recomputes
+  // this.a's sin/cos every time. Not tuned yet -- measure before and after with
+  // that tool, it prints phase split and operation counts.
   stepParticles() {
     const alive = [];
     for (const b of this.particles) {
@@ -20985,6 +21140,13 @@ class World {
   // proportional to the normal impulse. The original left this as a flat
   // component.damage(5) per contact and a "TODO force based impact damage"
   // (Ship.cs:586) -- so ramming never actually worked there.
+  //
+  // TUNING TARGET. 41% of the tick in the same melee, 12.67ms of 28.69ms. The
+  // outer loop is every ship PAIR, and a melee shatters: 8 ships become 164 within
+  // 0.8s, so 12090 pairs a tick reach the broad phase below. That broad phase is on
+  // ship CENTRES at 30 tiles, which a 461-tile hull exceeds on its own. Note also
+  // that B.worldTiles(cb) is inside the ca loop and allocates per pair. Not tuned
+  // yet -- `bun tools/corepox-melee-bench.ts`.
   collide() {
     const live = this.ships.filter(s => s.alive || s.live.length);
     for (let i = 0; i < live.length; i++) for (let j = i + 1; j < live.length; j++) {
@@ -21036,6 +21198,18 @@ class World {
        }
       }
       if (!deep) continue;
+      // BUG, measured 2026-08-22, `bun tools/corepox-collision-energy.ts` (which
+      // exits 1 on purpose): this creates energy, and all of the surplus is spin.
+      // Two identical bricks face to face on y=0 leave the contact at +/-297 deg/s
+      // -- a symmetric hit that by symmetry must produce none -- and the total goes
+      // 80.66 -> 183.42 in one tick. Three causes compound: `deep` collapses a flush
+      // contact patch to ONE cell pair tie-broken by iteration order, so a face-on
+      // hit resolves as a corner strike; `jmag` below is the LINEAR impulse but is
+      // spent at that offset on linear AND angular motion, because the denominator
+      // omits (r x n)^2/I (~2.5x too small for a 4x4 at a 2-tile lever); and force()
+      // scales it by another 1/UNITS.W. Sustained contact then feeds back -- the new
+      // spin raises velAt at the contact, which raises `rel`, which raises jmag.
+      // Not fixed. See plan/corepox-tasks.md.
       const mA = 1 / A.mass, mB = 1 / B.mass;
       const jmag = -(1 + 0.2) * deep.rel / (mA + mB);          // restitution 0.2
       A.force(deep.ax, deep.ay, -deep.nx * jmag / DT, -deep.ny * jmag / DT);
