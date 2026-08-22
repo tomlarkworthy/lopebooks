@@ -46,9 +46,11 @@ Edit blocks in place in the HTML; the unpacked copy is for reading.
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <title>Lopecode Quickstart</title>
-  <meta property="og:title" content="Lopecode Quickstart">
+  <title>Corepox</title>
+  <meta property="og:title" content="Corepox">
   <meta property="og:type" content="website">
+  <meta name="description" content="Build a ship out of wired components and fly it. A recovered Unity game, reimplemented as a Lopecode notebook: physics, damage and the run layer all in one file.">
+  <meta property="og:description" content="Build a ship out of wired components and fly it. A recovered Unity game, reimplemented as a Lopecode notebook: physics, damage and the run layer all in one file.">
   <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyBmaWxsPSJ3aGl0ZSIgd2lkdGg9IjUwcHgiIGhlaWdodD0iNTBweCIgdmlld0JveD0iMCAwIDY0IDY0IiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxyZWN0IGhlaWdodD0iNCIgd2lkdGg9IjQiIHg9IjIwIiB5PSI1MCI+PC9yZWN0PjxyZWN0IGhlaWdodD0iNCIgd2lkdGg9IjE2IiB4PSIyOCIgeT0iNTAiPjwvcmVjdD48cGF0aCBkPSJNMzIsMzhhOCw4LDAsMSwwLTgtOEE4LjAwOSw4LjAwOSwwLDAsMCwzMiwzOFptMC0xMmE0LDQsMCwxLDEtNCw0QTQsNCwwLDAsMSwzMiwyNloiPjwvcGF0aD48cGF0aCBkPSJNNiw2Mkg1OGEyLDIsMCwwLDAsMi0yVjE1YTIsMiwwLDAsMC0uNTg2LTEuNDE0bC0xMS0xMUEyLDIsMCwwLDAsNDcsMkg2QTIsMiwwLDAsMCw0LDRWNjBBMiwyLDAsMCwwLDYsNjJabTQyLTRIMTZWNDZINDhaTTE2LDZIMzF2NGg0VjZoNHY4SDE2Wk04LDZoNFYxNmEyLDIsMCwwLDAsMiwySDQxYTIsMiwwLDAsMCwyLTJWNmgzLjE3Mkw1NiwxNS44MjlWNThINTJWNDRhMiwyLDAsMCwwLTItMkgxNGEyLDIsMCwwLDAtMiwyVjU4SDhaIj48L3BhdGg+PC9zdmc+">
 </head>
 <body>
@@ -5335,6 +5337,18 @@ const _DUEL_MODES = function _DUEL_MODES(){return(
   survival: {
     label: "survival", desc: "A only has to still be there at the limit",
     decide: (D) => !D.aliveA ? "b" : D.timeUp ? "a" : null
+  },
+  // The N-side rule, and the only mode that means anything with more than two
+  // rosters in the world. It decides on TEAM rather than on side, so a 6-ship
+  // free-for-all (six teams) and a 3v3 (two teams) are the same mode.
+  melee: {
+    label: "melee", desc: "last team standing; a draw if the limit finds more than one",
+    decide: (D) => {
+      const up = new Set();
+      for (const id of D.sides) if (D.alive[id]) up.add(D.teamOf[id]);
+      if (up.size > 1) return D.timeUp ? "draw" : null;
+      return up.size === 1 ? [...up][0] : "draw";
+    }
   }
 }
 )};
@@ -5359,6 +5373,23 @@ const _duelPlacement = function _duelPlacement(geom){return(
 }
 )};
 
+// N on a ring, facing the middle. The chord between neighbours is the `separation`
+// a duel would have used, so R = sep / (2 sin(pi/n)) -- and at n = 2 that is
+// sep / 2, which puts the two ships exactly where `duelPlacement` puts them. The
+// half-turn offset is what keeps index 0 on the "a" side of the line rather than
+// mirrored across it.
+const _meleePlacement = function _meleePlacement(geom){return(
+(n, {separation = 18, bearing = 0, radius = null} = {}) => {
+  if (n < 2) return [{x: 0, y: 0, a: 0}];
+  const R = radius ?? separation / (2 * Math.sin(Math.PI / n));
+  return Array.from({length: n}, (_, i) => {
+    const [ux, uy] = geom.unit(bearing + 180 + i * 360 / n);
+    const x = ux * R, y = uy * R;
+    return {x, y, a: geom.bearing(x, y, 0, 0)};
+  });
+}
+)};
+
 // The stock opponent: close to `standoff` and hold the nose on the target. It is
 // deliberately dumb -- it exists so an unwired corpus hull can be a credible enemy
 // without hand-authoring a control program for each of the 892 of them.
@@ -5376,7 +5407,7 @@ const _chaseCmd = function _chaseCmd(geom){return(
 }
 )};
 
-const _newDuel = function _newDuel(Ship, World, loadShipSpec, duelPlacement, DUEL_MODES, DUEL_BACKDROP){return(
+const _newDuel = function _newDuel(Ship, World, loadShipSpec, duelPlacement, meleePlacement, DUEL_MODES, DUEL_BACKDROP){return(
 (cfg = {}) => {
   const {mode = "elimination", limit = 60, seed = 1} = cfg;
   const M = typeof mode === "string" ? DUEL_MODES[mode] : mode;
@@ -5387,23 +5418,48 @@ const _newDuel = function _newDuel(Ship, World, loadShipSpec, duelPlacement, DUE
     // idempotent on its own output and expands Composites, which raw specs do not
     return loadShipSpec(s).spec;
   };
-  const p = duelPlacement(cfg.placement, cfg.a ?? {}, cfg.b ?? {});
-  const mk = (side, o) => {
-    const s = new Ship(load(o.spec), {team: o.team ?? side, ...p[side]});
+  // `ships: [...]` is the N-side form and `{a, b}` is the same thing with two
+  // entries, so there is ONE code path below and the two-ship duel is a melee of
+  // two. `a` and `b` stay on the returned object as aliases for the first two
+  // sides, because every existing caller (runEncounter, duelView, the modes) reads
+  // them by name and a duel must not change shape to gain a third opponent.
+  const melee = Array.isArray(cfg.ships);
+  const roster = melee ? cfg.ships : [cfg.a ?? {}, cfg.b ?? {}];
+  const sides = melee ? roster.map((o, i) => o.id ?? "s" + i) : ["a", "b"];
+  const place = melee
+    ? meleePlacement(roster.length, cfg.placement)
+    : (() => { const p = duelPlacement(cfg.placement, cfg.a ?? {}, cfg.b ?? {});
+               return [p.a, p.b]; })();
+  const mk = (id, o, i) => {
+    // Explicit x/y/a on the entry still wins over the ring, which is what a mission
+    // editor and a reproducible regression fixture both need.
+    const at = {...place[i], ...(o.x != null ? {x: o.x} : {}), ...(o.y != null ? {y: o.y} : {}),
+                ...(o.a != null ? {a: o.a} : {})};
+    // A free-for-all is N teams, not one: the default team is the side's own id, so
+    // nothing shoots at its own hull and everything shoots at everything else.
+    const s = new Ship(load(o.spec), {team: o.team ?? id, ...at});
     s.vx = o.vx ?? 0; s.vy = o.vy ?? 0;
     return s;
   };
-  const a = mk("a", cfg.a ?? {}), b = mk("b", cfg.b ?? {});
+  const ship = {}, control = {}, cmd = {}, memo = {}, hadBrain = {}, teamOf = {}, alive = {};
+  sides.forEach((id, i) => {
+    const o = roster[i];
+    const s = ship[id] = mk(id, o, i);
+    control[id] = o.control ?? "wired";
+    cmd[id] = {target: null, face: null, drive: null, fire: false};
+    memo[id] = {};
+    hadBrain[id] = s.comps.some(c => c.type === "Brain");
+    teamOf[id] = s.team;
+    alive[id] = true;
+  });
+  const a = ship[sides[0]], b = ship[sides[1]] ?? null;
   return {
     cfg, mode: M, limit, seed,
-    world: new World([a, b]), a, b,
-    control: {a: cfg.a?.control ?? "wired", b: cfg.b?.control ?? "wired"},
+    world: new World(sides.map(id => ship[id])), a, b,
+    sides, ship, teamOf, alive,
+    control,
     // a `human` side reads its intent from here; a UI or a network peer writes it
-    cmd: {a: {target: null, face: null, drive: null, fire: false},
-          b: {target: null, face: null, drive: null, fire: false}},
-    memo: {a: {}, b: {}},
-    hadBrain: {a: a.comps.some(c => c.type === "Brain"),
-               b: b.comps.some(c => c.type === "Brain")},
+    cmd, memo, hadBrain,
     backdrop: cfg.backdrop === false ? false
       : {...DUEL_BACKDROP, ...(cfg.backdrop ?? {}),
          sky: {...DUEL_BACKDROP.sky, seed, ...(cfg.backdrop?.sky ?? {})},
@@ -5413,21 +5469,44 @@ const _newDuel = function _newDuel(Ship, World, loadShipSpec, duelPlacement, DUE
 }
 )};
 
-const _stepDuel = function _stepDuel(pilot, chaseCmd, duelAlive){return(
+const _stepDuel = function _stepDuel(pilot, chaseCmd, duelAlive, nearestFoe){return(
 (D) => {
   if (D.outcome) return D.outcome;
-  for (const side of ["a", "b"]) {
-    const c = D.control[side];
+  for (const id of D.sides) {
+    const c = D.control[id];
     if (c === "wired") continue;
-    const self = D[side], foe = D[side === "a" ? "b" : "a"];
-    const cmd = c === "auto" ? (D.cmd[side] = chaseCmd(self, foe, D.cfg.ai)) : D.cmd[side];
-    pilot(self, cmd, D.memo[side]);
+    const self = D.ship[id];
+    // With two sides the enemy is "the other one"; with N it has to be CHOSEN, and
+    // nearest-living-enemy is the same rule `chaseCmd` already implies at n = 2.
+    const cmd = c === "auto"
+      ? (D.cmd[id] = chaseCmd(self, nearestFoe(D, id), D.cfg.ai))
+      : D.cmd[id];
+    pilot(self, cmd, D.memo[id]);
   }
   D.world.step();
-  D.aliveA = duelAlive(D.a, D.hadBrain.a);
-  D.aliveB = duelAlive(D.b, D.hadBrain.b);
+  for (const id of D.sides) D.alive[id] = duelAlive(D.ship[id], D.hadBrain[id]);
+  D.aliveA = D.alive[D.sides[0]];
+  D.aliveB = D.sides.length > 1 ? D.alive[D.sides[1]] : false;
   D.timeUp = D.world.t >= D.limit;
   return (D.outcome = D.mode.decide(D) ?? null) ?? "playing";
+}
+)};
+
+// Nearest LIVING ship on another team. `splitDetached` can put debris in
+// `world.ships` that belongs to no side, so the search runs over the roster rather
+// than over the world -- a pilot chasing a shard of its own wreck is not a target.
+const _nearestFoe = function _nearestFoe(){return(
+(D, id) => {
+  const self = D.ship[id], team = D.teamOf[id];
+  let best = null, bd = Infinity;
+  for (const other of D.sides) {
+    if (D.teamOf[other] === team) continue;
+    const s = D.ship[other];
+    if (!s.live.length) continue;
+    const d = (s.x - self.x) ** 2 + (s.y - self.y) ** 2;
+    if (d < bd) { bd = d; best = s; }
+  }
+  return best;
 }
 )};
 
@@ -5437,10 +5516,14 @@ const _runDuel = function _runDuel(newDuel, stepDuel, DT){return(
   const cap = Math.ceil((cfg.limit ?? 60) / DT) + 2;
   let out = "playing";
   for (let i = 0; i < cap && out === "playing"; i++) out = stepDuel(D);
+  const sides = {};
+  for (const id of D.sides)
+    sides[id] = {live: D.ship[id].live.length, alive: !!D.alive[id], team: D.teamOf[id]};
   return {winner: out === "playing" ? "draw" : out,
           seconds: +D.world.t.toFixed(2), ticks: D.world.tick,
           a: {live: D.a.live.length, alive: !!D.aliveA},
-          b: {live: D.b.live.length, alive: !!D.aliveB}, duel: D};
+          b: D.b ? {live: D.b.live.length, alive: !!D.aliveB} : null,
+          sides, duel: D};
 }
 )};
 
@@ -5605,11 +5688,17 @@ const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, h
   root.append(hud);
 
   let raf = 0, acc = 0, last = 0, stopped = false;
+  // One readout per SIDE, not two hard-coded ones: a melee has N of them and the
+  // 2-ship duel is the n = 2 case of the same loop. The first two keep the colours
+  // A and B have always had so a duel looks unchanged.
+  const HUE = ["#8ef0c0", "#ffc42e", "#7fd4ff", "#ff9a3c", "#c46bff", "#56e39f",
+               "#ff6b9d", "#cdd94f"];
+  const label = (id, i) => D.sides.length === 2 ? "AB"[i] : id.toUpperCase();
   const paint = () => {
-    const w = (s, n, col) => `<span style="color:${col}">${s} ${n}</span>`;
-    hud.innerHTML =
-      w("A", D.a.live.length, D.aliveA === false ? "#ff6b6b" : "#8ef0c0") +
-      w("&nbsp;&middot;&nbsp;B", D.b.live.length, D.aliveB === false ? "#ff6b6b" : "#ffc42e") +
+    hud.innerHTML = D.sides.map((id, i) =>
+      `<span style="color:${D.alive[id] === false ? "#ff6b6b" : HUE[i % HUE.length]}"
+        >${label(id, i)} ${D.ship[id].live.length}</span>`).join(
+      `<span style="color:#41505f">&middot;</span>`) +
       `<span style="color:#6f8299">&nbsp;&middot;&nbsp;${D.world.t.toFixed(1)}s / ${D.limit}s` +
       (D.outcome ? ` &middot; ${D.outcome.toUpperCase()}` : "") + `</span>`;
   };
@@ -5723,8 +5812,10 @@ export default function define(runtime, observer) {
   main.variable(observer("duelDemo")).define("duelDemo",
     ["Generators","viewof duelDemo"], _duelDemo).pid = "_duelDemo";
   $def("_runDuel", "runDuel", ["newDuel","stepDuel","DT"], _runDuel);
-  $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
-  $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive"], _stepDuel);
+  $def("_meleePlacement", "meleePlacement", ["geom"], _meleePlacement);
+  $def("_nearestFoe", "nearestFoe", [], _nearestFoe);
+  $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","meleePlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
+  $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive","nearestFoe"], _stepDuel);
   $def("_duelView", "duelView", ["newDuel","stepDuel","backdrop","battlefield","htl","DT"], _duelView);
   $def("_humanControl", "humanControl", [], _humanControl);
   $def("_DUEL_MODES", "DUEL_MODES", [], _DUEL_MODES);
@@ -5880,8 +5971,12 @@ const _ENCOUNTER_RULES = function _ENCOUNTER_RULES(){return(
   mining:     {battle: false, mine: true, scrap: 0,
                field: {duration: 120, density: 0.40, radius: 34, rockVolume: 50,
                        oreVolume: 3, rockHp: 3, oreSpread: 5, drift: 1.2}},
-  shop:       {battle: false, scrap: 0},
-  repair:     {battle: false, scrap: 0},
+  // A station is PLAYED, like a seam is, so it posts no fixed reward: what you
+  // leave with is what you bought, sold and patched ("Shipyard Concepts" turn 10).
+  // `berth` is which one is open when you dock, which is the only difference
+  // between the two node kinds that land on the same station.
+  shop:       {battle: false, station: true, berth: "market", scrap: 0},
+  repair:     {battle: false, station: true, berth: "repair", scrap: 0},
   unknown:    {battle: false, scrap: 0}
 }
 )};
@@ -6012,7 +6107,7 @@ const _applySpoils = function _applySpoils(encounterSpoils){return(
 
 // The whole node without a screen: same foe, same rules, same spoils. This is what a
 // test drives and what an AI opponent would call; encounterView is this plus pixels.
-const _runEncounter = function _runEncounter(runDuel, runMining, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode){return(
+const _runEncounter = function _runEncounter(runDuel, runMining, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode, stationStock, repairQuote){return(
 (node0, camp, {control = "auto", seed = null} = {}) => {
   const node = resolveNode(node0, camp);
   const R = ENCOUNTER_RULES[node.kind] ?? {battle: false, scrap: 0};
@@ -6030,6 +6125,16 @@ const _runEncounter = function _runEncounter(runDuel, runMining, encounterFoe, E
             campaign: applySpoils(camp, node, verdict, hull,
                                   {scrap: m.scrap, parts: {}, ore: {...m.collected}})};
   }
+  // A station has no opponent and no clock, so headless it is a visit that pays
+  // nothing. What a caller still needs is the state of the node -- what was on the
+  // rail, and what a patch would have cost -- because those are the only decisions
+  // the node offers and a script that cannot see them cannot play it.
+  if (R.station) return {verdict: "win", battle: null, foe: null,
+                         station: {berth: R.berth ?? "market",
+                                   stock: stationStock(node, camp),
+                                   quote: repairQuote(camp.ship)},
+                         campaign: applySpoils(camp, node, "win", camp.ship,
+                                               {scrap: 0, parts: {}, spent: true})};
   if (!R.battle) return {verdict: "win", battle: null, foe: null,
                          campaign: applySpoils(camp, node, "win")};
   const foe = encounterFoe(node, camp);
@@ -6180,7 +6285,7 @@ const _refitBench = function _refitBench(shipEditor, refitCheck, applyRefit, enc
 // The node, end to end. Three phases in one element, because the run's state has to
 // survive the transitions and a caller that had to re-mount between them would lose
 // it. `onDone` gets the campaign the run continues with.
-const _encounterView = function _encounterView(refitBench, foePreview, duelView, miningView, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode, humanControl, encChip, encCss, htl, invalidation){return(
+const _encounterView = function _encounterView(refitBench, foePreview, duelView, miningView, encounterFoe, ENCOUNTER_RULES, applySpoils, survivingHull, resolveNode, humanControl, encChip, encCss, htl, invalidation, stationView, partsOf){return(
 (node0, camp, {onDone, height = 460, control = "human"} = {}) => {
   const node = resolveNode(node0, camp);
   const root = htl.html`<div style="display:flex;flex-direction:column;gap:10px;${encCss}"></div>`;
@@ -6220,6 +6325,19 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
     padding:3px 6px;font:inherit">${["human", "auto", "wired"].map(m =>
       htl.html`<option value=${m} selected=${m === mode}>${m}</option>`)}</select>`;
 
+  // Docking. Unlike every other branch this one does not end in a verdict: a visit
+  // cannot be lost, so it commits the campaign the station hands back and moves on.
+  const dock = () => {
+    title(`station — spend, refit, launch when ready`, {scrap: false});
+    live?.stop?.(); human?.stop?.();
+    const v = stationView(camp, node, {height, partsOf, berth: R.berth ?? "market",
+      onDone: (out) => {
+        camp = out;
+        done("win", out.ship, {scrap: 0, parts: {}, spent: true});
+      }});
+    body.replaceChildren(v);
+  };
+
   const mine = () => {
     const F = R.field ?? {};
     title(`mining — ${F.duration ?? 60}s on the seam`);
@@ -6246,6 +6364,7 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
   };
 
   const battle = () => {
+    if (R.station) return dock();
     if (R.mine) return mine();
     if (!R.battle) return done("win", camp.ship);
     const foe = encounterFoe(node, camp);
@@ -6272,7 +6391,22 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
   const done = (verdict, hull, haul = null) => {
     camp = applySpoils(camp, node, verdict, hull, haul);
     const s = camp.log[camp.log.length - 1];
-    title(verdict === "win" ? "spoils" : verdict === "loss" ? "destroyed" : "stalemate");
+    // A visit is not a victory. `spent` marks the station branch, whose card reports
+    // the balance it leaves with -- "WIN +0 scrap" after shopping reads as a bug.
+    title(s.spent ? "undocked" : verdict === "win" ? "spoils"
+                  : verdict === "loss" ? "destroyed" : "stalemate");
+    if (s.spent) {
+      body.replaceChildren(htl.html`<div style="display:flex;flex-direction:column;gap:8px;
+        padding:14px;border:1px solid #26364a;border-radius:8px;background:#0a0f18">
+        <div style="color:#7fd4ff;font:700 13px ui-monospace,monospace;letter-spacing:.1em">UNDOCKED</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">${[
+          encChip("scrap", camp.scrap, "#ffc42e"),
+          encChip("hull", (camp.ship.components ?? []).length + " parts", "#8b9bb0")]}</div>
+        <div style="color:#5b6b7d">the clamps let go</div></div>`);
+      root.value = camp;
+      root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
+      return onDone?.(camp, verdict);
+    }
     body.replaceChildren(htl.html`<div style="display:flex;flex-direction:column;gap:8px;
       padding:14px;border:1px solid #26364a;border-radius:8px;background:#0a0f18">
       <div style="color:${verdict === "win" ? "#8ef0c0" : verdict === "loss" ? "#ff6b6b" : "#ffc42e"};
@@ -6290,7 +6424,9 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
     onDone?.(camp, verdict);
   };
 
-  refit();
+  // A station IS the refit bench, with prices on it. Opening the free bench first
+  // would let the hold be spent before the shop was ever seen.
+  if (R.station) dock(); else refit();
   root.value = camp;
   return Object.assign(root, {campaign: () => camp, stop: () => { live?.stop?.(); human?.stop?.(); }});
 }
@@ -6330,7 +6466,7 @@ export default function define(runtime, observer) {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
   for (const m of ["corepox-engine", "corepox-render", "corepox-shipyard",
-                   "corepox-missions", "corepox-duel", "corepox-mining"])
+                   "corepox-missions", "corepox-duel", "corepox-mining", "corepox-station"])
     main.define("module @tomlarkworthy/" + m,
       async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
   for (const n of ["Ship", "World", "geom", "DT", "TYPES", "TYPE_ALIAS", "RELICS", "loadShipSpec"])
@@ -6345,6 +6481,8 @@ export default function define(runtime, observer) {
     (_, v) => v.import("SHIPS", _));
   for (const n of ["miningView", "runMining"])
     main.define(n, ["module @tomlarkworthy/corepox-mining", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["stationView", "stationStock", "repairQuote"])
+    main.define(n, ["module @tomlarkworthy/corepox-station", "@variable"], (_, v) => v.import(n, _));
 
   $def("_title", "title", ["md"], _title);
   $def("_PART_COST", "PART_COST", [], _PART_COST);
@@ -6363,7 +6501,8 @@ export default function define(runtime, observer) {
   $def("_survivingHull", "survivingHull", ["specOfShip"], _survivingHull);
   $def("_applySpoils", "applySpoils", ["encounterSpoils"], _applySpoils);
   $def("_runEncounter", "runEncounter",
-       ["runDuel","runMining","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull","resolveNode"], _runEncounter);
+       ["runDuel","runMining","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull","resolveNode",
+        "stationStock","repairQuote"], _runEncounter);
   $def("_encCss", "encCss", [], _encCss);
   $def("_encChip", "encChip", ["htl"], _encChip);
   $def("_foePreview", "foePreview", ["Ship","loadShipSpec","shipNode","TILE","htl"], _foePreview);
@@ -6371,7 +6510,7 @@ export default function define(runtime, observer) {
        ["shipEditor","refitCheck","applyRefit","encCss","TYPES","htl"], _refitBench);
   $def("_encounterView", "encounterView",
        ["refitBench","foePreview","duelView","miningView","encounterFoe","ENCOUNTER_RULES","applySpoils","survivingHull",
-        "resolveNode","humanControl","encChip","encCss","htl","invalidation"], _encounterView);
+        "resolveNode","humanControl","encChip","encCss","htl","invalidation","stationView","partsOf"], _encounterView);
   main.variable(observer("viewof encounterDemo")).define("viewof encounterDemo",
     ["SHIPS","ENCOUNTER_RULES","newCampaign","encounterView","htl","invalidation"], _viewof_encounterDemo).pid = "_viewof_encounterDemo";
   main.variable(observer("encounterDemo")).define("encounterDemo",
@@ -6445,8 +6584,12 @@ const _minRng = function _minRng(){return(
 // old cell-at-a-time random walk does not work -- a piece has to be tried against
 // the tiles it would occupy, which is why this is a placement loop and not a walk.
 const _rockSpec = function _rockSpec(TYPES, rotTile){return(
-(r, {rockVolume = 50, oreVolume = 3, rockHp = 12, oreSpread = 3,
+(r, {rockVolume = 50, oreVolume = 3, rockHp = 12, oreSpread = 3, oreHp = null,
      ore = ["Ore", "Ore", "Ore", "OreVein"], name = "rock"} = {}) => {
+  // Ore is worth shooting and has to cost something to shoot. Default is twice the
+  // rock's per-tile toughness, which is the ratio TYPES fixes; a field can override
+  // it outright without disturbing rockHp.
+  const OHP = oreHp ?? rockHp * 2;
   const used = new Map();                       // "x,y" -> piece index
   const comps = [];
   const DIRS = ["up", "right", "down", "left"], TURN = {up: 0, right: 90, down: 180, left: 270};
@@ -6474,7 +6617,8 @@ const _rockSpec = function _rockSpec(TYPES, rotTile){return(
       const cells = cellsOf(type, dir, px, py);
       const clear = cells.every(([x, y]) => ![[0,0],[1,0],[-1,0],[0,1],[0,-1]]
         .some(([dx, dy]) => used.has((x + dx) + "," + (y + dy))));
-      if (clear && place(type, dir, px, py)) { oreTypes.push(type); break; }
+      if (clear && place(type, dir, px, py, OHP * TYPES[type].tiles.length)) {
+        oreTypes.push(type); break; }
     }
   }
 
@@ -6579,6 +6723,9 @@ const _MINER = function _MINER(){return(
 )};
 
 const _MINING_DEFAULTS = function _MINING_DEFAULTS(){return(
+// `oreHp` is absent on purpose: it defaults to `rockHp * 2` in `rockSpec`, which is
+// the ratio the game is balanced on. Put it here only to break that tie deliberately.
+//
 // `rockVolume` counts PIECES, not tiles: a chunk of 50 is ~160 tiles, because a spar
 // is 3 and a slab is 4. Tom, 2026-08-21: "we should be aiming for much larger chunks
 // (50 components) so it takes quite a while to get to the ore."
@@ -6673,7 +6820,13 @@ const _minerCmd = function _minerCmd(geom, loosePiece, TYPES, DT){return(
 // deadlocked somewhere: 14% fire uptime parked and aimed, then 51% while sitting
 // inside its own standoff. Rules that can each veto both the trigger and the
 // throttle have a state where nothing happens, and on a 90-second clock that state
-// is the whole run. Making the ore indestructible deleted all of them.
+// is the whole run.
+//
+// They were deleted by making ore indestructible, and they have stayed deleted now
+// that it is destructible again -- for the opposite reason. Then there was nothing
+// to protect because a beam could not touch a seam; now there is nothing to protect
+// because shooting the seam is the point. The rules only ever existed to serve a
+// third model, where ore was breakable AND breaking it was a loss.
 (M, {standoff = 9, fireArc = 20, orbitRate = 0.25} = {}) => {
   const me = M.player, memo = M.memo;
   const isOre = (c) => TYPES[c.type]?.ore != null;
@@ -6739,37 +6892,31 @@ const _minerCmd = function _minerCmd(geom, loosePiece, TYPES, DT){return(
     memo.orbit = cur;
   memo.orbit += orbitRate * DT;
   const th = memo.orbit + 0.5;                   // lead, past pilot's arrival deadband
-  // NEGATIVE RESULT, 2026-08-21, and it is worth more than the change it rejects.
-  // This rig aims badly on purpose. `pilot`'s waypoint path allocates on flat
-  // weights `[1, 1, G.torque]`, and a torque row is two orders of magnitude
-  // smaller than a linear one, so a translation demand and a pinned `face` are
-  // not a trade -- position wins and rotation is rounding. The nose therefore
-  // sits 74-92 deg off the seam, on the orbit tangent, and the guns are fixed
-  // forward (tools/scratch/mine-aim.ts):
+  // NEGATIVE RESULT, 2026-08-21, kept because it was measured and because the model
+  // it was measured under is gone -- read it as history, not as a live constraint.
   //
-  //   seed 101  |heading-face| mean 76 deg   within 20 deg  0% of ticks   244 rock dmg/120s
-  //   seed 107                 mean 74                      0%             43 rock dmg/120s
-  //
-  // Dropping the waypoint within 4 tiles of the ring point (`{target: null,
-  // face: bearing}`) fixes exactly that: with the linear rows zero the turn is
-  // all that is left to allocate, aim goes to 28-56% within 20 deg and rock
-  // damage rises 3-18x. It also pays a THIRD of the ore. 20 held-out seeds,
-  // rockHp 3 / oreSpread 5 / density 0.4 / 120s:
+  // While ore was indestructible the miner's aim did not matter much and the numbers
+  // said so loudly. `pilot`'s waypoint path allocates on flat weights `[1, 1,
+  // G.torque]`, a torque row is two orders of magnitude smaller than a linear one,
+  // so a translation demand and a pinned `face` are not a trade -- position wins and
+  // rotation is rounding. The nose sat 74-92 deg off the seam, on the orbit tangent,
+  // with the guns fixed forward (tools/scratch/mine-aim.ts). Dropping the waypoint
+  // within 4 tiles (`{target: null, face: bearing}`) fixed exactly that -- aim went
+  // to 28-56% inside 20 deg, rock damage rose 3-18x -- and paid a THIRD of the ore:
   //
   //   orbit, nose on the tangent   10/20 paid   22 pieces   44 scrap/run
   //   stop and aim                  3/20 paid    4 pieces   11 scrap/run
   //
-  // So cutting is not what frees ore here. `collide` charges 5 a tick per contact
-  // pair -- 250/s against 15/s from three Lazers -- and the seeds that pay are the
-  // ones that MOVE (travel 197 tiles on the best payer, 66-90 on the ones that pay
-  // nothing). A miner that holds station is a miner that stopped ramming. Do not
-  // "fix" the aim without re-running the held-out set; better aim measured better
-  // on every proxy and worse on the only number that is the encounter.
+  // Because what freed ore then was not cutting. `collide` charges 5 a tick per
+  // contact pair, 250/s against 15/s from three Lazers, so the seeds that paid were
+  // the ones that MOVED. A miner that held station was a miner that stopped ramming.
+  // (Both arms ran with `World.rng` unseeded -- see MINING_DEFAULTS -- so the
+  // direction is probably real and the margin is not.)
   //
-  // Both arms were run with `World.rng` unseeded (see MINING_DEFAULTS), so the
-  // 10/20 and 3/20 each carry run-to-run noise the gate has since been shown to
-  // have. The gap is wide enough that the direction is probably real and the
-  // margin is not. If you re-open this, pin the rng before you measure.
+  // Now that a seam breaks, aim is worth something it was not worth before and this
+  // may well invert. It has NOT been re-measured. If you re-open it, pin the rng
+  // first and re-run the held-out set; do not cite the table above as if it still
+  // described the game.
   return {target: [cx + Math.cos(th) * ring, cy + Math.sin(th) * ring],
           face: bearing, drive: null, fire: off < fireArc};
 }
@@ -6815,14 +6962,44 @@ const _collectAt = function _collectAt(loosePiece, TYPES){return(
 }
 )};
 
+// A seam that was shot pays on the tick it dies. Called with the ore components
+// that were alive BEFORE `world.step()`, because the step is what removes them --
+// after it there is nothing left to ask. `hp <= 0` and not `!live.includes(c)` is
+// the test: `splitDetached` moves a component to another ship without killing it,
+// and being handed to a new hull is not being mined.
+//
+// Ramming pays through here too. `collide` charges 5 a tick per contact pair, so a
+// hull that flies into a seam breaks it and is credited exactly as if it had shot
+// it -- which is the same rule, not a special case.
+const _cashDead = function _cashDead(TYPES){return(
+(M, before) => {
+  const got = [];
+  for (const c of before) {
+    if (c.hp > 0) continue;
+    const T = TYPES[c.type];
+    M.collected[c.type] = (M.collected[c.type] ?? 0) + 1;
+    M.scrap += T?.ore ?? 0;
+    got.push(c.type);
+  }
+  return got;
+}
+)};
+
 // One tick. The order matters and each step says why.
-const _stepMining = function _stepMining(pilot, collectAt, minerCmd){return(
+const _stepMining = function _stepMining(pilot, collectAt, minerCmd, cashDead, TYPES){return(
 (M) => {
   if (M.outcome) return M.outcome;
   M.picked = collectAt(M);                       // before collide() charges for the touch
   if (M.control === "auto") M.cmd = minerCmd(M);
   if (M.control !== "wired" && M.cmd) pilot(M.player, M.cmd, M.memo);
+  // Which seams were alive going in. A shot seam pays on the tick it dies, and the
+  // only way to know it died is to have looked before the step -- `world.step()`
+  // drops the component and there is nothing left to read afterwards.
+  const before = [];
+  for (const s of M.world.ships) if (s !== M.player)
+    for (const c of s.live) if (TYPES[c.type]?.ore != null) before.push(c);
   M.world.step();
+  M.picked = M.picked.concat(cashDead(M, before));
   M.world.splitDetached();                       // a rock cut in two becomes two rocks
   M.t = M.world.t;
   const alive = M.player.live.length > 0 &&
@@ -6917,8 +7094,9 @@ const _viewof_miningDemo = function _viewof_miningDemo(MINER, MINING_DEFAULTS, m
   const stage = htl.html`<div></div>`;
   root.append(bar, stage,
     htl.html`<div style="color:#5b6b7d">WASD to fly · space to shoot · click for a waypoint —
-      ore cannot be shot. Cut the rock off a seam until the piece floats free, then fly into
-      it. The gold showing through a chunk is what is in there.</div>`);
+      shoot the gold. A seam is twice as tough as the rock over it, so the way to
+      more money is more guns and more seams, not more patience on one. Rock you cut free
+      still floats off; fly into a piece that is all ore and you take it whole.</div>`);
   const knob = (key, min, max, step) => {
     const out = htl.html`<span style="color:#dbe6f2;width:3em;display:inline-block">${cfg[key]}</span>`;
     const s = htl.html`<input type="range" min=${min} max=${max} step=${step} value=${cfg[key]}
@@ -6976,7 +7154,8 @@ export default function define(runtime, observer) {
   $def("_minerCmd", "minerCmd", ["geom","loosePiece","TYPES","DT"], _minerCmd);
   $def("_loosePiece", "loosePiece", ["TYPES"], _loosePiece);
   $def("_collectAt", "collectAt", ["loosePiece","TYPES"], _collectAt);
-  $def("_stepMining", "stepMining", ["pilot","collectAt","minerCmd"], _stepMining);
+  $def("_cashDead", "cashDead", ["TYPES"], _cashDead);
+  $def("_stepMining", "stepMining", ["pilot","collectAt","minerCmd","cashDead","TYPES"], _stepMining);
   $def("_runMining", "runMining", ["newMining","stepMining","DT"], _runMining);
   $def("_miningView", "miningView",
        ["newMining","stepMining","backdrop","battlefield","DUEL_BACKDROP","htl","DT"], _miningView);
@@ -7089,7 +7268,12 @@ const _boardSession = function _boardSession(Ship, World, loadShipSpec){return(
   const S = {
     player, world: new World([player]),
     mission: {allow, title: spec?.name ?? name},
-    inventory: Object.entries(parts).map(([type, n]) => ({type, n})),
+    // `parts` is a hold, `{type: n}`. An ARRAY instead is an explicit rail: ordered
+    // rows that may carry `price` (a market's goods) and `group` (a shelf heading),
+    // which is what turn 10a's station needs and a hold cannot express -- an object
+    // has no order and no room for a second number per key.
+    inventory: Array.isArray(parts) ? parts.map(i => ({...i}))
+                                    : Object.entries(parts).map(([type, n]) => ({type, n})),
     state: "build", paused: false, hasPlayed: false,
     freeBuild: true, initialParams: new Map(), cmd: null, home: null
   };
@@ -7144,7 +7328,7 @@ const _tempoChip = function _tempoChip(CLOCK, PALETTE, htl){const {C, MONO} = PA
 })};
 
 const _shipBoard = function _shipBoard(
-    battlefield, componentNode, INFO, MENU_ACTIONS, PALETTE, TYPES, PORTS, TILE, DT, htl, invalidation){return(
+    battlefield, componentNode, INFO, MENU_ACTIONS, PALETTE, partIcon, TYPES, PORTS, TILE, DT, htl, invalidation){return(
 (S0, opts = {}) => {
   let S = S0;
   // same convention as geom.bearing: 0 is up, clockwise positive
@@ -7154,6 +7338,7 @@ const _shipBoard = function _shipBoard(
   // "connect" waiting for a target, "move" waiting for a cell -- and it is null
   // the rest of the time.
   let picked = null;          // rail chip armed; STICKY -- survives a placement
+  let pickedRow = null;       // ...and WHICH row it came from, when a tap named one
   let sel = null;             // {px, py} of the selected component's anchor
   let act = null;             // null | "connect" | "move" | "cut" | "info"
   let wire = null;            // {from:{px,py,cell,port}, to:{...}|null}
@@ -7446,9 +7631,14 @@ const _shipBoard = function _shipBoard(
       !tiles.some(t => taken(x + t[0], y + t[1])));
   };
   const commitBuild = (px, py) => {
-    const item = S.inventory.find(i => i.type === picked);
-    if (!item || item.n <= 0) return;
-    item.n--;
+    const item = spendRow(picked);
+    if (!item) return;
+    // A priced item is bought AT THE MOMENT IT LANDS -- turn 10b: "the cost commits
+    // on release... There is no cart, no confirm, and no owned-but-unplaced state
+    // to explain." The host owns the money, so it gets the veto: `onBuy` returning
+    // false leaves the board exactly as it was.
+    if (priced(item) && opts.onBuy?.(item.type, item.price) === false) return;
+    if (Number.isFinite(item.n)) item.n--;
     editPause();
     S.player = rebuild([...specOf(S.player).components,
                         {type: picked, pos: [px, py], dir: "up"}],
@@ -7457,7 +7647,7 @@ const _shipBoard = function _shipBoard(
     // clearing the pick here is exactly what made it three: open the panel, choose
     // the part, tap the ghost, then do all three again for the next one. It
     // disarms when the stack runs out, and on Escape.
-    if (item.n <= 0) picked = null;
+    if (!spendRow(picked)) { picked = null; pickedRow = null; }
     panel = "none";
   };
   const commitMove = (px, py) => {
@@ -7504,6 +7694,22 @@ const _shipBoard = function _shipBoard(
     const item = S.inventory.find(i => i.type === c.type);
     if (item) item.n++; else S.inventory.push({type: c.type, n: 1});
     S.player = rebuild(comps, conns);
+    sel = null; act = null; panel = "none";
+  };
+  // The same removal `doDelete` performs, except the part does NOT come back to the
+  // hold -- the host is told and decides what it is worth. Split out rather than
+  // flagged inside doDelete because "put it back in the hold" and "sell it out of
+  // the run" are different events that happen to share their geometry.
+  const sellSel = () => {
+    const c = sel && S.player.at(sel.px, sel.py);
+    if (!c || opts.onSell?.(c.type, c) === false) return;
+    editPause();
+    const cells = c.tiles.map(t => `${t[0]},${t[1]}`);
+    S.player = rebuild(
+      specOf(S.player).components.filter(x => !(x.pos[0] === c.px && x.pos[1] === c.py)),
+      specOf(S.player).connections.filter(k =>
+        !cells.includes(`${k.from[0]},${k.from[1]}`) &&
+        !cells.includes(`${k.to[0]},${k.to[1]}`)));
     sel = null; act = null; panel = "none";
   };
   const connsOf = (c) => {
@@ -7758,6 +7964,10 @@ const _shipBoard = function _shipBoard(
     if (drag.kind === "place" || drag.kind === "hull") {
       const [px, py] = localTile(ev);
       hoverCell = drag.legal.some(([x, y]) => x === px && y === py) ? [px, py] : null;
+      // Only a HULL drag can be sold: a part still in the rail is not yours to sell
+      // back, and dragging stock onto the rail it came from has to mean nothing.
+      const hot = drag.kind === "hull" && overRail(ev);
+      if (hot !== sellHot) { sellHot = hot; render(); return; }
     } else if (drag.kind === "wire") {
       drag.at = worldTile(ev);
       const [wx, wy] = drag.at;
@@ -7801,7 +8011,7 @@ const _shipBoard = function _shipBoard(
   };
   const gestureUp = (ev) => {
     const g = drag;
-    drag = null; hoverCell = null; view.panLock = false;
+    drag = null; hoverCell = null; sellHot = false; view.panLock = false;
     window.removeEventListener("pointermove", gestureMove);
     window.removeEventListener("pointerup", gestureUp);
     window.removeEventListener("pointercancel", gestureUp);
@@ -7812,7 +8022,9 @@ const _shipBoard = function _shipBoard(
       else if (g.fromChip && !g.moved) picked = g.was === g.type ? null : g.type;
       else if (!g.fromChip) picked = null;
     } else if (g.kind === "hull") {
-      if (g.moved && g.legal.some(([x, y]) => x === px && y === py)) {
+      if (g.moved && overRail(ev)) {
+        sel = {px: g.px, py: g.py}; sellSel(); act = null;
+      } else if (g.moved && g.legal.some(([x, y]) => x === px && y === py)) {
         sel = {px: g.px, py: g.py}; commitMove(px, py); act = null;
       } else if (!g.moved) { sel = {px: g.px, py: g.py}; act = null; panel = "none"; }
     } else if (g.kind === "wire") {
@@ -8078,13 +8290,25 @@ const _shipBoard = function _shipBoard(
         const [wx, wy] = s.worldOf({px: j.mx, py: j.my});
         const g = add(overlay, "g", {transform:
           `translate(${(wx * TILE).toFixed(1)} ${(wy * TILE).toFixed(1)}) rotate(${s.a.toFixed(2)})`});
-        // Long across the seam, short along it, so the shape itself says which two
-        // cells it binds. Green, and only green: a joint takes neither part's hue.
-        const w = TILE * (j.edge === "h" ? 0.16 : 0.24);
-        const h = TILE * (j.edge === "h" ? 0.24 : 0.16);
-        add(g, "rect", {x: -w / 2, y: -h / 2, width: w, height: h, rx: TILE * 0.07,
-          fill: "#06120d", stroke: "#56e39f", "stroke-width": 2.4});
-        add(g, "circle", {cx: 0, cy: 0, r: TILE * 0.055, fill: "#56e39f"});
+        // A SEAM MARK, and the orientation is the correction: this ran long ACROSS
+        // the seam, which drew a rung between two cells rather than a weld along
+        // the edge they share. "Shipyard Concepts" 5c: "one symmetric capsule
+        // straddling the grid edge, half in each cell", and 9a labels it "joint =
+        // one 3px seam mark". Long ALONG the seam, thin across it.
+        //
+        // 5c draws it 3 x 13 with rx 1.5 at an 84-unit cell pitch, so 0.036 and
+        // 0.155 of a tile. It was 0.16 x 0.24 with a 2.4 stroke and a filled
+        // centre disc, roughly four times the ink -- on a 5x5 armour wall the
+        // marks read as the subject and the plating as the background
+        // (tools/screenshots/armour-before.png).
+        //
+        // Flat fill, no stroke, no centre dot: the capsule belongs to the PAIR,
+        // so anything that gives it a rim or a hub makes it look like a part.
+        const along = TILE * 0.155, across = TILE * 0.036;
+        const w = j.edge === "h" ? along : across;
+        const h = j.edge === "h" ? across : along;
+        add(g, "rect", {x: -w / 2, y: -h / 2, width: w, height: h,
+          rx: across / 2, fill: "#56e39f", opacity: 0.45});
       }
     }
 
@@ -8236,21 +8460,8 @@ const _shipBoard = function _shipBoard(
   // An icon of the component itself, for the build rows and the menu header. The
   // shipped panel leads every row with the drawing, which is the only thing that
   // tells ARMOUR from ORB before you have learned the names.
-  const icon = (type, size = 40) => {
-    const s = document.createElementNS(ns, "svg");
-    const tiles = TYPES[type]?.tiles ?? [[0, 0]];
-    const xs = tiles.map(t => t[0]), ys = tiles.map(t => t[1]);
-    const w = (Math.max(...xs) - Math.min(...xs) + 1.3) * TILE;
-    const h = (Math.max(...ys) - Math.min(...ys) + 1.3) * TILE;
-    const cx = (Math.max(...xs) + Math.min(...xs)) / 2 * TILE;
-    const cy = -(Math.max(...ys) + Math.min(...ys)) / 2 * TILE;
-    const m = Math.max(w, h);
-    s.setAttribute("viewBox", `${cx - m / 2} ${cy - m / 2} ${m} ${m}`);
-    s.setAttribute("width", size); s.setAttribute("height", size);
-    s.style.flex = "none";
-    s.appendChild(componentNode({type}));
-    return s;
-  };
+  // `partIcon` so the spoils popup draws a part exactly as the rail does.
+  const icon = (type, size = 40) => partIcon(type, size);
   let infoType = null;
   const infoPanel = () => panelBox(infoType.toUpperCase(), htl.html`<div>
     <div style="display:flex;gap:14px;align-items:center">${icon(infoType, 64)}
@@ -8286,12 +8497,60 @@ const _shipBoard = function _shipBoard(
   // The phone keeps the band, because turn 8a keeps it: 390px has no room for a
   // 160px rail and a board.
   let railOpen = true;
+  // The rail node itself, kept so a drag can be hit-tested against it. Selling is
+  // "drag a component off your hull into the rail" ("Shipyard Concepts" turn 10b:
+  // "The gesture that moves a part on the board is the gesture that removes it
+  // from the run -- one direction of travel, one meaning"), and a drop target has
+  // to be a rectangle somebody can measure.
+  let railBox = null, sellHot = false;
+  // Every render REBUILDS the rail, so its scroller is a new element and starts at
+  // 0. With a market rail long enough to scroll, that threw you back to the top on
+  // every placement -- and the chip stays armed precisely so you can place several,
+  // which is the case that got punished. Remembered here rather than on the node,
+  // because the node it belongs to no longer exists by the time it is needed.
+  let railScroll = {top: 0, left: 0}, railScroller = null;
+  const overRail = (ev) => {
+    if (!opts.onSell || !railBox) return false;
+    const r = railBox.getBoundingClientRect();
+    return ev.clientX >= r.left && ev.clientX <= r.right &&
+           ev.clientY >= r.top && ev.clientY <= r.bottom;
+  };
+  // `picked` is a TYPE, and a station rail carries the same type TWICE -- the
+  // market's Engine at a price, and the Engine already in your hold. A bare
+  // `find(i => i.type === picked)` took whichever came first, and the market is
+  // listed first: holding three Engines still charged 95 apiece, and the third
+  // placement was refused outright once the balance fell under 95 (reported
+  // 2026-08-22 -- "I was unable to place another engine even though I had it in
+  // the hold"). A part you already own is always spent before a part you buy.
+  const liveRow = (type) => {
+    const rows = S.inventory.filter(i => i.type === type && !dead(i));
+    return rows.find(i => !priced(i)) ?? rows[0] ?? null;
+  };
+  // The ROW the player tapped, when it is still theirs to spend -- tapping the
+  // market's Engine has to mean buy even while the hold has Engines in it, and
+  // tapping the hold's has to mean spend. It falls back to `liveRow` when that row
+  // is gone or spent, so a rail that runs out slides to the other shelf instead of
+  // going quietly dead under the finger. The rail highlight reads the same
+  // function, so the shelf that is about to be charged is the one that is lit.
+  const spendRow = (type) => (pickedRow && pickedRow.type === type &&
+    !dead(pickedRow) && S.inventory.includes(pickedRow)) ? pickedRow : liveRow(type);
   const RAIL_W = () => railOpen ? 160 : 44;
   const railItems = () =>
     S.mission.buildOnce && S.hasPlayed ? [] : S.inventory;
+  // A rail item is `{type, n}` in a hold and `{type, price}` in a market. Turn 10b:
+  // "Goods sit in the rail with a price instead of a count." Everything else about
+  // the row is the same, which is the point -- a shop that is the board.
+  const priced = (i) => i.price != null;
+  const afford = (i) => !priced(i) || i.price <= (opts.balance?.() ?? Infinity);
+  // Out of stock and out of money grey the row the same way, because to the player
+  // they are the same fact: this one is not available to you now.
+  const dead = (i) => priced(i) ? !afford(i) : i.n <= 0;
+  const badge = (i) => priced(i) ? "\u25c6" + i.price
+                                 : (i.n === Infinity ? "\u221e" : i.n);
   const chipNode = (i, w) => {
-    const on = picked === i.type;
-    const out = i.n <= 0;
+    const on = picked === i.type &&
+               i === spendRow(i.type);
+    const out = dead(i);
     const el = htl.html`<div title=${INFO[i.type] ?? i.type} data-part=${i.type}
       style="flex:none;width:${w}px;
       padding:${w > 80 ? 9 : 7}px 4px 6px;border-radius:10px;position:relative;
@@ -8302,7 +8561,8 @@ const _shipBoard = function _shipBoard(
       ${on ? htl.html`<div style="position:absolute;left:5px;top:5px;width:5px;height:5px;
         border-radius:50%;background:${C.green};box-shadow:0 0 6px ${C.green}"></div>` : ""}
       <div style="position:absolute;top:4px;right:6px;font:700 ${w > 80 ? 9 : 8}px ${MONO};
-        color:${C.ink}">${i.n === Infinity ? "∞" : "×" + i.n}</div>
+        color:${priced(i) ? (out ? "rgba(255,138,138,.75)" : C.amber) : C.ink}"
+        >${priced(i) ? badge(i) : (i.n === Infinity ? "∞" : "×" + i.n)}</div>
       ${icon(i.type, w > 80 ? 38 : 30)}
       <div style="font:${on ? 700 : 500} ${w > 80 ? 9 : 8}px ${MONO};
         color:${on ? C.green : C.dim}">${i.type}</div></div>`;
@@ -8314,8 +8574,9 @@ const _shipBoard = function _shipBoard(
   // read the shape of is a hold you can plan against -- a list that reflows every
   // time a part runs out is not.
   const railRow = (i) => {
-    const on = picked === i.type;
-    const out = i.n <= 0;
+    const on = picked === i.type &&
+               i === spendRow(i.type);
+    const out = dead(i);
     const el = htl.html`<div title=${INFO[i.type] ?? i.type} data-part=${i.type}
       style="display:flex;align-items:center;gap:9px;padding:7px 8px;border-radius:9px;
       position:relative;touch-action:none;opacity:${out ? 0.32 : 1};
@@ -8329,23 +8590,24 @@ const _shipBoard = function _shipBoard(
       <div style="flex:1;min-width:0;font:${on ? 700 : 500} 9.5px ${MONO};
         color:${on ? C.green : "rgba(232,236,245,.68)"};white-space:nowrap;
         overflow:hidden;text-overflow:ellipsis">${i.type}</div>
-      <div style="font:700 9px ${MONO};color:${out ? "rgba(232,236,245,.3)" : C.ink}"
-        >${i.n === Infinity ? "∞" : i.n}</div></div>`;
+      <div style="font:700 9px ${MONO};color:${out ? "rgba(255,138,138,.6)"
+        : priced(i) ? C.amber : C.ink}">${badge(i)}</div></div>`;
     armChip(el, i);
     return el;
   };
   // Collapsed: the drawing and the count, no name. 44px is the design's number and
   // it is also the smallest thing a thumb reliably hits.
   const railIcon = (i) => {
-    const on = picked === i.type;
-    const el = htl.html`<div title=${`${i.type} — ${i.n}`} data-part=${i.type}
+    const on = picked === i.type &&
+               i === spendRow(i.type);
+    const el = htl.html`<div title=${`${i.type} — ${badge(i)}`} data-part=${i.type}
       style="position:relative;display:flex;align-items:center;justify-content:center;
-      height:34px;border-radius:7px;touch-action:none;opacity:${i.n <= 0 ? 0.32 : 1};
-      cursor:${i.n <= 0 ? "default" : "grab"};
+      height:34px;border-radius:7px;touch-action:none;opacity:${dead(i) ? 0.32 : 1};
+      cursor:${dead(i) ? "default" : "grab"};
       border:1px solid ${on ? "rgba(86,227,159,.6)" : "transparent"};
       background:${on ? "rgba(86,227,159,.1)" : "transparent"}">${icon(i.type, 26)}
       <span style="position:absolute;right:1px;bottom:0;font:700 7.5px ${MONO};
-        color:${C.dim}">${i.n === Infinity ? "∞" : i.n}</span></div>`;
+        color:${priced(i) ? C.amber : C.dim}">${badge(i)}</span></div>`;
     armChip(el, i);
     return el;
   };
@@ -8353,16 +8615,24 @@ const _shipBoard = function _shipBoard(
   // somewhere the board cannot see. The window listeners in armGesture are what let
   // it cross the boundary.
   const armChip = (el, i) => el.addEventListener("pointerdown", (ev) => {
-    if (ev.button !== 0 || !editable() || i.n <= 0) return;
+    if (ev.button !== 0 || !editable() || dead(i)) return;
     ev.preventDefault();
     // `was` is read BEFORE the press arms the chip. Arming first and then toggling
     // against `picked` made every tap a no-op: the chip stuck and un-stuck inside
     // the same click.
     armGesture({kind: "place", type: i.type, legal: legalCells(i.type),
                 fromChip: true, was: picked}, ev, false);
-    picked = i.type;
+    picked = i.type; pickedRow = i;
     render();
   });
+  // The scroller is claimed as the shelf is built and restored once it is mounted
+  // -- scrollTop on a detached node is a no-op, so it cannot be done here.
+  const keepScroll = (el) => {
+    railScroller = el;
+    el.addEventListener("scroll", () => {
+      railScroll = {top: el.scrollTop, left: el.scrollLeft};
+    });
+  };
   const shelfNode = () => {
     const items = railItems();
     if (!items.length) return null;
@@ -8375,16 +8645,33 @@ const _shipBoard = function _shipBoard(
           HOLD ${picked ? "· " + picked.toUpperCase() : ""}</span>
         <span style="font:400 8px ${MONO};color:${C.faint}">tap to stick · drag to place</span></div>`;
       const row = htl.html`<div style="display:flex;gap:7px;overflow-x:auto;align-items:stretch"></div>`;
+      keepScroll(row);
       for (const i of items) row.append(chipNode(i, 66));
       box.append(head2, row);
       return box;
     }
     const box = htl.html`<div style="position:absolute;left:0;top:0;bottom:0;
-      width:${RAIL_W()}px;border-right:1px solid rgba(255,255,255,.09);
-      background:rgba(6,8,14,.86);display:flex;flex-direction:column;z-index:6"></div>`;
+      width:${RAIL_W()}px;border-right:1px solid ${sellHot ? C.green : "rgba(255,255,255,.09)"};
+      background:${sellHot ? "rgba(86,227,159,.14)" : "rgba(6,8,14,.86)"};
+      box-shadow:${sellHot ? "inset 0 0 0 1px " + C.green : "none"};
+      display:flex;flex-direction:column;z-index:6"></div>`;
+    railBox = box;
     const body = htl.html`<div style="flex:1;padding:8px 6px;display:flex;
       flex-direction:column;gap:2px;overflow-y:auto"></div>`;
-    for (const i of items) body.append(railOpen ? railRow(i) : railIcon(i));
+    keepScroll(body);
+    // A rail can carry more than one shelf. Turn 10a stacks the market's priced
+    // goods over YOUR HOLD in one column, because they are the same list to the
+    // hand -- both are things you drag onto the board -- and only the badge differs.
+    let seen = null;
+    for (const i of items) {
+      if (i.group && i.group !== seen) {
+        seen = i.group;
+        body.append(htl.html`<div style="padding:${body.childNodes.length ? "10px" : "2px"} 4px 4px;
+          font:700 8px ${MONO};letter-spacing:.16em;color:rgba(232,236,245,.38)"
+          >${railOpen ? i.group : "\u00b7"}</div>`);
+      }
+      body.append(railOpen ? railRow(i) : railIcon(i));
+    }
     const chevron = htl.html`<span onclick=${() => { railOpen = !railOpen; render(); }}
       title=${railOpen ? "collapse the hold" : "expand the hold"}
       style="font:700 10px ${MONO};color:rgba(86,227,159,.65);cursor:pointer;
@@ -8399,8 +8686,10 @@ const _shipBoard = function _shipBoard(
           >${opts.holdNote()}</span>` : ""}</div>`, body,
         htl.html`<div style="padding:9px 10px;border-top:1px solid rgba(255,255,255,.07);
           display:flex;flex-direction:column;gap:4px">
-          <span style="font:400 8px ${MONO};color:rgba(232,236,245,.3)">drag out to place</span>
-          <span style="font:400 8px ${MONO};color:rgba(232,236,245,.3)">tap to keep armed</span>
+          <span style="font:400 8px ${MONO};color:${sellHot ? C.green : "rgba(232,236,245,.3)"}"
+            >${items.some(priced) ? "drag out to buy + place" : "drag out to place"}</span>
+          <span style="font:400 8px ${MONO};color:${sellHot ? C.green : "rgba(232,236,245,.3)"}"
+            >${opts.onSell ? (opts.sellNote?.() ?? "drag in to sell at half") : "tap to keep armed"}</span>
           ${chevron}</div>`);
     } else {
       box.append(body, htl.html`<div style="padding:9px 0;text-align:center;
@@ -8627,8 +8916,16 @@ const _shipBoard = function _shipBoard(
     hud.textContent = "";
     opts.chrome?.(ctx());
 
-    shelf?.remove(); shelf = shelfNode();
+    shelf?.remove(); railScroller = null; shelf = shelfNode();
     if (shelf) stage.append(shelf);
+    if (railScroller) {
+      railScroller.scrollTop = railScroll.top;
+      railScroller.scrollLeft = railScroll.left;
+      // A shorter list clamps the assignment, so the remembered offset has to be
+      // re-read rather than trusted -- otherwise removing the last rows leaves a
+      // stale offset that snaps back the next time the list grows.
+      railScroll = {top: railScroller.scrollTop, left: railScroller.scrollLeft};
+    }
 
     // ---- the camera nub -----------------------------------------------------
     // Two pads, and neither exists until it is needed: the recentre only once the
@@ -8715,7 +9012,7 @@ const _shipBoard = function _shipBoard(
   const qa = {tileToView, localTile, session: () => S, svg: () => view.svg,
              sel: () => sel, act: () => act, picked: () => picked,
              panel: () => panel, wire: () => wire,
-             pick: (t) => { picked = t; panel = "none"; render(); },
+             pick: (t) => { picked = t; pickedRow = null; panel = "none"; render(); },
              open: (px, py) => { clickTile(px, py); },
              menu: (id) => { const c = S.player.at(sel.px, sel.py);
                if (!canDo(id, c)) return false;
@@ -8787,6 +9084,266 @@ const _shipBoard = function _shipBoard(
 }
 )};
 
+// A part, drawn on its own, sized to its footprint. The rail leads every build row
+// with this and the spoils popup leads every card with it; a second copy of the
+// rule would let the two disagree about what an Orb looks like.
+const _partIcon = function _partIcon(componentNode, TYPES, TILE){return(
+(type, size = 40) => {
+  const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const tiles = TYPES[type]?.tiles ?? [[0, 0]];
+  const xs = tiles.map(t => t[0]), ys = tiles.map(t => t[1]);
+  const w = (Math.max(...xs) - Math.min(...xs) + 1.3) * TILE;
+  const h = (Math.max(...ys) - Math.min(...ys) + 1.3) * TILE;
+  const cx = (Math.max(...xs) + Math.min(...xs)) / 2 * TILE;
+  const cy = -(Math.max(...ys) + Math.min(...ys)) / 2 * TILE;
+  const m = Math.max(w, h);
+  s.setAttribute("viewBox", `${cx - m / 2} ${cy - m / 2} ${m} ${m}`);
+  s.setAttribute("width", size); s.setAttribute("height", size);
+  s.style.flex = "none";
+  s.appendChild(componentNode({type}));
+  return s;
+}
+)};
+
+// What the fight cost, drawn on the hull rather than listed ("Shipyard Concepts"
+// turn 11: "Damage is drawn, not listed"). It is the same footprint the repair will
+// happen on, so a destroyed cell is in the place the player will have to fill.
+//
+// It cannot reuse shipNode: that hides a destroyed component (`display:none`, see
+// corepox-render's frame loop), and the destroyed ones are the subject here.
+const _damagePlate = function _damagePlate(componentNode, TILE, PALETTE){return(
+(ship, {size = 150} = {}) => {
+  const {C} = PALETTE;
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  const comps = ship?.comps ?? [];
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const c of comps) for (const [tx, ty] of c.tiles) {
+    x0 = Math.min(x0, tx); x1 = Math.max(x1, tx);
+    y0 = Math.min(y0, ty); y1 = Math.max(y1, ty);
+  }
+  if (!comps.length) { x0 = y0 = 0; x1 = y1 = 1; }
+  const pad = 0.7;
+  const L = (x0 - ship.cx - pad) * TILE, R = (x1 - ship.cx + pad) * TILE;
+  const T = -(y1 - ship.cy + pad) * TILE, B = -(y0 - ship.cy - pad) * TILE;
+  const m = Math.max(R - L, B - T);
+  svg.setAttribute("viewBox", `${(L + R) / 2 - m / 2} ${(T + B) / 2 - m / 2} ${m} ${m}`);
+  svg.setAttribute("width", size); svg.setAttribute("height", size);
+  svg.style.flex = "none";
+  const at = (tx, ty) => [(tx - ship.cx) * TILE, -(ty - ship.cy) * TILE];
+  const el = (n, attrs, into = svg) => {
+    const e = document.createElementNS(ns, n);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+    into.appendChild(e); return e;
+  };
+  // the grid it will be rebuilt on
+  for (let tx = x0; tx <= x1 + 1; tx++) {
+    const [gx] = at(tx - 0.5, 0), [, ya] = at(0, y0 - 0.5), [, yb] = at(0, y1 + 0.5);
+    el("path", {d: `M${gx} ${ya}V${yb}`, stroke: "#0d141c", "stroke-width": 1, fill: "none"});
+  }
+  for (let ty = y0; ty <= y1 + 1; ty++) {
+    const [, gy] = at(0, ty - 0.5), [xa] = at(x0 - 0.5, 0), [xb] = at(x1 + 0.5, 0);
+    el("path", {d: `M${xa} ${gy}H${xb}`, stroke: "#0d141c", "stroke-width": 1, fill: "none"});
+  }
+  for (const c of comps) {
+    if (c.hp > 0) {
+      const [lx, ly] = at(c.px, c.py);
+      const g = el("g", {transform: `translate(${lx.toFixed(1)} ${ly.toFixed(1)}) rotate(${c.dir})`});
+      g.appendChild(componentNode(c));
+      // hurt but standing: the cell dims towards the colour a destroyed one wears
+      if (c.maxHp && c.hp < c.maxHp) g.setAttribute("opacity", (0.45 + 0.5 * c.hp / c.maxHp).toFixed(2));
+      continue;
+    }
+    for (const [tx, ty] of c.tiles) {
+      const [lx, ly] = at(tx, ty);
+      el("rect", {x: (lx - TILE / 2).toFixed(1), y: (ly - TILE / 2).toFixed(1),
+                  width: TILE, height: TILE, rx: 2, fill: "rgba(255,92,114,.1)",
+                  stroke: C.red, "stroke-width": 1.6, "stroke-dasharray": "4 3"});
+      const q = TILE * 0.26;
+      el("path", {d: `M${(lx - q).toFixed(1)} ${(ly - q).toFixed(1)}l${2 * q} ${2 * q}` +
+                     `M${(lx + q).toFixed(1)} ${(ly - q).toFixed(1)}l${-2 * q} ${2 * q}`,
+                  stroke: C.red, "stroke-width": 1.4, opacity: .7, fill: "none"});
+    }
+  }
+  return svg;
+}
+)};
+
+// The end-of-encounter frame, from "Shipyard Concepts" turn 11. One layout does
+// every outcome: a coloured hairline, a verb in the title, a ledger column that
+// always occupies the same width, and a right column that is either a CHOICE or a
+// summary. The player learns one screen and reads the difference from the colour
+// and the noun.
+//
+// The choice is the reason it is a popup at all. Turn 11: "Three cards, one pick,
+// the rest burn -- a decision you can regret ... Rewards you cannot refuse should
+// just land in the hold with a number." So `cards: []` is a legitimate call and
+// draws the summary form, without a decision to make.
+//
+// `onDone(card)` is called with the taken card, or null for "take nothing". It is
+// the ONLY exit: the popup does not close itself, because what happens next --
+// next mission, jump, end of run -- belongs to the caller.
+const _spoilsPopup = function _spoilsPopup(partIcon, damagePlate, INFO, TYPES, PALETTE, htl){return(
+({verb = "CLEARED", tone = null, meta = "", note = "", summary = null, objectives = [], ship = null,
+  lost = [], hold = [], ledger = [], cards = [], hint = "", takeLabel = "TAKE & JUMP",
+  passLabel = "take nothing", onDone = null} = {}) => {
+  const {C, MONO} = PALETTE;
+  const hue = tone ?? C.green;
+  const RARITY = {common: C.dim, uncommon: C.purple, rare: C.amber};
+  let picked = cards.length ? 0 : null;
+
+  const label = (t) => htl.html`<span style="font:700 9.5px ${MONO};letter-spacing:.18em;
+    color:${C.dim}">${t}</span>`;
+  const row = (k, v, colour = C.amber, strong = false) => htl.html`<div style="display:flex;
+    align-items:baseline;justify-content:space-between;gap:12px">
+    <span style="font:${strong ? 700 : 400} 11px ${MONO};color:${strong ? C.ink : C.dim}">${k}</span>
+    <span style="font:700 ${strong ? 15 : 13}px ${MONO};color:${colour}">${v}</span></div>`;
+
+  const cardEls = cards.map((card, i) => {
+    const first = card.items?.[0];
+    const art = first ? partIcon(first.type, first.n > 1 ? 58 : 72) : null;
+    const el = htl.html`<div onclick=${() => pick(i)} style="min-width:0;
+      padding:14px 12px 12px;border-radius:11px;cursor:pointer;display:flex;
+      flex-direction:column;align-items:center;gap:9px;position:relative"></div>`;
+    const name = card.items?.length
+      ? card.items.map(it => it.type + (it.n > 1 ? " ×" + it.n : "")).join(" + ")
+      : card.name ?? "—";
+    const stats = first && TYPES[first.type]
+      ? `${TYPES[first.type].tiles.length} cell${TYPES[first.type].tiles.length > 1 ? "s" : ""} · hp ${TYPES[first.type].hp}`
+      : card.stats ?? "";
+    el.append(
+      htl.html`<div style="height:74px;display:flex;align-items:center;gap:4px">${
+        art ?? htl.html`<span style="font:700 26px ${MONO};color:${C.purple}">◈</span>`}</div>`,
+      htl.html`<div style="display:flex;flex-direction:column;align-items:center;gap:3px;text-align:center">
+        <span style="font:700 12.5px ${MONO};color:${card.colour ?? C.ink}">${name}</span>
+        <span style="font:400 9.5px ${MONO};color:${C.dim}">${stats}</span></div>`,
+      htl.html`<div style="font:400 10px/1.5 ${MONO};color:rgba(232,236,245,.55);
+        text-align:center">${card.why ?? INFO[first?.type] ?? ""}</div>`,
+      htl.html`<div style="margin-top:auto;padding-top:8px;width:100%;
+        border-top:1px solid ${C.line};display:flex;justify-content:space-between;gap:8px">
+        <span style="font:${card.rarity && card.rarity !== "common" ? 700 : 400} 9px ${MONO};
+          color:${RARITY[card.rarity] ?? C.faint}">${card.rarity ?? ""}</span>
+        <span class="cpx-take" style="font:400 9px ${MONO};color:${C.faint}">tap to take</span></div>`);
+    return el;
+  });
+
+  const paint = () => {
+    cardEls.forEach((el, i) => {
+      const on = i === picked;
+      el.style.border = `${on ? 1.5 : 1}px solid ${on ? C.green : C.line}`;
+      el.style.background = on ? "rgba(86,227,159,.07)" : "rgba(255,255,255,.02)";
+      el.style.boxShadow = on ? "0 0 24px rgba(86,227,159,.14) inset" : "none";
+      const tag = el.querySelector(".cpx-take");
+      tag.textContent = on ? "selected" : "tap to take";
+      tag.style.color = on ? C.green : C.faint;
+      tag.style.fontWeight = on ? 700 : 400;
+    });
+  };
+  const pick = (i) => { picked = i; paint(); };
+
+  const btn = (text, colour, strong, click) => htl.html`<button onclick=${click} style="
+    flex:none;white-space:nowrap;padding:${strong ? "12px 22px" : "11px 16px"};
+    border-radius:9px;cursor:pointer;pointer-events:auto;
+    border:${strong ? 1.5 : 1}px solid ${strong ? colour : C.line};
+    background:${strong ? colour + "1f" : "transparent"};color:${strong ? colour : C.dim};
+    font:${strong ? 700 : 500} ${strong ? 12 : 11}px ${MONO};
+    letter-spacing:${strong ? ".14em" : "0"}">${text}</button>`;
+
+  const objBlock = objectives.length ? htl.html`<div style="display:flex;
+    flex-direction:column;gap:8px">${[label("OBJECTIVES"), ...objectives.map(o => {
+      const colour = o.failed ? C.red : o.done ? C.green : C.dim;
+      return htl.html`<div style="display:flex;align-items:center;gap:9px">
+        <span style="width:14px;flex:none;text-align:center;font:700 11px ${MONO};
+          color:${colour}">${o.failed ? "✕" : o.done ? "✓" : "·"}</span>
+        <span style="flex:1;min-width:0;font:400 11.5px ${MONO};
+          color:${o.done ? C.ink : C.dim}">${o.node ?? o.text ?? ""}</span>
+        ${o.bonus ? htl.html`<span style="font:700 10px ${MONO};color:${C.amber}">${o.bonus}</span>` : ""}
+      </div>`;
+    })]}</div>` : null;
+
+  const dmgBlock = ship ? htl.html`<div style="display:flex;flex-direction:column;gap:9px">
+    ${label("DAMAGE")}
+    <div style="display:flex;gap:16px;align-items:flex-start">
+      ${damagePlate(ship, {size: 140})}
+      <div style="display:flex;flex-direction:column;gap:8px;padding-top:2px;min-width:0">
+        ${lost.length
+          ? htl.html`<div style="display:flex;flex-direction:column;gap:2px">
+              <span style="font:700 11px ${MONO};color:${C.red}">${
+                lost.reduce((a, b) => a + b.n, 0)} destroyed</span>
+              <span style="font:400 10px ${MONO};color:${C.dim}">${
+                lost.map(l => l.type + (l.n > 1 ? " ×" + l.n : "")).join(" · ")}</span></div>`
+          : htl.html`<span style="font:700 11px ${MONO};color:${C.green}">hull intact</span>`}
+        <div style="font:400 9.5px/1.5 ${MONO};color:${C.faint}">${
+          lost.length ? "rebuild it from the hold, or fly it as it is" : "nothing to rebuild"}</div>
+      </div></div></div>` : null;
+
+  const ledgerBlock = ledger.length || hold.length
+    ? htl.html`<div style="margin-top:auto;display:flex;flex-direction:column;gap:7px;
+        padding-top:14px;border-top:1px solid ${C.line}">
+        ${ledger.map(([k, v, c]) => row(k, v, c ?? C.amber))}
+        ${hold.length ? htl.html`<div style="display:flex;flex-wrap:wrap;gap:6px;padding-top:7px;
+          border-top:1px dashed ${C.line}">${hold.map(h => htl.html`<span style="font:400 10px ${MONO};
+          color:${C.dim};border:1px solid ${C.line};border-radius:999px;padding:2px 8px">${
+          h.type} ×${h.n}</span>`)}</div>` : ""}</div>`
+    : null;
+
+  const right = cards.length
+    ? htl.html`<div style="flex:1 1 380px;min-width:0;padding:20px 24px 22px;display:flex;
+        flex-direction:column;gap:13px">
+        <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+          ${label("SALVAGE — TAKE ONE")}
+          <span style="font:400 10px ${MONO};color:${C.faint}">the rest burns with the wreck</span>
+        </div>
+        <div style="display:grid;gap:12px;align-items:stretch;
+          grid-template-columns:repeat(auto-fit,minmax(148px,1fr))">${cardEls}</div>
+        <div style="margin-top:auto;display:flex;flex-direction:column;gap:12px;padding-top:14px;
+          border-top:1px solid ${C.line}">
+          ${hint ? htl.html`<div style="display:flex;align-items:center;gap:9px;padding:8px 12px;
+            border:1px solid rgba(255,196,46,.35);border-radius:8px;background:rgba(255,196,46,.05);
+            font:400 10.5px ${MONO};color:rgba(232,236,245,.6)">
+            <span style="color:${C.amber}">▲</span><span style="flex:1;min-width:0">${hint}</span></div>` : ""}
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:11px;flex-wrap:wrap">
+            ${btn(passLabel, C.dim, false, () => onDone?.(null))}
+            ${btn(takeLabel + " →", C.green, true, () => onDone?.(picked == null ? null : cards[picked]))}
+          </div></div></div>`
+    : htl.html`<div style="flex:1 1 320px;min-width:0;padding:20px 24px 22px;display:flex;
+        flex-direction:column;gap:12px">
+        ${label("SUMMARY")}
+        <div style="font:400 11.5px/1.7 ${MONO};color:rgba(232,236,245,.55)">${summary ?? note}</div>
+        <div style="margin-top:auto;display:flex;justify-content:flex-end;padding-top:14px;
+          border-top:1px solid ${C.line}">${btn(takeLabel + " →", hue, true, () => onDone?.(null))}</div>
+      </div>`;
+
+  const panel = htl.html`<div style="width:min(1060px,100%);max-height:100%;overflow:auto;
+    border:1px solid rgba(255,255,255,.14);border-radius:14px;background:#080a10;
+    box-shadow:0 24px 80px rgba(0,0,0,.7)">
+    <div style="height:3px;background:linear-gradient(90deg,${hue},${hue}00)"></div>
+    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;padding:18px 24px 15px">
+      <span style="font:700 20px ${MONO};letter-spacing:.18em;color:${C.ink}">${verb}</span>
+      <span style="font:400 11.5px ${MONO};color:${C.dim}">${meta}</span>
+      <div style="flex:1"></div>
+      <span style="font:400 11px ${MONO};color:${C.faint}">${note}</span>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;border-top:1px solid ${C.line}">
+      <div style="flex:1 1 340px;min-width:0;max-width:420px;padding:18px 22px 22px;
+        border-right:1px solid ${C.line};display:flex;flex-direction:column;gap:18px">
+        ${[objBlock, dmgBlock, ledgerBlock].filter(Boolean)}
+      </div>
+      ${right}
+    </div></div>`;
+
+  const root = htl.html`<div class="cpx-spoils" style="position:absolute;inset:0;z-index:24;
+    display:flex;align-items:center;justify-content:center;padding:20px;
+    background:rgba(4,5,10,.72);pointer-events:auto">${panel}</div>`;
+  paint();
+  // The QA seam is the cards and the two exits, so a test takes a card the way a
+  // finger does rather than by reaching into the campaign.
+  root.qa = {cards, pick, take: () => onDone?.(picked == null ? null : cards[picked]),
+             pass: () => onDone?.(null), picked: () => picked};
+  return root;
+}
+)};
+
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -8812,9 +9369,462 @@ export default function define(runtime, observer) {
   $def("_boardSession", "boardSession", ["Ship","World","loadShipSpec"], _boardSession);
   $def("_CLOCK", "CLOCK", ["PALETTE"], _CLOCK);
   $def("_tempoChip", "tempoChip", ["CLOCK","PALETTE","htl"], _tempoChip);
+  $def("_partIcon", "partIcon", ["componentNode","TYPES","TILE"], _partIcon);
+  $def("_damagePlate", "damagePlate", ["componentNode","TILE","PALETTE"], _damagePlate);
+  $def("_spoilsPopup", "spoilsPopup",
+       ["partIcon","damagePlate","INFO","TYPES","PALETTE","htl"], _spoilsPopup);
   $def("_shipBoard", "shipBoard",
-       ["battlefield","componentNode","INFO","MENU_ACTIONS","PALETTE","TYPES","PORTS","TILE","DT","htl","invalidation"],
+       ["battlefield","componentNode","INFO","MENU_ACTIONS","PALETTE","partIcon","TYPES","PORTS","TILE","DT","htl","invalidation"],
        _shipBoard);
+  return main;
+}</script>
+
+<script id="@tomlarkworthy/corepox-station" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// @tomlarkworthy/corepox-station — the shop, and it is the board.
+//
+// Implements "Shipyard Concepts" turn 10 (Claude Design project f9a1c3c2), which
+// is a claim about what a shop must NOT be: "A shop is the place a roguelike is
+// most tempted to open a catalogue over the game. This one does not."
+//
+// The four rules the design states, and where each one lives here:
+//
+//   BUYING IS PLACING     goods sit in the rail with a price instead of a count;
+//                         the cost commits on release. No cart, no confirm, and no
+//                         owned-but-unplaced state. -> corepox-board `onBuy`.
+//   SELLING IS THE SAME   drag a component off the hull into the rail and it sells
+//   DRAG, BACKWARD        at half. -> corepox-board `onSell`.
+//   BERTHS ARE PLACES     market / repair / locked salvage are selected the way a
+//                         component is selected, and tapping one swaps what the
+//                         rail holds and nothing else.
+//   THE DOCK IS DIEGETIC  a clamp arm reaches from the station to your hull, which
+//                         is what makes HARD legible without a modal.
+//
+// Nothing new is learned to shop: the board is corepox-board, the same one the
+// campaign and the refit bench use, and the clock is in HARD for the same reason a
+// refit is -- you are docked.
+
+const _title = function _title(md){return(
+md`# Corepox — station
+
+A shop that is the board. Drag a priced part out of the rail onto a legal cell to buy it;
+drag one of your own off the hull into the rail to sell it at half.`
+)};
+
+// What a part is worth new. Turn 10a's stock is Turret 180, Radar 120, Binary 60,
+// Engine 95, Armour 40, Lazer 260, so those six are the design's own numbers and
+// the rest are interpolated from them by role: hull plate cheapest, then logic,
+// then thrust, then guns.
+//
+// NOT a balance pass. The design says so itself: "Whether prices should also rise
+// by act, or stock should reroll for a fee, is an economy question I have not
+// answered here." Neither is answered here either -- price is flat across acts.
+const _STATION_PRICES = function _STATION_PRICES(){return(
+{Armour: 40, Constant: 45, Binary: 60, Radar: 120, Engine: 95, Lazer: 260,
+ LaserTurret2: 180, Explosive: 150, Shield: 210, Hyperdrive: 190, Orb: 240,
+ EnergyStore: 130, Brain: 300}
+)};
+
+// Half, rounded down. One number, one place, because the sell price appears in the
+// rail hint, in the confirmation and in the arithmetic and three copies of `/2`
+// would be three chances to disagree.
+const _sellPrice = function _sellPrice(STATION_PRICES){return(
+(type) => Math.floor((STATION_PRICES[type] ?? 30) / 2)
+)};
+
+// The berths. `locked` is a string rather than a boolean so the bay can say WHEN
+// it opens -- turn 10a draws "act 2" under SALVAGE, and a lock with no date on it
+// reads as broken rather than as coming.
+const _STATION_BERTHS = function _STATION_BERTHS(){return(
+[{id: "market", label: "MARKET", note: "buy · sell at half", locked: null},
+ {id: "repair", label: "REPAIR", note: "patch the hull", locked: null},
+ {id: "salvage", label: "SALVAGE", note: "act 2", locked: "act 2"}]
+)};
+
+const _stnRng = function _stnRng(){return(
+(seed) => { let a = seed >>> 0; return () => {
+  a = (a + 0x6D2B79F5) >>> 0;
+  let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+)};
+
+// Six goods, deterministic in the run seed and the node id, with AT LEAST ONE the
+// player cannot afford. Turn 10b: "stock is six items with one unaffordable, which
+// makes the ◆ constraint visible at a glance." That is a legibility requirement,
+// not flavour -- a stock list you can buy all of does not show you there is a
+// constraint, and the shop then teaches nothing on the visit where you are rich.
+const _stationStock = function _stationStock(STATION_PRICES, TYPES, stnRng){return(
+(node, camp, {n = 6} = {}) => {
+  const id = String(node?.id ?? "n0");
+  let h = camp.seed * 9176 + 7;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  const r = stnRng(h);
+  const pool = Object.keys(STATION_PRICES)
+    .filter(t => TYPES[t] && !TYPES[t].mineral && t !== "Composite");
+  const pick = [];
+  while (pick.length < Math.min(n, pool.length)) {
+    const t = pool[Math.floor(r() * pool.length)];
+    if (!pick.includes(t)) pick.push(t);
+  }
+  // The guarantee, enforced rather than hoped for: if everything drawn is
+  // affordable, the dearest slot is replaced by the dearest thing in the pool that
+  // is not. If the player cannot afford ANYTHING the list is already honest and is
+  // left alone.
+  const over = pool.filter(t => STATION_PRICES[t] > camp.scrap);
+  if (over.length && pick.every(t => STATION_PRICES[t] <= camp.scrap)) {
+    const dearest = over.sort((a, b) => STATION_PRICES[a] - STATION_PRICES[b])[0];
+    pick[pick.length - 1] = dearest;
+  }
+  return pick.map(type => ({type, price: STATION_PRICES[type]}));
+}
+)};
+
+// What the rail holds, which is the only thing a berth changes. Turn 10b: "Tapping
+// one swaps what the rail holds and nothing else."
+//
+// MARKET stacks the priced goods over YOUR HOLD in one column because to the hand
+// they are the same list -- both are things you drag onto the board -- and only the
+// badge differs. `n: Infinity` on a good is deliberate: stock is not a count, and a
+// market that ran out after one Armour would be a hold with a price sticker.
+const _stationRail = function _stationRail(){return(
+(berth, stock, camp) => {
+  const hold = Object.entries(camp.parts).filter(([, n]) => n > 0)
+    .map(([type, n]) => ({type, n, group: "YOUR HOLD"}));
+  if (berth === "market")
+    return [...stock.map(g => ({...g, n: Infinity, group: "MARKET"})), ...hold];
+  // REPAIR is a berth the design names and does not draw -- turn 10's own "try
+  // next" line is "design the repair berth". What is here is the smallest thing
+  // consistent with the frame and it is EXTRAPOLATION, flagged as such: the rail
+  // swaps to the hold alone, and the repair itself is one priced action on the
+  // board's action bar rather than an invented rail gesture. Do not read it as
+  // designed.
+  return hold;
+}
+)};
+
+// What patching the hull costs. Damage is carried per component now (`dmg` in the
+// spec, `maxHp - hp` on a live one), so the price is the damage itself at a rate --
+// a hull that limped in pays for exactly what it lost.
+const _repairQuote = function _repairQuote(){return(
+(ship, rate = 0.6) => {
+  let dmg = 0;
+  for (const c of ship?.components ?? []) dmg += c.dmg ?? 0;
+  return {dmg: Math.round(dmg), cost: Math.ceil(dmg * rate)};
+}
+)};
+
+// The station itself, as a thing you flew to. Turn 10b: "The station art borrows
+// the map's plated, riveted slabs rather than inventing a new material, so the
+// place you land on looks like the node you chose. Lit windows and the two cargo
+// hatches are the only warm accents; everything else stays grey so your own neon
+// parts stay the brightest thing on screen."
+//
+// It draws BEHIND the board and is not interactive: the berth strip is separate
+// HTML on top, because a berth has to be tappable and an SVG backdrop that swallows
+// pointer events would take the board's own drags with it.
+// The station itself. Built as SVG SOURCE and parsed, not interpolated into
+// `htl.html`: htl ESCAPES an interpolated string, so `${plates}` landed in the
+// document as the literal text "<rect .../>" and the whole station rendered as an
+// empty glow. Measured in Chromium 2026-08-22 -- `svg.querySelectorAll("g[opacity]
+// rect").length` was 0 with eleven plates built.
+const _stationArt = function _stationArt(){return(
+({w = 1400, h = 620, seed = 1, layer = "body"} = {}) => {
+  let a = (seed * 2654435761) >>> 0;
+  const r = () => ((a = (a * 48271) % 2147483647) / 2147483647);
+  const slab = (x, y, ww, hh, rot) =>
+    `<rect x="${x}" y="${y}" width="${ww}" height="${hh}" rx="3"` +
+    ` transform="rotate(${rot} ${x + ww / 2} ${y + hh / 2})"` +
+    ` fill="#2e2a33" stroke="#6b6577" stroke-width="1.6"/>`;
+  // The mass, right of frame, so the board sits clear of it. Plates are jittered a
+  // few degrees off square: a station built of perfectly aligned rectangles reads
+  // as a UI panel, which is the one thing this must not read as.
+  let plates = "";
+  for (let i = 0; i < 11; i++)
+    plates += slab(w * 0.78 + (r() - 0.5) * 120, 90 + i * 42,
+                   96 + r() * 60, 30 + r() * 6, (r() - 0.5) * 8);
+  // Lit windows and the two cargo hatches -- the only warm things in the frame.
+  let win = "";
+  for (let i = 0; i < 26; i++)
+    win += `<rect x="${w * 0.80 + r() * 190}" y="${104 + r() * 420}" width="4" height="3"` +
+           ` fill="#ffd76a" opacity="${(0.25 + r() * 0.6).toFixed(2)}"/>`;
+  const hatch = (x, y) =>
+    `<g><rect x="${x}" y="${y}" width="46" height="30" rx="4" fill="#1a1408"` +
+    ` stroke="#ffc42e" stroke-width="1.6"/><path d="M${x + 8} ${y + 15}h30"` +
+    ` stroke="#ffc42e" stroke-width="1.2" opacity=".7"/></g>`;
+  // The clamp is the whole reason HARD needs no modal. It reaches from the station
+  // toward where the hull is, so the pause has a cause on screen.
+  // The clamp is the whole reason HARD needs no modal: it reaches from the station
+  // to where the hull is, so the pause has a cause on screen. It is its own layer
+  // because the station body sits BEHIND the board and the arm has to sit in FRONT
+  // of it -- drawn with the body it was clipped at the board's edge and read as a
+  // broken stub with a bolt on the end.
+  const arm = `<g stroke="#8b93a5" fill="none" stroke-width="3" stroke-linecap="round">
+         <path d="M${w * 0.79} 330 L${w * 0.60} 330"/>
+         <path d="M${w * 0.60} 330 l0 -26 M${w * 0.60} 330 l0 26"/>
+         <path d="M${w * 0.60} 304 l-22 8 M${w * 0.60} 356 l-22 -8"/>
+       </g>
+       <circle cx="${w * 0.79}" cy="330" r="7" fill="#12151c" stroke="#8b93a5" stroke-width="2"/>`;
+  const body = `<defs><radialGradient id="stn-glow" cx=".82" cy=".45" r=".5">
+      <stop offset="0" stop-color="#2a3550" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#04050a" stop-opacity="0"/></radialGradient></defs>
+    <rect width="${w}" height="${h}" fill="#04050a"/>
+    <rect width="${w}" height="${h}" fill="url(#stn-glow)"/>
+    <g opacity=".92">${plates}</g>
+    ${win}
+    ${hatch(w * 0.83, 470)}${hatch(w * 0.90, 470)}`;
+  // Parsed as image/svg+xml, which needs the xmlns the template does not carry.
+  const src = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}"
+    preserveAspectRatio="xMidYMid slice">${layer === "clamp" ? arm : body}</svg>`;
+  const el = new DOMParser().parseFromString(src, "image/svg+xml").documentElement;
+  el.setAttribute("style",
+    "position:absolute;inset:0;width:100%;height:100%;pointer-events:none");
+  return el;
+}
+)};
+
+// The berth strip. Turn 10a anchors it to the station structure on the right and
+// selects a berth "the way a component is selected" -- so it is a press with a
+// selected state, not a tab bar, and the locked one stays in the list rather than
+// disappearing, for the same reason an out-of-stock rail row stays at .32.
+const _berthStrip = function _berthStrip(STATION_BERTHS, htl){return(
+(berth, onPick) => {
+  const MONO = "ui-monospace,SFMono-Regular,Menlo,monospace";
+  const box = htl.html`<div style="position:absolute;right:14px;top:64px;width:150px;
+    display:flex;flex-direction:column;gap:8px;z-index:7"></div>`;
+  for (const b of STATION_BERTHS) {
+    const on = berth === b.id, off = !!b.locked;
+    const el = htl.html`<div style="padding:9px 11px;border-radius:8px;
+      cursor:${off ? "default" : "pointer"};pointer-events:auto;
+      border:1px solid ${on ? "rgba(255,196,46,.7)" : "rgba(255,255,255,.09)"};
+      box-shadow:${on ? "inset 0 0 0 999px rgba(255,196,46,.1)" : "none"};
+      background:rgba(10,12,18,.93)">
+      <div style="font:700 10px ${MONO};letter-spacing:.12em;
+        color:${on ? "#ffc42e" : off ? "rgba(232,236,245,.3)" : "rgba(232,236,245,.6)"}"
+        >${b.label}</div>
+      <div style="font:400 8px ${MONO};margin-top:2px;
+        color:rgba(232,236,245,${off ? ".22" : ".32"})">${b.locked ?? b.note}</div></div>`;
+    if (!off) el.addEventListener("click", () => onPick(b.id));
+    box.append(el);
+  }
+  return box;
+}
+)};
+
+// The visit. Returns a node whose `value` is the campaign as it stands, and which
+// calls `onDone(campaign)` when the player undocks.
+//
+// A visit is a TRANSACTION: `revert` rolls the whole thing back -- hull, scrap and
+// hold together -- because turn 10b says so and because a shop you can half-undo is
+// a shop you have to explain. `camp0` is the snapshot it rolls back to.
+const _stationView = function _stationView(
+    shipEditor, stationArt, berthStrip, stationStock, stationRail, sellPrice,
+    repairQuote, htl){return(
+(camp0, node, {onDone, height = 420, span = 13, pad = 3,
+               partsOf = null, berth: berth0 = "market"} = {}) => {
+  const MONO = "ui-monospace,SFMono-Regular,Menlo,monospace";
+  // Relics expand to several parts, so counting `components` by type is wrong for
+  // a design that names one. The caller hands in the real `partsOf`; the fallback
+  // is only for a demo with no campaign around it.
+  const countOf = partsOf ?? ((spec) => {
+    const o = {};
+    for (const c of spec?.components ?? []) o[c.type] = (o[c.type] ?? 0) + 1;
+    return o;
+  });
+  let camp = structuredClone(camp0);
+  // Which bay is OPEN when the clamps take, not which bays exist -- a repair node
+  // and a market node are the same station seen from a different gantry.
+  let berth = berth0;
+  const stock = stationStock(node, camp0);
+  // The hold is not read off the board, it is DERIVED, because the board's rail and
+  // the campaign's hold are the same parts counted from opposite ends and a second
+  // writer would let them disagree mid-drag. Everything is conserved except a buy
+  // (a part appears on the hull) and a sell (one leaves the run), so
+  //
+  //   hold = hold0 + hull0 - hullNow + bought - sold
+  //
+  // and the two counters below are the only bookkeeping the visit needs.
+  const bought = {}, sold = {};
+  const hold0 = {...camp0.parts}, hull0 = countOf(camp0.ship);
+  const holdNow = (hull) => {
+    const now = countOf(hull), out = {};
+    for (const t of new Set([...Object.keys(hold0), ...Object.keys(hull0),
+                             ...Object.keys(now), ...Object.keys(bought),
+                             ...Object.keys(sold)]))
+      out[t] = (hold0[t] ?? 0) + (hull0[t] ?? 0) - (now[t] ?? 0) +
+               (bought[t] ?? 0) - (sold[t] ?? 0);
+    for (const t of Object.keys(out)) if (out[t] <= 0) delete out[t];
+    return out;
+  };
+
+  const root = htl.html`<div style="position:relative;border-radius:8px;overflow:hidden;
+    background:#04050a;font:12px/1.4 ${MONO};color:#dbe6f2"></div>`;
+  const artSeed = (camp.seed ?? 1) + String(node?.id ?? "").length;
+  const art = stationArt({seed: artSeed});
+  const clampArm = stationArt({seed: artSeed, layer: "clamp"});
+  clampArm.style.zIndex = 5;
+  // The board's own svg paints an opaque #05070a starfield across its whole width
+  // (`battlefield`, corepox-render.js:552), so art placed BEHIND it is not dimmed,
+  // it is invisible -- checked in Chromium, the station drew nothing. The art puts
+  // its mass at 0.78w and expects the board to sit clear of it, so the board is
+  // inset by that much and the right quarter is the station itself.
+  const GUTTER = "23%";
+  const host = htl.html`<div style="position:relative;z-index:2;margin-right:${GUTTER}"></div>`;
+
+  const btn = (label, hue, click) => htl.html`<button onclick=${click} style="
+    font:700 11px ${MONO};letter-spacing:.14em;padding:0 16px;height:40px;
+    border-radius:8px;cursor:pointer;pointer-events:auto;
+    border:1.5px solid ${hue};background:${hue}22;color:${hue}">${label}</button>`;
+
+  // Right, over the station, above the berth strip. It was top-LEFT and sat on the
+  // board's own hold note -- "STATION" and "\u25c6 214" printed 12px apart, which
+  // reads as one broken line. The "no clock" line is gone with it: the board
+  // already draws a HARD chip that says the same thing.
+  const head = () => htl.html`<div style="position:absolute;right:14px;top:12px;z-index:7;
+    width:200px;text-align:right;pointer-events:none">
+    <div style="font:700 11px ${MONO};letter-spacing:.18em;color:#ffc42e">STATION</div>
+    <div style="font:400 10px ${MONO};color:rgba(232,236,245,.5);margin-top:3px"
+      >${node?.name ?? "Waypoint"} · ${berth}</div></div>`;
+
+  let ed = null;
+  const build = () => {
+    // Rebuilt on a berth change rather than mutated: `boardSession` copies the
+    // inventory once, so "tapping a berth swaps what the rail holds" is a new
+    // session. Cheap, because the visit is paused and there is no simulation to lose.
+    const keep = ed ? structuredClone(ed.value) : camp.ship;
+    const quote = repairQuote(keep);
+    ed = shipEditor(keep, {name: keep?.name ?? "hull", height, span, pad,
+      parts: stationRail(berth, stock, {...camp, parts: holdNow(keep)}),
+      tempo: "build",
+      holdNote: () => "◆ " + camp.scrap,
+      balance: () => camp.scrap,
+      sellNote: () => berth === "market" ? "drag in to sell at half" : "",
+      onBuy: (type, price) => {
+        if (price > camp.scrap) return false;
+        camp.scrap -= price;
+        bought[type] = (bought[type] ?? 0) + 1;
+        sync();
+        return true;
+      },
+      onSell: (type) => {
+        // Only at the market, and only a part that is on the HULL -- the board
+        // already guarantees the second, since a rail row cannot be sell-dragged.
+        if (berth !== "market") return false;
+        camp.scrap += sellPrice(type);
+        sold[type] = (sold[type] ?? 0) + 1;
+        sync();
+        return true;
+      },
+      actions: () => {
+        const out = [];
+        if (berth === "repair")
+          out.push(quote.dmg > 0
+            ? btn(`PATCH ◆${quote.cost}`, quote.cost <= camp.scrap ? "#56e39f" : "#5b6b7d",
+                () => {
+                  if (quote.cost > camp.scrap) return;
+                  camp.scrap -= quote.cost;
+                  const s = structuredClone(ed.value);
+                  for (const c of s.components) delete c.dmg;
+                  camp.ship = s; build();
+                })
+            : btn("NO DAMAGE", "#5b6b7d", () => {}));
+        out.push(btn("UNDOCK ▶", "#56e39f", () => {
+          camp.ship = structuredClone(ed.value);
+          camp.parts = holdNow(camp.ship);
+          onDone?.(camp);
+        }));
+        out.push(btn("revert", "#5b6b7d", () => {
+          camp = structuredClone(camp0);
+          for (const k of Object.keys(bought)) delete bought[k];
+          for (const k of Object.keys(sold)) delete sold[k];
+          ed = null; berth = berth0; build();
+        }));
+        return out;
+      }});
+    host.replaceChildren(ed);
+    root.replaceChildren(art, host, clampArm, head(),
+                         berthStrip(berth, (b) => { berth = b; build(); }));
+    ed.addEventListener("input", sync);
+    sync();
+  };
+  // The board owns the hull while the visit is open; the campaign value follows it.
+  const sync = () => {
+    camp.ship = ed ? ed.value : camp.ship;
+    camp.parts = holdNow(camp.ship);
+    root.value = camp;
+    root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
+  };
+
+  build();
+  return root;
+}
+)};
+
+const _viewof_stationDemo = function _viewof_stationDemo(stationView, htl){return(
+(() => {
+  // A campaign-shaped object with no campaign around it, so the station can be
+  // opened on its own. `parts` is a hold with something in it, because a rail whose
+  // YOUR HOLD shelf is empty does not show that there are two shelves.
+  const camp = {seed: 3, scrap: 214,
+    parts: {Constant: 2, Armour: 1},
+    ship: {name: "hull", components: [
+      {type: "Brain", pos: [0, 0]},
+      {type: "Engine", pos: [-1, -1]}, {type: "Engine", pos: [1, -1]},
+      {type: "Lazer", pos: [0, 1]}], connections: []}};
+  const root = htl.html`<div></div>`;
+  const open = () => {
+    const v = stationView(camp, {id: "n2-1", name: "Threnody Waypoint"},
+      {height: 430, onDone: (out) => {
+        root.replaceChildren(htl.html`<div style="padding:18px;
+          font:12px ui-monospace,monospace;color:#8ef0c0">undocked · ◆ ${out.scrap} ·
+          hold ${JSON.stringify(out.parts)} · ${out.ship.components.length} parts
+          <button onclick=${open} style="margin-left:12px">dock again</button></div>`);
+      }});
+    v.addEventListener("input", () => { root.value = v.value; });
+    root.replaceChildren(v);
+    root.value = v.value;
+  };
+  open();
+  return root;
+})()
+)};
+
+const _stationDemo = function _stationDemo(Generators, $0){return(
+Generators.input($0)
+)};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  for (const m of ["corepox-engine", "corepox-shipyard"])
+    main.define("module @tomlarkworthy/" + m,
+      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
+  main.define("TYPES", ["module @tomlarkworthy/corepox-engine", "@variable"],
+    (_, v) => v.import("TYPES", _));
+  main.define("shipEditor", ["module @tomlarkworthy/corepox-shipyard", "@variable"],
+    (_, v) => v.import("shipEditor", _));
+
+  $def("_title", "title", ["md"], _title);
+  $def("_STATION_PRICES", "STATION_PRICES", [], _STATION_PRICES);
+  $def("_sellPrice", "sellPrice", ["STATION_PRICES"], _sellPrice);
+  $def("_STATION_BERTHS", "STATION_BERTHS", [], _STATION_BERTHS);
+  $def("_stnRng", "stnRng", [], _stnRng);
+  $def("_stationStock", "stationStock", ["STATION_PRICES","TYPES","stnRng"], _stationStock);
+  $def("_stationRail", "stationRail", [], _stationRail);
+  $def("_repairQuote", "repairQuote", [], _repairQuote);
+  $def("_stationArt", "stationArt", [], _stationArt);
+  $def("_berthStrip", "berthStrip", ["STATION_BERTHS","htl"], _berthStrip);
+  $def("_stationView", "stationView",
+       ["shipEditor","stationArt","berthStrip","stationStock","stationRail","sellPrice",
+        "repairQuote","htl"], _stationView);
+  main.variable(observer("viewof stationDemo")).define("viewof stationDemo",
+    ["stationView","htl"], _viewof_stationDemo).pid = "_viewof_stationDemo";
+  main.variable(observer("stationDemo")).define("stationDemo",
+    ["Generators","viewof stationDemo"], _stationDemo).pid = "_stationDemo";
   return main;
 }</script>
 
@@ -10289,11 +11299,15 @@ const _shipEditor = function _shipEditor(
     shipBoard, boardSession, tempoChip, portsOfShip, TYPES, htl){return(
 (spec0, {name = "ship", types = null, height = 420, span = 14, pad = 6,
          parts = null, holdNote = null, actions = null, tempo = null,
+         onBuy = null, onSell = null, balance = null, sellNote = null,
          mode: mode0 = "select", team = "player"} = {}) => {
   // Minerals are components so that an asteroid can be a Ship; they are not parts,
   // and a build palette that offers Ore is offering something no hull can use.
   const PALETTE = types ?? Object.keys(TYPES)
     .filter(t => t !== "Composite" && !TYPES[t].mineral);
+  // An array passes through untouched: it is already the rail the caller wants,
+  // rows and order and prices included (a station's market). Only the `{type: n}`
+  // form is a hold this has to invent a default for.
   const hold = parts ?? Object.fromEntries(PALETTE.map(t => [t, Infinity]));
   let S = boardSession(spec0, {parts: hold, name: spec0?.name ?? name, team});
 
@@ -10317,6 +11331,11 @@ const _shipEditor = function _shipEditor(
     // What the rail's head says under HOLD -- scrap, on a refit bench. A function
     // rather than a string because it is read on every paint and the number moves.
     holdNote,
+    // The station's two halves of one transaction, straight through to the board:
+    // `onBuy` may refuse a placement it cannot pay for, `onSell` receives a part
+    // dragged off the hull into the rail, and `balance` is what greys an
+    // unaffordable row. All null for a shipyard and a refit, which have no money.
+    onBuy, onSell, balance, sellNote,
     onChange: (spec) => {
       root.value = spec;
       paint();
@@ -12597,8 +13616,18 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   // units. Without it the wheel could only zoom about the centre of the framed
   // content, so there was no way to look at a corner. Tom, 2026-08-20: "Zoom is
   // always centered, so I can't use it to pan."
+  // `free` DETACHES the camera. `pan` is an offset from whatever the auto-frame
+  // chose, and the auto-frame recomputes the bounding box of every framed ship and
+  // focus point on every draw -- so a panned camera still slides whenever a part is
+  // placed, a ship moves, or the ghosts under a picked chip change the box. Tom,
+  // 2026-08-22: "Its quite hard using the camera controls. After panning I think
+  // the camera should dettach from the scene instead of trying to follow all the
+  // components." Once set to {cx, cy, w} the camera holds that absolute centre and
+  // width and stops asking what is on the board; pan and zoom move THAT instead.
+  // Cleared by resetView, which is the recentre pad, and by a board loading a new
+  // session.
   const api = {focus, minSpan: span, pad: 6, framed: null, zoom: 1, pan: [0, 0],
-               follow, dragging: false, panLock: false};
+               follow, dragging: false, panLock: false, free: null};
   let cam = {cx: 0, cy: 0, w: W, h: H};
   const frame = (k = 0.12) => {
     const pts = [];
@@ -12621,6 +13650,14 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
         `translate(${x.toFixed(1)} ${y.toFixed(1)}) ` +
         `scale(${(cam.w / W).toFixed(4)} ${(cam.h / H).toFixed(4)})`);
     };
+    if (api.free) {
+      const w = api.free.w / api.zoom, h = w * height / width;
+      const cx = api.free.cx + api.pan[0], cy = api.free.cy + api.pan[1];
+      cam = {cx: cam.cx + (cx - cam.cx) * k, cy: cam.cy + (cy - cam.cy) * k,
+             w: cam.w + (w - cam.w) * k, h: cam.h + (h - cam.h) * k};
+      write();
+      return;
+    }
     if (!pts.length) {
       // Nothing to frame: the first mission starts you with an EMPTY ship, so
       // there is no live component anywhere and the board would otherwise ignore
@@ -12780,6 +13817,13 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
     const dx = ev.clientX - down.x, dy = ev.clientY - down.y;
     if (!down.moved && Math.hypot(dx, dy) < 5) return;
     down.moved = true; api.dragging = true;
+    // Detach on the first real drag, not on the pointerdown: a 4px wobble on a
+    // click must not take the camera off the fight. The anchor is the auto-frame's
+    // own answer with pan and zoom taken back out -- base centre is `cam - pan` and
+    // base width is `cam.w * zoom` -- so the camera does not jump at the moment it
+    // detaches, and `down.pan` stays a valid origin for the drag in progress.
+    if (!api.free)
+      api.free = {cx: cam.cx - api.pan[0], cy: cam.cy - api.pan[1], w: cam.w * api.zoom};
     const r = svg.getBoundingClientRect();
     api.pan[0] = down.pan[0] - dx / r.width * cam.w;
     api.pan[1] = down.pan[1] - dy / r.height * cam.h;
@@ -12792,8 +13836,11 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   };
   svg.addEventListener("pointerup", release);
   svg.addEventListener("pointercancel", release);
-  api.resetView = () => { api.pan[0] = api.pan[1] = 0; zoomTo = api.zoom = 1; draw(true); };
-  api.moved = () => api.pan[0] !== 0 || api.pan[1] !== 0 || api.zoom !== 1;
+  api.resetView = () => { api.free = null; api.pan[0] = api.pan[1] = 0;
+                          zoomTo = api.zoom = 1; draw(true); };
+  // `free` counts as moved even at pan 0 zoom 1, so the recentre pad is offered
+  // for as long as the camera is detached -- it is the only way back.
+  api.moved = () => !!api.free || api.pan[0] !== 0 || api.pan[1] !== 0 || api.zoom !== 1;
 
   draw();
   // The screen -> tile map, from this view's own viewBox. Exposed because every
@@ -14718,9 +15765,12 @@ const _stepSession = function _stepSession(Ship, geom, DT, pilot){return(
 // clock, and the loop that steps it.
 const _viewof_game = function _viewof_game(
     MISSIONS, CAMPAIGNS, newSession, evaluateObjectives, stepSession, shipBoard,
-    PALETTE, tempoChip, componentNode, objectiveHtml, htl, invalidation) {
+    PALETTE, tempoChip, spoilsPopup, TYPES, componentNode, objectiveHtml, htl, invalidation) {
   let mi = 0, S = newSession(MISSIONS[0]);
   const kept = new Map();            // buildOnce: mission id -> the ship you took in
+  let carried = [];                  // [{type, n}] won at a mission end and kept
+  const claimed = new Set();         // mission ids already paid: a replay is not a farm
+  let result = null;                 // the live end-of-mission popup, or null
   const {C, MONO} = PALETTE;
   let clock = null, raf = null, stop = false;
 
@@ -14739,7 +15789,7 @@ const _viewof_game = function _viewof_game(
   // camera, the layout and the window key listeners, and rebuilding it would drop
   // all three on every retry.
   const board = shipBoard(S, {
-    blocked: () => !!scene,
+    blocked: () => !!scene || !!result,
     chrome: (ctx) => chrome(ctx),
     // The VALUE has to move with the ship, not with the chrome. It used to be
     // written only by `render`, which was fine while every edit ended in one --
@@ -14869,7 +15919,7 @@ const _viewof_game = function _viewof_game(
       if (clock) clock.textContent = `${S.world.t.toFixed(1)}s`;
       root.dispatchEvent(new CustomEvent("input", {bubbles: true}));
       if (S.state === "playing") raf = requestAnimationFrame(tick);
-      else render();
+      else { render(); finish(); }
     };
     raf = requestAnimationFrame(tick);
     render();
@@ -14881,8 +15931,9 @@ const _viewof_game = function _viewof_game(
   const reset = (idx = mi, showIntro = idx !== mi) => {
     if (raf) cancelAnimationFrame(raf);
     if (scene) { scene.remove(); scene = null; }
+    if (result) { result.remove(); result = null; }
     mi = idx;
-    const m0 = MISSIONS[mi];
+    const m0 = withCarry(MISSIONS[mi]);
     S = newSession(m0.buildOnce && kept.has(m0.id) ? {...m0, ...kept.get(m0.id)} : m0);
     // `load` clears the board's gesture state and recentres it -- a hand-panned
     // camera does not carry to the next mission.
@@ -15016,6 +16067,146 @@ const _viewof_game = function _viewof_game(
           : "restart, top right"}</div></div>`);
   };
 
+  // ---- spoils ---------------------------------------------------------------
+  // A mission used to PRINT its spoils and hand over nothing: `m.spoils` was drawn
+  // as a line of text on the victory overlay, and every mission starts from its own
+  // authored `inventory`, so nothing won was ever spendable. That is Tom's "there
+  // are few chances to get more components", and it is most of why the boss reads
+  // as overtuned -- you fight it with exactly the parts its own mission hands you.
+  //
+  // Two changes, both from "Shipyard Concepts" turn 11. A win offers a CHOICE of
+  // cards rather than a fixed award ("three cards, one pick, the rest burn -- a
+  // decision you can regret"), and what is taken is CARRIED into the missions after
+  // it. Paid once per mission id: replaying a cleared mission is not a farm.
+  //
+  // This is not PART_COST. The mission campaign has no scrap and nothing to spend
+  // it on, so rarity here is about how much a part changes a build, not its price.
+  const SPOILS_POOL = {
+    Armour:       {n: 3, rarity: "common"},
+    Constant:     {n: 2, rarity: "common"},
+    Engine:       {n: 1, rarity: "common"},
+    Binary:       {n: 2, rarity: "uncommon"},
+    Explosive:    {n: 2, rarity: "uncommon"},
+    Lazer:        {n: 1, rarity: "uncommon"},
+    Radar:        {n: 1, rarity: "uncommon"},
+    Orb:          {n: 1, rarity: "rare"},
+    LaserTurret2: {n: 1, rarity: "rare"}
+  };
+  const WEIGHT = {common: 6, uncommon: 3, rare: 1};
+
+  // Deterministic in the mission id, so the alternates are a property of the
+  // mission and not of when you happened to finish it -- the same shape encRng and
+  // hashId give the map's encounters in corepox-duel-encounter.
+  const rngOf = (id) => {
+    let h = 2166136261;
+    for (const ch of String(id)) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+    let x = (h >>> 0) || 1;
+    return () => (x = (x * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  };
+
+  const bank = (items) => {
+    for (const it of items ?? []) {
+      const row = carried.find(x => x.type === it.type);
+      if (row) row.n += it.n; else carried.push({type: it.type, n: it.n});
+    }
+  };
+  // What the next mission starts with: its authored inventory PLUS what has been
+  // carried. Additive only -- a mission that teaches with three Armour still has
+  // its three, and the rail groups rows by type so a second row of the same part
+  // is not a second entry on screen.
+  const withCarry = (m) => carried.length
+    ? {...m, inventory: [...(m.inventory ?? []), ...carried.map(i => ({...i}))]} : m;
+
+  const spoilsOffer = (m, S, objs) => {
+    const dead = S.player.comps.filter(c => c.hp <= 0);
+    // PERFECT is turn 11's fourth outcome: every objective, no cells lost. It buys
+    // a fourth card and a guaranteed uncommon-or-better, which is the only place
+    // in the campaign where flying well pays more than flying adequately.
+    const perfect = !dead.length && objs.length > 0 && objs.every(o => o.done && !o.failed);
+    const cards = [];
+    const authored = (m.spoils ?? []).filter(sp => sp.type !== "relic" && TYPES[sp.type]);
+    if (authored.length)
+      cards.push({items: authored.map(sp => ({type: sp.type, n: sp.n})),
+                  rarity: SPOILS_POOL[authored[0].type]?.rarity ?? "common",
+                  why: "What this mission was written to hand over."});
+    const taken = new Set(cards.flatMap(c => c.items.map(i => i.type)));
+    const r = rngOf(m.id);
+    const draw = (only = null) => {
+      const pool = Object.keys(SPOILS_POOL)
+        .filter(t => TYPES[t] && !taken.has(t) && (!only || only.includes(SPOILS_POOL[t].rarity)));
+      if (!pool.length) return null;
+      const total = pool.reduce((a, t) => a + WEIGHT[SPOILS_POOL[t].rarity], 0);
+      let x = r() * total, got = pool[0];
+      for (const t of pool) { x -= WEIGHT[SPOILS_POOL[t].rarity]; if (x <= 0) { got = t; break; } }
+      taken.add(got);
+      return {items: [{type: got, n: SPOILS_POOL[got].n}], rarity: SPOILS_POOL[got].rarity};
+    };
+    const want = perfect ? 4 : 3;
+    while (cards.length < want - (perfect ? 1 : 0)) { const c = draw(); if (!c) break; cards.push(c); }
+    if (perfect) { const c = draw(["uncommon", "rare"]) ?? draw(); if (c) cards.push(c); }
+    // Marked, not recommended. Turn 11: the bar "states the ship's actual deficit
+    // rather than recommending a card, so it informs the choice without making it".
+    const lostTypes = new Set(dead.map(c => c.type));
+    for (const c of cards)
+      if (c.items.some(i => lostTypes.has(i.type))) c.why = "Replaces what you lost. " + (c.why ?? "");
+    const cells = dead.reduce((a, c) => a + c.tiles.length, 0);
+    return {cards, perfect,
+            hint: cells ? `your hull is short ${cells} cell${cells > 1 ? "s" : ""} — ` +
+                          [...lostTypes].join(", ") + " went with them"
+                        : ""};
+  };
+
+  // ---- the end-of-mission popup ---------------------------------------------
+  // One frame for every outcome (turn 11), mounted over the board the way the
+  // cutscene is. It is the only exit from a finished mission: taking a card, taking
+  // nothing, or retrying all go through it, which is what makes the choice a
+  // decision rather than a notification.
+  const finish = () => {
+    if (result || (S.state !== "win" && S.state !== "loss")) return;
+    const m = MISSIONS[mi], camp = campaignOf(mi), won = S.state === "win";
+    const objs = evaluateObjectives(S);
+    const dead = S.player.comps.filter(c => c.hp <= 0);
+    const lost = Object.entries(dead.reduce((a, c) => (a[c.type] = (a[c.type] ?? 0) + 1, a), {}))
+      .map(([type, n]) => ({type, n}));
+    const first = !claimed.has(m.id);
+    const offer = won && first ? spoilsOffer(m, S, objs) : {cards: [], perfect: false, hint: ""};
+    const next = mi + 1 < MISSIONS.length;
+    // A relic is recovered, not banked: AimMission and FollowCourseAdvanced hand
+    // over composites that the shipped game filed in the player's account record,
+    // and there is no account here. It reads on the ledger and goes nowhere.
+    const relic = won ? (m.spoils ?? []).find(sp => sp.type === "relic") : null;
+    const pop = spoilsPopup({
+      verb: !won ? "BROKEN UP" : offer.perfect ? "PERFECT" : "MISSION CLEARED",
+      tone: !won ? C.red : offer.perfect ? C.purple : C.green,
+      meta: `${camp.name} ${camp.k + 1} of ${camp.n} · ${m.title} · ${S.world.t.toFixed(1)}s`,
+      note: !won ? (S.player.live.some(c => c.type === "Brain") ? "the objective was lost"
+                                                                : "the Brain is gone")
+                 : dead.length ? `${dead.length} component${dead.length > 1 ? "s" : ""} lost`
+                               : "hull held",
+      summary: !won
+        ? "The hull did not come back. RETRY rebuilds this mission from its own inventory; " +
+          "what you carried in is untouched."
+        : "This mission has already paid. Its cards were taken the first time it was cleared.",
+      objectives: objs.map(o => ({node: objectiveHtml(o.text), done: o.done, failed: o.failed})),
+      ship: S.player, lost, hold: carried,
+      ledger: [...(relic ? [["recovered", relic.name, C.purple]] : []),
+               ...(won && !first ? [["already claimed", "no cards", C.dim]] : [])],
+      cards: offer.cards, hint: offer.hint,
+      takeLabel: !won ? "RETRY" : next ? (offer.cards.length ? "TAKE & NEXT" : "NEXT") : "TAKE",
+      passLabel: "take nothing",
+      onDone: (card) => {
+        result?.remove(); result = null;
+        if (!won) return reset(mi, false);
+        claimed.add(m.id);
+        bank(card?.items);
+        if (next) return reset(mi + 1);
+        render();
+      }
+    });
+    result = pop;
+    stage.appendChild(pop);
+  };
+
   // ---- render ---------------------------------------------------------------
   // The mission bar, and then the board. Everything below the bar is the board's.
   const render = () => {
@@ -15053,7 +16244,17 @@ const _viewof_game = function _viewof_game(
     intro: () => scene, skipIntro: () => { while (scene) scene.next(); },
     play: () => { play(); }, restart: () => { reset(mi); },
     mission: () => MISSIONS[mi].id,
-    select: (i) => reset(i)
+    select: (i) => reset(i),
+    // The end-of-mission popup covers the board exactly as the cutscene does, so a
+    // driver has to get past it the way a player does: pick a card, or pass.
+    spoils: () => result?.qa ?? null,
+    carried: () => carried.map(i => ({...i})),
+    // Ends the mission at a verdict WITHOUT playing it, so a gate on the popup is
+    // not also a gate on winning -- corepox-qa-campaign.ts already plays all twelve
+    // by clicking. This seam decides nothing about spoils: the offer, the carry and
+    // the buttons are the same code a real win runs.
+    end: (verdict) => { if (raf) cancelAnimationFrame(raf);
+                        S.state = verdict; render(); finish(); }
   });
 
   reset(0, true);
@@ -15066,7 +16267,7 @@ export default function define(runtime, observer) {
   };
   main.variable(observer("viewof game")).define("viewof game",
     ["MISSIONS","CAMPAIGNS","newSession","evaluateObjectives","stepSession","shipBoard",
-     "PALETTE","tempoChip","componentNode","objectiveHtml","htl","invalidation"],
+     "PALETTE","tempoChip","spoilsPopup","TYPES","componentNode","objectiveHtml","htl","invalidation"],
     _viewof_game).pid = "_viewof_game";
   main.variable(observer("game")).define("game", ["Generators", "viewof game"],
     (G, _) => G.input(_)).pid = "_game";
@@ -15078,14 +16279,14 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-board",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-board.js?v=4")).default));
-  for (const n of ["Ship", "World", "geom", "DT", "pilot"])
+  for (const n of ["Ship", "World", "geom", "DT", "pilot", "TYPES"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   main.define("componentNode", ["module @tomlarkworthy/corepox-render", "@variable"],
     (_, v) => v.import("componentNode", _));
   for (const n of ["MISSIONS", "CAMPAIGNS"])
     main.define(n, ["module @tomlarkworthy/corepox-missions", "@variable"],
       (_, v) => v.import(n, _));
-  for (const n of ["shipBoard", "PALETTE", "tempoChip"])
+  for (const n of ["shipBoard", "PALETTE", "tempoChip", "spoilsPopup"])
     main.define(n, ["module @tomlarkworthy/corepox-board", "@variable"], (_, v) => v.import(n, _));
 
   $def("_title", "title", ["md"], _title);
@@ -18701,17 +19902,22 @@ const _TYPES = function _TYPES(){return(
   // and not an engine constant.
   RockSpar:     {hp: 60,  mineral: true, tiles: [[0,0],[0,1],[0,2]], ins: [], outs: []},
   RockSlab:     {hp: 80,  mineral: true, tiles: [[0,0],[1,0],[0,1],[1,1]], ins: [], outs: []},
-  // Ore does not break. The hp is a number no weapon in the game can reach, and it
-  // is the rule that makes mining a distinct verb rather than shooting with extra
-  // steps: a beam that reaches the seam does nothing, so the only way to a piece of
-  // ore is to destroy the rock HOLDING it until the piece is its own island.
+  // Ore breaks, and shooting it IS the harvest. Twice rock's 20/tile, so a seam
+  // costs about as much fire as the rock hiding it and the answer to wanting more
+  // money is more guns and more seams rather than more patience on one.
   //
-  // It replaced a robot miner that had grown four rules for not shooting its own
-  // prize -- lane tests, a hold-fire, a cut-target, an orbit -- which deadlocked
-  // against each other in three different ways (2026-08-21). One indestructible
-  // component removes all four.
-  Ore:          {hp: 1e9, mineral: true, ore: 30, tiles: [[0,0]], ins: [], outs: []},
-  OreVein:      {hp: 1e9, mineral: true, ore: 75, tiles: [[0,0],[0,1]], ins: [], outs: []}
+  // Tom, 2026-08-21: "We want people to shoot multiple ores to get money. Thats the
+  // fun, designing a ship that optimizes swarming and mining a lot in parrallel...
+  // the game is exploration and mass farming."
+  //
+  // It was `hp: 1e9` for about six hours -- indestructible, so the only route to a
+  // seam was cutting the rock around it until the piece floated free. That removed
+  // four deadlocking fire-discipline rules from the miner AI and it also removed the
+  // game: an encounter you excavate is one seam at a time, and one seam at a time is
+  // not a farm. A field overrides these per component from its own `rockHp`, so the
+  // ratio is what is fixed here, not the number.
+  Ore:          {hp: 40,  mineral: true, ore: 30, tiles: [[0,0]], ins: [], outs: []},
+  OreVein:      {hp: 80,  mineral: true, ore: 75, tiles: [[0,0],[0,1]], ins: [], outs: []}
 }
 )};
 
@@ -20534,7 +21740,7 @@ const _SYMBOL_FOR = function _SYMBOL_FOR(){return(
   Engine:       ["engine-3",   28,   28],
   Lazer:        ["lazer-2",    28,  140],
   Explosive:    ["explosive-3",    24.9,  24.9],
-  Armour:       ["armour-2",    23.3,  23.3],
+  Armour:       ["armour-3",    30.08, 30.08],
   Orb:          ["orb",       89.66, 145.10],
   // Was (135, 79.5), which put the gear nowhere near the base cells. The teeth
   // ring centres on art (111.0, 124.0) and the mount's left edge and bottom sit
@@ -21137,10 +22343,46 @@ const _h_Armour = function _h_Armour(section){return(
 section("Armour")
 )};
 
+// Armour, redrawn to "Shipyard Concepts" 5h (2026-08-22). The recovered Unity art
+// was a rounded ring, and 5h says what is wrong with it: "a single cell read as a
+// button and a field of them read as a bubble sheet" -- which is what
+// tools/screenshots/armour-before.png shows, 24 rounded squares and no plating.
+//
+// A chamfered plate instead: square where it meets a neighbour so runs come out
+// flush, cut at 45 degrees on the corners so four plates leave a small dark
+// diamond between them. The diamond is the point and it is NEGATIVE space --
+// nothing draws it, it is the hole the four chamfers leave, which is why 5h can
+// say it costs nothing.
+//
+// THE ART BOX HAD TO GROW, and that is the part that is not a path edit. Every
+// recovered symbol is authored in a 46.59-unit box on a 56-unit cell, so the old
+// plate never reached its own cell edge and neighbours could not touch
+// (tools/screenshots/armour-zoom.png, before: a clear gutter between plates).
+// A `use` maps art unit u to `u - viewBoxMinX - anchor`, so a plate spanning
+// -28..28 needs the box widened to 56 + 2x2.08 bleed and the anchor moved with
+// it: viewBox -2.08 -2.08 60.16 60.16 and SYMBOL_FOR 30.08, which puts art 0 at
+// -28 and art 56 at +28 exactly. Nothing else in the pipeline changes.
+//
+// Geometry is 5h's, scaled from its 112-unit cell to 56 (x 0.5): chamfer 9, inner
+// outline inset 6 with chamfer 7, rivets at 6.5/49.5 r 1.5, three ribs at y
+// 21/28/35 spanning x 13..43.
+//
+// One departure, deliberate: 5h strokes the outline at 3 (-> 1.5 here) and this
+// uses 3.4. The design is a flat mock; our sheet is stamped through cp-bloom and
+// sits beside eleven parts still on the recovered art at the sheet's 4.16 weight,
+// where 1.5 reads as a different game. The alternative -- take 5h's weight and
+// restroke every other part to match -- is right, and it is turn 5's whole
+// component sheet rather than this change.
 const _art_Armour = function _art_Armour(svg){return(
-svg`<svg viewBox="-2.08 -2.08 50.75 50.75" width="320.0" height="320.0">
-  <path d="M5.09,0L41.51,0C44.31,0,46.59,2.28,46.59,5.09L46.59,41.51C46.59,44.31,44.31,46.59,41.51,46.59L5.09,46.59C2.28,46.59,0,44.31,0,41.51L0,5.09C0,2.28,2.28,0,5.09,0Z" fill="rgba(16,9,44,0.500)" stroke="rgba(207,207,230,0.520)" stroke-width="0.84" stroke-linejoin="round"/>
-  <path d="M5.09,0L41.51,0C44.31,0,46.59,2.28,46.59,5.09L46.59,41.51C46.59,44.31,44.31,46.59,41.51,46.59L5.09,46.59C2.28,46.59,0,44.31,0,41.51L0,5.09C0,2.28,2.28,0,5.09,0Z" fill="none" stroke="rgb(138,138,230)" stroke-width="4.16" stroke-linejoin="round"/>
+svg`<svg viewBox="-2.08 -2.08 60.16 60.16" width="320.0" height="320.0">
+  <path d="M9,0L47,0L56,9L56,47L47,56L9,56L0,47L0,9Z" fill="rgba(16,9,44,0.560)" stroke="rgba(207,207,230,0.520)" stroke-width="0.9" stroke-linejoin="round"/>
+  <path d="M9,0L47,0L56,9L56,47L47,56L9,56L0,47L0,9Z" fill="none" stroke="rgb(138,138,230)" stroke-width="3.4" stroke-linejoin="round"/>
+  <path d="M13,6L43,6L50,13L50,43L43,50L13,50L6,43L6,13Z" fill="none" stroke="rgb(143,140,255)" stroke-width="1.1" stroke-linejoin="round" opacity="0.45"/>
+  <g fill="rgb(143,140,255)" opacity="0.5">
+    <circle cx="6.5" cy="6.5" r="1.5"/><circle cx="49.5" cy="6.5" r="1.5"/>
+    <circle cx="49.5" cy="49.5" r="1.5"/><circle cx="6.5" cy="49.5" r="1.5"/>
+  </g>
+  <path d="M13,21L43,21M13,28L43,28M13,35L43,35" fill="none" stroke="rgb(179,176,255)" stroke-width="0.6" opacity="0.22"/>
 </svg>`
 )};
 
