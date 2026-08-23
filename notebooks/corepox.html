@@ -5669,8 +5669,8 @@ const _humanControl = function _humanControl(){return(
 
 // The view is a thin shell: a backdrop behind, the shared battlefield on top, and a
 // scoreboard. It owns no rules -- everything it shows comes from stepDuel.
-const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, htl, DT){return(
-(cfg = {}, {height = 520, span = 46, speed = 1, onEnd} = {}) => {
+const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, htl, DT, UNITS){return(
+(cfg = {}, {height = 520, span = 46, speed = 1, onEnd, hold = UNITS.CORE_TIME + 0.15} = {}) => {
   const D = cfg.world ? cfg : newDuel(cfg);
   const root = htl.html`<div style="position:relative;border-radius:8px;overflow:hidden;
     background:#04050a;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dbe6f2"></div>`;
@@ -5692,7 +5692,7 @@ const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, h
     pointer-events:none;text-shadow:0 1px 3px #000"></div>`;
   root.append(hud);
 
-  let raf = 0, acc = 0, last = 0, stopped = false;
+  let raf = 0, acc = 0, last = 0, stopped = false, endAt = 0;
   // One readout per SIDE, not two hard-coded ones: a melee has N of them and the
   // 2-ship duel is the n = 2 case of the same loop. The first two keep the colours
   // A and B have always had so a duel looks unchanged.
@@ -5714,7 +5714,19 @@ const _duelView = function _duelView(newDuel, stepDuel, backdrop, battlefield, h
     while (acc >= DT) { acc -= DT; if (!D.outcome) stepDuel(D); }
     if (bg) bg.update(now / 1000);
     view.draw(); paint();
-    if (D.outcome && onEnd) { onEnd(D.outcome, D); onEnd = null; }
+    // The match is decided the tick the last Brain dies, and that same tick queues
+    // the core explosion. Handing straight over showed one frame of it. Hold for the
+    // length of the effect (CORE_TIME, the prefab's trailTime) and let it play.
+    //
+    // The world is NOT stepped during the hold, and that is the point: onEnd reads
+    // the winner's surviving hull (`survivingHull(D.a, ...)` in corepox-duel-encounter)
+    // to decide what they carry out, so a second of extra physics after the verdict
+    // could take parts off a ship that had already won. The burst is drawn on the
+    // renderer's own clock for exactly this reason.
+    if (D.outcome && onEnd) {
+      if (!endAt) endAt = now + hold * 1000;
+      if (now >= endAt) { onEnd(D.outcome, D); onEnd = null; }
+    }
   };
   last = performance.now();
   raf = requestAnimationFrame(loop);
@@ -5793,7 +5805,7 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-backdrops.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-missions",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
-  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec", "TYPES", "TYPE_ALIAS", "RELICS"])
+  for (const n of ["Ship", "World", "geom", "DT", "UNITS", "pilot", "loadShipSpec", "TYPES", "TYPE_ALIAS", "RELICS"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
     (_, v) => v.import("battlefield", _));
@@ -5821,7 +5833,7 @@ export default function define(runtime, observer) {
   $def("_nearestFoe", "nearestFoe", [], _nearestFoe);
   $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","meleePlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
   $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive","nearestFoe"], _stepDuel);
-  $def("_duelView", "duelView", ["newDuel","stepDuel","backdrop","battlefield","htl","DT"], _duelView);
+  $def("_duelView", "duelView", ["newDuel","stepDuel","backdrop","battlefield","htl","DT","UNITS"], _duelView);
   $def("_humanControl", "humanControl", [], _humanControl);
   $def("_DUEL_MODES", "DUEL_MODES", [], _DUEL_MODES);
   $def("_duelAlive", "duelAlive", [], _duelAlive);
@@ -5864,7 +5876,9 @@ runEncounter(node, camp, {control: "auto"})     // the same thing headless
 \`\`\`
 
 \`control: "human"\` gives the battle to the keyboard: **WASD** to fly, **space** to
-shoot, **click** to set a waypoint the autopilot drives to. \`"auto"\` hands the same
+shoot. Pressing the field sets a waypoint the autopilot drives to, but only once the
+autopilot pad (➤, beside the pan handle) is armed — off, which is the default,
+the field pans. \`"auto"\` hands the same
 ship to the robot pilot, and \`"wired"\` lets the ship run only the program its own
 wires describe.`
 )};
@@ -5936,14 +5950,22 @@ const _applyRefit = function _applyRefit(refitCheck){return(
 }
 )};
 
-// The loadout a run starts with. A Brain, one Engine and a Constant is a hull that
-// flies and cannot shoot, so the first refit is a real decision rather than a
-// formality: the Lazer in the hold has to displace something or go somewhere that
-// costs steering. Kept here rather than in the map so a run is defined in one place.
+// The loadout a run starts with: a bare Brain, and everything else in the hold.
+// Tom, 2026-08-23: "the starting ship is dumb. Just start a map with a simple brain
+// and no more." It used to be `wiredCore` -- Brain + Engine + Constant, already
+// wired -- on the argument that a hull which flies and cannot shoot makes the first
+// refit a decision. It does the opposite: it makes the first refit an EDIT of
+// somebody else's ship, and the wire is already drawn, so the one thing the game is
+// about has been done for you before you arrive.
+//
+// Nothing is taken away. The Engine and the Constant that were bolted on move into
+// the hold (Engine 2->3, Constant 2->3), so the run starts with the same materials
+// and none of the layout. The wire is gone with the hull that carried it.
+// Kept here rather than in the map so a run is defined in one place.
 const _newRunCampaign = function _newRunCampaign(SHIPS, newCampaign){return(
 (seed = 41) => newCampaign({
-  seed, ship: SHIPS.wiredCore, scrap: 214,
-  parts: {Engine: 2, Lazer: 2, Armour: 4, Constant: 2, Radar: 1}
+  seed, ship: SHIPS.lonelyCore, scrap: 214,
+  parts: {Engine: 3, Lazer: 2, Armour: 4, Constant: 3, Radar: 1}
 })
 )};
 
@@ -6402,7 +6424,7 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
     live = v; human = mode === "human" ? humanControl(v, v.mining, null) : null;
     body.replaceChildren(v,
       htl.html`<div style="margin-top:6px;color:#5b6b7d;font:11.5px ui-monospace,monospace">${
-        mode === "human" ? "WASD to fly · space to shoot · click the field for a waypoint · break the rock, then touch what falls out"
+        mode === "human" ? "WASD to fly · space to shoot · ➤ arms the autopilot, then press the field for a waypoint · break the rock, then touch what falls out"
                          : mode === "auto" ? "the robot pilot works the seam" : "the ship runs its own wiring"}</div>`);
   };
 
@@ -6427,7 +6449,7 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
     live = v; human = mode === "human" ? humanControl(v, v.duel, "a") : null;
     body.replaceChildren(v,
       htl.html`<div style="margin-top:6px;color:#5b6b7d;font:11.5px ui-monospace,monospace">${
-        mode === "human" ? "WASD to fly · space to shoot · click the board for a waypoint"
+        mode === "human" ? "WASD to fly · space to shoot · ➤ arms the autopilot, then press the board for a waypoint"
                          : mode === "auto" ? "the robot pilot has it" : "the ship runs its own wiring"}</div>`);
   };
 
@@ -7423,7 +7445,7 @@ const _tempoChip = function _tempoChip(CLOCK, PALETTE, htl){const {C, MONO} = PA
 })};
 
 const _shipBoard = function _shipBoard(
-    battlefield, componentNode, INFO, MENU_ACTIONS, PALETTE, partIcon, TYPES, PORTS, TILE, DT, htl, invalidation){return(
+    battlefield, componentNode, INFO, MENU_ACTIONS, PALETTE, partIcon, TYPES, PORTS, TILE, DT, rotTile, htl, invalidation){return(
 (S0, opts = {}) => {
   let S = S0;
   // The cells the session's own ship arrived on. A mission ENVELOPE is a fixed
@@ -7454,6 +7476,25 @@ const _shipBoard = function _shipBoard(
   // while it is held nothing claims the pointer and the camera's own drag-to-pan
   // gets it, which is the design's "two fingers - middle - space" row.
   let drag = null, hoverCell = null, space = false;
+  // Click-the-field-to-fly, OFF until asked for. Turn 7b's press table gives sky
+  // drag one meaning in both states -- "go there, facing the drag" -- and in
+  // practice it takes every drag the player meant as a look-around: Tom,
+  // 2026-08-23, "I don't like auto-pilot being on by default, it gets triggered
+  // easily by panning, so can we make that mode opt-in and off by default".
+  // While it is off a press on empty sky arms nothing and the camera's own
+  // drag-to-pan gets the pointer, which is what a bare drag does in BUILD already.
+  // WASD and space are unaffected -- they are direct commands, not a waypoint.
+  let autopilot = false;
+  // Which way the NEXT part goes down, in degrees. Rotating after the fact is a
+  // second gesture on a part that is already in the wrong place; Tom, 2026-08-23:
+  // "we should be able to place components rotated, I think there should be a
+  // rotate button above the shelf, which will rotate all the parts in the shelf
+  // and also when placed." It is a property of the RAIL, not of a chip, so every
+  // row turns together and the icon is the readout.
+  let placeDir = 0;
+  // The spec's word for it. `specOf` writes the same four names back out of the
+  // live degrees; this is the one place that goes the other way.
+  const DIRS = ["up", "right", "down", "left"];
   // WASD drives; F fires. Keys were on `window` and unguarded, which in a lopepage
   // layout meant typing "f" in another pane's editor fired the guns -- so anything
   // with a caret in it swallows the key first.
@@ -7541,7 +7582,7 @@ const _shipBoard = function _shipBoard(
   // indistinguishable from the recentre pad beside it; the design's arrows are
   // four strokes on a square, and the square is the affordance.
   const panPad = (size) => htl.html`<button
-    title=${space ? "pan latched \u2014 click to release" : "pan the camera"}
+    title=${space ? "pan latched — click to release" : "pan the camera"}
     onclick=${() => { space = !space; render(); }} style="width:${size}px;height:${size}px;
     border-radius:${size > 44 ? 12 : 10}px;pointer-events:auto;display:flex;
     border:1px solid ${space ? C.amber : "rgba(255,255,255,.18)"};
@@ -7730,7 +7771,7 @@ const _shipBoard = function _shipBoard(
     // A part coming off the rail has no rotation yet (commitBuild writes
     // dir: "up"), so TYPES is right for that case and only that case.
     const tiles = ignore ? ignore.tiles.map(t => [t[0] - ignore.px, t[1] - ignore.py])
-                         : (TYPES[type]?.tiles ?? [[0, 0]]);
+                         : (TYPES[type]?.tiles ?? [[0, 0]]).map(t => rotTile(t, placeDir));
     const taken = (x, y) => S.player.comps.some(c =>
       c !== ignore && c.tiles.some(t => t[0] === x && t[1] === y));
     // The envelope constrains the ANCHOR, not the footprint. SideShooter's
@@ -7770,7 +7811,7 @@ const _shipBoard = function _shipBoard(
     if (Number.isFinite(item.n)) item.n--;
     editPause();
     S.player = rebuild([...specOf(S.player).components,
-                        {type: picked, pos: [px, py], dir: "up"}],
+                        {type: picked, pos: [px, py], dir: DIRS[(placeDir / 90) % 4]}],
                        specOf(S.player).connections);
     // The chip STAYS armed. Turn 7c's PLACE claim is "3 taps / part -> 1", and
     // clearing the pick here is exactly what made it three: open the panel, choose
@@ -7951,6 +7992,7 @@ const _shipBoard = function _shipBoard(
   //   your own hull   drag -> move that part to a legal cell  tap -> select
   //   a shelf chip    drag -> carry it out and place          tap -> stick it
   //   empty / enemy   drag -> fly there facing the drag       tap -> fly there
+  //                   ...only with AUTOPILOT armed; off, both pan
   //   space held      pan, always
   //
   // There is no verb to choose first, and that is the whole redesign: the board
@@ -8084,7 +8126,7 @@ const _shipBoard = function _shipBoard(
       const legal = edit && A.build ? legalCells(c.type, c) : [];
       return armGesture({kind: "hull", px: c.px, py: c.py, legal}, ev, legal.length > 1);
     }
-    if (S.state === "playing") {
+    if (S.state === "playing" && autopilot) {
       const at = worldTile(ev);
       S.cmd = {...(S.cmd ?? {}), target: at, face: null, drive: null};
       held.clear();
@@ -8458,18 +8500,36 @@ const _shipBoard = function _shipBoard(
                     : picked ?? (act === "move" ? S.player.at(sel.px, sel.py)?.type : null);
     const ghostIgnore = moveDrag ? S.player.at(moveDrag.px, moveDrag.py)
                       : act === "move" ? S.player.at(sel.px, sel.py) : null;
+    // A ghost that draws the part upright while the rail is turned is lying about
+    // where the press will put it -- Tom, 2026-08-23: "the ghosts are not rotated
+    // currently". A part being MOVED keeps the rotation it already has; one coming
+    // off the rail takes the rail's.
+    const ghostDir = ghostIgnore ? (ghostIgnore.dir ?? 0) : placeDir;
     if (ghostType) {
       for (const [gx, gy] of legalCells(ghostType, ghostIgnore)) {
         if (ghostIgnore && gx === ghostIgnore.px && gy === ghostIgnore.py) continue;
         const on = hoverCell && hoverCell[0] === gx && hoverCell[1] === gy;
         const [vx, vy] = tileToView(gx, gy);
+        const at = `translate(${vx.toFixed(1)} ${vy.toFixed(1)})`;
+        // The art turns with the part, exactly as a live component's holder does
+        // (corepox-render's frame loop writes `rotate(c.dir)` on the same kind of
+        // holder). The CELLS do not: they are drawn in the ship's frame at the
+        // offsets rotTile reports, which is the same function the legality test
+        // above used -- so the outline is the footprint that was tested rather
+        // than a second construction of it that could disagree.
         const holder = add(overlay, "g", {
-          transform: `translate(${vx.toFixed(1)} ${vy.toFixed(1)}) rotate(${S.player.a.toFixed(2)})`,
+          transform: `${at} rotate(${(S.player.a + ghostDir).toFixed(2)})`,
           opacity: on ? 0.95 : 0.42});
         holder.appendChild(componentNode({type: ghostType}));
-        for (const t of TYPES[ghostType]?.tiles ?? [[0, 0]]) {
+        const cells = add(overlay, "g", {
+          transform: `${at} rotate(${S.player.a.toFixed(2)})`,
+          opacity: on ? 0.95 : 0.42});
+        const foot = ghostIgnore
+          ? ghostIgnore.tiles.map(t => [t[0] - ghostIgnore.px, t[1] - ghostIgnore.py])
+          : (TYPES[ghostType]?.tiles ?? [[0, 0]]).map(t => rotTile(t, placeDir));
+        for (const t of foot) {
           const [tx, ty] = [t[0] * TILE, -t[1] * TILE];
-          add(holder, "rect", {x: tx - TILE / 2, y: ty - TILE / 2, width: TILE,
+          add(cells, "rect", {x: tx - TILE / 2, y: ty - TILE / 2, width: TILE,
             height: TILE, rx: 5, fill: on ? C.green + "2e" : C.green + "14",
             stroke: C.green, "stroke-width": on ? 3 : 2,
             ...(on ? {} : {"stroke-dasharray": "7 6"})});
@@ -8596,7 +8656,7 @@ const _shipBoard = function _shipBoard(
   // shipped panel leads every row with the drawing, which is the only thing that
   // tells ARMOUR from ORB before you have learned the names.
   // `partIcon` so the spoils popup draws a part exactly as the rail does.
-  const icon = (type, size = 40) => partIcon(type, size);
+  const icon = (type, size = 40, dir = 0) => partIcon(type, size, dir);
   let infoType = null;
   const infoPanel = () => panelBox(infoType.toUpperCase(), htl.html`<div>
     <div style="display:flex;gap:14px;align-items:center">${icon(infoType, 64)}
@@ -8698,7 +8758,7 @@ const _shipBoard = function _shipBoard(
       <div style="position:absolute;top:4px;right:6px;font:700 ${w > 80 ? 9 : 8}px ${MONO};
         color:${priced(i) ? (out ? "rgba(255,138,138,.75)" : C.amber) : C.ink}"
         >${priced(i) ? badge(i) : (i.n === Infinity ? "∞" : "×" + i.n)}</div>
-      ${icon(i.type, w > 80 ? 38 : 30)}
+      ${icon(i.type, w > 80 ? 38 : 30, placeDir)}
       <div style="font:${on ? 700 : 500} ${w > 80 ? 9 : 8}px ${MONO};
         color:${on ? C.green : C.dim}">${i.type}</div></div>`;
     armChip(el, i);
@@ -8721,7 +8781,7 @@ const _shipBoard = function _shipBoard(
       ${on ? htl.html`<div style="position:absolute;left:2px;top:50%;width:4px;height:16px;
         margin-top:-8px;border-radius:2px;background:${C.green};
         box-shadow:0 0 6px ${C.green}"></div>` : ""}
-      ${icon(i.type, 30)}
+      ${icon(i.type, 30, placeDir)}
       <div style="flex:1;min-width:0;font:${on ? 700 : 500} 9.5px ${MONO};
         color:${on ? C.green : "rgba(232,236,245,.68)"};white-space:nowrap;
         overflow:hidden;text-overflow:ellipsis">${i.type}</div>
@@ -8740,12 +8800,28 @@ const _shipBoard = function _shipBoard(
       height:34px;border-radius:7px;touch-action:none;opacity:${dead(i) ? 0.32 : 1};
       cursor:${dead(i) ? "default" : "grab"};
       border:1px solid ${on ? "rgba(86,227,159,.6)" : "transparent"};
-      background:${on ? "rgba(86,227,159,.1)" : "transparent"}">${icon(i.type, 26)}
+      background:${on ? "rgba(86,227,159,.1)" : "transparent"}">${icon(i.type, 26, placeDir)}
       <span style="position:absolute;right:1px;bottom:0;font:700 7.5px ${MONO};
         color:${priced(i) ? C.amber : C.dim}">${badge(i)}</span></div>`;
     armChip(el, i);
     return el;
   };
+  // Above the shelf, because it belongs to the whole shelf: one press turns every
+  // row, the ghosts, and whatever lands next. It reads out the angle rather than
+  // just being a button, so the rail says which way it is pointing even when
+  // nothing is armed.
+  const ROTNAME = ["UP", "RIGHT", "DOWN", "LEFT"];
+  const rotPad = ({wide = false} = {}) => htl.html`<div data-rot=${placeDir}
+    title=${`parts go down facing ${ROTNAME[(placeDir / 90) % 4]} — press to turn`}
+    onclick=${() => { placeDir = (placeDir + 90) % 360; render(); }}
+    style="display:flex;align-items:center;justify-content:center;gap:5px;
+    ${wide ? "padding:4px 9px" : "padding:3px 7px"};border-radius:7px;cursor:pointer;
+    user-select:none;pointer-events:auto;flex:none;
+    border:1px solid ${placeDir ? C.amber : "rgba(255,255,255,.16)"};
+    background:${placeDir ? "rgba(255,196,46,.12)" : "transparent"};
+    color:${placeDir ? C.amber : C.dim};font:700 8.5px ${MONO};letter-spacing:.1em">
+    <span style="font-size:11px;line-height:1">↻</span>${
+      wide ? htl.html`<span>${ROTNAME[(placeDir / 90) % 4]}</span>` : ""}</div>`;
   // The chip's press is the same gesture as a press on a ghost -- it just starts
   // somewhere the board cannot see. The window listeners in armGesture are what let
   // it cross the boundary.
@@ -8775,10 +8851,13 @@ const _shipBoard = function _shipBoard(
       const box = htl.html`<div style="position:absolute;left:0;right:0;bottom:88px;
         height:110px;border-top:1px solid ${C.line};background:${C.panel};
         padding:9px 12px;display:flex;flex-direction:column;gap:7px;z-index:6"></div>`;
-      const head2 = htl.html`<div style="display:flex;align-items:center;justify-content:space-between">
+      const head2 = htl.html`<div style="display:flex;align-items:center;gap:8px;
+        justify-content:space-between">
         <span style="font:700 8.5px ${MONO};letter-spacing:.16em;color:${C.dim}">
           HOLD ${picked ? "· " + picked.toUpperCase() : ""}</span>
-        <span style="font:400 8px ${MONO};color:${C.faint}">tap to stick · drag to place</span></div>`;
+        ${rotPad()}
+        <span style="font:400 8px ${MONO};color:${C.faint};flex:1;text-align:right"
+          >tap to stick · drag to place</span></div>`;
       const row = htl.html`<div style="display:flex;gap:7px;overflow-x:auto;align-items:stretch"></div>`;
       keepScroll(row);
       for (const i of items) row.append(chipNode(i, 66));
@@ -8814,9 +8893,10 @@ const _shipBoard = function _shipBoard(
     if (railOpen) {
       box.append(htl.html`<div style="padding:12px 10px 9px;
         border-bottom:1px solid rgba(255,255,255,.07);display:flex;
-        flex-direction:column;gap:3px">
-        <span style="font:700 8.5px ${MONO};letter-spacing:.16em;
-          color:rgba(232,236,245,.38)">HOLD</span>
+        flex-direction:column;gap:6px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <span style="font:700 8.5px ${MONO};letter-spacing:.16em;
+            color:rgba(232,236,245,.38)">HOLD</span>${rotPad({wide: true})}</div>
         ${opts.holdNote ? htl.html`<span style="font:700 12px ${MONO};color:${C.amber}"
           >${opts.holdNote()}</span>` : ""}</div>`, body,
         htl.html`<div style="padding:9px 10px;border-top:1px solid rgba(255,255,255,.07);
@@ -8827,6 +8907,9 @@ const _shipBoard = function _shipBoard(
             >${opts.onSell ? (opts.sellNote?.() ?? "drag in to sell at half") : "tap to keep armed"}</span>
           ${chevron}</div>`);
     } else {
+      box.insertBefore(htl.html`<div style="padding:7px 4px;display:flex;
+        justify-content:center;border-bottom:1px solid rgba(255,255,255,.07)"
+        >${rotPad()}</div>`, null);
       box.append(body, htl.html`<div style="padding:9px 0;text-align:center;
         border-top:1px solid rgba(255,255,255,.07)">${chevron}</div>`);
     }
@@ -9105,11 +9188,29 @@ const _shipBoard = function _shipBoard(
           display:flex;align-items:center;justify-content:center;font:400 15px ${MONO};
           color:${C.dim};cursor:pointer;user-select:none;
           ${k ? "" : `border-bottom:1px solid ${C.line}`}">${g}</div>`)}</div>`;
+    // Arming it is a decision, so it looks like one: lit amber while it holds the
+    // sky, and turning it off drops the standing waypoint as well -- leaving the
+    // ship flying to a target the player can no longer see or clear is worse than
+    // the gesture it replaces.
+    const autoPad = (size) => htl.html`<button
+      title=${autopilot ? "autopilot ARMED — press the field to fly there"
+                        : "autopilot off — the field pans; arm it to fly by pressing"}
+      onclick=${() => { autopilot = !autopilot;
+                        if (!autopilot && S.cmd) { S.cmd.target = null; S.cmd.face = null; }
+                        render(); }}
+      style="width:${size}px;height:${size}px;border-radius:${size > 44 ? 12 : 10}px;
+      pointer-events:auto;display:flex;align-items:center;justify-content:center;
+      border:1px solid ${autopilot ? C.amber : "rgba(255,255,255,.18)"};
+      background:${autopilot ? "rgba(255,196,46,.12)" : "rgba(6,8,14,.9)"};
+      color:${autopilot ? C.amber : C.dim};cursor:pointer;
+      font:${Math.round(size * 0.44)}px/1 ${MONO}">➤</button>`;
     if (mob) {
       camPads.push(panPad(46));
+      if (S.state === "playing" && S.cmd) camPads.push(autoPad(46));
       if (view.moved()) camPads.push(centrePad());
     } else {
       camPads.push(zoomPad(), panPad(40));
+      if (S.state === "playing" && S.cmd) camPads.push(autoPad(40));
       if (view.moved()) camPads.push(centrePad());
     }
     // Left of the thumb bar on the phone, which is where turn 8a has them -- the
@@ -9178,6 +9279,11 @@ const _shipBoard = function _shipBoard(
              layout: (l) => { if (l) { layout = l; sel = null; picked = null; render(); }
                               return layout; },
              paused: (p) => { if (p != null) { S.paused = !!p; render(); } return !!S.paused; },
+             rot: (deg) => { if (deg != null) { placeDir = ((deg % 360) + 360) % 360;
+                                               render(); } return placeDir; },
+             autopilot: (v) => { if (v != null) { autopilot = !!v;
+               if (!autopilot && S.cmd) { S.cmd.target = null; S.cmd.face = null; }
+               render(); } return autopilot; },
              setParam: (v, px, py) => setParam(v, S.player.at(px, py)),
              // Where a port is DRAWN. Named by COMPONENT and PORT, never by cell:
              // on a Constant the cell centre belongs to the value disc, and on
@@ -9218,12 +9324,12 @@ const _shipBoard = function _shipBoard(
     // Everything a press could be holding, dropped. A match starting must not
     // begin with a part armed or half a wire drawn.
     clearGesture: () => { picked = null; wire = null; act = null; drag = null;
-                          hoverCell = null; held.clear(); },
+                          hoverCell = null; held.clear(); autopilot = false; },
     session: () => S,
     // A host that swaps the session -- a retry, the next mission, a different
     // hull on the bench -- hands the board the new one rather than rebuilding it,
     // so the camera, the layout and the window listeners survive the change.
-    load: (next) => { S = next; seedStart();
+    load: (next) => { S = next; seedStart(); autopilot = false;
                       picked = null; wire = null; sel = null; act = null;
                       panel = "none"; drag = null; hoverCell = null;
                       view?.resetView?.(); render(); },
@@ -9236,10 +9342,12 @@ const _shipBoard = function _shipBoard(
 // A part, drawn on its own, sized to its footprint. The rail leads every build row
 // with this and the spoils popup leads every card with it; a second copy of the
 // rule would let the two disagree about what an Orb looks like.
-const _partIcon = function _partIcon(componentNode, TYPES, TILE){return(
-(type, size = 40) => {
+const _partIcon = function _partIcon(componentNode, TYPES, TILE, rotTile){return(
+(type, size = 40, dir = 0) => {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  const tiles = TYPES[type]?.tiles ?? [[0, 0]];
+  // The box is measured on the ROTATED footprint, so a turned Engine is as wide as
+  // it is tall on the rail and the drawing does not run out of its own icon.
+  const tiles = (TYPES[type]?.tiles ?? [[0, 0]]).map(t => rotTile(t, dir));
   const xs = tiles.map(t => t[0]), ys = tiles.map(t => t[1]);
   const w = (Math.max(...xs) - Math.min(...xs) + 1.3) * TILE;
   const h = (Math.max(...ys) - Math.min(...ys) + 1.3) * TILE;
@@ -9249,7 +9357,12 @@ const _partIcon = function _partIcon(componentNode, TYPES, TILE){return(
   s.setAttribute("viewBox", `${cx - m / 2} ${cy - m / 2} ${m} ${m}`);
   s.setAttribute("width", size); s.setAttribute("height", size);
   s.style.flex = "none";
-  s.appendChild(componentNode({type}));
+  if (dir % 360) {
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.setAttribute("transform", `rotate(${dir})`);
+    g.appendChild(componentNode({type}));
+    s.appendChild(g);
+  } else s.appendChild(componentNode({type}));
   return s;
 }
 )};
@@ -9441,15 +9554,17 @@ const _spoilsPopup = function _spoilsPopup(partIcon, damagePlate, INFO, TYPES, P
     : null;
 
   const right = cards.length
-    ? htl.html`<div style="flex:1 1 380px;min-width:0;padding:20px 24px 22px;display:flex;
-        flex-direction:column;gap:13px">
+    ? htl.html`<div style="flex:1 1 380px;min-width:0;min-height:0;
+        padding:20px 24px 22px;display:flex;flex-direction:column;gap:13px">
         <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
           ${label("SALVAGE — TAKE ONE")}
           <span style="font:400 10px ${MONO};color:${C.faint}">the rest burns with the wreck</span>
         </div>
-        <div style="display:grid;gap:12px;align-items:stretch;
-          grid-template-columns:repeat(auto-fit,minmax(148px,1fr))">${cardEls}</div>
-        <div style="margin-top:auto;display:flex;flex-direction:column;gap:12px;padding-top:14px;
+        <div class="cpx-spoils-grid" style="flex:1 1 auto;min-height:0;overflow-y:auto;
+          padding:3px;margin:-3px">
+          <div style="display:grid;gap:12px;align-items:stretch;
+            grid-template-columns:repeat(auto-fit,minmax(148px,1fr))">${cardEls}</div></div>
+        <div style="flex:0 0 auto;display:flex;flex-direction:column;gap:12px;padding-top:14px;
           border-top:1px solid ${C.line}">
           ${hint ? htl.html`<div style="display:flex;align-items:center;gap:9px;padding:8px 12px;
             border:1px solid rgba(255,196,46,.35);border-radius:8px;background:rgba(255,196,46,.05);
@@ -9459,36 +9574,65 @@ const _spoilsPopup = function _spoilsPopup(partIcon, damagePlate, INFO, TYPES, P
             ${btn(passLabel, C.dim, false, () => onDone?.(null))}
             ${btn(takeLabel + " →", C.green, true, () => onDone?.(picked == null ? null : cards[picked]))}
           </div></div></div>`
-    : htl.html`<div style="flex:1 1 320px;min-width:0;padding:20px 24px 22px;display:flex;
-        flex-direction:column;gap:12px">
+    : htl.html`<div style="flex:1 1 320px;min-width:0;min-height:0;
+        padding:20px 24px 22px;display:flex;flex-direction:column;gap:12px">
         ${label("SUMMARY")}
-        <div style="font:400 11.5px/1.7 ${MONO};color:rgba(232,236,245,.55)">${summary ?? note}</div>
-        <div style="margin-top:auto;display:flex;justify-content:flex-end;padding-top:14px;
+        <div style="flex:1 1 auto;min-height:0;overflow-y:auto;
+          font:400 11.5px/1.7 ${MONO};color:rgba(232,236,245,.55)">${summary ?? note}</div>
+        <div style="flex:0 0 auto;display:flex;justify-content:flex-end;padding-top:14px;
           border-top:1px solid ${C.line}">${btn(takeLabel + " →", hue, true, () => onDone?.(null))}</div>
       </div>`;
 
-  const panel = htl.html`<div style="width:min(1060px,100%);max-height:100%;overflow:auto;
+  // The PANEL does not scroll -- the salvage grid does. Tom, 2026-08-23: "When Duel
+  // cleared has multiple rows of items, the items part should scroll, not the whole
+  // dialoge so that the TAK button is offscreen". With `overflow:auto` here a second
+  // row of cards grew the panel past the viewport and took the TAKE button with it.
+  const panel = htl.html`<div class="cpx-spoils-panel" style="width:min(1060px,100%);
+    max-height:100%;display:flex;flex-direction:column;
     border:1px solid rgba(255,255,255,.14);border-radius:14px;background:#080a10;
     box-shadow:0 24px 80px rgba(0,0,0,.7)">
     <div style="height:3px;background:linear-gradient(90deg,${hue},${hue}00)"></div>
-    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;padding:18px 24px 15px">
+    <div style="flex:0 0 auto;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+      padding:18px 24px 15px">
       <span style="font:700 20px ${MONO};letter-spacing:.18em;color:${C.ink}">${verb}</span>
       <span style="font:400 11.5px ${MONO};color:${C.dim}">${meta}</span>
       <div style="flex:1"></div>
       <span style="font:400 11px ${MONO};color:${C.faint}">${note}</span>
     </div>
-    <div style="display:flex;flex-wrap:wrap;border-top:1px solid ${C.line}">
+    <div class="cpx-spoils-body" style="flex:1 1 auto;min-height:0;display:flex;
+      border-top:1px solid ${C.line}">
       <div style="flex:${solo ? "0 1 280px" : "1 1 340px"};min-width:0;max-width:420px;
-        padding:18px 22px 22px;
+        min-height:0;overflow-y:auto;padding:18px 22px 22px;
         border-right:1px solid ${C.line};display:flex;flex-direction:column;gap:18px">
         ${[objBlock, dmgBlock, ledgerBlock].filter(Boolean)}
       </div>
       ${right}
     </div></div>`;
 
+  // Two layouts, and the switch has to be a media query because the thing that
+  // decides it -- whether the two columns sit side by side -- is a width. Side by
+  // side, the body is NOWRAP so the columns take the panel's height and the salvage
+  // grid is the only scroller; the footer with TAKE stays put. Stacked, wrap comes
+  // back and the panel scrolls as a whole, which is the only sane thing when the
+  // columns are already using the full height each.
+  //
+  // max-height:100% on the columns was tried first and does nothing: a WRAPPED flex
+  // line is sized to its tallest item and align-content:stretch only grows lines, so
+  // the column stayed at its content height (605px inside a 461px body, measured)
+  // and the percentage had nothing to resolve against.
+  const css = htl.html`<style>
+    .cpx-spoils-panel { overflow: hidden }
+    .cpx-spoils-body { flex-wrap: nowrap }
+    /* No scrollbar styling: headless Chromium reports a 0px bar whichever rules are
+       set (measured), so any such rule would be unverifiable here. The affordance is
+       the half-visible card row the clip leaves behind. */
+    @media (max-width: 900px) {
+      .cpx-spoils-panel { overflow-y: auto }
+      .cpx-spoils-body { flex-wrap: wrap }
+    }</style>`;
   const root = htl.html`<div class="cpx-spoils" style="position:absolute;inset:0;z-index:24;
     display:flex;align-items:center;justify-content:center;padding:20px;
-    background:rgba(4,5,10,.72);pointer-events:auto">${panel}</div>`;
+    background:rgba(4,5,10,.72);pointer-events:auto">${css}${panel}</div>`;
   paint();
   // The QA seam is the cards and the two exits, so a test takes a card the way a
   // finger does rather than by reaching into the campaign.
@@ -9509,7 +9653,7 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-render.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-assets",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
-  for (const n of ["Ship", "World", "TYPES", "PORTS", "DT", "loadShipSpec"])
+  for (const n of ["Ship", "World", "TYPES", "PORTS", "DT", "loadShipSpec", "rotTile"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   for (const n of ["battlefield", "componentNode"])
     main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
@@ -9523,12 +9667,12 @@ export default function define(runtime, observer) {
   $def("_boardSession", "boardSession", ["Ship","World","loadShipSpec"], _boardSession);
   $def("_CLOCK", "CLOCK", ["PALETTE"], _CLOCK);
   $def("_tempoChip", "tempoChip", ["CLOCK","PALETTE","htl"], _tempoChip);
-  $def("_partIcon", "partIcon", ["componentNode","TYPES","TILE"], _partIcon);
+  $def("_partIcon", "partIcon", ["componentNode","TYPES","TILE","rotTile"], _partIcon);
   $def("_damagePlate", "damagePlate", ["componentNode","TILE","PALETTE"], _damagePlate);
   $def("_spoilsPopup", "spoilsPopup",
        ["partIcon","damagePlate","INFO","TYPES","PALETTE","htl"], _spoilsPopup);
   $def("_shipBoard", "shipBoard",
-       ["battlefield","componentNode","INFO","MENU_ACTIONS","PALETTE","partIcon","TYPES","PORTS","TILE","DT","htl","invalidation"],
+       ["battlefield","componentNode","INFO","MENU_ACTIONS","PALETTE","partIcon","TYPES","PORTS","TILE","DT","rotTile","htl","invalidation"],
        _shipBoard);
   return main;
 }</script>
@@ -9992,6 +10136,755 @@ export default function define(runtime, observer) {
   return main;
 }</script>
 
+<script id="@tomlarkworthy/corepox-app-impl" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// @tomlarkworthy/corepox-app-impl — the landing shell, and the routing behind it.
+//
+// Implements "Landing Screen" turn 2 (Claude Design project f9a1c3c2), option 2a
+// desktop / 2b phone, as one responsive surface rather than two layouts.
+//
+// WHY THIS MODULE EXISTS SEPARATELY FROM @tomlarkworthy/corepox-app:
+// `corepox-app` is what boots as the notebook's default page, and a default page
+// that renders twelve explanatory cells is a worse landing screen than one that
+// renders a landing screen. So `corepox-app` imports exactly one cell from here --
+// `corepox_app` -- and everything that needs explaining is explained HERE, where a
+// reader who wants the reasoning can find it and a player never has to scroll past it.
+//
+// WHAT THE DESIGN SETTLED, and it answers three questions plan/corepox-landing-brief.md
+// left open:
+//
+//   IT IS A SHELL, NOT A SCREEN YOU LEAVE   a persistent four-tab bar pins the bottom,
+//                                           as the shipped game's did.
+//   FOUR DOORS, NOT THREE                   EXPLORE, MISSIONS, SHIPYARD, LADDER --
+//                                           the last two marked SOON rather than hidden.
+//   EXPLORE LEADS                           the run is the screen; missions sit beside it.
+//
+// WHERE THIS DEPARTS FROM THE MOCKUP, deliberately, in each case because the mockup
+// is a drawing and this is wired to the real game:
+//
+//   - The mission rows are built from the real `MISSIONS`, not the mockup's text. The
+//     drawing labels a row `gunner` and gives it Cocoon's brief ("Two bombs, north and
+//     south..."); the real `gunner` is ManualAim. Drawing wins on layout, data wins on data.
+//   - The route preview is generated by the real `genRun`, not hand-placed circles. Since
+//     `mapParams` defaults (seed 41, galaxy 2, jumps 7) are `genRun`'s defaults, the graph
+//     on the landing IS the run LAUNCH opens -- not an illustration of one.
+//   - A back affordance exists. The drawing has none, and without one a mounted
+//     destination is a trap.
+//
+// KNOWN GAP, stated rather than hidden: the design shows `★ 5/7` and locked rows, which
+// need progress that this game did not previously persist at all. `loadProgress` adds the
+// smallest thing that makes the drawing honest -- see its comment for what that costs.
+
+const _title = function _title(md){return(
+md`# Corepox — app shell (implementation)
+
+The landing screen, its routing, and the progress store behind the stars. The page you
+actually play is \`@tomlarkworthy/corepox-app\`, which imports one cell from here.`
+)};
+
+const _architecture = function _architecture(md){return(
+md`## How the routing works
+
+One cell, \`corepox_app\`, builds the whole shell **once** and then routes by mutating its
+own DOM. It never recomputes.
+
+That is not a style preference. \`viewof game\` and \`viewof galaxyMap\` are stateful DOM
+nodes owned by their own cells — a running campaign, a run in progress. Mounting one means
+*moving* its node into the shell's stage. If the shell re-rendered on every tab press, each
+press would orphan whatever the player had going. So tab state lives in a \`data-tab\`
+attribute and a \`replaceChildren\`, not in a reactive dependency.
+
+The destinations are imported eagerly. **This costs nothing extra today**: every one of
+them is already named in the notebook's \`bootconf.json\` \`mains\`, so they boot regardless,
+and \`corepox-game\` in particular is what the default page used to be. Deferring them
+behind a lazy \`runtime.module()\` import is a real improvement and is *not* done here.`
+)};
+
+// ---------------------------------------------------------------------------
+// Progress
+// ---------------------------------------------------------------------------
+
+const _progressNote = function _progressNote(md){return(
+md`## Progress, and why it is this small
+
+Nothing in Corepox persisted before this: \`grep -i localStorage\` over \`corepox-map\`,
+\`corepox-duel-encounter\` and \`corepox-game\` returned nothing, so a reload was a new run
+and every mission was permanently mission one. The design's \`★ 5/7\` and its locked rows
+cannot be drawn from nothing, so this is the smallest store that makes them true: a set of
+cleared mission ids and a set of perfect ones.
+
+Two hazards, both already paid for elsewhere in this corpus:
+
+- **\`localStorage\` is resolved inside the body, in a \`try\`/\`catch\`, never as a cell
+  input.** On an opaque origin — which is what a \`blob:\` fork of a lopecode file gets —
+  *reading* \`window.localStorage\` throws, and an input that throws becomes the cell's
+  value and takes every downstream cell with it.
+- **The key is namespaced.** Every \`file://\` notebook on the machine shares one origin,
+  so an unprefixed key would collide with any other notebook that wanted one.`
+)};
+
+const _PROGRESS_KEY = function _PROGRESS_KEY(){return(
+"corepox.progress.v1"
+)};
+
+// Resolved in the body, never as a dependency -- see _progressNote.
+const _loadProgress = function _loadProgress(PROGRESS_KEY){return(
+() => {
+  const empty = {cleared: [], perfect: []};
+  try {
+    const raw = window.localStorage?.getItem(PROGRESS_KEY);
+    if (!raw) return empty;
+    const p = JSON.parse(raw);
+    return {cleared: Array.isArray(p.cleared) ? p.cleared : [],
+            perfect: Array.isArray(p.perfect) ? p.perfect : []};
+  } catch (_) { return empty; }
+}
+)};
+
+const _saveProgress = function _saveProgress(PROGRESS_KEY){return(
+(p) => {
+  try { window.localStorage?.setItem(PROGRESS_KEY, JSON.stringify(p)); return true; }
+  catch (_) { return false; }        // a fork, or storage denied -- the session still plays
+}
+)};
+
+// ---------------------------------------------------------------------------
+// Mission list state
+// ---------------------------------------------------------------------------
+
+const _missionNote = function _missionNote(md){return(
+md`## What a mission row knows
+
+\`missionRows(progress)\` turns \`MISSIONS\` + \`CAMPAIGNS\` + the store into exactly what the
+drawing renders: a star, an armed ▶ with a red badge, or a padlock.
+
+The unlock rule is the shipped one, recovered in \`knowledge/corepox-shipped-ui-observed.md\`:
+*more than one row can be playable at a time*. A mission is open when every earlier mission
+in its campaign is cleared, and a campaign is locked until the one before it is finished —
+which is what the drawing's dashed \`ADVANCED STEERING / CLEAR THE TUTORIAL\` bar says.
+
+The verb glyph is read off the mission's own \`allow\` set rather than authored per row,
+because \`allow\` *is* the tutorial: the campaign teaches one verb per mission by removing
+the others. Checked against the drawing, the rule reproduces it exactly — birthing and
+cocoon build, run connects, gunner modifies.`
+)};
+
+const _VERBS = function _VERBS(){return(
+// Order matters: the first allowed verb is the one the row advertises.
+[{key: "build",   sym: "v-build",   colour: "lime"},
+ {key: "connect", sym: "v-connect", colour: "cyan"},
+ {key: "modify",  sym: "v-modify",  colour: "amber"},
+ {key: "rotate",  sym: "v-rotate",  colour: "purple"}]
+)};
+
+const _missionRows = function _missionRows(MISSIONS, CAMPAIGNS, VERBS){return(
+(progress) => {
+  const cleared = new Set(progress.cleared);
+  const byId = new Map(MISSIONS.map((m, i) => [m.id, {m, i}]));
+  const rows = [];
+  let campaignOpen = true;               // the first campaign is always available
+
+  for (const [ci, camp] of CAMPAIGNS.entries()) {
+    const items = camp.missions.map((id) => byId.get(id)).filter(Boolean);
+    // The divider HEADS the campaign it gates, and names what must be cleared to reach
+    // it -- the drawing's dashed `ADVANCED STEERING / CLEAR THE TUTORIAL` bar. Heading
+    // rather than trailing matters: a bar that trails the campaign it names sits above
+    // the missions it does not describe.
+    if (ci > 0) rows.push({divider: camp.name, unlocked: campaignOpen, needs: CAMPAIGNS[ci - 1].name});
+    let priorCleared = true;
+    for (const {m, i} of items) {
+      const done = cleared.has(m.id);
+      // Open when the campaign is reachable and nothing earlier in it is outstanding.
+      const open = campaignOpen && (done || priorCleared);
+      const verb = VERBS.find((v) => m.allow?.[v.key]) ?? VERBS[0];
+      rows.push({
+        id: m.id, index: i, title: m.title, brief: m.brief,
+        campaign: camp.name, live: !!m.live,
+        state: done ? "cleared" : open ? "open" : "locked",
+        verb
+      });
+      if (!done) priorCleared = false;
+    }
+    // The next campaign unlocks only when this one is finished end to end.
+    campaignOpen = campaignOpen && items.every(({m}) => cleared.has(m.id));
+  }
+  return rows;
+}
+)};
+
+// ---------------------------------------------------------------------------
+// The route preview
+// ---------------------------------------------------------------------------
+
+const _routeNote = function _routeNote(md){return(
+md`## The route preview is the run, not a picture of one
+
+\`genRun()\` with no arguments defaults to \`{seed: 41, galaxy: 2, jumps: 7}\`, and
+\`corepox-map\`'s own \`mapParams\` form defaults to the same three numbers. So the graph
+drawn on the landing screen is the board LAUNCH opens, node for node.
+
+That is worth more than it costs: the alternative — hand-placing circles to match the
+drawing — produces a landing screen that lies about the run, and drifts the moment the
+generator changes. Rendering goes through the same \`NODE_KINDS\` colours and the same
+\`n-*\` symbols the map uses, so there is one visual vocabulary and not two.`
+)};
+
+const _routePreview = function _routePreview(genRun, NODE_KINDS){return(
+({width = 900, height = 300, pad = 42} = {}) => {
+  const run = genRun();
+  const xs = run.nodes.map((n) => n.x), ys = run.nodes.map((n) => n.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const sx = (x) => pad + (width - 2 * pad) * (x - x0) / Math.max(1, x1 - x0);
+  const sy = (y) => pad + (height - 2 * pad) * (y - y0) / Math.max(1, y1 - y0);
+  const at = new Map(run.nodes.map((n) => [n.id, n]));
+
+  const edges = run.edges.map((e) => {
+    const a = at.get(e.from), b = at.get(e.to);
+    return `<path d="M${sx(a.x).toFixed(1)} ${sy(a.y).toFixed(1)} ${sx(b.x).toFixed(1)} ${sy(b.y).toFixed(1)}"/>`;
+  }).join("");
+
+  const nodes = run.nodes.map((n) => {
+    const K = NODE_KINDS[n.kind] ?? NODE_KINDS.unknown;
+    const boss = n.kind === "boss", start = n.id === run.start.id;
+    const r = boss ? 21 : 16, ir = boss ? 26 : 21;
+    // The start node breathes, which is the map's own affordance for "you are here".
+    const ring = start
+      ? `<circle r="${r + 7}" fill="none" stroke="${K.colour}" stroke-width="1.1" opacity=".5"
+           style="animation:cx-breathe 2.8s ease-in-out infinite"/>` : "";
+    const label = (boss || start)
+      ? `<text y="${boss ? r + 20 : r + 20}" fill="rgba(232,236,245,.5)" font-size="9"
+           letter-spacing="1.5" text-anchor="middle">${boss ? "BOSS" : K.label}</text>` : "";
+    return `<g transform="translate(${sx(n.x).toFixed(1)},${sy(n.y).toFixed(1)})">
+      ${ring}<circle r="${r}" fill="rgba(6,8,14,.92)" stroke="${K.colour}" stroke-width="${boss ? 2.1 : 1.7}"/>
+      <svg x="${-ir / 2}" y="${-ir / 2}" width="${ir}" height="${ir}" style="color:${K.colour}"><use href="#n-${n.kind}"/></svg>
+      ${label}</g>`;
+  }).join("");
+
+  // The hazard ellipses are the map's, rescaled with the nodes so a node inside one
+  // on the landing is inside it on the board too.
+  const haz = run.hazards.map((h) => `
+    <ellipse cx="${sx(h.cx).toFixed(1)}" cy="${sy(h.cy).toFixed(1)}"
+      rx="${(sx(h.cx + h.rx) - sx(h.cx)).toFixed(1)}" ry="${(sy(h.cy + h.ry) - sy(h.cy)).toFixed(1)}"
+      fill="${h.fill}" opacity=".07"/>
+    <ellipse cx="${sx(h.cx).toFixed(1)}" cy="${sy(h.cy).toFixed(1)}"
+      rx="${(sx(h.cx + h.rx) - sx(h.cx)).toFixed(1)}" ry="${(sy(h.cy + h.ry) - sy(h.cy)).toFixed(1)}"
+      fill="none" stroke="${h.colour}" stroke-width="1" opacity=".28" stroke-dasharray="5 6"/>`).join("");
+
+  return {
+    run,
+    svg: `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet"
+            font-family="'JetBrains Mono',ui-monospace,monospace">
+      ${haz}<g stroke="rgba(232,236,245,.3)" stroke-width="1.5" fill="none">${edges}</g>${nodes}</svg>`
+  };
+}
+)};
+
+// ---------------------------------------------------------------------------
+// Chrome
+// ---------------------------------------------------------------------------
+
+const _appSymbols = function _appSymbols(){return(
+// The n-* node glyphs come from corepox-map's `mapSymbols` and are not redrawn here.
+// These are the four verb glyphs the mission rows need, plus the two component glyphs
+// the tab bar borrows, taken from the design document's own defs.
+`<symbol id="v-build" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 8 12 3l8 5v8l-8 5-8-5Z"/></g></symbol>
+<symbol id="v-connect" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="12" r="2.6"/><path d="M7.6 12h8.8" stroke-dasharray="3 3"/></g></symbol>
+<symbol id="v-modify" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.2"><path d="M3 9h18M3 16h18" opacity=".55"/><circle cx="9" cy="9" r="2.6"/><circle cx="16" cy="16" r="2.6"/></g></symbol>
+<symbol id="v-rotate" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.2"><path d="M20 12a8 8 0 1 1-3-6.2"/><path d="M20 4v5h-5"/></g></symbol>
+<symbol id="v-lock" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></g></symbol>
+<symbol id="v-play" viewBox="0 0 12 12"><path d="M2 1l8 5-8 5Z" fill="currentColor"/></symbol>
+<symbol id="v-gear" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3.4"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1"/></g></symbol>
+<symbol id="m-core" viewBox="0 0 100 100"><g fill="none" stroke="currentColor"><path d="M35 6H65L94 35V65L65 94H35L6 65V35Z" stroke-width="3"/><circle cx="50" cy="50" r="27" stroke-width="1.6" opacity=".45" stroke-dasharray="3 6" style="animation:cx-spin 14s linear infinite;transform-origin:50px 50px"/><circle cx="50" cy="50" r="18" stroke-width="2" opacity=".8"/></g><circle cx="50" cy="50" r="7.5" fill="currentColor"/><g stroke="currentColor" stroke-width="2.5" opacity=".5"><path d="M50 6V20M50 80V94M6 50H20M80 50H94"/></g></symbol>
+<symbol id="m-armour" viewBox="0 0 100 100"><g fill="none" stroke="currentColor" stroke-width="3.5"><path d="M8 24 34 8H66L92 24V76L66 92H34L8 76Z"/></g><g fill="none" stroke="currentColor" stroke-width="1.6" opacity=".28"><path d="M22 74 74 22M34 82 82 34M14 62 62 14"/></g></symbol>`
+)};
+
+const _appCss = function _appCss(PALETTE){const {C, MONO} = PALETTE; return(
+/* A lopepage pane does NOT impose a bounded height on the DOM a cell renders, so
+   height:100% resolves against nothing and the shell grows to its content -- which
+   pushes LAUNCH and the tab bar below the fold. The height has to be viewport-relative.
+   The subtraction is the module's own import strip, which lopepage renders above us. */
+`.cx-shell{position:relative;display:flex;flex-direction:column;
+  height:calc(100vh - 56px);min-height:560px;
+  background:#04050a;font-family:${MONO};overflow:hidden}
+.cx-shell *{box-sizing:border-box}
+.cx-app{position:relative;flex:1;min-height:0;display:flex;flex-direction:column;
+  background:#04050a;color:${C.ink};overflow:hidden}
+.cx-sky{position:absolute;inset:0;pointer-events:none}
+.cx-top{position:relative;z-index:2;flex:none;height:72px;display:flex;align-items:center;
+  justify-content:space-between;padding:0 34px;background:${C.panel};
+  border-bottom:1px solid ${C.line};backdrop-filter:blur(6px)}
+.cx-brand{display:flex;align-items:baseline;gap:18px}
+.cx-mark{font:700 18px/1 ${MONO};letter-spacing:.28em}
+.cx-sub{font:400 10px/1 ${MONO};letter-spacing:.18em;color:${C.dim}}
+.cx-stats{display:flex;align-items:center;gap:26px}
+.cx-scrap{font:700 14px/1 ${MONO};color:${C.amber}}
+.cx-stars{font:700 14px/1 ${MONO};color:${C.lime}}
+.cx-icon{width:30px;height:30px;border:1px solid rgba(255,255,255,.14);border-radius:7px;
+  display:flex;align-items:center;justify-content:center;color:${C.dim};background:none;cursor:pointer}
+
+.cx-stage{position:relative;z-index:1;flex:1;min-height:0;display:flex;gap:24px;padding:24px 34px}
+/* A mounted destination brings its own intrinsic height (the board is tall), so the
+   mount has to clip it rather than let it spill under the pinned tab bar. */
+.cx-stage>.cx-mount{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:auto}
+.cx-mount>*{flex:1 0 auto;min-height:0}
+/* A destination wants the whole stage; the padding is landing-screen chrome. */
+.cx-app:not([data-route="landing"]) .cx-stage{padding:0}
+
+.cx-explore{flex:1;min-width:0;display:flex;flex-direction:column;padding:26px 30px 30px;
+  border-radius:12px;background:rgba(6,8,14,.86);border:1px solid rgba(86,227,159,.28);backdrop-filter:blur(6px)}
+.cx-hd{display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.cx-hd-l{display:flex;align-items:baseline;gap:16px}
+.cx-eyebrow{font:700 12px/1 ${MONO};letter-spacing:.24em;color:${C.green}}
+.cx-where{font:400 11px/1 ${MONO};letter-spacing:.16em;color:${C.dim}}
+.cx-fam{display:flex;gap:16px;font:400 10px/1 ${MONO};letter-spacing:.14em}
+.cx-map{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding:14px 0}
+.cx-map svg{width:100%;height:100%;max-height:340px}
+.cx-foot{display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+.cx-blurb{flex:1;min-width:240px;display:flex;flex-direction:column;gap:8px}
+.cx-blurb p{margin:0;font:400 12px/1.6 ${MONO};color:rgba(232,236,245,.6);text-wrap:pretty}
+.cx-hold{display:flex;gap:18px;flex-wrap:wrap;font:400 10.5px/1 ${MONO};letter-spacing:.12em;color:${C.dim}}
+.cx-launch-wrap{position:relative}
+.cx-launch-wrap::before{content:"";position:absolute;inset:-7px;border:1px solid ${C.green};
+  border-radius:13px;opacity:.45;animation:cx-focusring 2.6s ease-in-out infinite;pointer-events:none}
+.cx-launch{width:330px;max-width:100%;height:68px;border:0;border-radius:9px;background:${C.green};
+  color:#04050a;display:flex;align-items:center;justify-content:center;gap:14px;cursor:pointer;
+  font:700 20px/1 ${MONO};letter-spacing:.2em}
+.cx-launch:hover{filter:brightness(1.08)}
+
+.cx-missions{flex:none;width:478px;display:flex;flex-direction:column;gap:12px;min-height:0}
+.cx-mhd{display:flex;align-items:baseline;justify-content:space-between}
+.cx-mtitle{font:700 12px/1 ${MONO};letter-spacing:.24em;color:rgba(232,236,245,.65)}
+.cx-mcount{font:400 11px/1 ${MONO};letter-spacing:.14em;color:${C.dim}}
+.cx-mlist{display:flex;flex-direction:column;gap:8px;overflow:auto;padding-right:2px}
+.cx-row{flex:none;min-height:50px;border-radius:9px;background:rgba(6,8,14,.9);
+  border:1px solid ${C.line};display:flex;align-items:center;gap:14px;padding:8px 14px;
+  text-align:left;color:inherit;font:inherit;cursor:pointer;width:100%}
+.cx-row:hover{border-color:rgba(255,255,255,.2)}
+.cx-row[data-state="open"]{min-height:60px;border-color:rgba(79,216,232,.4);background:rgba(6,8,14,.94)}
+.cx-row[data-state="locked"]{opacity:.6;cursor:not-allowed;background:rgba(6,8,14,.7);border-color:rgba(255,255,255,.07)}
+.cx-badge{position:relative;flex:none;width:34px;height:34px;border-radius:7px;display:flex;
+  align-items:center;justify-content:center;font-size:15px}
+.cx-row[data-state="cleared"] .cx-badge{border:1px solid rgba(143,230,74,.5);background:rgba(143,230,74,.12);color:${C.lime}}
+.cx-row[data-state="open"] .cx-badge{width:40px;height:40px;background:${C.lime};color:#04050a}
+.cx-row[data-state="locked"] .cx-badge{border:1px solid rgba(255,255,255,.12);color:rgba(232,236,245,.4)}
+.cx-bang{position:absolute;top:-6px;right:-6px;width:17px;height:17px;border-radius:50%;
+  background:${C.red};color:#fff;font:700 11px/17px ${MONO};text-align:center}
+.cx-rmain{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.cx-rname{font:500 13px/1 ${MONO};letter-spacing:.1em;color:rgba(232,236,245,.75)}
+.cx-row[data-state="open"] .cx-rname{font-size:14px;color:${C.ink}}
+.cx-rbrief{font:400 10px/1.35 ${MONO};color:rgba(232,236,245,.45);
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.cx-rlive{flex:none;font:400 9px/1 ${MONO};letter-spacing:.14em;color:${C.orange};opacity:.8}
+.cx-divider{flex:none;height:44px;border-radius:9px;border:1px dashed rgba(255,255,255,.14);
+  display:flex;align-items:center;justify-content:space-between;padding:0 14px;margin-top:4px}
+.cx-dname{font:500 11px/1 ${MONO};letter-spacing:.16em;color:${C.dim}}
+.cx-dgate{font:400 9.5px/1 ${MONO};letter-spacing:.12em;color:rgba(255,92,114,.7)}
+
+.cx-tabs{position:relative;z-index:2;flex:none;height:96px;display:flex;align-items:stretch;
+  background:rgba(6,8,14,.96);border-top:1px solid ${C.line}}
+.cx-tab{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;
+  border:0;border-top:2px solid transparent;background:none;color:${C.dim};cursor:pointer;font:inherit}
+.cx-tab[aria-selected="true"]{background:rgba(86,227,159,.1);border-top-color:${C.green};color:${C.green}}
+.cx-tab[disabled]{opacity:.5;cursor:not-allowed}
+.cx-tlabel{font:700 11px/1 ${MONO};letter-spacing:.2em}
+.cx-soon{font:400 8.5px/1 ${MONO};letter-spacing:.16em;opacity:.7}
+
+/* A mounted destination is FULL SCREEN. corepox-map draws at a fixed 1600x900, so every
+   row of shell chrome above it is a row the map loses -- the top bar and the tab bar get
+   out of the way entirely.
+   BACK lives in the outer bar, not floating over the destination. It was a floating pill
+   at 16,16 first, and at 1280x860 it landed on top of the map's own header -- the map
+   draws a COREPOX wordmark and a galaxy tracker in exactly that corner, so the pill hid
+   them. Every destination owns its full surface; the outer bar is the only strip this
+   module can put chrome in without covering someone else's. */
+.cx-back{display:none;align-items:center;gap:8px;background:transparent;
+  border:1px solid ${C.line};border-radius:999px;padding:5px 14px;
+  color:${C.dim};font:500 11px/1 ${MONO};letter-spacing:.14em;cursor:pointer}
+.cx-back:hover{color:${C.ink};border-color:rgba(255,255,255,.28)}
+.cx-shell:not([data-route="landing"]) .cx-back{display:inline-flex}
+.cx-shell:not([data-route="landing"]) .cx-layouthint{display:none}
+.cx-app:not([data-route="landing"]) .cx-top,
+.cx-app:not([data-route="landing"]) .cx-tabs{display:none}
+.cx-app:not([data-route="landing"]) .cx-landing{display:none}
+.cx-app[data-route="landing"] .cx-mount{display:none}
+.cx-landing{flex:1;min-width:0;display:flex;gap:24px}
+
+@keyframes cx-breathe{0%,100%{opacity:.45}50%{opacity:1}}
+@keyframes cx-spin{to{transform:rotate(360deg)}}
+@keyframes cx-focusring{0%,100%{opacity:.35}50%{opacity:.9}}
+
+/* The layout bar. Explicit until auto-detect exists -- and explicit means a media query
+   CANNOT also be in play: at 390px wide a max-width query would force the phone rules
+   no matter what the toggle said, so the control would appear not to work. One authority,
+   and it is this attribute. Matches corepox-board's own pill: cyan while PHONE. */
+.cx-layoutbar{position:relative;z-index:3;flex:none;height:38px;display:flex;align-items:center;
+  justify-content:center;gap:14px;background:rgba(6,8,14,.96);border-top:1px solid ${C.line}}
+.cx-layoutbtn{background:transparent;border:1px solid ${C.line};border-radius:999px;
+  padding:5px 14px;color:${C.dim};font:500 11px/1 ${MONO};letter-spacing:.1em;cursor:pointer}
+.cx-layoutbtn:hover{color:${C.ink}}
+.cx-shell[data-layout="phone"] .cx-layoutbtn{border-color:${C.cyan};color:${C.cyan}}
+.cx-layouthint{font:400 9.5px/1 ${MONO};letter-spacing:.14em;color:rgba(232,236,245,.28)}
+
+/* Phone: option 2b. One panel at a time, chosen by the tab bar; the route and LAUNCH
+   stay above the fold and the mission list becomes the single next-mission row. The app
+   is held to 390px and centred so the phone layout can be previewed on a desktop screen,
+   which is what corepox-board's PHONE mode does too. */
+.cx-shell[data-layout="phone"] .cx-app{width:390px;max-width:100%;margin:0 auto;
+  border-left:1px solid ${C.line};border-right:1px solid ${C.line}}
+.cx-shell[data-layout="phone"] .cx-top{height:52px;padding:0 18px}
+.cx-shell[data-layout="phone"] .cx-mark{font-size:12px}
+.cx-shell[data-layout="phone"] .cx-sub{display:none}
+.cx-shell[data-layout="phone"] .cx-stats{gap:14px}
+.cx-shell[data-layout="phone"] .cx-stage{padding:16px;gap:16px}
+.cx-shell[data-layout="phone"] .cx-landing{flex-direction:column}
+.cx-shell[data-layout="phone"] .cx-missions{width:auto}
+.cx-shell[data-layout="phone"] .cx-explore{padding:16px 14px}
+.cx-shell[data-layout="phone"] .cx-launch{width:100%;height:58px;font-size:16px}
+.cx-shell[data-layout="phone"] .cx-tabs{height:76px}
+.cx-shell[data-layout="phone"] .cx-tlabel{font-size:8px;letter-spacing:.14em}
+.cx-shell[data-layout="phone"] .cx-app[data-tab="explore"] .cx-missions{display:none}
+.cx-shell[data-layout="phone"] .cx-app[data-tab="missions"] .cx-explore{display:none}`
+)};
+
+// ---------------------------------------------------------------------------
+// The shell
+// ---------------------------------------------------------------------------
+
+const _corepox_app = function _corepox_app(
+  html, appCss, appSymbols, mapSymbols, routePreview, missionRows,
+  loadProgress, saveProgress, NODE_KINDS, newRunCampaign, TYPES,
+  $galaxyMap, $game, invalidation
+) {
+  const C = {fight: "#ff5c72", travel: "#4fd8e8", economy: "#ffc42e", support: "#56e39f"};
+  let progress = loadProgress();
+
+  const root = html`<div class="cx-app" data-route="landing" data-tab="explore"></div>`;
+  root.appendChild(html`<style>${appCss}</style>`);
+  // One <defs> for the whole shell: the map's node glyphs plus this module's verb glyphs.
+  root.appendChild(html`<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>${mapSymbols}${appSymbols}</defs></svg>`);
+
+  // --- backdrop -----------------------------------------------------------
+  root.appendChild(html`<svg class="cx-sky" preserveAspectRatio="none" viewBox="0 0 1600 900">
+    <defs><pattern id="cx-stars" width="140" height="120" patternUnits="userSpaceOnUse">
+      <circle cx="18" cy="26" r="1" fill="#fff" opacity=".55"/><circle cx="96" cy="12" r="1.4" fill="#dfe7ff" opacity=".4"/>
+      <circle cx="63" cy="74" r=".8" fill="#fff" opacity=".35"/><circle cx="124" cy="96" r="1.1" fill="#cfe3ff" opacity=".5"/>
+      <circle cx="34" cy="104" r=".7" fill="#fff" opacity=".3"/></pattern>
+      <filter id="cx-neb" x="-20%" y="-20%" width="140%" height="140%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="4" seed="7"/>
+        <feDisplacementMap in="SourceGraphic" scale="60"/><feGaussianBlur stdDeviation="18"/></filter></defs>
+    <rect width="1600" height="900" fill="#04050a"/><rect width="1600" height="900" fill="url(#cx-stars)" opacity=".75"/>
+    <ellipse cx="700" cy="380" rx="460" ry="280" fill="#16406f" opacity=".28" filter="url(#cx-neb)"/>
+    <ellipse cx="1320" cy="700" rx="300" ry="200" fill="#3a2a72" opacity=".2" filter="url(#cx-neb)"/></svg>`);
+
+  // --- top bar ------------------------------------------------------------
+  const scrapEl = html`<div class="cx-scrap">◆ 214</div>`;
+  const starsEl = html`<div class="cx-stars">★ 0</div>`;
+  root.appendChild(html`<header class="cx-top">
+    <div class="cx-brand"><span class="cx-mark">COREPOX</span><span class="cx-sub">SEED SHIP #342164</span></div>
+    <div class="cx-stats">${scrapEl}${starsEl}
+      <button class="cx-icon" title="settings"><svg width="15" height="15"><use href="#v-gear"/></svg></button></div>
+  </header>`);
+
+  // --- back (not in the drawing; without it a mounted destination is a trap) ------
+  // Mounted into the outer layout bar further down, so it never covers a destination.
+  const backBtn = html`<button class="cx-back">◀ &nbsp;COREPOX</button>`;
+  backBtn.onclick = () => showLanding();
+
+  // --- stage --------------------------------------------------------------
+  const preview = routePreview();
+  const hold = newRunCampaign();          // the loadout a run actually starts with
+  const holdBits = Object.entries(hold.parts)
+    .map(([t, n]) => `<span>${(TYPES?.[t]?.label ?? t).toUpperCase()} ${n}</span>`).join("");
+
+  const launchBtn = html`<button class="cx-launch"><svg width="17" height="17" viewBox="0 0 12 12"><use href="#v-play"/></svg>LAUNCH</button>`;
+  launchBtn.onclick = () => openRun();
+
+  const explore = html`<section class="cx-explore">
+    <div class="cx-hd">
+      <div class="cx-hd-l"><span class="cx-eyebrow">EXPLORE</span>
+        <span class="cx-where">RUN ${String(preview.run.seed).padStart(3, "0")} · ${preview.run.jumps} JUMPS TO THE RIM</span></div>
+      <div class="cx-fam">
+        <span style="color:${C.fight}">FIGHT</span><span style="color:${C.travel}">TRAVEL</span>
+        <span style="color:${C.economy}">ECONOMY</span><span style="color:${C.support}">SUPPORT</span></div>
+    </div>
+    <div class="cx-map">${(() => { const d = html`<div style="width:100%;height:100%">${preview.svg}</div>`; return d; })()}</div>
+    <div class="cx-foot">
+      <div class="cx-blurb">
+        <p>A lonely core, four plates and whatever you can bolt on before the rim.
+           ${Object.keys(NODE_KINDS).length} kinds of stop, and only some of them shoot back.</p>
+        <div class="cx-hold"><span style="color:#ffc42e">◆ ${hold.scrap}</span>${holdBits}</div>
+      </div>
+      <div class="cx-launch-wrap">${launchBtn}</div>
+    </div>
+  </section>`;
+
+  const mlist = html`<div class="cx-mlist"></div>`;
+  const mcount = html`<span class="cx-mcount"></span>`;
+  const missions = html`<aside class="cx-missions">
+    <div class="cx-mhd"><span class="cx-mtitle">MISSIONS</span>${mcount}</div>${mlist}</aside>`;
+
+  const landing = html`<div class="cx-landing"></div>`;
+  landing.append(explore, missions);
+  const mount = html`<div class="cx-mount"></div>`;
+  const stage = html`<div class="cx-stage"></div>`;
+  stage.append(landing, mount);
+  root.appendChild(stage);
+
+  // --- mission list -------------------------------------------------------
+  function renderMissions() {
+    const rows = missionRows(progress);
+    const tut = rows.filter((r) => !r.divider && r.campaign === "tutorial");
+    const done = tut.filter((r) => r.state === "cleared").length;
+    mcount.innerHTML = `TUTORIAL&nbsp;&nbsp;<span style="color:#8fe64a">★ ${done}/${tut.length}</span>`;
+    starsEl.textContent = `★ ${progress.cleared.length}`;
+
+    mlist.replaceChildren(...rows.map((r) => {
+      if (r.divider) {
+        return html`<div class="cx-divider">
+          <span class="cx-dname">${r.divider.toUpperCase()}</span>
+          ${r.unlocked ? "" : html`<span class="cx-dgate">CLEAR ${String(r.needs).toUpperCase()}</span>`}</div>`;
+      }
+      const badge = r.state === "cleared" ? html`<div class="cx-badge">★</div>`
+        : r.state === "open" ? html`<div class="cx-badge"><svg width="14" height="14" viewBox="0 0 12 12"><use href="#v-play"/></svg><div class="cx-bang">!</div></div>`
+        : html`<div class="cx-badge"><svg width="13" height="13"><use href="#v-lock"/></svg></div>`;
+      const row = html`<button class="cx-row" data-state=${r.state} data-mission=${r.id}>
+        ${badge}
+        <div class="cx-rmain"><span class="cx-rname">${r.title}</span>
+          ${r.state === "open" ? html`<span class="cx-rbrief">${r.brief ?? ""}</span>` : ""}</div>
+        ${r.live && r.state !== "locked" ? html`<span class="cx-rlive">LIVE</span>` : ""}
+        <svg width="13" height="13" style="color:${r.state === "locked" ? "rgba(232,236,245,.3)" : r.verb.colour === "lime" ? "rgba(143,230,74,.7)" : r.verb.colour === "cyan" ? "rgba(79,216,232,.7)" : r.verb.colour === "amber" ? "rgba(255,196,46,.7)" : "rgba(196,107,255,.7)"}"><use href="#${r.verb.sym}"/></svg>
+      </button>`;
+      if (r.state === "locked") row.disabled = true;
+      else row.onclick = () => openMission(r.index);
+      return row;
+    }));
+  }
+  renderMissions();
+
+  // --- tab bar ------------------------------------------------------------
+  const TABS = [
+    {key: "explore",  label: "EXPLORE",  sym: "n-race",  colour: "#56e39f"},
+    {key: "missions", label: "MISSIONS", sym: "m-core",  colour: "rgba(232,236,245,.5)"},
+    {key: "shipyard", label: "SHIPYARD", sym: "m-armour", colour: "rgba(232,236,245,.6)", soon: true},
+    {key: "ladder",   label: "LADDER",   sym: "n-boss",  colour: "#c46bff", soon: true}
+  ];
+  const tabs = html`<nav class="cx-tabs"></nav>`;
+  const tabBtns = TABS.map((t) => {
+    const b = html`<button class="cx-tab" role="tab" data-tab=${t.key} aria-selected=${t.key === "explore"}>
+      <svg width="26" height="26" style="color:${t.colour}"><use href="#${t.sym}"/></svg>
+      <span class="cx-tlabel" style="color:${t.colour}">${t.label}</span>
+      ${t.soon ? html`<span class="cx-soon" style="color:${t.colour}">SOON</span>` : ""}</button>`;
+    if (t.soon) b.disabled = true;
+    else b.onclick = () => selectTab(t.key);
+    tabs.appendChild(b);
+    return b;
+  });
+  root.appendChild(tabs);
+
+  // --- routing ------------------------------------------------------------
+  // Routing mutates attributes and moves nodes. It never rebuilds the shell, because
+  // `viewof game` and `viewof galaxyMap` are live stateful nodes -- rebuilding would
+  // throw away a campaign or a run in progress.
+  function selectTab(key) {
+    root.dataset.tab = key;
+    tabBtns.forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === key)));
+    if (root.dataset.route !== "landing") showLanding();
+  }
+  function showLanding() {
+    root.dataset.route = shell.dataset.route = "landing";
+    mount.replaceChildren();
+    progress = loadProgress();           // a destination may have cleared something
+    renderMissions();
+  }
+  function openRun() {
+    root.dataset.route = shell.dataset.route = "run";
+    try { mount.replaceChildren($galaxyMap); }
+    catch (e) { mount.replaceChildren(html`<div style="padding:24px;color:#ff5c72">the map failed to mount: ${String(e)}</div>`); }
+  }
+  function openMission(index) {
+    root.dataset.route = shell.dataset.route = "campaign";
+    try {
+      // `select` is corepox-game's own QA seam. Used deliberately: the alternative is
+      // duplicating its `reset`, and a duplicated reset drifts from the real one.
+      $game.qa?.select?.(index);
+      mount.replaceChildren($game);
+    } catch (e) {
+      mount.replaceChildren(html`<div style="padding:24px;color:#ff5c72">the campaign failed to mount: ${String(e)}</div>`);
+    }
+  }
+
+  // A mission that reaches `win` is recorded once. corepox-game reports its state on
+  // its own value, so this listens rather than reaching inside it.
+  const onGame = () => {
+    const v = $game.value;
+    if (!v || v.state !== "win") return;
+    if (progress.cleared.includes(v.mission)) return;
+    progress = {...progress, cleared: [...progress.cleared, v.mission]};
+    saveProgress(progress);
+    renderMissions();
+  };
+  $game.addEventListener("input", onGame);
+  invalidation.then(() => $game.removeEventListener("input", onGame));
+
+  // --- the shell wrapper and the layout toggle ----------------------------
+  // The app is the flex child; the wrapper owns the height and carries the layout bar
+  // underneath it. `data-layout` on the wrapper is the single authority for phone-vs-
+  // desktop (see the CSS note above), and it is also what gets pushed down into
+  // corepox-board so the mounted destination agrees with the shell around it.
+  const shell = html`<div class="cx-shell" data-layout="desktop" data-route="landing"></div>`;
+  shell.appendChild(root);
+
+  const layoutBtn = html`<button class="cx-layoutbtn" type="button">DESKTOP</button>`;
+  shell.appendChild(html`<div class="cx-layoutbar">${backBtn}${layoutBtn}
+    <span class="cx-layouthint">LAYOUT &middot; AUTO-DETECT NOT YET WIRED</span></div>`);
+
+  const setLayout = (mode) => {
+    shell.dataset.layout = mode === "phone" ? "phone" : "desktop";
+    layoutBtn.textContent = mode === "phone" ? "PHONE" : "DESKTOP";
+    // Push the mode down into the mounted game so a destination agrees with the shell
+    // around it. Prefer the game's OWN toggle over its seam: `qa.layout(l)` is corepox-
+    // board's setter (board.js:1939) and re-renders the BOARD only, leaving the game's
+    // mission-bar pill on the old label -- observed, board `desktop` with the pill still
+    // reading `PHONE`. Clicking is what a finger does and keeps both in step. The seam
+    // stays as the fallback for when the pill is not on screen (a cutscene, a popup).
+    const want = shell.dataset.layout === "phone" ? "mobile" : "desktop";
+    try {
+      if ($game.qa?.layout?.() !== want) {
+        const pill = [...$game.querySelectorAll("button")]
+          .find((b) => /^(PHONE|DESKTOP)$/.test(b.textContent.trim()));
+        if (pill) pill.click(); else $game.qa?.layout?.(want);
+      }
+    } catch (_) {}
+    fit();
+  };
+  layoutBtn.onclick = () => setLayout(shell.dataset.layout === "phone" ? "desktop" : "phone");
+
+  // The CSS fallback subtracts a one-line import strip, and on a narrow viewport that
+  // strip wraps to two -- which pushed the tab bar's labels off the bottom of a phone.
+  // Measure the offset instead of assuming it, and re-measure on resize.
+  const fit = () => {
+    const top = shell.getBoundingClientRect().top;
+    shell.style.height = `${Math.max(560, window.innerHeight - top)}px`;
+  };
+  // A cell RETURNS its node and the runtime inserts it afterwards, so measuring on the
+  // next frame measures a DETACHED node -- `top` reads 0 and the shell is sized to the
+  // whole viewport, overshooting by the strip's height and pushing the tab bar off the
+  // bottom. That is the bug this loop exists for: wait for insertion, then fit twice,
+  // the second time after layout has settled.
+  let tries = 0;
+  const settle = () => {
+    if (shell.isConnected) { fit(); requestAnimationFrame(fit); return; }
+    if (tries++ < 120) requestAnimationFrame(settle);
+  };
+  requestAnimationFrame(settle);
+  window.addEventListener("resize", fit);
+  invalidation.then(() => window.removeEventListener("resize", fit));
+
+  // QA seam, matching the house shape elsewhere in this notebook.
+  shell.qa = root.qa = {
+    fit,
+    layout: () => shell.dataset.layout,
+    setLayout,
+    tab: () => root.dataset.tab,
+    route: () => root.dataset.route,
+    rows: () => [...mlist.querySelectorAll(".cx-row")].map((b) => ({
+      mission: b.dataset.mission, state: b.dataset.state})),
+    open: (id) => mlist.querySelector(`.cx-row[data-mission="${id}"]`)?.click(),
+    launch: () => launchBtn.click(),
+    back: () => backBtn.click(),
+    progress: () => ({...progress}),
+    setProgress: (p) => { progress = {cleared: [], perfect: [], ...p}; saveProgress(progress); renderMissions(); },
+    reset: () => { progress = {cleared: [], perfect: []}; saveProgress(progress); renderMissions(); },
+    run: () => preview.run
+  };
+  return shell;
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+
+  main.define("module @tomlarkworthy/corepox-missions",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-board",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-board.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-map",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-map.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-game",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-game.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-duel-encounter",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-duel-encounter.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-engine",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
+
+  for (const n of ["MISSIONS", "CAMPAIGNS"])
+    main.define(n, ["module @tomlarkworthy/corepox-missions", "@variable"], (_, v) => v.import(n, _));
+  main.define("PALETTE", ["module @tomlarkworthy/corepox-board", "@variable"], (_, v) => v.import("PALETTE", _));
+  for (const n of ["genRun", "NODE_KINDS", "mapSymbols"])
+    main.define(n, ["module @tomlarkworthy/corepox-map", "@variable"], (_, v) => v.import(n, _));
+  main.define("viewof galaxyMap", ["module @tomlarkworthy/corepox-map", "@variable"], (_, v) => v.import("viewof galaxyMap", _));
+  main.define("viewof game", ["module @tomlarkworthy/corepox-game", "@variable"], (_, v) => v.import("viewof game", _));
+  main.define("newRunCampaign", ["module @tomlarkworthy/corepox-duel-encounter", "@variable"], (_, v) => v.import("newRunCampaign", _));
+  main.define("TYPES", ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import("TYPES", _));
+
+  $def("_title", "title", ["md"], _title);
+  $def("_architecture", "architecture", ["md"], _architecture);
+  $def("_progressNote", "progressNote", ["md"], _progressNote);
+  $def("_PROGRESS_KEY", "PROGRESS_KEY", [], _PROGRESS_KEY);
+  $def("_loadProgress", "loadProgress", ["PROGRESS_KEY"], _loadProgress);
+  $def("_saveProgress", "saveProgress", ["PROGRESS_KEY"], _saveProgress);
+  $def("_missionNote", "missionNote", ["md"], _missionNote);
+  $def("_VERBS", "VERBS", [], _VERBS);
+  $def("_missionRows", "missionRows", ["MISSIONS", "CAMPAIGNS", "VERBS"], _missionRows);
+  $def("_routeNote", "routeNote", ["md"], _routeNote);
+  $def("_routePreview", "routePreview", ["genRun", "NODE_KINDS"], _routePreview);
+  $def("_appSymbols", "appSymbols", [], _appSymbols);
+  $def("_appCss", "appCss", ["PALETTE"], _appCss);
+  $def("_corepox_app", "corepox_app",
+    ["html", "appCss", "appSymbols", "mapSymbols", "routePreview", "missionRows",
+     "loadProgress", "saveProgress", "NODE_KINDS", "newRunCampaign", "TYPES",
+     "viewof galaxyMap", "viewof game", "invalidation"], _corepox_app);
+
+  return main;
+}</script>
+
+<script id="@tomlarkworthy/corepox-app" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// @tomlarkworthy/corepox-app — the notebook's default page.
+//
+// This module is deliberately almost empty. It boots as the landing screen, so anything
+// it renders is something a player has to look at before they can play. The whole
+// implementation, and every word explaining it, lives in
+// @tomlarkworthy/corepox-app-impl; this imports exactly one cell from there and shows it.
+//
+// In Observable source that is two lines:
+//
+//   import {corepox_app} from "@tomlarkworthy/corepox-app-impl"
+//   corepox_app
+//
+// Keep it that way. A cell added here is a cell on the landing page.
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+
+  main.define("module @tomlarkworthy/corepox-app-impl",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-app-impl.js?v=4")).default));
+  main.define("corepox_app", ["module @tomlarkworthy/corepox-app-impl", "@variable"],
+    (_, v) => v.import("corepox_app", _));
+
+  // The one visible cell: the shell itself.
+  main.variable(observer()).define(null, ["corepox_app"], (app) => app).pid = "_show";
+
+  return main;
+}</script>
+
 <!-- Bootloader -->
 <script id="bootconf.json"
         type="text/plain"
@@ -10028,9 +10921,10 @@ export default function define(runtime, observer) {
     "@tomlarkworthy/corepox-map",
     "@tomlarkworthy/corepox-duel",
     "@tomlarkworthy/corepox-duel-encounter",
-    "@tomlarkworthy/corepox-mining"
+    "@tomlarkworthy/corepox-mining",
+    "@tomlarkworthy/corepox-app"
   ],
-  "hash": "#view=R100(S70(@tomlarkworthy/corepox-game),S30(@tomlarkworthy/claude-code-pairing))",
+  "hash": "#view=R100(S100(@tomlarkworthy/corepox-app))",
   "headless": true,
   "prerender": true
 }
@@ -13733,6 +14627,46 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   const fragLanes    = FRAG_RAMP.map(c => lane(c, 14));
   const exhaustLanes = EXHAUST_RAMP.map(c => lane(c, 8));
   const beamLane     = lane("#ff5a4a", 7);
+  // The core explosion, colour-matched to the promo reel (data/corepox/video,
+  // reel-CE4bDuaCGIe.mp4 at 30.1s, where a ship dies against open space). It goes
+  // blazing WHITE, then PINK/MAGENTA through the middle of its life, then a dim
+  // VIOLET ring of separated dots. It is not orange and it is not green -- the
+  // green starburst at 54.6s and 55.7s in the same reel is fx/Placement.cs, a
+  // different effect that converges INWARD onto a component being placed.
+  const CORE_RAMP    = ["#6a3a8f", "#9d4fc4", "#d264cf", "#ff8fdc", "#ffcdef", "#ffffff"];
+  // Tagged, because the ramps SHARE colours -- EXHAUST_RAMP's brightest lane is
+  // #ffffff too, and a probe filtering the fx layer by stroke counted the exhaust
+  // plume as part of the burst (125 "trails" and a 535px reach for an effect that
+  // is 40px across on its first frame). The tag is how a test addresses this layer.
+  const coreLanes    = CORE_RAMP.map(c => lane(c, 0.07 * TILE));
+  const burstLane    = lane("#fff4d6", 0.9 * TILE);
+  for (const e of coreLanes) e.setAttribute("data-fx", "core");
+  burstLane.setAttribute("data-fx", "core-flash");
+
+  // fx/Explosion.cs, with Random replaced by a hash of the trail index so the same
+  // death draws the same burst twice -- a replay that re-renders must not differ.
+  // 120 trails is the prefab's number and it costs no nodes: every streak is one
+  // more `M..L..` in a string that was going to be set anyway.
+  const CORE_N = UNITS.CORE_TRAILS;
+  const coreTrail = new Float64Array(CORE_N * 3);          // theta, mag, built once
+  for (let i = 0; i < CORE_N; i++) {
+    const h = Math.imul(i + 1, 2654435761) >>> 0;
+    const u = ((h >>> 8) & 1023) / 1024;                   // Random.Range(1, 10f)
+    coreTrail[i * 3]     = (Math.PI * 2 * i) / CORE_N + (((h >>> 20) & 255) / 255 - 0.5) * 0.2;
+    coreTrail[i * 3 + 1] = 1 - 1 / (1 + 9 * u);            // magnitude, 0 .. 0.9
+  }
+  // The renderer owns the burst clock, NOT world.t, and it runs on WALL time.
+  //
+  // Two reasons, and the second was measured. The duel freezes the world the tick
+  // the last Brain dies -- that is what keeps the winner's salvage honest -- so an
+  // effect aged by sim time would freeze on its first frame. And tying it to the
+  // view's `speed` instead made a speed-8 duel play the 1s burst in 125ms while the
+  // hold still waited 1.15s: 146 segments on the first frame and 26 (residue, not
+  // burst) on every frame after. A death explosion is a beat for the player, not a
+  // simulated quantity; at wall time the burst and the duel's hold agree at any
+  // speed. `api.fxSpeed` is left as a knob for a screenshot, defaulting to 1.
+  const seen = new Map();
+  let fxT = 0, fxLast = 0;
 
   // splitDetached() pushes new bodies into world.ships mid-match, so the node set
   // has to be reconciled every frame. Building it once left every severed piece
@@ -13918,6 +14852,47 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
     for (let i = 0; i < eBuf.length; i++) exhaustLanes[i].setAttribute("d", eBuf[i]);
     for (let i = 0; i < fBuf.length; i++) fragLanes[i].setAttribute("d", fBuf[i]);
     beamLane.setAttribute("d", bBuf);
+    drawCore();
+  };
+
+  // OutCubic on the way out, InCubic on the fade and on the length -- the three
+  // eases Explosion.cs tweens with.
+  const outCubic = (p) => 1 - (1 - p) * (1 - p) * (1 - p);
+  const drawCore = () => {
+    const now = performance.now() / 1000;
+    fxT += fxLast ? Math.min(0.1, now - fxLast) * (api.fxSpeed ?? 1) : 0;
+    fxLast = now;
+    const live = world.fx ?? [];
+    if (seen.size) for (const k of seen.keys()) if (!live.includes(k)) seen.delete(k);
+    const cBuf = ["", "", "", "", "", ""];
+    let burst = "";
+    const T = UNITS.CORE_TIME, R = UNITS.CORE_R;
+    for (const e of live) {
+      if (e.kind !== "core") continue;
+      if (!seen.has(e)) seen.set(e, fxT);
+      const p = (fxT - seen.get(e)) / T;
+      if (p < 0 || p >= 1) continue;
+      const cx = e.x * TILE, cy = e.y * TILE;
+      // the initial_burst sprite: one bright disc, gone in the first quarter
+      if (p < 0.2) burst += `M${cx.toFixed(1)} ${cy.toFixed(1)}h0`;   // initial_burst_prefab
+      const reach = outCubic(p), fade = 1 - p * p * p;
+      // ONE band for the whole burst, stepped by AGE. Explosion.cs tints every
+      // trail from the same sprite and tweens them together, and the reel agrees:
+      // the ring is a single colour at any instant, white early and violet late.
+      // Grading per-trail by travel distance was mine, not the original's, and it
+      // read as a bonfire rather than a detonation.
+      const band = Math.max(0, Math.min(cBuf.length - 1, ((1 - p) * cBuf.length) | 0));
+      for (let i = 0; i < CORE_N; i++) {
+        const th = coreTrail[i * 3], mag = coreTrail[i * 3 + 1];
+        const ux = Math.cos(th), uy = Math.sin(th);
+        const r = R * mag * reach * TILE;
+        const len = mag * fade * 0.75 * TILE;              // DOScaleX(0) on InCubic
+        cBuf[band] += `M${(cx + ux * r).toFixed(1)} ${(cy + uy * r).toFixed(1)}`
+                    + `L${(cx + ux * (r - len)).toFixed(1)} ${(cy + uy * (r - len)).toFixed(1)}`;
+      }
+    }
+    for (let i = 0; i < cBuf.length; i++) coreLanes[i].setAttribute("d", cBuf[i]);
+    burstLane.setAttribute("d", burst);
   };
   // Wheel zoom. deltaY is in pixels, lines or pages depending on the device, and
   // Firefox reports lines -- normalising first is the difference between a
@@ -19969,6 +20944,37 @@ const _UNITS = function _UNITS(){return(
   // fitted to two things the game has to do, not to one thing it turns out not to
   // need.
   BEAM_R: 0.25,
+  // A cell's collision half-extent, and it is deliberately INSIDE the unit square
+  // rather than flush with its edge. Tom, 2026-08-23: "all collision bounds should
+  // be inside their square, not actually right to the edge, so anything with
+  // velocity 0 on start should not be touching if no movement has occured, even if
+  // they do not join properly."
+  //
+  // 0.5 -- flush -- made two cells one tile apart score as a contact at d === 1.0
+  // exactly, with rel === 0. collide()'s tests are both inclusive, so that pair
+  // took RAM_DMG every tick while producing no impulse (rel is not < 0) and no
+  // depenetration (push = (1 - d) * 0.5 = 0). Nothing ever separated them. A
+  // corpus design whose parts do not join arrives split, at rest, in exact face
+  // contact, and grinds itself apart in 0.4s with no enemy present
+  // (tools/corepox-spawn-selfkill.ts, CEC3F746).
+  //
+  // 0.45 leaves 0.1 tiles of clearance between adjacent cells, which is what makes
+  // "not touching at rest" true rather than true-to-within-rounding. It is not a
+  // fidelity claim: the original's colliders DO cover the whole part
+  // (fx/Placement.cs:30). It is a deliberate departure.
+  // The core explosion, recovered whole from prefabs/fx/CoreExplosion.prefab --
+  // trails: 120, radius: 3, trailTime: 1. fx/Explosion.cs is the whole effect: an
+  // initial burst sprite, then `trails` streaks on even bearings with +-0.1 rad of
+  // jitter, each at magnitude 1 - 1/Random.Range(1,10) so most are short and a few
+  // reach. Each streak tweens outward on Ease.OutCubic while its colour goes to
+  // clear and its length to zero on Ease.InCubic.
+  //
+  // ShipComponent.cs:96 fires it in exactly one place: a component reaching 0hp
+  // whose name is "Brain". Everything else plays Block_Break and no effect.
+  //
+  // radius 3 is in world units, hence /0.64 -- 4.6875 tiles.
+  CORE_TRAILS: 120, CORE_R: 3 / 0.64, CORE_TIME: 1.0, CORE_MAX: 8,
+  CELL_R: 0.45,
   HIT_R: 0.5                  // a component is one tile across
 }
 )};
@@ -20919,7 +21925,11 @@ class Ship {
   damage(comp, n, transfer = false) {
     comp.hp -= n;
     if (comp.hp <= 0) {
+      // BEFORE reindex, which moves this.x,y to the new centre and would put the
+      // burst at the wrong place -- the same ordering trap Ship.detach documents.
+      const core = !transfer && comp.type === "Brain" ? this.worldOf(comp) : null;
       comp.hp = 0; this.reindex(); this.order = this.topo();
+      if (core) this.world?.coreBurst(core[0], core[1]);
       if (!transfer && comp.type === "Explosive") this.world?.detonate(this, comp);
       return true;
     }
@@ -20952,6 +21962,10 @@ class World {
   static rng = Math.random;
   constructor(ships = []) {
     this.ships = ships; this.beams = []; this.particles = [];
+    // Drawn effects. Nothing in here is stepped, collided or integrated -- it is a
+    // list of things that HAPPENED, for a renderer to read. It consumes no rng, so
+    // determinism is unaffected (tools/corepox-determinism.ts).
+    this.fx = [];
     this.t = 0; this.tick = 0;
     // A component's death is resolved on the ship (Ship.damage), but an explosion is
     // particles, and particles live out here. The back-reference is what lets the
@@ -21112,6 +22126,16 @@ class World {
   // ExplosiveFn.destroy(): 32 fragments evenly around a circle, then the component
   // removes itself. It runs on DESTRUCTION, not only on trigger, which is why a
   // hit on a loaded bomb takes its neighbours with it.
+  // A Brain died. Records where, for the renderer; deliberately not a particle --
+  // 120 streaks through stepParticles would be 120 more x ship collision tests a
+  // tick for something that must not touch anything (and stepParticles is already
+  // 45% of the frame). The renderer draws them into its existing per-colour lane
+  // paths, so the whole burst costs no new DOM nodes.
+  coreBurst(x, y) {
+    this.fx.push({kind: "core", x, y, t: this.t});
+    if (this.fx.length > UNITS.CORE_MAX) this.fx.shift();
+  }
+
   detonate(ship, c) {
     if (c.spent) return;
     c.spent = true;
@@ -21243,7 +22267,7 @@ class World {
           if (dd < bd) { bd = dd; ax = px; ay = py; bx = qx; by = qy; }
         }
         const d = Math.sqrt(bd);
-        if (d > 1) continue;                                   // two unit cells, r 0.5 each
+        if (d > 2 * UNITS.CELL_R) continue;                    // two cells, CELL_R each
         let nx = bx - ax, ny = by - ay;
         if (d === 0) {
           // Dead-centre cells have no contact normal to read off. `continue`ing
@@ -21302,7 +22326,7 @@ class World {
         A.impulse(cax, cay, -mnx * jmag, -mny * jmag);
         B.impulse(cbx, cby,  mnx * jmag,  mny * jmag);
       }
-      const push = (1 - deep.d) * 0.5;                         // depenetrate
+      const push = (2 * UNITS.CELL_R - deep.d) * 0.5;                         // depenetrate
       A.x -= deep.nx * push; A.y -= deep.ny * push;
       B.x += deep.nx * push; B.y += deep.ny * push;
     }
