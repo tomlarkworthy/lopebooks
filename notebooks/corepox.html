@@ -20890,7 +20890,8 @@ class Ship {
     [f.vx, f.vy] = at0(f.x, f.y);
     f.w = w0;
 
-    for (const c of grp) this.damage(c, c.hp);       // reindex moves this.x,y to the new centre
+    // transfer, not destruction: these components are alive on `f` -- see Ship.damage
+    for (const c of grp) this.damage(c, c.hp, true); // reindex moves this.x,y to the new centre
     if (this.live.length) [this.vx, this.vy] = at0(this.x, this.y);
     return f;
   }
@@ -20903,9 +20904,25 @@ class Ship {
     this.a = geom.norm(this.a + this.w * DT);
   }
 
-  damage(comp, n) {
+  // ShipComponent.cs:84 damage(): when hp reaches 0 it calls `this.destroy()`, and
+  // ExplosiveFn overrides destroy() to fire its 32 fragments first. So a bomb goes
+  // off however it dies -- shot, rammed, or touched by an Orb -- and the rule lives
+  // HERE rather than at each attacker, which is why the original has it in one place.
+  //
+  // It used to sit in the particle path alone (`if (died && hit.c.type ===
+  // "Explosive")` in World.step), so a bolt set a bomb off and a collision did not:
+  // Tom, 2026-08-23, "Explosives don't trigger on contact destruction".
+  //
+  // `transfer` is the one death that is not a death: Ship.detach removes a component
+  // from the parent by damaging it to 0 after copying it into the fragment, and a
+  // bomb that detonated every time a hull split would be a different game.
+  damage(comp, n, transfer = false) {
     comp.hp -= n;
-    if (comp.hp <= 0) { comp.hp = 0; this.reindex(); this.order = this.topo(); return true; }
+    if (comp.hp <= 0) {
+      comp.hp = 0; this.reindex(); this.order = this.topo();
+      if (!transfer && comp.type === "Explosive") this.world?.detonate(this, comp);
+      return true;
+    }
     return false;
   }
 }
@@ -20936,9 +20953,13 @@ class World {
   constructor(ships = []) {
     this.ships = ships; this.beams = []; this.particles = [];
     this.t = 0; this.tick = 0;
+    // A component's death is resolved on the ship (Ship.damage), but an explosion is
+    // particles, and particles live out here. The back-reference is what lets the
+    // rule stay in one place.
+    for (const s of ships) s.world = this;
   }
 
-  add(ship) { this.ships.push(ship); return ship; }
+  add(ship) { ship.world = this; this.ships.push(ship); return ship; }
 
   nearestEnemy(ship, wx, wy) {
     let best = null, bd = Infinity;
@@ -21101,7 +21122,7 @@ class World {
                 Math.sin(r) * UNITS.FRAG_SPEED, -Math.cos(r) * UNITS.FRAG_SPEED,
                 UNITS.FRAG_TTL, UNITS.FRAG_DMG);
     }
-    ship.damage(c, c.hp);
+    if (c.hp > 0) ship.damage(c, c.hp);
   }
 
   // Move every particle, then damage the first component its swept segment
@@ -21170,8 +21191,7 @@ class World {
       }
       if (hit) {
         b.hx = hit.px; b.hy = hit.py; b.hitOk = true;
-        const died = hit.s.damage(hit.c, b.dmg);
-        if (died && hit.c.type === "Explosive") this.detonate(hit.s, hit.c);
+        hit.s.damage(hit.c, b.dmg);          // a destroyed Explosive detonates in there
       } else if (b.ttl > 0) alive.push(b);
     }
     this.particles = alive;
@@ -21295,12 +21315,17 @@ class World {
       const isl = s.islands();
       if (isl.length < 2) continue;
       isl.sort((a, b) => b.length - a.length);
-      for (const grp of isl.slice(1)) this.ships.push(s.detach(grp));
+      for (const grp of isl.slice(1)) this.add(s.detach(grp));   // `add`, so the fragment knows its world
     }
   }
 
   step() {
     for (const ship of this.ships) {
+      // Claimed every tick rather than only in `add`: four modules build their world
+      // by pushing onto `world.ships` directly (corepox-game, corepox-lab), and a
+      // ship that did not know its world would be one whose bombs did not go off --
+      // a back-reference set at insertion is a back-reference someone will bypass.
+      ship.world = this;
       if (!ship.live.length) continue;
       ship.propagate();
       for (const i of ship.order) {
