@@ -5154,11 +5154,14 @@ const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapSc
                              layer.replaceChildren(); layerMin = 0; fit(); };
   closeBtn.onclick = () => { closeLayer(); fire(); };
   invalidation.then(closeLayer);
-  // An encounter opens with no way out -- the fight is the commitment. The exit is
-  // put back the moment it resolves, which is also the only moment the board behind
-  // it has changed; without that the spoils panel is a dead end (measured: the
-  // layer stayed up with no button, tools/scratch/encounter-spoils.mjs).
-  const exitAs = (label) => { closeBtn.textContent = label; bar.style.display = "flex"; };
+  // An encounter opens with no way out -- the fight is the commitment -- and it now
+  // closes on its OWN button. `exitAs` used to put a "back to the map" control on the
+  // layer bar when a node resolved, because the old spoils card had no control of its
+  // own and the layer was otherwise a dead end (measured:
+  // tools/scratch/encounter-spoils.mjs, the layer stayed up with no button). Since
+  // 2026-08-22 the node ends on spoilsPopup, whose TAKE & JUMP commits the campaign,
+  // so a second button after it left the player looking at a finished battlefield and
+  // pressing "back to the map" to leave a screen they had already left.
   const showLayer = (el, {closable = true} = {}) => {
     open?.stop?.();
     open = el;
@@ -5199,7 +5202,9 @@ const _cpmMap = function _galaxyMap(html,mapCss,mapParams,genRun,runStates,mapSc
         st.selected = null;
         sync();
         if (verdict === "loss") st.over = "destroyed";
-        exitAs(verdict === "loss" ? "the run ends ▶" : "back to the map ▶");
+        // Straight to the map: the popup's button IS the transition, and this runs
+        // on that click.
+        closeLayer();
         fire();
       }}), {closable: false});
     }
@@ -9876,7 +9881,17 @@ const _stationView = function _stationView(
                   camp.scrap -= quote.cost;
                   const s = structuredClone(ed.value);
                   for (const c of s.components) delete c.dmg;
-                  camp.ship = s; build();
+                  camp.ship = s;
+                  // `ed` has to go FIRST. build() opens with
+                  // `keep = ed ? structuredClone(ed.value) : camp.ship`, so while
+                  // the old editor is still here the rebuild reads the damaged
+                  // hull straight back off it and the write to camp.ship is
+                  // discarded -- the money left and nothing was patched. Reported
+                  // by Tom 2026-08-22: "patch in the space station doesn't seem to
+                  // repair the ship", and before that "after repairing a node on a
+                  // space station, I did not see the nodes look fixed".
+                  ed = null;
+                  build();
                 })
             : btn("NO DAMAGE", "#5b6b7d", () => {}));
         out.push(btn("UNDOCK ▶", "#56e39f", () => {
@@ -19899,6 +19914,7 @@ const _UNITS = function _UNITS(){return(
   // rate EMIT * magnitude * dt, magnitude 0..100 -- 2 a tick at full thrust.
   EXHAUST_SPEED: 1 / 0.64, EXHAUST_BACK: 1.6, EXHAUST_DMG: 1, EXHAUST_RATE: 1,
   RAM_DMG: 5,                                    // Ship.cs:586, per contact per tick
+  RESTITUTION: 0.2,                              // bounciness of a hull-vs-hull contact
   // The Orb is MeleeFn: FixedUpdate calls `damageArea.GetContacts` and damages
   // EVERY ShipComponent touching the trigger by `damageAmount`, at 50Hz -- which
   // is this engine's tick, DT is already 0.02. Both numbers are off Orb.prefab
@@ -20004,7 +20020,18 @@ const _TYPES = function _TYPES(){return(
   // output semantics, so they are not modelled.
   Orb:          {hp: 75,  tiles: [[0,0],[1,0],[0,1],[1,1]],
                  ins: [], outs: []},
-  Armour:       {hp: 100, tiles: [[0,0]], ins: [],                    outs: []},
+  // 75, not the 100 the game shipped with. Tom, 2026-08-22: "armour seems a bit too
+  // strong". At 100 one plate is 20 SECONDS of unbroken fire from one Lazer
+  // (BEAM_DMG 5 per BEAM_CYCLE 1.0s), against missions that resolve in 3-74s
+  // (tools/corepox-play-missions.ts) -- so a single 1-cell part outlasts most of
+  // them, and it is 5x a Brain and 4x an Engine PER CELL. 75 is not invented: it is
+  // the value the game shipped before 2018-01-14, seen on 65 dated corpus ships from
+  // 2017-11-23 (tools/corepox-hp-eras.ts). That patch is the one that took Brain
+  // 50->20, Binary 100->25, Constant 50->25, Lazer 100->75, Radar 50->25 and
+  // LaserTurret2 100->50 -- Armour was the ONLY part it moved up. Going back to 75
+  // is 15s a plate. tools/corepox-armour-balance.ts prints the table; 50 is the next
+  // step down if it still soaks too much.
+  Armour:       {hp: 75,  tiles: [[0,0]], ins: [],                    outs: []},
   // 12 cells, verbatim from TurretFn.Awake() -- the SHIPPED occupancy, with the
   // ASCII in that comment matching cell for cell. LaserTurret2.prefab serialises
   // only 10 (no y=3 row) and is the stale one: Awake() runs after deserialisation
@@ -20786,6 +20813,21 @@ class Ship {
     this.w += (rx * fy - ry * fx) / this.I * k / geom.D;
   }
 
+  // An impulse is a VELOCITY change, so it does not go through force(). force()
+  // carries a deliberate 1/UNITS.W = 1.5625x on both its linear and angular terms
+  // to make thrust match the original's pace (see the note on it); a collision
+  // impulse is an analytic quantity with a restitution already baked in, and
+  // scaling it by 1.5625 was turning e = 0.2 into an effective 0.875.
+  //
+  // Units check: jmag is mass * velocity in the same units velAt reports, so j/mass
+  // is a velocity and (r x j)/I is rad/s, converted to the deg/s w is kept in.
+  impulse(wx, wy, jx, jy) {
+    this.vx += jx / this.mass;
+    this.vy += jy / this.mass;
+    const rx = wx - this.x, ry = wy - this.y;
+    this.w += (rx * jy - ry * jx) / this.I / geom.D;
+  }
+
   propagate() {
     for (const k of this.conns) {
       const s = this.at(k.from[0], k.from[1]), d = this.at(k.to[0], k.to[1]);
@@ -21159,7 +21201,13 @@ class World {
       // applying a full impulse and a full depenetration per pair multiplies both
       // by the contact area -- which is what happens the moment footprints stop
       // being single points and a flush hull registers six pairs instead of one.
-      let deep = null;
+      // The contact MANIFOLD, not one point of it. Keeping only the deepest cell
+      // pair meant a flush face-on hit -- where four pairs are exactly equidistant
+      // -- was resolved wherever iteration order happened to land, i.e. at a
+      // corner, which spun both hulls up on a collision that is symmetric about the
+      // line of centres. One impulse per body pair is still right; it just has to
+      // act at the centroid of the contact and along the average normal.
+      let deep = null, nc = 0, sax = 0, say = 0, sbx = 0, sby = 0, snx = 0, sny = 0;
       for (const ca of A.live) {
        const [cax, cay] = A.worldOf(ca), ta = A.worldTiles(ca);
        for (const cb of B.live) {
@@ -21194,26 +21242,46 @@ class World {
         // contact) buys time rather than immunity. The old impulse model
         // (jmag * 2) was invented and read as a much softer bump.
         A.damage(ca, UNITS.RAM_DMG); B.damage(cb, UNITS.RAM_DMG);
+        nc++; sax += ax; say += ay; sbx += bx; sby += by; snx += nx; sny += ny;
         if (!deep || d < deep.d) deep = {d, nx, ny, ax, ay, bx, by, rel};
        }
       }
       if (!deep) continue;
-      // BUG, measured 2026-08-22, `bun tools/corepox-collision-energy.ts` (which
-      // exits 1 on purpose): this creates energy, and all of the surplus is spin.
-      // Two identical bricks face to face on y=0 leave the contact at +/-297 deg/s
-      // -- a symmetric hit that by symmetry must produce none -- and the total goes
-      // 80.66 -> 183.42 in one tick. Three causes compound: `deep` collapses a flush
-      // contact patch to ONE cell pair tie-broken by iteration order, so a face-on
-      // hit resolves as a corner strike; `jmag` below is the LINEAR impulse but is
-      // spent at that offset on linear AND angular motion, because the denominator
-      // omits (r x n)^2/I (~2.5x too small for a 4x4 at a 2-tile lever); and force()
-      // scales it by another 1/UNITS.W. Sustained contact then feeds back -- the new
-      // spin raises velAt at the contact, which raises `rel`, which raises jmag.
-      // Not fixed. See plan/corepox-tasks.md.
-      const mA = 1 / A.mass, mB = 1 / B.mass;
-      const jmag = -(1 + 0.2) * deep.rel / (mA + mB);          // restitution 0.2
-      A.force(deep.ax, deep.ay, -deep.nx * jmag / DT, -deep.ny * jmag / DT);
-      B.force(deep.bx, deep.by,  deep.nx * jmag / DT,  deep.ny * jmag / DT);
+      // Fixed 2026-08-22 (`bun tools/corepox-collision-energy.ts` is the gate; it
+      // failed on three checks before this and passes after). It used to create
+      // energy, all of it rotational: two identical bricks meeting face to face on
+      // y = 0 left the contact at +/-297 deg/s and the total went 80.66 -> 183.42 in
+      // one tick, on a collision that by symmetry must produce no spin at all.
+      //
+      // The standard 2D rigid-body impulse, which is energy non-increasing for
+      // e <= 1 -- the previous denominator was the LINEAR one only, so the rotation
+      // it induced at an offset contact was never paid for and came out free.
+      //
+      //   j = -(1 + e) * v_rel . n / (1/mA + 1/mB + (rA x n)^2/IA + (rB x n)^2/IB)
+      //
+      // Nothing here is a Unity compatibility shim any more (Tom, 2026-08-22: "we
+      // are not on unity anymore so all those old things are not relevant"), so the
+      // impulse is applied as an impulse rather than as a force scaled for thrust.
+      const cax = sax / nc, cay = say / nc, cbx = sbx / nc, cby = sby / nc;
+      let mnx = snx / nc, mny = sny / nc;
+      const nl = Math.hypot(mnx, mny);
+      // Opposed normals across a wrap-around contact can cancel; fall back to the
+      // deepest pair's normal rather than dividing by zero.
+      if (nl < 1e-9) { mnx = deep.nx; mny = deep.ny; } else { mnx /= nl; mny /= nl; }
+      // rel has to be read where the impulse ACTS, not at some other cell.
+      const [avx, avy] = A.velAt(cax, cay), [bvx, bvy] = B.velAt(cbx, cby);
+      const rel = (bvx - avx) * mnx + (bvy - avy) * mny;
+      // Separating at the CENTROID while individual cells were still closing is
+      // possible under spin. Skip the impulse then, but still depenetrate below --
+      // `continue`ing here would leave the two hulls overlapped indefinitely.
+      if (rel < 0) {
+        const ran = (cax - A.x) * mny - (cay - A.y) * mnx;     // (r x n), z only
+        const rbn = (cbx - B.x) * mny - (cby - B.y) * mnx;
+        const denom = 1 / A.mass + 1 / B.mass + ran * ran / A.I + rbn * rbn / B.I;
+        const jmag = -(1 + UNITS.RESTITUTION) * rel / denom;
+        A.impulse(cax, cay, -mnx * jmag, -mny * jmag);
+        B.impulse(cbx, cby,  mnx * jmag,  mny * jmag);
+      }
       const push = (1 - deep.d) * 0.5;                         // depenetrate
       A.x -= deep.nx * push; A.y -= deep.ny * push;
       B.x += deep.nx * push; B.y += deep.ny * push;
