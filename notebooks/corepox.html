@@ -4741,7 +4741,10 @@ of every one.
 The map is **generated**, not drawn — \`genRun(seed, galaxy)\` lays out the columns, wires a
 non-crossing graph between them and drops hazard regions on top; every state in the legend is
 derived from \`{at, visited}\` rather than authored. Click a reachable node to preview it,
-JUMP to commit.`);};
+JUMP to commit.
+
+The **run seed is rolled on load**, so the galaxy differs every time the page opens; type a number
+into the slider to explore a particular one twice.`);};
 const _cpmKinds = function _NODE_KINDS() {return ({
   duel:       {label: "DUEL",       colour: "#ff5c72", family: "fight",
                kind: "hostile contact", desc: "A single armed ship, wired to hunt. It fights the way its builder wired it, and the wiring is public.",
@@ -5099,8 +5102,15 @@ const _cpmHazTags = function _mapHazTags() {return ((run) => run.hazards.map(h =
 <span style="font:400 10px ui-monospace,monospace;color:rgba(232,236,245,.62)">${h.effect}</span></div>`;
 }).join(""));};
 const _cpmParams = function _mapParams(Inputs) {
+  // The seed is ROLLED, not fixed. It sat at 41, so every player who ever opened the
+  // map explored the same galaxy -- Tom, 2026-08-23: "we should get a random seed
+  // every corepox-app galaxy explore map". Rolled here, when the form is built, which
+  // is once per page load: `genRun` is pure in the seed, so a run stays stable while
+  // it is being played and the slider still pins one deliberately (typing 41 gets the
+  // galaxy every screenshot in plan/ was taken on).
+  const seed0 = 1 + Math.floor(Math.random() * 999);
   const i = {
-    seed: Inputs.range([1, 999], {step: 1, value: 41, label: "run seed"}),
+    seed: Inputs.range([1, 999], {step: 1, value: seed0, label: "run seed"}),
     galaxy: Inputs.range([1, 3], {step: 1, value: 2, label: "galaxy"}),
     jumps: Inputs.range([5, 9], {step: 1, value: 7, label: "jumps"})
   };
@@ -5255,12 +5265,6 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  main.define("module @tomlarkworthy/corepox-duel-encounter",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-duel-encounter.js?v=4")).default));
-  for (const n of ["newRunCampaign", "encounterView", "refitBench", "applyRefit", "partsOf"])
-    main.define(n, ["module @tomlarkworthy/corepox-duel-encounter", "@variable"],
-      (_, v) => v.import(n, _));
-
   $def("_cpmTitle", "title", ["md"], _cpmTitle);
   $def("_cpmParams", "viewof mapParams", ["Inputs"], _cpmParams);
   $def("_cpmParamsv", "mapParams", ["Generators","viewof mapParams"], _cpmParamsv);
@@ -5284,6 +5288,11 @@ export default function define(runtime, observer) {
   $def("_cpmDark", "darkOf", [], _cpmDark);
   $def("_cpmRng", "mapRng", [], _cpmRng);
 
+  main.define("module @tomlarkworthy/corepox-duel-encounter",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-duel-encounter.js?v=4")).default));
+  for (const n of ["newRunCampaign", "encounterView", "refitBench", "applyRefit", "partsOf"])
+    main.define(n, ["module @tomlarkworthy/corepox-duel-encounter", "@variable"],
+      (_, v) => v.import(n, _));
   return main;
 }</script>
 
@@ -5612,58 +5621,26 @@ const _DUEL_BACKDROP = function _DUEL_BACKDROP(){return(
 // Manual piloting
 // ---------------------------------------------------------------------------
 
-// The input half of `control: "human"`, which corepox-duel declares but gives a view
-// no way to drive. WASD writes a drive command, a click writes a waypoint, and the
-// two are exclusive -- pressing a key clears the waypoint, because a ship obeying
-// both at once reads as a ship ignoring you.
-//
-// Keys are taken on the WINDOW, not the board, so the player does not have to click
-// the battle first; the guard is a focused input, which is what makes a select or a
-// text field usable on the same page.
-const _humanControl = function _humanControl(){return(
-// `side` names which of a duel's two command slots to write. A state that has only
-// ONE ship under command -- the mining field -- passes null and gets `D.cmd` itself,
-// which is what keeps this one control layer usable by both.
+// The input half of `control: "human"`, which corepox-duel declares but gives a view no
+// way to drive. The keys, the waypoint press and the rule that they exclude each other
+// all live in `pilotInput` in @tomlarkworthy/corepox-engine, next to the command shape
+// pilot() reads -- this used to carry its own copy of the key table and the copy drifted
+// (see that cell). What is left here is the one thing this view knows and the engine
+// cannot: which of a duel's two command slots to write, and that a press on the
+// battlefield svg means a waypoint.
+const _humanControl = function _humanControl(pilotInput){return(
+// `side` names the command slot. A state with only ONE ship under command -- the mining
+// field -- passes null and gets `D.cmd` itself, which is what keeps one control layer
+// usable by both.
 (host, D, side = "a") => {
-  const DRIVE = {w: [1, 0], s: [-1, 0], a: [0, -1], d: [0, 1]};
-  const held = new Set();
-  const cmd = () => (side == null ? D.cmd : D.cmd[side]);
-  const typing = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? "");
-  const apply = () => {
-    let thrust = 0, yaw = 0;
-    for (const k of held) { thrust += DRIVE[k][0]; yaw += DRIVE[k][1]; }
-    const c = cmd();
-    c.drive = (thrust || yaw) ? {thrust: Math.max(-1, Math.min(1, thrust)),
-                                yaw: Math.max(-1, Math.min(1, yaw))} : null;
-    if (c.drive) { c.target = null; c.face = null; }
-  };
-  const key = (down) => (ev) => {
-    if (typing()) return;
-    const k = ev.key.toLowerCase();
-    if (k === " ") { cmd().fire = down; ev.preventDefault(); return; }
-    if (!DRIVE[k]) return;
-    ev.preventDefault();
-    down ? held.add(k) : held.delete(k);
-    apply();
-  };
-  const kd = key(true), ku = key(false);
-  const blur = () => { held.clear(); apply(); cmd().fire = false; };
-  addEventListener("keydown", kd); addEventListener("keyup", ku);
-  addEventListener("blur", blur);
+  const input = pilotInput(() => (side == null ? D.cmd : D.cmd[side]), {fire: [" "]});
   const svg = host.view?.svg;
   const point = (ev) => {
-    if (!host.view) return;
-    held.clear();
-    const c = cmd();
-    c.drive = null;
-    c.target = host.view.tileAt(ev);       // the view's own map, never re-derived
-    c.face = null;
+    if (host.view) input.waypoint(host.view.tileAt(ev));   // the view's own map, never re-derived
   };
   svg?.addEventListener("pointerdown", point);
-  return {stop: () => { removeEventListener("keydown", kd); removeEventListener("keyup", ku);
-                        removeEventListener("blur", blur); svg?.removeEventListener("pointerdown", point);
-                        blur(); },
-          held};
+  return {stop: () => { input.stop(); svg?.removeEventListener("pointerdown", point); },
+          held: input.held};
 }
 )};
 
@@ -5797,6 +5774,24 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
+  $def("_title", "title", ["md"], _title);
+  main.variable(observer("viewof duelDemo")).define("viewof duelDemo",
+    ["duelRoster","DUEL_MODES","duelView","htl","invalidation"], _viewof_duelDemo).pid = "_viewof_duelDemo";
+  main.variable(observer("duelDemo")).define("duelDemo",
+    ["Generators","viewof duelDemo"], _duelDemo).pid = "_duelDemo";
+  $def("_runDuel", "runDuel", ["newDuel","stepDuel","DT"], _runDuel);
+  $def("_meleePlacement", "meleePlacement", ["geom"], _meleePlacement);
+  $def("_nearestFoe", "nearestFoe", [], _nearestFoe);
+  $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","meleePlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
+  $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive","nearestFoe"], _stepDuel);
+  $def("_duelView", "duelView", ["newDuel","stepDuel","backdrop","battlefield","htl","DT","UNITS"], _duelView);
+  $def("_humanControl", "humanControl", ["pilotInput"], _humanControl);
+  $def("_DUEL_MODES", "DUEL_MODES", [], _DUEL_MODES);
+  $def("_duelAlive", "duelAlive", [], _duelAlive);
+  $def("_duelPlacement", "duelPlacement", ["geom"], _duelPlacement);
+  $def("_chaseCmd", "chaseCmd", ["geom"], _chaseCmd);
+  $def("_DUEL_BACKDROP", "DUEL_BACKDROP", [], _DUEL_BACKDROP);
+
   main.define("module @tomlarkworthy/corepox-engine",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-render",
@@ -5805,7 +5800,7 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-backdrops.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-missions",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
-  for (const n of ["Ship", "World", "geom", "DT", "UNITS", "pilot", "loadShipSpec", "TYPES", "TYPE_ALIAS", "RELICS"])
+  for (const n of ["Ship", "World", "geom", "DT", "UNITS", "pilot", "pilotInput", "loadShipSpec", "TYPES", "TYPE_ALIAS", "RELICS"])
     main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
     (_, v) => v.import("battlefield", _));
@@ -5822,24 +5817,6 @@ export default function define(runtime, observer) {
   // copied up. Imported under the old name so nothing else here had to change.
   main.define("duelRoster", ["module @tomlarkworthy/corepox-shipyard", "@variable"],
     (_, v) => v.import("shipRoster", "duelRoster", _));
-
-  $def("_title", "title", ["md"], _title);
-  main.variable(observer("viewof duelDemo")).define("viewof duelDemo",
-    ["duelRoster","DUEL_MODES","duelView","htl","invalidation"], _viewof_duelDemo).pid = "_viewof_duelDemo";
-  main.variable(observer("duelDemo")).define("duelDemo",
-    ["Generators","viewof duelDemo"], _duelDemo).pid = "_duelDemo";
-  $def("_runDuel", "runDuel", ["newDuel","stepDuel","DT"], _runDuel);
-  $def("_meleePlacement", "meleePlacement", ["geom"], _meleePlacement);
-  $def("_nearestFoe", "nearestFoe", [], _nearestFoe);
-  $def("_newDuel", "newDuel", ["Ship","World","loadShipSpec","duelPlacement","meleePlacement","DUEL_MODES","DUEL_BACKDROP"], _newDuel);
-  $def("_stepDuel", "stepDuel", ["pilot","chaseCmd","duelAlive","nearestFoe"], _stepDuel);
-  $def("_duelView", "duelView", ["newDuel","stepDuel","backdrop","battlefield","htl","DT","UNITS"], _duelView);
-  $def("_humanControl", "humanControl", [], _humanControl);
-  $def("_DUEL_MODES", "DUEL_MODES", [], _DUEL_MODES);
-  $def("_duelAlive", "duelAlive", [], _duelAlive);
-  $def("_duelPlacement", "duelPlacement", ["geom"], _duelPlacement);
-  $def("_chaseCmd", "chaseCmd", ["geom"], _chaseCmd);
-  $def("_DUEL_BACKDROP", "DUEL_BACKDROP", [], _DUEL_BACKDROP);
   return main;
 }</script>
 
@@ -5875,8 +5852,8 @@ encounterView(node, camp, {onDone: (r) => …})   // refit -> battle -> spoils, 
 runEncounter(node, camp, {control: "auto"})     // the same thing headless
 \`\`\`
 
-\`control: "human"\` gives the battle to the keyboard: **WASD** to fly, **space** to
-shoot. Pressing the field sets a waypoint the autopilot drives to, but only once the
+\`control: "human"\` gives the battle to the keyboard: **WASD** to move and **Q**/**E**
+to turn, both in the ship's own frame, and **space** to shoot. Pressing the field sets a waypoint the autopilot drives to, but only once the
 autopilot pad (➤, beside the pan handle) is armed — off, which is the default,
 the field pans. \`"auto"\` hands the same
 ship to the robot pilot, and \`"wired"\` lets the ship run only the program its own
@@ -6424,7 +6401,7 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
     live = v; human = mode === "human" ? humanControl(v, v.mining, null) : null;
     body.replaceChildren(v,
       htl.html`<div style="margin-top:6px;color:#5b6b7d;font:11.5px ui-monospace,monospace">${
-        mode === "human" ? "WASD to fly · space to shoot · ➤ arms the autopilot, then press the field for a waypoint · break the rock, then touch what falls out"
+        mode === "human" ? "WASD to move · QE to turn · space to shoot · ➤ arms the autopilot, then press the field for a waypoint · break the rock, then touch what falls out"
                          : mode === "auto" ? "the robot pilot works the seam" : "the ship runs its own wiring"}</div>`);
   };
 
@@ -6449,7 +6426,7 @@ const _encounterView = function _encounterView(refitBench, foePreview, duelView,
     live = v; human = mode === "human" ? humanControl(v, v.duel, "a") : null;
     body.replaceChildren(v,
       htl.html`<div style="margin-top:6px;color:#5b6b7d;font:11.5px ui-monospace,monospace">${
-        mode === "human" ? "WASD to fly · space to shoot · ➤ arms the autopilot, then press the board for a waypoint"
+        mode === "human" ? "WASD to move · QE to turn · space to shoot · ➤ arms the autopilot, then press the board for a waypoint"
                          : mode === "auto" ? "the robot pilot has it" : "the ship runs its own wiring"}</div>`);
   };
 
@@ -6577,29 +6554,6 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  for (const m of ["corepox-engine", "corepox-render", "corepox-shipyard",
-                   "corepox-missions", "corepox-duel", "corepox-mining", "corepox-station"])
-    main.define("module @tomlarkworthy/" + m,
-      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
-  for (const n of ["Ship", "World", "geom", "DT", "TYPES", "TYPE_ALIAS", "RELICS", "loadShipSpec"])
-    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
-  for (const n of ["shipNode", "TILE"])
-    main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
-  main.define("module @tomlarkworthy/corepox-board",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-board.js?v=4")).default));
-  main.define("spoilsPopup", ["module @tomlarkworthy/corepox-board", "@variable"],
-    (_, v) => v.import("spoilsPopup", _));
-  for (const n of ["shipEditor", "specOfShip", "CORPUS"])
-    main.define(n, ["module @tomlarkworthy/corepox-shipyard", "@variable"], (_, v) => v.import(n, _));
-  for (const n of ["runDuel", "duelView", "newDuel", "stepDuel", "humanControl"])
-    main.define(n, ["module @tomlarkworthy/corepox-duel", "@variable"], (_, v) => v.import(n, _));
-  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
-    (_, v) => v.import("SHIPS", _));
-  for (const n of ["miningView", "runMining"])
-    main.define(n, ["module @tomlarkworthy/corepox-mining", "@variable"], (_, v) => v.import(n, _));
-  for (const n of ["stationView", "stationStock", "repairQuote"])
-    main.define(n, ["module @tomlarkworthy/corepox-station", "@variable"], (_, v) => v.import(n, _));
-
   $def("_title", "title", ["md"], _title);
   $def("_PART_COST", "PART_COST", [], _PART_COST);
   $def("_partsOf", "partsOf", ["TYPE_ALIAS","RELICS"], _partsOf);
@@ -6632,6 +6586,29 @@ export default function define(runtime, observer) {
     ["SHIPS","ENCOUNTER_RULES","newCampaign","encounterView","htl","invalidation"], _viewof_encounterDemo).pid = "_viewof_encounterDemo";
   main.variable(observer("encounterDemo")).define("encounterDemo",
     ["Generators","viewof encounterDemo"], _encounterDemo).pid = "_encounterDemo";
+
+  for (const m of ["corepox-engine", "corepox-render", "corepox-shipyard",
+                   "corepox-missions", "corepox-duel", "corepox-mining", "corepox-station"])
+    main.define("module @tomlarkworthy/" + m,
+      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
+  for (const n of ["Ship", "World", "geom", "DT", "TYPES", "TYPE_ALIAS", "RELICS", "loadShipSpec"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["shipNode", "TILE"])
+    main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
+  main.define("module @tomlarkworthy/corepox-board",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-board.js?v=4")).default));
+  main.define("spoilsPopup", ["module @tomlarkworthy/corepox-board", "@variable"],
+    (_, v) => v.import("spoilsPopup", _));
+  for (const n of ["shipEditor", "specOfShip", "CORPUS"])
+    main.define(n, ["module @tomlarkworthy/corepox-shipyard", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["runDuel", "duelView", "newDuel", "stepDuel", "humanControl"])
+    main.define(n, ["module @tomlarkworthy/corepox-duel", "@variable"], (_, v) => v.import(n, _));
+  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
+    (_, v) => v.import("SHIPS", _));
+  for (const n of ["miningView", "runMining"])
+    main.define(n, ["module @tomlarkworthy/corepox-mining", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["stationView", "stationStock", "repairQuote"])
+    main.define(n, ["module @tomlarkworthy/corepox-station", "@variable"], (_, v) => v.import(n, _));
   return main;
 }</script>
 
@@ -7245,21 +7222,6 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  for (const m of ["corepox-engine", "corepox-render", "corepox-backdrops",
-                   "corepox-missions", "corepox-duel"])
-    main.define("module @tomlarkworthy/" + m,
-      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
-  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec", "TYPES", "rotTile"])
-    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
-  main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
-    (_, v) => v.import("battlefield", _));
-  main.define("backdrop", ["module @tomlarkworthy/corepox-backdrops", "@variable"],
-    (_, v) => v.import("backdrop", _));
-  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
-    (_, v) => v.import("SHIPS", _));
-  for (const n of ["DUEL_BACKDROP", "humanControl"])
-    main.define(n, ["module @tomlarkworthy/corepox-duel", "@variable"], (_, v) => v.import(n, _));
-
   $def("_title", "title", ["md"], _title);
   $def("_MINING_ORE", "MINING_ORE", [], _MINING_ORE);
   $def("_MINER", "MINER", [], _MINER);
@@ -7280,6 +7242,21 @@ export default function define(runtime, observer) {
     ["MINER","MINING_DEFAULTS","miningView","humanControl","htl","invalidation"], _viewof_miningDemo).pid = "_viewof_miningDemo";
   main.variable(observer("miningDemo")).define("miningDemo",
     ["Generators","viewof miningDemo"], _miningDemo).pid = "_miningDemo";
+
+  for (const m of ["corepox-engine", "corepox-render", "corepox-backdrops",
+                   "corepox-missions", "corepox-duel"])
+    main.define("module @tomlarkworthy/" + m,
+      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
+  for (const n of ["Ship", "World", "geom", "DT", "pilot", "loadShipSpec", "TYPES", "rotTile"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  main.define("battlefield", ["module @tomlarkworthy/corepox-render", "@variable"],
+    (_, v) => v.import("battlefield", _));
+  main.define("backdrop", ["module @tomlarkworthy/corepox-backdrops", "@variable"],
+    (_, v) => v.import("backdrop", _));
+  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
+    (_, v) => v.import("SHIPS", _));
+  for (const n of ["DUEL_BACKDROP", "humanControl"])
+    main.define(n, ["module @tomlarkworthy/corepox-duel", "@variable"], (_, v) => v.import(n, _));
   return main;
 }</script>
 
@@ -7445,7 +7422,7 @@ const _tempoChip = function _tempoChip(CLOCK, PALETTE, htl){const {C, MONO} = PA
 })};
 
 const _shipBoard = function _shipBoard(
-    battlefield, componentNode, INFO, MENU_ACTIONS, PALETTE, partIcon, TYPES, PORTS, TILE, DT, rotTile, htl, invalidation){return(
+    battlefield, componentNode, INFO, MENU_ACTIONS, PALETTE, partIcon, pilotInput, TYPES, PORTS, TILE, DT, rotTile, htl, invalidation){return(
 (S0, opts = {}) => {
   let S = S0;
   // The cells the session's own ship arrived on. A mission ENVELOPE is a fixed
@@ -7483,7 +7460,7 @@ const _shipBoard = function _shipBoard(
   // easily by panning, so can we make that mode opt-in and off by default".
   // While it is off a press on empty sky arms nothing and the camera's own
   // drag-to-pan gets the pointer, which is what a bare drag does in BUILD already.
-  // WASD and space are unaffected -- they are direct commands, not a waypoint.
+  // The flight keys are unaffected -- they are direct commands, not a waypoint.
   let autopilot = false;
   // Which way the NEXT part goes down, in degrees. Rotating after the fact is a
   // second gesture on a part that is already in the wrong place; Tom, 2026-08-23:
@@ -7495,25 +7472,22 @@ const _shipBoard = function _shipBoard(
   // The spec's word for it. `specOf` writes the same four names back out of the
   // live degrees; this is the one place that goes the other way.
   const DIRS = ["up", "right", "down", "left"];
-  // WASD drives; F fires. Keys were on `window` and unguarded, which in a lopepage
-  // layout meant typing "f" in another pane's editor fired the guns -- so anything
-  // with a caret in it swallows the key first.
-  const held = new Set();
+  // WASD/QE drive, F and space fire. The mapping, the waypoint exclusivity and the
+  // blur release are `pilotInput` in @tomlarkworthy/corepox-engine -- shared with
+  // Explore's duel view, which is the other place a key becomes a drive command and
+  // which drifted while each kept its own table. What stays here is the board's own
+  // press table: space is the pan modifier out of a match and the trigger inside one,
+  // and Escape drops whatever the board is holding. Both are board-wide, so they run
+  // before the flight keys and only what they leave reaches the pilot. Space and Escape
+  // need the same "a caret swallows it first" guard, so `typing` is defined here and
+  // handed down rather than left to the pilot's default.
   const typing = () => {
     const e = document.activeElement;
     return !!e && (e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName) ||
                    !!e.closest?.(".cm-editor"));
   };
-  const DRIVE = {w: [1, 0], s: [-1, 0], a: [0, -1], d: [0, 1]};
-  const applyDrive = () => {
-    if (!S.cmd) return;
-    let thrust = 0, yaw = 0;
-    for (const k of held) { const v = DRIVE[k]; if (v) { thrust += v[0]; yaw += v[1]; } }
-    // a key press is a direct command and overrides where you last clicked,
-    // otherwise the two demands fight for the same nozzles
-    if (thrust || yaw) { S.cmd.drive = {thrust, yaw}; S.cmd.target = null; }
-    else S.cmd.drive = null;
-  };
+  const input = pilotInput(() => (S.state === "playing" ? S.cmd : null),
+                           {fire: ["f"], attach: false, typing});
   const gameKey = (down) => (ev) => {
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     // Space is the pan modifier from the design's press table, and Escape drops
@@ -7536,17 +7510,11 @@ const _shipBoard = function _shipBoard(
       picked = null; act = null; wire = null; sel = null; panel = "none";
       render(); return;
     }
-    if (S.state !== "playing" || !S.cmd) return;
-    const k = ev.key.toLowerCase();
-    if (k !== "f" && !DRIVE[k]) return;
-    if (down && typing()) return;
-    if (down) held.add(k); else held.delete(k);
-    if (k === "f") S.cmd.fire = down;
-    else { applyDrive(); ev.preventDefault(); }
+    input.key(ev, down);
   };
   const kd = gameKey(true), ku = gameKey(false);
   // a key held while the window loses focus never sees its keyup
-  const blur = () => { held.clear(); space = false; if (S.cmd) { S.cmd.drive = null; S.cmd.fire = false; } };
+  const blur = () => { space = false; input.release(); };
   window.addEventListener("blur", blur);
   window.addEventListener("keydown", kd);
   window.addEventListener("keyup", ku);
@@ -8128,8 +8096,8 @@ const _shipBoard = function _shipBoard(
     }
     if (S.state === "playing" && autopilot) {
       const at = worldTile(ev);
-      S.cmd = {...(S.cmd ?? {}), target: at, face: null, drive: null};
-      held.clear();
+      S.cmd ??= {};
+      input.waypoint(at);
       return armGesture({kind: "fly", at}, ev, true);
     }
     armGesture({kind: "empty"}, ev, false);
@@ -8181,7 +8149,7 @@ const _shipBoard = function _shipBoard(
     } else if (drag.kind === "fly") {
       const [x, y] = worldTile(ev);
       const dx = x - drag.at[0], dy = y - drag.at[1];
-      if (S.cmd) S.cmd.face = Math.hypot(dx, dy) > 1.5 ? geomBearing(dx, dy) : null;
+      input.faceTo(Math.hypot(dx, dy) > 1.5 ? geomBearing(dx, dy) : null);
       return;
     }
     render();
@@ -9196,7 +9164,7 @@ const _shipBoard = function _shipBoard(
       title=${autopilot ? "autopilot ARMED — press the field to fly there"
                         : "autopilot off — the field pans; arm it to fly by pressing"}
       onclick=${() => { autopilot = !autopilot;
-                        if (!autopilot && S.cmd) { S.cmd.target = null; S.cmd.face = null; }
+                        if (!autopilot) input.clearWaypoint();
                         render(); }}
       style="width:${size}px;height:${size}px;border-radius:${size > 44 ? 12 : 10}px;
       pointer-events:auto;display:flex;align-items:center;justify-content:center;
@@ -9282,7 +9250,7 @@ const _shipBoard = function _shipBoard(
              rot: (deg) => { if (deg != null) { placeDir = ((deg % 360) + 360) % 360;
                                                render(); } return placeDir; },
              autopilot: (v) => { if (v != null) { autopilot = !!v;
-               if (!autopilot && S.cmd) { S.cmd.target = null; S.cmd.face = null; }
+               if (!autopilot) input.clearWaypoint();
                render(); } return autopilot; },
              setParam: (v, px, py) => setParam(v, S.player.at(px, py)),
              // Where a port is DRAWN. Named by COMPONENT and PORT, never by cell:
@@ -9324,7 +9292,7 @@ const _shipBoard = function _shipBoard(
     // Everything a press could be holding, dropped. A match starting must not
     // begin with a part armed or half a wire drawn.
     clearGesture: () => { picked = null; wire = null; act = null; drag = null;
-                          hoverCell = null; held.clear(); autopilot = false; },
+                          hoverCell = null; input.release(); autopilot = false; },
     session: () => S,
     // A host that swaps the session -- a retry, the next mission, a different
     // hull on the bench -- hands the board the new one rather than rebuilding it,
@@ -9647,19 +9615,6 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  main.define("module @tomlarkworthy/corepox-engine",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
-  main.define("module @tomlarkworthy/corepox-render",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-render.js?v=4")).default));
-  main.define("module @tomlarkworthy/corepox-assets",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
-  for (const n of ["Ship", "World", "TYPES", "PORTS", "DT", "loadShipSpec", "rotTile"])
-    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
-  for (const n of ["battlefield", "componentNode"])
-    main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
-  main.define("TILE", ["module @tomlarkworthy/corepox-assets", "@variable"],
-    (_, v) => v.import("TILE", _));
-
   $def("_title", "title", ["md"], _title);
   $def("_INFO", "INFO", [], _INFO);
   $def("_MENU_ACTIONS", "MENU_ACTIONS", [], _MENU_ACTIONS);
@@ -9672,8 +9627,21 @@ export default function define(runtime, observer) {
   $def("_spoilsPopup", "spoilsPopup",
        ["partIcon","damagePlate","INFO","TYPES","PALETTE","htl"], _spoilsPopup);
   $def("_shipBoard", "shipBoard",
-       ["battlefield","componentNode","INFO","MENU_ACTIONS","PALETTE","partIcon","TYPES","PORTS","TILE","DT","rotTile","htl","invalidation"],
+       ["battlefield","componentNode","INFO","MENU_ACTIONS","PALETTE","partIcon","pilotInput","TYPES","PORTS","TILE","DT","rotTile","htl","invalidation"],
        _shipBoard);
+
+  main.define("module @tomlarkworthy/corepox-engine",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-render",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-render.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-assets",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
+  for (const n of ["Ship", "World", "TYPES", "PORTS", "DT", "loadShipSpec", "rotTile", "pilotInput"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["battlefield", "componentNode"])
+    main.define(n, ["module @tomlarkworthy/corepox-render", "@variable"], (_, v) => v.import(n, _));
+  main.define("TILE", ["module @tomlarkworthy/corepox-assets", "@variable"],
+    (_, v) => v.import("TILE", _));
   return main;
 }</script>
 
@@ -10108,14 +10076,6 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  for (const m of ["corepox-engine", "corepox-shipyard"])
-    main.define("module @tomlarkworthy/" + m,
-      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
-  main.define("TYPES", ["module @tomlarkworthy/corepox-engine", "@variable"],
-    (_, v) => v.import("TYPES", _));
-  main.define("shipEditor", ["module @tomlarkworthy/corepox-shipyard", "@variable"],
-    (_, v) => v.import("shipEditor", _));
-
   $def("_title", "title", ["md"], _title);
   $def("_STATION_PRICES", "STATION_PRICES", [], _STATION_PRICES);
   $def("_sellPrice", "sellPrice", ["STATION_PRICES"], _sellPrice);
@@ -10133,6 +10093,14 @@ export default function define(runtime, observer) {
     ["stationView","htl"], _viewof_stationDemo).pid = "_viewof_stationDemo";
   main.variable(observer("stationDemo")).define("stationDemo",
     ["Generators","viewof stationDemo"], _stationDemo).pid = "_stationDemo";
+
+  for (const m of ["corepox-engine", "corepox-shipyard"])
+    main.define("module @tomlarkworthy/" + m,
+      async () => runtime.module((await import(`/@tomlarkworthy/${m}.js?v=4`)).default));
+  main.define("TYPES", ["module @tomlarkworthy/corepox-engine", "@variable"],
+    (_, v) => v.import("TYPES", _));
+  main.define("shipEditor", ["module @tomlarkworthy/corepox-shipyard", "@variable"],
+    (_, v) => v.import("shipEditor", _));
   return main;
 }</script>
 
@@ -10167,9 +10135,10 @@ export default function define(runtime, observer) {
 //   - The mission rows are built from the real `MISSIONS`, not the mockup's text. The
 //     drawing labels a row `gunner` and gives it Cocoon's brief ("Two bombs, north and
 //     south..."); the real `gunner` is ManualAim. Drawing wins on layout, data wins on data.
-//   - The route preview is generated by the real `genRun`, not hand-placed circles. Since
-//     `mapParams` defaults (seed 41, galaxy 2, jumps 7) are `genRun`'s defaults, the graph
-//     on the landing IS the run LAUNCH opens -- not an illustration of one.
+//   - The route preview is generated by the real `genRun`, not hand-placed circles, and it
+//     is fed the LIVE `mapParams` -- the same object corepox-map's own `galaxyMap` passes
+//     to `genRun`. So the graph on the landing IS the run LAUNCH opens, not an
+//     illustration of one, and it stays that way now the seed is rolled per load.
 //   - A back affordance exists. The drawing has none, and without one a mounted
 //     destination is a trap.
 //
@@ -10321,9 +10290,10 @@ const _missionRows = function _missionRows(MISSIONS, CAMPAIGNS, VERBS){return(
 const _routeNote = function _routeNote(md){return(
 md`## The route preview is the run, not a picture of one
 
-\`genRun()\` with no arguments defaults to \`{seed: 41, galaxy: 2, jumps: 7}\`, and
-\`corepox-map\`'s own \`mapParams\` form defaults to the same three numbers. So the graph
-drawn on the landing screen is the board LAUNCH opens, node for node.
+This is handed the same \`mapParams\` that \`corepox-map\` hands \`genRun\`, so the graph drawn
+on the landing screen is the board LAUNCH opens, node for node. It used to rely on the two
+sharing a default of \`{seed: 41, galaxy: 2, jumps: 7}\`, which stopped being true the moment
+the seed started being rolled on load.
 
 That is worth more than it costs: the alternative — hand-placing circles to match the
 drawing — produces a landing screen that lies about the run, and drifts the moment the
@@ -10331,9 +10301,13 @@ generator changes. Rendering goes through the same \`NODE_KINDS\` colours and th
 \`n-*\` symbols the map uses, so there is one visual vocabulary and not two.`
 )};
 
-const _routePreview = function _routePreview(genRun, NODE_KINDS){return(
+const _routePreview = function _routePreview(genRun, NODE_KINDS, mapParams){return(
 ({width = 900, height = 300, pad = 42} = {}) => {
-  const run = genRun();
+  // The LIVE params, not `genRun()`'s defaults. The seed is rolled on load now
+  // (corepox-map's `mapParams`), so calling genRun with no arguments drew seed 41
+  // while LAUNCH opened a different galaxy -- and the claim this preview is built on
+  // is that the two are the same board.
+  const run = genRun(mapParams);
   const xs = run.nodes.map((n) => n.x), ys = run.nodes.map((n) => n.y);
   const x0 = Math.min(...xs), x1 = Math.max(...xs);
   const y0 = Math.min(...ys), y1 = Math.max(...ys);
@@ -10561,7 +10535,10 @@ const _corepox_app = function _corepox_app(
   const C = {fight: "#ff5c72", travel: "#4fd8e8", economy: "#ffc42e", support: "#56e39f"};
   let progress = loadProgress();
 
-  const root = html`<div class="cx-app" data-route="landing" data-tab="explore"></div>`;
+  // data-cpx-sound marks the play surface: corepox-render's battlefield only plays
+  // the engine's sound queue inside this region, so the duel and mining DEMO cells --
+  // which are booted mains and run forever -- stay silent.
+  const root = html`<div class="cx-app" data-route="landing" data-tab="explore" data-cpx-sound></div>`;
   root.appendChild(html`<style>${appCss}</style>`);
   // One <defs> for the whole shell: the map's node glyphs plus this module's verb glyphs.
   root.appendChild(html`<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>${mapSymbols}${appSymbols}</defs></svg>`);
@@ -10808,6 +10785,23 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
+  $def("_title", "title", ["md"], _title);
+  $def("_architecture", "architecture", ["md"], _architecture);
+  $def("_progressNote", "progressNote", ["md"], _progressNote);
+  $def("_PROGRESS_KEY", "PROGRESS_KEY", [], _PROGRESS_KEY);
+  $def("_loadProgress", "loadProgress", ["PROGRESS_KEY"], _loadProgress);
+  $def("_saveProgress", "saveProgress", ["PROGRESS_KEY"], _saveProgress);
+  $def("_missionNote", "missionNote", ["md"], _missionNote);
+  $def("_VERBS", "VERBS", [], _VERBS);
+  $def("_missionRows", "missionRows", ["MISSIONS", "CAMPAIGNS", "VERBS"], _missionRows);
+  $def("_routeNote", "routeNote", ["md"], _routeNote);
+  $def("_routePreview", "routePreview", ["genRun", "NODE_KINDS", "mapParams"], _routePreview);
+  $def("_appSymbols", "appSymbols", [], _appSymbols);
+  $def("_appCss", "appCss", ["PALETTE"], _appCss);
+  $def("_corepox_app", "corepox_app",
+    ["html", "appCss", "appSymbols", "mapSymbols", "routePreview", "missionRows",
+     "loadProgress", "saveProgress", "NODE_KINDS", "newRunCampaign", "TYPES",
+     "viewof galaxyMap", "viewof game", "invalidation"], _corepox_app);
 
   main.define("module @tomlarkworthy/corepox-missions",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
@@ -10821,35 +10815,15 @@ export default function define(runtime, observer) {
     async () => runtime.module((await import("/@tomlarkworthy/corepox-duel-encounter.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-engine",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
-
   for (const n of ["MISSIONS", "CAMPAIGNS"])
     main.define(n, ["module @tomlarkworthy/corepox-missions", "@variable"], (_, v) => v.import(n, _));
   main.define("PALETTE", ["module @tomlarkworthy/corepox-board", "@variable"], (_, v) => v.import("PALETTE", _));
-  for (const n of ["genRun", "NODE_KINDS", "mapSymbols"])
+  for (const n of ["genRun", "NODE_KINDS", "mapSymbols", "mapParams"])
     main.define(n, ["module @tomlarkworthy/corepox-map", "@variable"], (_, v) => v.import(n, _));
   main.define("viewof galaxyMap", ["module @tomlarkworthy/corepox-map", "@variable"], (_, v) => v.import("viewof galaxyMap", _));
   main.define("viewof game", ["module @tomlarkworthy/corepox-game", "@variable"], (_, v) => v.import("viewof game", _));
   main.define("newRunCampaign", ["module @tomlarkworthy/corepox-duel-encounter", "@variable"], (_, v) => v.import("newRunCampaign", _));
   main.define("TYPES", ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import("TYPES", _));
-
-  $def("_title", "title", ["md"], _title);
-  $def("_architecture", "architecture", ["md"], _architecture);
-  $def("_progressNote", "progressNote", ["md"], _progressNote);
-  $def("_PROGRESS_KEY", "PROGRESS_KEY", [], _PROGRESS_KEY);
-  $def("_loadProgress", "loadProgress", ["PROGRESS_KEY"], _loadProgress);
-  $def("_saveProgress", "saveProgress", ["PROGRESS_KEY"], _saveProgress);
-  $def("_missionNote", "missionNote", ["md"], _missionNote);
-  $def("_VERBS", "VERBS", [], _VERBS);
-  $def("_missionRows", "missionRows", ["MISSIONS", "CAMPAIGNS", "VERBS"], _missionRows);
-  $def("_routeNote", "routeNote", ["md"], _routeNote);
-  $def("_routePreview", "routePreview", ["genRun", "NODE_KINDS"], _routePreview);
-  $def("_appSymbols", "appSymbols", [], _appSymbols);
-  $def("_appCss", "appCss", ["PALETTE"], _appCss);
-  $def("_corepox_app", "corepox_app",
-    ["html", "appCss", "appSymbols", "mapSymbols", "routePreview", "missionRows",
-     "loadProgress", "saveProgress", "NODE_KINDS", "newRunCampaign", "TYPES",
-     "viewof galaxyMap", "viewof game", "invalidation"], _corepox_app);
-
   return main;
 }</script>
 
@@ -10874,14 +10848,535 @@ export default function define(runtime, observer) {
 export default function define(runtime, observer) {
   const main = runtime.module();
 
+  // The one visible cell: the shell itself.
+  main.variable(observer()).define(null, ["corepox_app"], (app) => app).pid = "_show";
+
   main.define("module @tomlarkworthy/corepox-app-impl",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-app-impl.js?v=4")).default));
   main.define("corepox_app", ["module @tomlarkworthy/corepox-app-impl", "@variable"],
     (_, v) => v.import("corepox_app", _));
+  return main;
+}</script>
 
-  // The one visible cell: the shell itself.
-  main.variable(observer()).define(null, ["corepox_app"], (app) => app).pid = "_show";
+<script id="@tomlarkworthy/corepox-audio" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+// The original's sound, rebuilt with WebAudio.
+//
+// The samples are NOT in the repo. `vendor/corepox/fmod/corepox/` ships
+// `Build/GUIDs.txt` and `Metadata/` only -- there is no .wav, .ogg, .mp3, .bank or
+// .aiff anywhere under it. What did survive:
+//
+//   * 20 event names with GUIDs                   Build/GUIDs.txt
+//   * 171 AudioFile records, each carrying the    Metadata/AudioFile/*.xml
+//     source filename, length, sample rate and
+//     channel count
+//   * exactly ONE event definition, LAZER_FIRE    Metadata/Event/{f8c946c0-...}.xml
+//
+// So for LAZER_FIRE the round-robin size (7 sounds), the event length (0.58s), the
+// pitch offset (+0.6 st), the pitch randomiser (+/-2.083 st) and the voice cap
+// (maxVoices 2, stealing on) are all read off the project. For every other event only
+// the name survives, and the sound files are matched to it by filename -- `Explosion
+// 1..4` to EXPLOSION, `Menue Button 1..7` to MENU_BUTTON. Several events have no
+// recoverable files at all.
+//
+// Every TIMBRE below is invented. Nothing here was measured against audio, because
+// there is no audio to measure against. Each recipe records which of its numbers came
+// from the project and which were chosen by ear.
 
+const _title = function _title(md){return(
+md`# corepox-audio
+
+A WebAudio stand-in for the original's FMOD bank. \`sfx("EXPLOSION")\` plays one.`
+)};
+
+// The audio graph, built once and torn down on invalidation. Chrome caps a page at
+// six AudioContexts, so a cell that leaked one per recompute would wedge the notebook
+// after six edits -- hence the invalidation hook rather than a module-level singleton.
+//
+// Nothing is constructed until the first sound is asked for: a headless gate that
+// boots the notebook and never plays anything pays nothing, and a context built
+// before any user gesture would start suspended anyway.
+const _sfxKit = function _sfxKit(invalidation){
+  const AC = globalThis.AudioContext || globalThis.webkitAudioContext || null;
+  let ctx = null, master = null, noiseBuf = null, shaper = null;
+  const state = {volume: 0.5, muted: false};
+  const voices = new Map();          // event name -> live [{gain, endAt}]
+
+  const boot = () => {
+    ctx = new AC();
+    master = ctx.createGain();
+    master.gain.value = state.muted ? 0 : state.volume;
+    master.connect(ctx.destination);
+    // One 2s white-noise buffer for every noise voice in the bank. Re-reading it at a
+    // different playbackRate is what gives a bright crack and a low rumble the same
+    // source, which is the cheapest way to have both without a sample per sound.
+    noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    shaper = ctx.createWaveShaper();
+    const curve = new Float32Array(1024);
+    for (let i = 0; i < 1024; i++) {
+      const x = (i / 1023) * 2 - 1;
+      curve[i] = Math.tanh(x * 3);
+    }
+    shaper.curve = curve;
+    // A gesture is what lifts the autoplay block. Registering once here rather than at
+    // module load means a notebook that never makes a sound never listens either.
+    const wake = () => ctx && ctx.state === "suspended" && ctx.resume();
+    for (const ev of ["pointerdown", "keydown", "touchstart"])
+      globalThis.addEventListener?.(ev, wake, {passive: true});
+    invalidation.then(() => {
+      for (const ev of ["pointerdown", "keydown", "touchstart"])
+        globalThis.removeEventListener?.(ev, wake);
+      ctx?.close?.();
+      ctx = master = noiseBuf = shaper = null;
+    });
+  };
+
+  const kit = {
+    state,
+    // null means "no audio here" -- node, a locked-down embed, an old browser. Every
+    // caller treats that as a silent no-op rather than an error, so the same module
+    // boots in a headless gate.
+    ready() {
+      if (!AC) return null;
+      if (!ctx) boot();
+      if (ctx.state === "suspended") ctx.resume();
+      return ctx;
+    },
+    now() { return ctx ? ctx.currentTime : 0; },
+    applyMix() { if (master) master.gain.value = state.muted ? 0 : state.volume; },
+    /** The facade over the live graph. Recipes never see `ctx` directly, which is what
+     *  lets the same recipe run offline. */
+    live() { return kit.forGraph({ctx, noiseBuf, shaper}); },
+
+    /** A per-shot gain node feeding the master, with the voice cap the FMOD events
+     *  call maxVoices. Overflow steals the OLDEST voice (FMOD's "voice stealing"),
+     *  ramped down over 8ms rather than cut, because a hard stop clicks. */
+    bus(name, gain, dur, cap) {
+      const g = ctx.createGain();
+      g.gain.value = gain;
+      g.connect(master);
+      let live = voices.get(name);
+      if (!live) voices.set(name, live = []);
+      const t = ctx.currentTime;
+      for (let i = live.length - 1; i >= 0; i--) if (live[i].endAt <= t) live.splice(i, 1);
+      while (cap && live.length >= cap) {
+        const old = live.shift();
+        old.gain.gain.cancelScheduledValues(t);
+        old.gain.gain.setValueAtTime(old.gain.gain.value, t);
+        old.gain.gain.linearRampToValueAtTime(0, t + 0.008);
+      }
+      live.push({gain: g, endAt: t + dur + 0.05});
+      return g;
+    },
+
+    /** A facade bound to one audio graph. The live one is `kit` itself; `render`
+     *  below builds another over an OfflineAudioContext, which is how
+     *  tools/corepox-audio-check.ts proves every recipe emits a non-silent buffer
+     *  rather than merely not throwing. */
+    forGraph(g) {
+      return {state, drive: () => g.shaper,
+              tone: (...a) => kit.tone.call(g, ...a),
+              noise: (...a) => kit.noise.call(g, ...a)};
+    },
+
+    /** Render one event into an AudioBuffer, offline and faster than real time. */
+    async render(spec, rate = 1, seconds = null) {
+      const OAC = globalThis.OfflineAudioContext;
+      if (!OAC) return null;
+      const sr = 44100, dur = seconds ?? spec.len + 0.3;
+      const oc = new OAC(1, Math.ceil(sr * dur), sr);
+      const nb = oc.createBuffer(1, sr * 2, sr);
+      const d = nb.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      const sh = oc.createWaveShaper();
+      const curve = new Float32Array(1024);
+      for (let i = 0; i < 1024; i++) curve[i] = Math.tanh(((i / 1023) * 2 - 1) * 3);
+      sh.curve = curve;
+      const g = {ctx: oc, noiseBuf: nb, shaper: sh};
+      const out = oc.createGain();
+      out.gain.value = 1;
+      out.connect(oc.destination);
+      spec.play(kit.forGraph(g), out, 0, rate);
+      return oc.startRendering();
+    },
+
+    /** An oscillator sweeping f0 -> f1 over `dur`, with a percussive envelope.
+     *  `hold` keeps the peak before the decay starts; `a` is the attack. */
+    tone(out, t, dur, {type = "sine", f0, f1 = f0, gain = 1, a = 0.004, hold = 0} = {}) {
+      const ctx = this.ctx;
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(Math.max(1, f0), t);
+      if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gain, t + a);
+      g.gain.setValueAtTime(gain, t + a + hold);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g).connect(out);
+      o.start(t); o.stop(t + dur + 0.02);
+      return g;
+    },
+
+    /** A filtered noise burst. `rate` re-pitches the shared buffer; `f`/`f1` sweep the
+     *  filter, which is what turns one white-noise source into a crack, a hiss or a
+     *  rumble. */
+    noise(out, t, dur, {type = "bandpass", f = 1000, f1 = f, q = 1, gain = 1,
+                        rate = 1, a = 0.003, drive = false} = {}) {
+      const ctx = this.ctx, noiseBuf = this.noiseBuf, shaper = this.shaper;
+      const s = ctx.createBufferSource(), b = ctx.createBiquadFilter(), g = ctx.createGain();
+      s.buffer = noiseBuf;
+      s.playbackRate.value = rate;
+      s.loop = true;
+      // A random read offset per shot: the same two seconds replayed from zero every
+      // time is a repeated sound, not a noise source.
+      const off = Math.random() * 1.5;
+      b.type = type; b.Q.value = q;
+      b.frequency.setValueAtTime(Math.max(20, f), t);
+      if (f1 !== f) b.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gain, t + a);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      s.connect(b);
+      if (drive) { b.connect(shaper); shaper.connect(g); } else b.connect(g);
+      g.connect(out);
+      s.start(t, off, dur + 0.05); s.stop(t + dur + 0.05);
+      return g;
+    }
+  };
+  return kit;
+};
+
+// The bank. One entry per FMOD event, keyed by the name the C# fires.
+//
+//   n      how many sounds the event round-robins over
+//   len    the event's length in seconds
+//   cap    maxVoices; 0 means unlimited
+//   st     pitch randomisation in semitones, +/- st
+//   bias   a fixed pitch offset in semitones
+//   from   where n/len came from -- a filename group in Metadata/AudioFile, or
+//          "event" for the one event definition that survived, or null when nothing
+//          about the original sound is recoverable and the entry is invention.
+//   play   the recipe: (kit, out, t, rate) -> void
+const _SFX = function _SFX(){return(
+{
+  // The only event with a definition. MultiSound over 7 sounds, length 0.58, pitch
+  // +0.600000024 st, a pitch modulator of amount 2.08333349, maxVoices 2 with
+  // voiceStealing 1. All five numbers below are read off that file.
+  LAZER_FIRE: {
+    n: 7, len: 0.58, cap: 2, st: 2.083, bias: 0.6, from: "event",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.26, {type: "sawtooth", f0: 1900 * r, f1: 230 * r, gain: 0.5});
+      k.tone(out, t, 0.14, {type: "square",   f0: 2600 * r, f1: 700 * r, gain: 0.14});
+      k.noise(out, t, 0.09, {f: 3200 * r, f1: 1200 * r, q: 1.6, gain: 0.3});
+      k.tone(out, t + 0.02, 0.5, {type: "sine", f0: 300 * r, f1: 90 * r, gain: 0.1});
+    }
+  },
+  // Explosion 1..4 (2.01s) + Explosion Neu 1..2 (2.12s): six sounds, so the round
+  // robin is six wide. Fired from ShipComponent.cs:95 when a Brain reaches 0 hp --
+  // the same line that starts the core burst in corepox-render.
+  EXPLOSION: {
+    n: 6, len: 2.01, cap: 3, st: 1.5, bias: 0, from: "Explosion 1..4, Explosion Neu 1..2",
+    play: (k, out, t, r) => {
+      k.noise(out, t, 0.12, {type: "highpass", f: 2000, q: 0.7, gain: 0.3, rate: 1.4});
+      k.noise(out, t, 1.7, {type: "lowpass", f: 1800 * r, f1: 90, q: 0.9, gain: 0.5,
+                            rate: 0.55, a: 0.01, drive: true});
+      k.tone(out, t, 0.9, {type: "sine", f0: 120 * r, f1: 28, gain: 0.34, a: 0.006});
+      k.tone(out, t + 0.03, 1.4, {type: "triangle", f0: 70 * r, f1: 22, gain: 0.16, a: 0.02});
+      k.noise(out, t + 0.25, 1.5, {type: "lowpass", f: 400, f1: 60, q: 0.5, gain: 0.14,
+                                   rate: 0.3, a: 0.15});
+    }
+  },
+  // Damage Sound 1..5 plus Damage Sound 3(2): six files at 0.81-0.88s. Matched to
+  // Block_Break by elimination -- it is the only combat event without an obvious
+  // filename group, and no event fires on damage taken. Fired from
+  // ShipComponent.cs:98 for any component that is not a Brain.
+  Block_Break: {
+    n: 6, len: 0.81, cap: 4, st: 2.5, bias: 0, from: "Damage Sound 1..5 (inferred)",
+    play: (k, out, t, r) => {
+      k.noise(out, t, 0.09, {f: 1400 * r, f1: 500 * r, q: 1.2, gain: 0.5, rate: 1.1});
+      k.tone(out, t, 0.13, {type: "square", f0: 420 * r, f1: 120 * r, gain: 0.2});
+      k.noise(out, t + 0.01, 0.42, {type: "lowpass", f: 900 * r, f1: 140, q: 0.8,
+                                    gain: 0.35, rate: 0.7, a: 0.008});
+      k.tone(out, t + 0.005, 0.3, {type: "sine", f0: 150 * r, f1: 45, gain: 0.3});
+    }
+  },
+  // Menue Button 1..7, 0.44s (Menue Button 6 is 0.62s). The most-fired event in the
+  // scripts: 16 call sites.
+  MENU_BUTTON: {
+    n: 7, len: 0.44, cap: 3, st: 1.2, bias: 0, from: "Menue Button 1..7",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.09, {type: "square", f0: 880 * r, f1: 1320 * r, gain: 0.16});
+      k.tone(out, t + 0.05, 0.2, {type: "sine", f0: 1760 * r, gain: 0.1, a: 0.006});
+      k.noise(out, t, 0.04, {f: 4000, q: 2, gain: 0.1});
+    }
+  },
+  // No recoverable files. A down-tone answer to MENU_BUTTON, chosen by ear.
+  FAIL_BUTTON: {
+    n: 3, len: 0.5, cap: 2, st: 0.8, bias: 0, from: null,
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.14, {type: "square", f0: 400 * r, f1: 300 * r, gain: 0.18});
+      k.tone(out, t + 0.1, 0.3, {type: "sawtooth", f0: 220 * r, f1: 110 * r, gain: 0.14});
+      k.noise(out, t, 0.06, {type: "lowpass", f: 800, q: 1, gain: 0.12, rate: 0.6});
+    }
+  },
+  // Epic_Bass_Console_Game_Page_Change(_2), 0.57-0.59s, matched by name: a page
+  // change is what TRANSITION_BUTTON does at its four call sites.
+  TRANSITION_BUTTON: {
+    n: 2, len: 0.59, cap: 2, st: 0.6, bias: 0, from: "Epic_Bass_Console_Game_Page_Change (inferred)",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.45, {type: "sawtooth", f0: 110 * r, f1: 55 * r, gain: 0.3, a: 0.01});
+      k.noise(out, t, 0.35, {type: "bandpass", f: 300, f1: 2600, q: 3, gain: 0.22, rate: 1.2, a: 0.05});
+      k.tone(out, t + 0.06, 0.3, {type: "sine", f0: 440 * r, f1: 660 * r, gain: 0.1});
+    }
+  },
+  // No recoverable files. A short metallic swell, chosen by ear.
+  Battle_Button: {
+    n: 2, len: 0.61, cap: 2, st: 0.8, bias: 0, from: null,
+    play: (k, out, t, r) => {
+      k.noise(out, t, 0.5, {type: "bandpass", f: 900 * r, f1: 4200 * r, q: 6, gain: 0.3, a: 0.03});
+      k.tone(out, t, 0.35, {type: "sawtooth", f0: 165 * r, f1: 330 * r, gain: 0.16, a: 0.02});
+    }
+  },
+  // No recoverable files. A power-on ramp, chosen by ear; BOOT fires twice, both at
+  // start-up.
+  BOOT: {
+    n: 1, len: 1.6, cap: 1, st: 0, bias: 0, from: null, swell: true,
+    play: (k, out, t, r) => {
+      k.tone(out, t, 1.5, {type: "sawtooth", f0: 55 * r, f1: 220 * r, gain: 0.22, a: 0.3, hold: 0.4});
+      k.noise(out, t, 1.4, {type: "bandpass", f: 200, f1: 3000, q: 2, gain: 0.16, rate: 0.9, a: 0.5});
+      k.tone(out, t + 1.1, 0.45, {type: "sine", f0: 660, f1: 990, gain: 0.14, a: 0.01});
+    }
+  },
+  // No recoverable files. A chirp train -- the computer voice line reads as a
+  // synthesised speech blip in the reel, so this is a burst of them.
+  COMPUTER_SPEAKING: {
+    n: 3, len: 0.85, cap: 2, st: 1.5, bias: 0, from: null,
+    play: (k, out, t, r) => {
+      for (let i = 0; i < 5; i++) {
+        const f = (500 + (i % 3) * 260 + (i === 4 ? 320 : 0)) * r;
+        k.tone(out, t + i * 0.075, 0.06, {type: "square", f0: f, f1: f * 1.15, gain: 0.09});
+      }
+    }
+  },
+  // Component Info 1..3, 0.75s each -- three sounds, so the round robin is three wide.
+  Component_Info: {
+    n: 3, len: 0.75, cap: 2, st: 1, bias: 0, from: "Component Info 1..3",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.12, {type: "triangle", f0: 660 * r, f1: 990 * r, gain: 0.16});
+      k.tone(out, t + 0.08, 0.35, {type: "sine", f0: 1320 * r, gain: 0.1, a: 0.01});
+      k.noise(out, t, 0.05, {f: 5000, q: 3, gain: 0.07});
+    }
+  },
+  // Bot_Select 1..3, 0.72-0.74s. GUIDs.txt spells it Component_Selected; the scripts
+  // call Select_Component at one site, which resolves to nothing -- kept under the
+  // GUID name, with the script's spelling aliased below.
+  Component_Selected: {
+    n: 3, len: 0.73, cap: 2, st: 1, bias: 0, from: "Bot_Select 1..3 (inferred)",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.1, {type: "square", f0: 520 * r, f1: 780 * r, gain: 0.15});
+      k.noise(out, t, 0.07, {f: 2600 * r, f1: 5200 * r, q: 2.5, gain: 0.14});
+      k.tone(out, t + 0.06, 0.22, {type: "sine", f0: 1040 * r, gain: 0.09});
+    }
+  },
+  // Select Ship 1.wav, 0.44s -- one file, so no round robin.
+  Select_Ship_Strip: {
+    n: 1, len: 0.44, cap: 2, st: 1.2, bias: 0, from: "Select Ship 1.wav",
+    play: (k, out, t, r) => {
+      k.noise(out, t, 0.18, {type: "bandpass", f: 1200 * r, f1: 3600 * r, q: 4, gain: 0.2, a: 0.01});
+      k.tone(out, t, 0.14, {type: "triangle", f0: 440 * r, f1: 880 * r, gain: 0.12});
+    }
+  },
+  // Wires.wav and Wires 2.wav, 0.62s each -- two sounds. Fired while dragging a wire
+  // on the build grid.
+  Ajusting_Wires: {
+    n: 2, len: 0.62, cap: 2, st: 2, bias: 0, from: "Wires, Wires 2",
+    play: (k, out, t, r) => {
+      k.noise(out, t, 0.3, {type: "bandpass", f: 2200 * r, f1: 900 * r, q: 8, gain: 0.22, rate: 1.3, a: 0.02});
+      k.tone(out, t, 0.2, {type: "sawtooth", f0: 180 * r, f1: 120 * r, gain: 0.07});
+    }
+  },
+  // No recoverable files (Counter_Medium_13 at 4.7s is the only counter-shaped sound
+  // and is far too long for a one-shot). A rising arpeggio, chosen by ear.
+  Gain_Experience: {
+    n: 1, len: 0.9, cap: 2, st: 0, bias: 0, from: null,
+    play: (k, out, t, r) => {
+      const steps = [0, 4, 7, 12];
+      for (let i = 0; i < steps.length; i++) {
+        const f = 523.25 * Math.pow(2, steps[i] / 12) * r;
+        k.tone(out, t + i * 0.08, 0.34, {type: "triangle", f0: f, gain: 0.13, a: 0.006});
+      }
+    }
+  },
+  // Deep_Tone_Bubble_Pop(_2), 0.75-0.77s, matched by name.
+  SUBTLE_BLOOP: {
+    n: 2, len: 0.77, cap: 3, st: 2, bias: 0, from: "Deep_Tone_Bubble_Pop (inferred)",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.22, {type: "sine", f0: 180 * r, f1: 640 * r, gain: 0.2, a: 0.008});
+      k.tone(out, t, 0.1, {type: "sine", f0: 90 * r, f1: 260 * r, gain: 0.1});
+    }
+  },
+  // Nav_Battle V1/V2, 1.98s -- two sounds. The four NAV_* events are the tab bar.
+  NAV_BATTLE: {
+    n: 2, len: 1.98, cap: 1, st: 0.5, bias: 0, from: "Nav_Battle V1, V2",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.6, {type: "sawtooth", f0: 82 * r, f1: 165 * r, gain: 0.22, a: 0.02});
+      k.noise(out, t, 0.9, {type: "bandpass", f: 400, f1: 2400, q: 3, gain: 0.18, a: 0.08});
+      k.tone(out, t + 0.15, 0.5, {type: "square", f0: 330 * r, f1: 494 * r, gain: 0.09});
+    }
+  },
+  // Nav_Built.wav, 0.75s.
+  NAV_BUILD: {
+    n: 1, len: 0.75, cap: 1, st: 0.5, bias: 0, from: "Nav_Built.wav",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.3, {type: "square", f0: 294 * r, f1: 440 * r, gain: 0.15, a: 0.01});
+      k.noise(out, t, 0.2, {type: "bandpass", f: 1600, q: 3, gain: 0.12});
+    }
+  },
+  // Nav_Mission(2).wav, 0.37s -- the shortest of the four.
+  NAV_MISSION: {
+    n: 1, len: 0.37, cap: 1, st: 0.5, bias: 0, from: "Nav_Mission(2).wav",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.22, {type: "triangle", f0: 392 * r, f1: 588 * r, gain: 0.15});
+      k.noise(out, t, 0.09, {f: 3000, q: 3, gain: 0.09});
+    }
+  },
+  // Nav_Shop(2).wav, 0.83s.
+  NAV_SHOP: {
+    n: 1, len: 0.83, cap: 1, st: 0.5, bias: 0, from: "Nav_Shop(2).wav",
+    play: (k, out, t, r) => {
+      k.tone(out, t, 0.18, {type: "sine", f0: 880 * r, f1: 1320 * r, gain: 0.14});
+      k.tone(out, t + 0.1, 0.4, {type: "sine", f0: 1760 * r, gain: 0.08, a: 0.01});
+      k.noise(out, t, 0.06, {f: 5200, q: 4, gain: 0.08});
+    }
+  },
+  // Place Component 1/2, 1.75s -- two files with no event in GUIDs.txt, so the
+  // original either fired it another way or cut it. Kept because the build grid needs
+  // a placement sound and fx/Placement.cs already draws the sparks that go with it.
+  Place_Component: {
+    n: 2, len: 1.0, cap: 2, st: 1.5, bias: 0, from: "Place Component 1, 2 (no event GUID)",
+    play: (k, out, t, r) => {
+      k.noise(out, t, 0.07, {f: 1800 * r, f1: 700 * r, q: 1.5, gain: 0.35});
+      k.tone(out, t, 0.14, {type: "square", f0: 240 * r, f1: 90 * r, gain: 0.18});
+      k.tone(out, t + 0.05, 0.5, {type: "sine", f0: 660 * r, f1: 880 * r, gain: 0.1, a: 0.01});
+    }
+  }
+}
+)};
+
+// The trigger. `sfx("EXPLOSION")` is the whole interface; everything else is optional.
+//
+//   sfx(name, {gain, rate, when})   play one, returns true if it was audible
+//   sfx.drain(world)                play and clear a World's queued sounds
+//   sfx.names                       every event in the bank
+//   sfx.volume(v) / sfx.mute(b)     the mixer, also driven by `viewof sfxMixer`
+//
+// An unknown name is a silent false rather than a throw: a game that renames an event
+// should lose a sound, not a frame.
+const _sfx = function _sfx(sfxKit, SFX){
+  const ALIAS = {Select_Component: "Component_Selected"};   // the one C# name with no GUID
+  const rr = new Map();                                     // event -> round-robin cursor
+  const play = (name, o = {}) => {
+    const spec = SFX[ALIAS[name] ?? name];
+    if (!spec) return false;
+    const ctx = sfxKit.ready();
+    if (!ctx || sfxKit.state.muted || sfxKit.state.volume <= 0) return false;
+    // The round robin is FMOD's, and it is what stops six components breaking at once
+    // from sounding like one loud component breaking. The variant only re-seeds the
+    // pitch here, since we have no per-sound samples to select between.
+    const i = ((rr.get(name) ?? -1) + 1) % spec.n;
+    rr.set(name, i);
+    const jitter = spec.st ? (Math.random() * 2 - 1) * spec.st : 0;
+    const semis = (spec.bias ?? 0) + jitter + (i - (spec.n - 1) / 2) * 0.35;
+    const rate = (o.rate ?? 1) * Math.pow(2, semis / 12);
+    const t = Math.max(ctx.currentTime, o.when ?? 0) + 0.002;
+    const out = sfxKit.bus(name, o.gain ?? 1, spec.len, spec.cap);
+    spec.play(sfxKit.live(), out, t, rate);
+    // Drop the bus once the tail is done. Left connected, a long duel accumulates one
+    // dead GainNode per shot.
+    setTimeout(() => out.disconnect(), (spec.len + 0.3) * 1000);
+    return true;
+  };
+  play.names = Object.keys(SFX);
+  play.spec = SFX;
+  play.volume = (v) => { sfxKit.state.volume = Math.max(0, Math.min(1, v)); sfxKit.applyMix(); };
+  play.mute = (b) => { sfxKit.state.muted = !!b; sfxKit.applyMix(); };
+  play.state = sfxKit.state;
+  /** Drain a World's sound queue. The engine records what happened and clears
+   *  nothing itself, so a headless run with no renderer simply fills a capped ring and
+   *  never touches WebAudio. */
+  play.drain = (world) => {
+    const q = world?.snd;
+    if (!q || !q.length) return 0;
+    let n = 0;
+    for (const e of q) if (play(e.name, {gain: e.gain})) n++;
+    q.length = 0;
+    return n;
+  };
+  return play;
+};
+
+const _viewof_sfxMixer = function _viewof_sfxMixer(Inputs, sfx){
+  const vol = Inputs.range([0, 1], {value: sfx.state.volume, step: 0.01, label: "volume", width: 220});
+  const mute = Inputs.toggle({label: "mute", value: sfx.state.muted});
+  const form = Inputs.form({volume: vol, muted: mute});
+  const apply = () => { sfx.volume(form.value.volume); sfx.mute(form.value.muted); };
+  form.addEventListener("input", apply);
+  apply();
+  form.style.display = "flex";
+  form.style.gap = "18px";
+  form.style.alignItems = "center";
+  return form;
+};
+
+const _sfxMixer = (G, _) => G.input(_);
+
+// One button per event, so the bank can be heard without running a duel. Also the QA
+// surface: `document.querySelector(".cpx-sfx").qa.play("EXPLOSION")`.
+const _sfxBoard = function _sfxBoard(sfx, SFX, sfxKit, htl){
+  const btn = (name) => {
+    const s = SFX[name];
+    const b = htl.html`<button title="${s.from ?? "no surviving source"} — ${s.len}s, ${s.n} variation${s.n > 1 ? "s" : ""}"
+      style="font:11px/1.5 ui-monospace,monospace;padding:4px 8px;border-radius:5px;cursor:pointer;
+             border:1px solid ${s.from ? "#5c7fa8" : "#7a5c8f"};background:#141821;color:#cfe0f5">${name}</button>`;
+    b.onclick = () => sfx(name);
+    return b;
+  };
+  const root = htl.html`<div class="cpx-sfx" style="display:flex;flex-wrap:wrap;gap:6px;padding:10px;
+    background:#0b0e14;border-radius:8px">${sfx.names.map(btn)}</div>`;
+  // The QA surface. A view-only module is not registered in runtime.mains, so a
+  // gate cannot reach these cells by module name -- the mounted node is the handle.
+  root.qa = {play: (n) => sfx(n), names: sfx.names, sfx, SFX, kit: sfxKit};
+  return root;
+};
+
+const _sfxDocs = function _sfxDocs(md, SFX){
+  const known = Object.entries(SFX).filter(([, s]) => s.from).length;
+  return md`Purple-edged buttons are events whose original sound files did not survive; the
+rest are matched to a filename group in the FMOD project (${known} of ${Object.keys(SFX).length}).
+Only \`LAZER_FIRE\` has a surviving event definition — its length, round-robin size, pitch
+offset, pitch randomisation and voice cap are read off it. Every timbre is synthesised.`;
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+
+  $def("_title", "title", ["md"], _title);
+  $def("_sfxKit", "sfxKit", ["invalidation"], _sfxKit);
+  $def("_SFX", "SFX", [], _SFX);
+  $def("_sfx", "sfx", ["sfxKit","SFX"], _sfx);
+  main.variable(observer("viewof sfxMixer")).define("viewof sfxMixer",
+    ["Inputs","sfx"], _viewof_sfxMixer).pid = "_viewof_sfxMixer";
+  main.variable(observer("sfxMixer")).define("sfxMixer",
+    ["Generators","viewof sfxMixer"], _sfxMixer).pid = "_sfxMixer";
+  $def("_sfxBoard", "sfxBoard", ["sfx","SFX","sfxKit","htl"], _sfxBoard);
+  $def("_sfxDocs", "sfxDocs", ["md","SFX"], _sfxDocs);
   return main;
 }</script>
 
@@ -12641,23 +13136,6 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  main.define("module @tomlarkworthy/corepox-engine",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
-  main.define("module @tomlarkworthy/corepox-assets",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
-  main.define("module @tomlarkworthy/corepox-missions",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
-  main.define("module @tomlarkworthy/corepox-board",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-board.js?v=4")).default));
-  for (const n of ["TYPES", "PORTS", "TYPE_ALIAS", "RELICS", "loadShipSpec"])
-    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
-  main.define("TILE", ["module @tomlarkworthy/corepox-assets", "@variable"],
-    (_, v) => v.import("TILE", _));
-  for (const n of ["shipBoard", "boardSession", "tempoChip"])
-    main.define(n, ["module @tomlarkworthy/corepox-board", "@variable"], (_, v) => v.import(n, _));
-  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
-    (_, v) => v.import("SHIPS", _));
-
   const fileAttachments = new Map(["corpus.json.gz"].map((name) => {
     const module_name = "@tomlarkworthy/corepox-shipyard";
     const {status, mime, bytes} = window.lopecode.contentSync(module_name + "/" + encodeURIComponent(name));
@@ -12665,7 +13143,6 @@ export default function define(runtime, observer) {
     return [name, {url: blob_url, mimeType: mime}]
   }));
   main.builtin("FileAttachment", runtime.fileAttachments(name => fileAttachments.get(name)));
-
   $def("_title", "title", ["md"], _title);
   $def("_unpackCorpus", "unpackCorpus", [], _unpackCorpus);
   $def("_corpusGz", "corpusGz", ["Response","DecompressionStream"], _corpusGz);
@@ -12685,6 +13162,23 @@ export default function define(runtime, observer) {
     ["Generators", "viewof shipDesign"], (G, _) => G.input(_)).pid = "_shipDesign";
   $def("_shipDesignSource", "shipDesignSource",
        ["shipDesign","shipSource","htl"], _shipDesignSource);
+
+  main.define("module @tomlarkworthy/corepox-engine",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-assets",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-missions",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-missions.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-board",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-board.js?v=4")).default));
+  for (const n of ["TYPES", "PORTS", "TYPE_ALIAS", "RELICS", "loadShipSpec"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  main.define("TILE", ["module @tomlarkworthy/corepox-assets", "@variable"],
+    (_, v) => v.import("TILE", _));
+  for (const n of ["shipBoard", "boardSession", "tempoChip"])
+    main.define(n, ["module @tomlarkworthy/corepox-board", "@variable"], (_, v) => v.import(n, _));
+  main.define("SHIPS", ["module @tomlarkworthy/corepox-missions", "@variable"],
+    (_, v) => v.import("SHIPS", _));
   return main;
 }</script><!--/-->
 
@@ -14583,7 +15077,7 @@ const _starfield = function _starfield(){return(
 }
 )};
 
-const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TILE, UNITS){return(
+const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TILE, UNITS, sfx){return(
 (world, {width = 900, height = 560, span = 60, follow = true, focus = []} = {}) => {
   symbolSheet;
   const ns = "http://www.w3.org/2000/svg";
@@ -14784,6 +15278,14 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
   // snap=true jumps the camera to its target instead of easing. The editor needs
   // it: a click is aimed at a connector the player can SEE, and a viewBox that
   // moves between the paint and the click puts the hit a tile out.
+  // Walks THROUGH shadow boundaries: Element.closest stops at the shadow root, and
+  // lopepage mounts panes inside one.
+  const inSoundRegion = (n) => {
+    for (let e = n; e; e = e.parentNode ?? e.host)
+      if (e.nodeType === 1 && e.hasAttribute?.("data-cpx-sound")) return true;
+    return false;
+  };
+
   const draw = (snap = false) => {
     reconcile();
     if (api.follow) frame(snap ? 1 : 0.12);
@@ -14853,6 +15355,22 @@ const _battlefield = function _battlefield(shipNode, starfield, symbolSheet, TIL
     for (let i = 0; i < fBuf.length; i++) fragLanes[i].setAttribute("d", fBuf[i]);
     beamLane.setAttribute("d", bBuf);
     drawCore();
+    // The engine records what happened; this is the only per-frame presentation loop
+    // every battlefield runs through, so it is where the queue gets played.
+    //
+    // Sound is opt-in BY REGION, and defaults OFF. Six call sites mount a battlefield
+    // and four of them are demo cells that run forever whether or not anyone is
+    // looking -- corepox-duel and corepox-mining are booted mains, so their demos were
+    // firing lazers from panes nobody had open. Tom, 2026-08-24: "the audio is firing
+    // in the background all the time and I can't find the source. I want it only for
+    // the corepox-app play." A battlefield plays only when it is mounted inside
+    // [data-cpx-sound], which corepox-app-impl puts on its shell; `api.sound` forces
+    // it either way for a gate. The queue is drained regardless, so a silent
+    // battlefield does not sit on a full ring.
+    if (world.snd?.length) {
+      if (api.sound ?? inSoundRegion(svg)) sfx.drain(world);
+      else world.snd.length = 0;
+    }
   };
 
   // OutCubic on the way out, InCubic on the fade and on the length -- the three
@@ -15069,15 +15587,6 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  main.define("module @tomlarkworthy/corepox-assets",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
-  main.define("module @tomlarkworthy/corepox-engine",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
-  for (const n of ["SYMBOLS", "SYMBOL_FOR", "TILE", "symbolSheet", "sprite", "use"])
-    main.define(n, ["module @tomlarkworthy/corepox-assets", "@variable"], (_, v) => v.import(n, _));
-  for (const n of ["Ship", "World", "TYPES", "PORTS", "rotTile", "geom", "DT", "UNITS", "simulate"])
-    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
-
   $def("_title", "title", ["md"], _title);
   $def("_teamFilter", "teamFilter", [], _teamFilter);
   $def("_TURRET_PIVOT", "TURRET_PIVOT", [], _TURRET_PIVOT);
@@ -15096,10 +15605,23 @@ export default function define(runtime, observer) {
   $def("_wireNode", "wireNode", ["connColour","TILE"], _wireNode);
   $def("_shipNode", "shipNode", ["componentNode","portNode","opNode","PORT_TYPE","TYPES","TILE","teamFilter","ART_TURRET_DEG","wireNode","portCell","PORTS","rotTile"], _shipNode);
   $def("_starfield", "starfield", [], _starfield);
-  $def("_battlefield", "battlefield", ["shipNode","starfield","symbolSheet","TILE","UNITS"], _battlefield);
+  $def("_battlefield", "battlefield", ["shipNode","starfield","symbolSheet","TILE","UNITS","sfx"], _battlefield);
   $def("_SEEKER", "SEEKER", [], _SEEKER);
   $def("_DRONE", "DRONE", [], _DRONE);
   $def("_demo", "demo", ["Ship","World","battlefield","SEEKER","DRONE","invalidation"], _demo);
+
+  main.define("module @tomlarkworthy/corepox-assets",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-assets.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-engine",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
+  main.define("module @tomlarkworthy/corepox-audio",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-audio.js?v=4")).default));
+  for (const n of ["sfx"])
+    main.define(n, ["module @tomlarkworthy/corepox-audio", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["SYMBOLS", "SYMBOL_FOR", "TILE", "symbolSheet", "sprite", "use"])
+    main.define(n, ["module @tomlarkworthy/corepox-assets", "@variable"], (_, v) => v.import(n, _));
+  for (const n of ["Ship", "World", "TYPES", "PORTS", "rotTile", "geom", "DT", "UNITS", "simulate"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
   return main;
 }</script><!--/-->
 
@@ -15650,15 +16172,24 @@ const _MISSIONS = function _MISSIONS(SHIPS, BOX_5x7){return(
     // Period and radius are the CircleSpawn on Aim.unity verbatim (5 and 18, up
     // from the 4.5 and 22 authored here). The arc is NOT: the scene's is [-2, 10],
     // a 12 degree window centred on +4, and this hull cannot hit off the boresight.
-    // Every arc centred on zero wins and every arc centred anywhere else loses,
-    // which is parallax and not luck (tools/corepox-aim-spawn.ts, 5 runs each):
-    //     [-6,6]   win 22.5s      [-14,14] win 22.5s     [-22,22] win 26.8s
-    //     [-2,10]  loss 22-26s    [2,10]   loss 20.1s    [-10,-2] loss 23.1s
-    // The radar sits 3 tiles behind the turret, so at 18 tiles a target 6 degrees
-    // off centre is thrown by atan(3/18) = 9.5 degrees -- more than the target is
-    // wide. The original had the same geometry, so either its beam was more
-    // forgiving than ours or the level was hard; UNRESOLVED, and the arc is
-    // centred here rather than ship a mission its own reference solution loses.
+    // "Every arc centred on zero wins and every arc centred anywhere else loses,
+    // which is parallax and not luck" was WRONG, and it was wrong because it was
+    // read off single runs. A run here is deterministic (8/8 identical), so one
+    // draw per arc looks like a measurement and is not one -- it is one sample of
+    // a chaotic outcome. Swept 60 arcs x 2 engines on 2026-08-23
+    // (tools/scratch/aim-grid.ts): the reference solution wins on 8 of 60, the
+    // winning set is different on the two engines, and neighbouring arcs disagree
+    // ([-3,3] wins where [-2,2] and [-4,4] lose). The level is decided by ONE bolt
+    // -- tools/scratch/aim-trace.ts shows 6 beam hits landing in a whole run, all
+    // four rockets killed between 1.1 and 5.2 tiles out, and the winning run ends
+    // with the core on 5 hp of 20.
+    //
+    // Left at [-6,6]. [1,9] is the one arc that wins on both the old muzzle and the
+    // corrected one, and three lines of evidence point at it -- the scene's own
+    // CircleSpawn is [-2,10], centred on +4, and the hull measurably hits between 0
+    // and +5 degrees and nowhere else (tools/corepox-turret-hits.ts) -- but it wins
+    // 1 of 5 seeds, not 5, so moving the number would be trading one lucky draw for
+    // another. What this level needs is margin, not a better arc.
     spawn: {spec: SHIPS.rocket, every: 5, radius: 18, count: 4, team: "enemy",
             toward: true, arc: [-6, 6]},
     objectives: [
@@ -16670,6 +17201,23 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
+  $def("_title", "title", ["md"], _title);
+  $def("_shipRefOf", "shipRefOf", ["SHIPS"], _shipRefOf);
+  $def("_missionSource", "missionSource", ["shipRefOf","shipSource"], _missionSource);
+  $def("_cellGrid", "cellGrid", [], _cellGrid);
+  main.variable(observer("viewof levelEditor")).define("viewof levelEditor",
+    ["MISSIONS","SHIPS","Ship","World","TYPES","battlefield","TILE","shipEditor","specOfShip",
+     "missionSource","cellGrid","htl","invalidation"], _viewof_levelEditor).pid = "_viewof_levelEditor";
+  main.variable(observer("levelEditor")).define("levelEditor",
+    ["Generators", "viewof levelEditor"], (G, _) => G.input(_)).pid = "_levelEditor";
+  $def("_levelSource", "levelSource", ["levelEditor","missionSource","htl"], _levelSource);
+  $def("_runMatch", "runMatch", ["Ship","World","DT"], _runMatch);
+  main.variable(observer("viewof arena")).define("viewof arena",
+    ["SHIPS","Ship","World","DT","battlefield","htl","invalidation",
+     "CORPUS","corpusIndex","loadShipSpec"], _viewof_arena).pid = "_viewof_arena";
+  main.variable(observer("arena")).define("arena",
+    ["Generators", "viewof arena"], (G, _) => G.input(_)).pid = "_arena";
+
   main.define("module @tomlarkworthy/corepox-engine",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-render",
@@ -16690,23 +17238,6 @@ export default function define(runtime, observer) {
     main.define(n, ["module @tomlarkworthy/corepox-missions", "@variable"], (_, v) => v.import(n, _));
   for (const n of ["shipEditor", "shipSource", "specOfShip", "CORPUS", "corpusIndex"])
     main.define(n, ["module @tomlarkworthy/corepox-shipyard", "@variable"], (_, v) => v.import(n, _));
-
-  $def("_title", "title", ["md"], _title);
-  $def("_shipRefOf", "shipRefOf", ["SHIPS"], _shipRefOf);
-  $def("_missionSource", "missionSource", ["shipRefOf","shipSource"], _missionSource);
-  $def("_cellGrid", "cellGrid", [], _cellGrid);
-  main.variable(observer("viewof levelEditor")).define("viewof levelEditor",
-    ["MISSIONS","SHIPS","Ship","World","TYPES","battlefield","TILE","shipEditor","specOfShip",
-     "missionSource","cellGrid","htl","invalidation"], _viewof_levelEditor).pid = "_viewof_levelEditor";
-  main.variable(observer("levelEditor")).define("levelEditor",
-    ["Generators", "viewof levelEditor"], (G, _) => G.input(_)).pid = "_levelEditor";
-  $def("_levelSource", "levelSource", ["levelEditor","missionSource","htl"], _levelSource);
-  $def("_runMatch", "runMatch", ["Ship","World","DT"], _runMatch);
-  main.variable(observer("viewof arena")).define("viewof arena",
-    ["SHIPS","Ship","World","DT","battlefield","htl","invalidation",
-     "CORPUS","corpusIndex","loadShipSpec"], _viewof_arena).pid = "_viewof_arena";
-  main.variable(observer("arena")).define("arena",
-    ["Generators", "viewof arena"], (G, _) => G.input(_)).pid = "_arena";
   return main;
 }</script><!--/-->
 
@@ -17410,6 +17941,12 @@ export default function define(runtime, observer) {
     _viewof_game).pid = "_viewof_game";
   main.variable(observer("game")).define("game", ["Generators", "viewof game"],
     (G, _) => G.input(_)).pid = "_game";
+  $def("_title", "title", ["md"], _title);
+  $def("_objectiveHtml", "objectiveHtml", ["htl"], _objectiveHtml);
+  $def("_newSession", "newSession", ["Ship","World"], _newSession);
+  $def("_evaluateObjectives", "evaluateObjectives", [], _evaluateObjectives);
+  $def("_stepSession", "stepSession", ["Ship","geom","DT","pilot"], _stepSession);
+
   main.define("module @tomlarkworthy/corepox-engine",
     async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
   main.define("module @tomlarkworthy/corepox-render",
@@ -17427,12 +17964,6 @@ export default function define(runtime, observer) {
       (_, v) => v.import(n, _));
   for (const n of ["shipBoard", "PALETTE", "tempoChip", "spoilsPopup"])
     main.define(n, ["module @tomlarkworthy/corepox-board", "@variable"], (_, v) => v.import(n, _));
-
-  $def("_title", "title", ["md"], _title);
-  $def("_objectiveHtml", "objectiveHtml", ["htl"], _objectiveHtml);
-  $def("_newSession", "newSession", ["Ship","World"], _newSession);
-  $def("_evaluateObjectives", "evaluateObjectives", [], _evaluateObjectives);
-  $def("_stepSession", "stepSession", ["Ship","geom","DT","pilot"], _stepSession);
   return main;
 }</script><!--/-->
 
@@ -20879,7 +21410,19 @@ const _UNITS = function _UNITS(){return(
   // every gun hitscan, which is most of why guns dominated self-play.
   BEAM_SPEED: 20 / 0.64, BEAM_LEN: 1 / 0.64,
   BEAM_TTL: 1.0,        BEAM_MUZZLE: 2.0 / 0.64,      // LaserFn
-  TURRET_TTL: 1.3,      TURRET_MUZZLE: 1.8 / 0.64,    // TurretFn
+  TURRET_TTL: 1.3,
+  // The turret's two numbers are OUR drawing's, not the prefab's, because they are
+  // what the player watches a bolt leave. TurretFn emits at local (0, 1.8) off
+  // `lazer` -- the rotating barrel, whose transform sits at the hinge -- so the
+  // original offsets from the hinge too; we were the ones firing from the anchor.
+  //
+  // art_LaserTurret2 (corepox-components) hinges the barrel on the gear at (112,174)
+  // and ends it at x=209, against an anchor at (84,196) and 56 art units to the tile:
+  //   hinge   (112-84, 174-196) / 56 = (0.5, -0.393) tiles off the anchor, +Y DOWN
+  //   barrel  (209-112) / 56          = 1.732 tiles
+  // 1.8/0.64 = 2.8125 was the shipped sprite's barrel and is 1.08 tiles longer than
+  // the one on screen. tools/corepox-muzzle.ts holds the two to a quarter tile.
+  TURRET_HINGE: [0.5, -22 / 56], TURRET_MUZZLE: 97 / 56,
   BEAM_CYCLE: 1.0, BEAM_DMG: 5,          // FIRE_S 0.1 + RECHARGE_S 0.9
   // ExplosiveFn.cs: 32 fragments evenly around a circle at 2 world u/s, ttl 3s,
   // 5 dmg each -- a shrapnel bomb with a 9.4 tile reach, not a point blast.
@@ -20975,6 +21518,7 @@ const _UNITS = function _UNITS(){return(
   // radius 3 is in world units, hence /0.64 -- 4.6875 tiles.
   CORE_TRAILS: 120, CORE_R: 3 / 0.64, CORE_TIME: 1.0, CORE_MAX: 8,
   CELL_R: 0.45,
+  SND_MAX: 24,              // World.snd ring: a frame drains it, a headless run never does
   HIT_R: 0.5                  // a component is one tile across
 }
 )};
@@ -21526,14 +22070,23 @@ const _applyOverrides = function _applyOverrides(OVERRIDE_PORT){return(
 )};
 
 // Where a component's SENSOR sits, in tiles from its origin tile's centre, in the
-// component's own frame (+y forward). RadarFn.cs measures from a `center` child
-// object -- `Vector3 here = center.transform.position` -- not from the component's
-// own transform, and the shipped sprite says where that child is: the ring centre
-// is at (206.7, 204.6)px and the pivot at (111.8, 491.4)px, so the ring sits
-// (+0.494, +1.494) tiles from the pivot at 192px to the tile. That is the centre
-// of the 2x2 top block to within a hundredth of a tile, which is Tom's "a circle
-// for the 2x2 top part". Measuring from the origin tile instead put every `dist`
-// reading 1.58 tiles long.
+// component's own frame: +x RIGHT, +y FORWARD. sensorOf negates the y on its way
+// into geom.rot, which works in +y-DOWN space -- see the note there.
+//
+// RadarFn.cs measures from a `center` child object -- `Vector3 here =
+// center.transform.position` -- not from the component's own transform. Three
+// independent sources agree on where that child is:
+//
+//   * Radar.prefab: the `arrow` that carries radar_trace has localPosition
+//     (0.32, 0.96) world units, and 0.64 world units to the tile makes that
+//     (0.5, 1.5) tiles. radar_trace hangs off it at a further (0, 0.64), which is
+//     the one-tile stand-off the renderer draws.
+//   * the shipped sprite: ring centre (206.7, 204.6)px, pivot (111.8, 491.4)px,
+//     192px to the tile -> (+0.494, +1.494) tiles ahead of the pivot.
+//   * our own art: tools/corepox-radar-sensor.ts measures the drawn ring against
+//     this table through the live DOM, and they agree to 0.001 tiles.
+//
+// Measuring from the origin tile instead put every `dist` reading 1.58 tiles long.
 const _SENSOR = function _SENSOR(){return(
 {Radar: [0.5, 1.5]}
 )};
@@ -21787,11 +22340,19 @@ class Ship {
   // worldOf gives the component's ORIGIN tile; a sensor may read from somewhere
   // else on the part (see SENSOR). The offset is in the component's own frame, so
   // it turns with c.dir as well as with the ship.
+  //
+  // The y is NEGATED on the way in. SENSOR is written +y FORWARD, to match the art
+  // it was measured off; geom.rot is documented "clockwise-positive in +Y-DOWN
+  // space". Passing it straight through put the sensor 1.5 tiles BEHIND the part
+  // instead of 1.5 tiles ahead -- 3.0 tiles from the ring the renderer draws,
+  // measured against the live DOM in tools/corepox-radar-sensor.ts. That is worse
+  // than not applying the offset at all, and it is what Tom saw: "the radar dotted
+  // lines are not coming from the component center" (2026-08-23).
   sensorOf(c) {
     const o = SENSOR[c.type];
     if (!o) return this.worldOf(c);
     const [wx, wy] = this.worldOf(c);
-    const [dx, dy] = geom.rot(o, this.a + (typeof c.dir === "number" ? c.dir : 0));
+    const [dx, dy] = geom.rot([o[0], -o[1]], this.a + (typeof c.dir === "number" ? c.dir : 0));
     return [wx + dx, wy + dy];
   }
 
@@ -21926,10 +22487,16 @@ class Ship {
     comp.hp -= n;
     if (comp.hp <= 0) {
       // BEFORE reindex, which moves this.x,y to the new centre and would put the
-      // burst at the wrong place -- the same ordering trap Ship.detach documents.
-      const core = !transfer && comp.type === "Brain" ? this.worldOf(comp) : null;
+      // burst -- and the sound -- at the wrong place. The same ordering trap
+      // Ship.detach documents.
+      const at = transfer ? null : this.worldOf(comp);
+      const core = at && comp.type === "Brain" ? at : null;
       comp.hp = 0; this.reindex(); this.order = this.topo();
       if (core) this.world?.coreBurst(core[0], core[1]);
+      // ShipComponent.cs:95-98 fires event:/EXPLOSION for a Brain and event:/Block_Break
+      // for everything else, on the same branch that runs destroy(). A `transfer` is a
+      // hull split, not a death, so it is silent -- the same exclusion the burst uses.
+      if (at) this.world?.sound(core ? "EXPLOSION" : "Block_Break", at[0], at[1]);
       if (!transfer && comp.type === "Explosive") this.world?.detonate(this, comp);
       return true;
     }
@@ -21966,6 +22533,10 @@ class World {
     // list of things that HAPPENED, for a renderer to read. It consumes no rng, so
     // determinism is unaffected (tools/corepox-determinism.ts).
     this.fx = [];
+    // Sounds that HAPPENED, for a presentation layer to drain (corepox-audio's
+    // sfx.drain). Same contract as fx: nothing here is stepped or read back by the
+    // simulation, so a headless run just fills a capped ring and never plays anything.
+    this.snd = [];
     this.t = 0; this.tick = 0;
     // A component's death is resolved on the ship (Ship.damage), but an explosion is
     // particles, and particles live out here. The back-reference is what lets the
@@ -22046,7 +22617,8 @@ class World {
         if (c.t > UNITS.BEAM_CYCLE && c.in.fire > 0) {
           c.t = 0;
           this.fire(ship, c, ship.a + c.dir + (c.turret ?? 0),
-                    {ttl: UNITS.TURRET_TTL, muzzle: UNITS.TURRET_MUZZLE});
+                    {ttl: UNITS.TURRET_TTL, muzzle: UNITS.TURRET_MUZZLE,
+                     hinge: UNITS.TURRET_HINGE});
         }
         break;
       }
@@ -22092,20 +22664,30 @@ class World {
                          ttl, ttl0: ttl, dmg, ...extra});
   }
 
-  fire(ship, c, a, {ttl = UNITS.BEAM_TTL, muzzle = UNITS.BEAM_MUZZLE} = {}) {
+  // `hinge` is where the barrel is MOUNTED, in the component's own frame (tiles,
+  // +Y down), and it does not turn with the barrel -- so a gun that pivots fires
+  // from one fixed point on the part however it is aimed. A gun that does not
+  // pivot passes nothing and fires from its anchor, which for the Lazer is the
+  // centre line of a 1x3 part and needs no correction.
+  //
+  // This was tried once before as `TYPES[c.type].pivot` -- [0.5, 0.5], from
+  // recollection -- and it broke Aim (24.7s win -> 25.1s loss) and TwinTurrets
+  // (-> 10.5s loss), which was read at the time as evidence against offsetting at
+  // all. The offset was the wrong one: the art puts the gear at (0.5, -0.393),
+  // three quarters of a tile from where pivot claimed, and it is a MEASUREMENT off
+  // the drawing rather than a remembered number. tools/corepox-muzzle.ts is the
+  // gate, tools/corepox-play-missions.ts says what it cost.
+  fire(ship, c, a, {ttl = UNITS.BEAM_TTL, muzzle = UNITS.BEAM_MUZZLE, hinge} = {}) {
     const [ux, uy] = geom.unit(a);
-    // NOT offset by TYPES[c.type].pivot, though TurretFn's emitParticle argues it
-    // should be: it TransformPoints (0, 1.8) off `lazer`, the rotating barrel,
-    // whose transform sits at the pivot. Tried 2026-08-21. Half a tile of lateral
-    // bias is enough to break the two missions built around the radar-to-turret
-    // wire -- Aim goes from a 24.7s win to a 25.1s loss, TwinTurrets to a 10.5s
-    // loss -- which says the pivot value, the radar's sensor offset, or both are
-    // wrong, and that is its own investigation rather than a line in this one.
-    const [cx, cy] = ship.worldOf(c);
+    const [ox, oy] = hinge ? geom.rot(hinge, ship.a + (c.dir ?? 0)) : [0, 0];
+    const [cx, cy] = [ship.worldOf(c)[0] + ox, ship.worldOf(c)[1] + oy];
     this.emit(ship, c, "beam", cx + ux * muzzle, cy + uy * muzzle,
               ux * UNITS.BEAM_SPEED, uy * UNITS.BEAM_SPEED,
               ttl, UNITS.BEAM_DMG, {a});
     this.recoil(ship, c, cx, cy, a);
+    // At the muzzle, where the bolt leaves -- LaserFn.cs:19 and TurretFn.cs:69 both
+    // fire the event next to the emitParticle call, not at the hull centre.
+    this.sound("LAZER_FIRE", cx + ux * muzzle, cy + uy * muzzle);
   }
 
   exhaust(ship, c, wx, wy, ux, uy, magnitude) {
@@ -22131,6 +22713,11 @@ class World {
   // tick for something that must not touch anything (and stepParticles is already
   // 45% of the frame). The renderer draws them into its existing per-colour lane
   // paths, so the whole burst costs no new DOM nodes.
+  sound(name, x, y) {
+    this.snd.push({name, x, y, t: this.t});
+    if (this.snd.length > UNITS.SND_MAX) this.snd.shift();
+  }
+
   coreBurst(x, y) {
     this.fx.push({kind: "core", x, y, t: this.t});
     if (this.fx.length > UNITS.CORE_MAX) this.fx.shift();
@@ -22546,6 +23133,8 @@ const _fireGuns = function _fireGuns(){return(
 
 // pilot(ship, {target, face, drive, fire}) -- writes engine throttles for one tick.
 // `memo` is per-ship scratch the caller owns; it latches the turn direction.
+// drive is {move: [x, y], yaw} in the BODY frame, each -1..1; `{thrust, yaw}` is the
+// older one-axis shape and still works.
 const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, fireGuns, geom, UNITS){return(
 (ship, cmd = {}, memo = {}, A = pilotActuators(ship)) => {
   for (const a of A) a.c.in.in = 0;
@@ -22555,18 +23144,41 @@ const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, fireG
   const R = flightModel(A);
   let bx = 0, by = 0, want = cmd.face ?? ship.a;
 
-  // Direct drive (WASD). Same allocator, different demand: instead of deriving a
-  // wrench from a waypoint the caller names one outright, as a fraction of what
-  // this hull can produce. thrust and yaw are each -1..1, and each is scaled by
-  // the authority the build actually has in that direction -- so a hull with no
-  // reverse ignores S and one with no yaw ignores A/D, which is the same "the
-  // failure is the build's" property the waypoint mode has.
+  // Direct drive (WASD + QE). Same allocator, different demand: instead of deriving
+  // a wrench from a waypoint the caller names one outright, as a fraction of what
+  // this hull can produce.
+  //
+  // `move` is a BODY-FRAME direction, not a scalar, and that is the whole change.
+  // It used to be `thrust`, one number along R.axis -- the hull's strongest thrust
+  // heading -- so the drive command carried 2 of the allocator's 3 degrees of
+  // freedom and the missing one was exactly strafe. A ship whose guns and engines
+  // disagree could not fly the way it was built to fight: Tom, 2026-08-23, on a hull
+  // with two Lazers on +y and its engines on the right and bottom faces, "if I make a
+  // ship that is primarily meant to strafe then do the WASD controls still make
+  // sense?" They did not. R.axis landed roughly perpendicular to the guns, so W flew
+  // sideways relative to the aim and the direction the player wanted had no key.
+  //
+  // Nothing under here needed to change to allow it: the waypoint path already hands
+  // the allocator a two-component body-frame demand whenever `face` is held. Body
+  // frame, not world, because the camera is to be locked to the hull (Tom, same day).
+  //
+  // Each axis is still scaled by the authority the build has IN THE COMMANDED
+  // DIRECTION, which is the old `along` generalised from R.axis to an arbitrary
+  // heading. So a hull with no leftward thrust ignores A outright rather than
+  // drifting there slowly -- the same "the failure is the build's" property the
+  // waypoint mode has, now stated per direction instead of per sign.
   if (cmd.drive) {
-    const {thrust = 0, yaw = 0} = cmd.drive;
+    const {yaw = 0} = cmd.drive;
+    // `thrust` is the old shape, kept working: one scalar along R.axis is the
+    // special case of `move` where the direction is the hull's best one. Headless
+    // callers and tools/corepox-drive-yaw.ts still speak it.
+    const mv = cmd.drive.move ??
+      [R.axis[0] * (cmd.drive.thrust ?? 0), R.axis[1] * (cmd.drive.thrust ?? 0)];
+    // Diagonals are clamped to unit, so W+A is not faster than W alone.
+    const mag = Math.hypot(mv[0], mv[1]), s = Math.min(1, mag);
+    const dx = mag > 1e-9 ? mv[0] / mag : 0, dy = mag > 1e-9 ? mv[1] / mag : 0;
     let along = 0;
-    for (const a of A)
-      along += Math.max(0, a.ux * R.axis[0] * Math.sign(thrust || 1) +
-                          a.uy * R.axis[1] * Math.sign(thrust || 1));
+    for (const a of A) along += Math.max(0, a.ux * dx + a.uy * dy);
     // yaw is a RATE demand, not a torque one. Asking for zero torque only means
     // "add no spin" -- it does not take away the spin the hull's own asymmetry is
     // producing, so holding W turned 19 of 40 corpus ships at more than 5 deg/s
@@ -22578,11 +23190,12 @@ const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, fireG
     // Both demands are asked for as a FRACTION of this hull's own authority. A flat
     // [1,1,2] compares tiles/s^2 against a torque row two orders of magnitude
     // smaller, so the allocator served position and treated rotation as rounding:
-    // holding D alone turned the median ship 4.68 deg/s when it could do 21.7. The
-    // normalised weights also make the feel independent of ship size.
+    // holding yaw alone (D, before turn moved to Q/E) turned the median ship
+    // 4.68 deg/s when it could do 21.7. The normalised weights also make the feel
+    // independent of ship size.
     const hi = R.vmax / (KL * TAU), aMax = Math.max(R.yawP, R.yawN) * geom.D / KL;
     const wl = 1 / Math.max(1e-9, hi * hi), wa = 2 / Math.max(1e-18, aMax * aMax);
-    const b = [R.axis[0] * thrust * along, R.axis[1] * thrust * along, alpha];
+    const b = [dx * s * along, dy * s * along, alpha];
     const out = pilotAllocate(A, b, [wl, wl, wa]);
     A.forEach((a, i) => { a.c.in.in = out.f[i] * 100; });
     fireGuns(ship, cmd);
@@ -22631,6 +23244,108 @@ const _pilot = function _pilot(pilotActuators, pilotAllocate, flightModel, fireG
 }
 )};
 
+// ---------------------------------------------------------------------------
+
+// The human half of pilot(): keys and a waypoint press, turned into the command object
+// pilot() reads. It lives HERE, beside the command shape, because two views fly a ship
+// by hand -- the board's own battle and Explore's duel -- and while each kept its own
+// key table they drifted. The board's moved to WASD-translate plus Q/E-turn and
+// Explore's did not, which is Tom, 2026-08-24: "I don't think the WASDQE controls work
+// at all ... W does not move it forward and Q or E does not turn it." In Explore A/D
+// still yawed, Q/E fell through the unknown-key guard and did nothing, and W was thrust
+// along the hull's best axis rather than where the nose points. Then: "seems like the
+// auto-controls and keyboard handling needs to be factored out if there is multiple
+// places to change things." One table, one exclusivity rule, one blur release; each
+// caller keeps only its own chrome.
+//
+// `cmdOf` is a GETTER, not a command object: the board nulls and replaces `S.cmd` as
+// sessions load and end, so a binder holding the object would write into a dead one.
+// Returning null from it is how a caller says "not now" -- outside a match nothing is
+// written and every key is left for whoever else wants it.
+//
+// Body frame, because the camera is to be locked to the hull. `geom.unit(0)` is [0,-1],
+// so W is -y: the way the ship's `up` parts face, whatever the ship is doing. Which
+// direction actually MOVES is still the build's business -- pilot() scales each axis by
+// the thrust available along it, so a hull with nothing pushing left ignores A.
+const _pilotInput = function _pilotInput(){return(
+(cmdOf, {fire = [], attach = true, typing} = {}) => {
+  const DRIVE = {w: [0, -1], s: [0, 1], a: [-1, 0], d: [1, 0]};
+  const TURN = {q: -1, e: 1};                              // clockwise is positive
+  const held = new Set();
+  // Anything with a caret in it swallows the key first. These listeners are on the
+  // window so the player does not have to click the battle before flying, which in a
+  // lopepage layout means typing "f" in another pane's editor used to fire the guns.
+  const isTyping = typing ?? (() => {
+    const e = document.activeElement;
+    return !!e && (e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName) ||
+                   !!e.closest?.(".cm-editor"));
+  });
+  const clamp = (v) => Math.max(-1, Math.min(1, v));
+  const apply = () => {
+    const c = cmdOf();
+    if (!c) return;
+    let mx = 0, my = 0, yaw = 0;
+    for (const k of held) {
+      const v = DRIVE[k]; if (v) { mx += v[0]; my += v[1]; }
+      if (TURN[k]) yaw += TURN[k];
+    }
+    // Diagonals are clamped to the unit square here and to unit LENGTH in pilot(), so
+    // W+A is a direction and not extra speed.
+    if (mx || my || yaw) {
+      // A key is a direct command and outranks where you last pressed: a ship obeying
+      // both at once reads as a ship ignoring you, and the two demands fight over the
+      // same nozzles.
+      c.drive = {move: [clamp(mx), clamp(my)], yaw: clamp(yaw)};
+      c.target = null; c.face = null;
+    } else c.drive = null;
+  };
+  // Reports whether the key was the pilot's, so a caller with its own press table --
+  // the board's space-to-pan and Escape -- can run first and pass the rest down.
+  const key = (ev, down) => {
+    const k = ev.key.toLowerCase();
+    const shoots = fire.includes(k);
+    if (!shoots && !DRIVE[k] && !TURN[k]) return false;
+    // Only the PRESS is guarded. A key already held when a field takes focus still has
+    // to release, or the ship flies on by itself with no keyup coming.
+    if (down && isTyping()) return false;
+    const c = cmdOf();
+    if (!c) return false;
+    ev.preventDefault();
+    if (shoots) { c.fire = down; return true; }
+    down ? held.add(k) : held.delete(k);
+    apply();
+    return true;
+  };
+  // The other half of the exclusivity: a press drops whatever is held, so the keys do
+  // not immediately overwrite the waypoint the player just set.
+  const waypoint = (target, face = null) => {
+    const c = cmdOf();
+    if (!c) return;
+    held.clear();
+    c.drive = null; c.target = target; c.face = face;
+  };
+  const faceTo = (bearing) => { const c = cmdOf(); if (c) c.face = bearing; };
+  const clearWaypoint = () => { const c = cmdOf(); if (c) { c.target = null; c.face = null; } };
+  // A key held while the window loses focus never sees its keyup.
+  const release = () => { held.clear(); const c = cmdOf(); if (c) { c.drive = null; c.fire = false; } };
+  const kd = (ev) => key(ev, true), ku = (ev) => key(ev, false);
+  if (attach) {
+    window.addEventListener("keydown", kd);
+    window.addEventListener("keyup", ku);
+    window.addEventListener("blur", release);
+  }
+  return {held, key, apply, waypoint, faceTo, clearWaypoint, release, keys: {DRIVE, TURN},
+          stop: () => {
+            if (attach) {
+              window.removeEventListener("keydown", kd);
+              window.removeEventListener("keyup", ku);
+              window.removeEventListener("blur", release);
+            }
+            release();
+          }};
+}
+)};
+
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -22664,6 +23379,7 @@ export default function define(runtime, observer) {
   $def("_flightModel", "flightModel", ["geom","UNITS"], _flightModel);
   $def("_fireGuns", "fireGuns", [], _fireGuns);
   $def("_pilot", "pilot", ["pilotActuators","pilotAllocate","flightModel","fireGuns","geom","UNITS"], _pilot);
+  $def("_pilotInput", "pilotInput", [], _pilotInput);
   return main;
 }</script><!--/-->
 
@@ -23860,16 +24576,6 @@ export default function define(runtime, observer) {
     main.variable(observer(name)).define(name, ["Generators", "viewof " + name],
       (G, _) => G.input(_)).pid = pid + "v";
   };
-  main.define("module @tomlarkworthy/corepox-engine",
-    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
-  for (const n of ["TYPES", "JOINTS", "PORTS"])
-    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
-  // svg-lens's tag, not htl's: the drawings below are edited in place, and the
-  // write path resolves the cell by finding this tag among the cell's inputs.
-  main.define("module @tomlarkworthy/svg-lens",
-    async () => runtime.module((await import("/@tomlarkworthy/svg-lens.js?v=4")).default));
-  main.define("svg", ["module @tomlarkworthy/svg-lens", "@variable"], (_, v) => v.import("svg", _));
-
   $def("_title", "title", ["md"], _title);
   $def("_toc", "toc", ["TYPES", "CPX", "SYMBOL_FOR", "htl"], _toc);
   $def("_CPX", "CPX", [], _CPX);
@@ -23889,59 +24595,56 @@ export default function define(runtime, observer) {
   $def("_artSheet", "artSheet", ["artPlate","htl","CPX"], _artSheet);
   $def("_componentEditor", "componentEditor",
        ["initialTables","drawComponent","CPX","htl"], _componentEditor);
-
   $def("_h_Brain", "h_Brain", ["section"], _h_Brain);
   $def("_art_Brain", "art_Brain", ["svg"], _art_Brain);
   $view("_viewof_tbl_Brain", "tbl_Brain", ["componentEditor","art_Brain"], _viewof_tbl_Brain);
-
   $def("_h_Constant", "h_Constant", ["section"], _h_Constant);
   $def("_art_Constant", "art_Constant", ["svg"], _art_Constant);
   $view("_viewof_tbl_Constant", "tbl_Constant", ["componentEditor","art_Constant"], _viewof_tbl_Constant);
-
   $def("_h_Binary", "h_Binary", ["section"], _h_Binary);
   $def("_art_Binary", "art_Binary", ["svg"], _art_Binary);
   $view("_viewof_tbl_Binary", "tbl_Binary", ["componentEditor","art_Binary"], _viewof_tbl_Binary);
-
   $def("_h_Radar", "h_Radar", ["section"], _h_Radar);
   $def("_art_Radar", "art_Radar", ["svg"], _art_Radar);
   $view("_viewof_tbl_Radar", "tbl_Radar", ["componentEditor","art_Radar"], _viewof_tbl_Radar);
-
   $def("_h_Engine", "h_Engine", ["section"], _h_Engine);
   $def("_art_Engine", "art_Engine", ["svg"], _art_Engine);
   $view("_viewof_tbl_Engine", "tbl_Engine", ["componentEditor","art_Engine"], _viewof_tbl_Engine);
-
   $def("_h_Lazer", "h_Lazer", ["section"], _h_Lazer);
   $def("_art_Lazer", "art_Lazer", ["svg"], _art_Lazer);
   $view("_viewof_tbl_Lazer", "tbl_Lazer", ["componentEditor","art_Lazer"], _viewof_tbl_Lazer);
-
   $def("_h_Explosive", "h_Explosive", ["section"], _h_Explosive);
   $def("_art_Explosive", "art_Explosive", ["svg"], _art_Explosive);
   $view("_viewof_tbl_Explosive", "tbl_Explosive", ["componentEditor","art_Explosive"], _viewof_tbl_Explosive);
-
   $def("_h_Orb", "h_Orb", ["section"], _h_Orb);
   $def("_art_Orb", "art_Orb", ["svg"], _art_Orb);
   $view("_viewof_tbl_Orb", "tbl_Orb", ["componentEditor","art_Orb"], _viewof_tbl_Orb);
-
   $def("_h_Armour", "h_Armour", ["section"], _h_Armour);
   $def("_art_Armour", "art_Armour", ["svg"], _art_Armour);
   $view("_viewof_tbl_Armour", "tbl_Armour", ["componentEditor","art_Armour"], _viewof_tbl_Armour);
-
   $def("_h_LaserTurret2", "h_LaserTurret2", ["section"], _h_LaserTurret2);
   $def("_art_LaserTurret2", "art_LaserTurret2", ["svg"], _art_LaserTurret2);
   $view("_viewof_tbl_LaserTurret2", "tbl_LaserTurret2", ["componentEditor","art_LaserTurret2"], _viewof_tbl_LaserTurret2);
-
   $def("_h_Hyperdrive", "h_Hyperdrive", ["section"], _h_Hyperdrive);
   $def("_art_Hyperdrive", "art_Hyperdrive", ["svg"], _art_Hyperdrive);
   $view("_viewof_tbl_Hyperdrive", "tbl_Hyperdrive", ["componentEditor","art_Hyperdrive"], _viewof_tbl_Hyperdrive);
-
   $def("_h_Composite", "h_Composite", ["section"], _h_Composite);
   $view("_viewof_tbl_Composite", "tbl_Composite", ["componentEditor"], _viewof_tbl_Composite);
-
   $def("_COMPONENT_ART", "COMPONENT_ART", ["SYMBOL_FOR", "art_Brain", "art_Constant", "art_Binary", "art_Radar", "art_Engine", "art_Lazer", "art_Explosive", "art_Orb", "art_Armour", "art_LaserTurret2", "art_Hyperdrive"], _COMPONENT_ART);
   $def("_componentTables", "componentTables", ["tbl_Brain", "tbl_Constant", "tbl_Binary", "tbl_Radar", "tbl_Engine", "tbl_Lazer", "tbl_Explosive", "tbl_Orb", "tbl_Armour", "tbl_LaserTurret2", "tbl_Hyperdrive", "tbl_Composite"], _componentTables);
   $def("_componentTable", "componentTable", ["componentTables","htl","CPX"], _componentTable);
   $def("_engineSnippet", "engineSnippet",
        ["componentTables","initialTables","htl","CPX"], _engineSnippet);
+
+  main.define("module @tomlarkworthy/corepox-engine",
+    async () => runtime.module((await import("/@tomlarkworthy/corepox-engine.js?v=4")).default));
+  for (const n of ["TYPES", "JOINTS", "PORTS"])
+    main.define(n, ["module @tomlarkworthy/corepox-engine", "@variable"], (_, v) => v.import(n, _));
+  // svg-lens's tag, not htl's: the drawings below are edited in place, and the
+  // write path resolves the cell by finding this tag among the cell's inputs.
+  main.define("module @tomlarkworthy/svg-lens",
+    async () => runtime.module((await import("/@tomlarkworthy/svg-lens.js?v=4")).default));
+  main.define("svg", ["module @tomlarkworthy/svg-lens", "@variable"], (_, v) => v.import("svg", _));
   return main;
 }</script><!--/-->
 
@@ -29806,6 +30509,15 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
+  $def("_title", "title", ["md"], _title);
+  $def("_SHEET", "SHEET", [], _SHEET);
+  $def("_SHEET_SYMBOLS", "SHEET_SYMBOLS", [], _SHEET_SYMBOLS);
+  $def("_SYMBOLS", "SYMBOLS", ["SHEET_SYMBOLS", "COMPONENT_ART"], _SYMBOLS);
+  $def("_symbolSheet", "symbolSheet", ["SHEET", "COMPONENT_ART", "artKids"], _symbolSheet);
+  $def("_use", "use", ["SYMBOLS", "symbolSheet"], _use);
+  $def("_sprite", "sprite", ["SYMBOLS", "symbolSheet"], _sprite);
+  $def("_gallery", "gallery", ["htl", "SYMBOLS", "sprite"], _gallery);
+
   // The component drawings and the data that addresses them. This module used to
   // be a leaf; it now sits above corepox-components, which is why the dependency
   // reads assets -> components and not the other way about: the art is edited in
@@ -29822,15 +30534,6 @@ export default function define(runtime, observer) {
   // with no error anywhere, and the whole game sat on a spinner.
   main.define("TILE", ["module @tomlarkworthy/corepox-components", "@variable"],
               (_, v) => v.import("ART_TILE", "TILE", _));
-
-  $def("_title", "title", ["md"], _title);
-  $def("_SHEET", "SHEET", [], _SHEET);
-  $def("_SHEET_SYMBOLS", "SHEET_SYMBOLS", [], _SHEET_SYMBOLS);
-  $def("_SYMBOLS", "SYMBOLS", ["SHEET_SYMBOLS", "COMPONENT_ART"], _SYMBOLS);
-  $def("_symbolSheet", "symbolSheet", ["SHEET", "COMPONENT_ART", "artKids"], _symbolSheet);
-  $def("_use", "use", ["SYMBOLS", "symbolSheet"], _use);
-  $def("_sprite", "sprite", ["SYMBOLS", "symbolSheet"], _sprite);
-  $def("_gallery", "gallery", ["htl", "SYMBOLS", "sprite"], _gallery);
   return main;
 }</script><!--/-->
 
