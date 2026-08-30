@@ -7,6 +7,14 @@
 # invariant "in committed history, spec.hash matches the block" is established
 # here rather than by any individual writer.
 #
+# The same applies to `bootconf`, and it is the half other tools READ:
+# lope-jumpgate.js takes `mains` and `hash` from the spec to decide what to
+# re-export. Left unmaintained it went badly wrong -- on 2026-08-13, 187 of 229
+# specs recorded different `mains` than their own HTML, so a jumpgate
+# regeneration silently dropped mains and downgraded the frame. `theme` is the
+# one key the HTML cannot carry (the exporter never writes one into the block),
+# so spec-sync preserves it rather than overwriting.
+#
 # A notebook with no sibling spec FAILS rather than being skipped: otherwise
 # every new notebook silently opts out of the invariant. Mint one with
 #   bun tools/lope-sync.ts spec-sync --rebuild notebooks/<name>.html
@@ -18,9 +26,57 @@
 repos:
   - repo: local
     hooks:
+      # A tab paired with Claude Code carries `&cc=LOPE-<port>-<id>` in its hash, and the exporter
+      # copies location.hash into bootconf when no hash is given. A reader of that export then
+      # auto-connects to ws://localhost:<port> on load; from a public origin Chrome answers with
+      # the Local Network Access prompt (published newsletter-001, 2026-08-29). Runs first: it
+      # only reads, and a token in the spec's bootconf is the same leak.
+      - id: lope-token-scan
+        name: no pairing token in bootconf hash
+        entry: sh -c 'test -f ../tools/lope-token-scan.ts || exit 0; exec bun ../tools/lope-token-scan.ts "$@"' --
+        language: system
+        files: ^notebooks/.*\.(html|json)$
+        pass_filenames: true
+
+      # Does every module a notebook embeds provide what the others import, and does each cell's
+      # input list match what its body references? An unresolved import is never DELIVERED, so a
+      # stale copy throws nothing: the dependent cell simply never runs, and under prerender:true
+      # the page paints and then goes blank. Dep skew fails the same silent way -- a declared dep
+      # the body dropped still makes the cell WAIT on it; a reference the input list lost resolves
+      # to nothing. Both are what patching a cell body without updating its `$def` array produces.
+      #
+      # Judged against tools/preflight-baseline.json: the corpus carries 624 findings already
+      # (617 of them dep skew), so only NEW ones fail. Re-cut it with `--json` after a deliberate
+      # change. Only findings in the boot closure gate; `-lazy` ones never run.
+      #
+      # Runs before lope-spec-sync because it only reads, and spec-sync REWRITES spec files: a
+      # commit that will fail anyway should not leave those rewrites behind.
+      #
+      # Scoped to the notebooks being committed, so it cannot see one that went stale because a
+      # DIFFERENT notebook's canonical moved. The corpus sweep is what covers that.
+      - id: lope-preflight
+        name: notebook module graph resolves
+        entry: sh -c 'test -f ../tools/lope-preflight.ts || exit 0; exec bun ../tools/lope-preflight.ts --baseline ../tools/preflight-baseline.json "$@"' --
+        language: system
+        files: ^notebooks/.*\.html$
+        pass_filenames: true
+
       - id: lope-spec-sync
-        name: notebook spec hashes
+        name: notebook spec hashes + bootconf
         entry: sh -c 'test -f ../tools/lope-sync.ts || exit 0; exec bun ../tools/lope-sync.ts spec-sync "$@"' --
         language: system
         files: ^notebooks/.*\.html$
         pass_filenames: true
+
+      # A notebook Google never fetches is a notebook that does not exist, and the only crawl path
+      # to most of these is the sitemap. Adding one is the moment it gets forgotten, so the check
+      # sits here. It compares the URL SET only -- `lastmod` is a git commit date, which at
+      # pre-commit time still reads the previous commit and would flag every fresh notebook
+      # forever. Deletions do not trigger it (pre-commit filters to added/modified paths); a
+      # removed notebook surfaces on the next commit that touches any notebook.
+      - id: lope-sitemap
+        name: sitemap lists every notebook
+        entry: sh -c 'test -f ../tools/build-sitemaps.ts || exit 0; exec bun ../tools/build-sitemaps.ts --check --only lopebooks'
+        language: system
+        files: ^notebooks/.*\.html$
+        pass_filenames: false
