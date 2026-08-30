@@ -33135,7 +33135,7 @@ import {sheet} from '@tomlarkworthy/sheet'
 
 widget = sheet(runtime, {
   invalidation,     // required for teardown
-  module,           // module to project, default main
+  module,           // REQUIRED — the module whose scope the sheet projects
   format: {},       // { B3: "0.00" } — the ONLY state the sheet owns
   persist: true     // rewrite own source when format changes
 })
@@ -33156,8 +33156,12 @@ B1 = taxRate         // placement — "this lives at B1"
 
 The sheet detects a placement cell (a positional name whose body is a bare reference to a
 non-positional name), renders the target's value at B1 and labels it. \`= B1 * 12\` is then
-relative and shifts on copy; \`= taxRate * 12\` is absolute and never shifts — Excel's \`A1\` vs
-\`$A$1\`, with no syntax invented. Placement also puts *any* cell on the grid: \`D5 = revenuePlot\`.
+relative and shifts on copy; \`= taxRate * 12\` is absolute and never shifts. Placement also puts
+*any* cell on the grid: \`D5 = revenuePlot\`.
+
+**Pinning a coordinate.** \`$\` is legal in a JS identifier, so \`$A$1\`, \`$A1\` and \`A$1\` are
+names too. The sheet defines each one it sees as an alias to the plain address, and paste leaves
+a pinned component alone — Excel's semantics, still with nothing stored outside the names.
 
 **Sparse.** Only defined cells are variables and only defined cells have DOM. An empty sheet is
 zero of both; the grid is painted, not built.`
@@ -33193,6 +33197,17 @@ const _shshift = function _shiftAddr(parseAddr,formatAddr){return(
   return col < 0 || row < 0 ? "#REF" : formatAddr(col, row);
 }
 )};
+const _shparseref = function _parseRef(colIndex){return(
+// An A1-shaped REFERENCE. Unlike a cell NAME it may pin either component with `$`, which is
+// legal in a JS identifier -- so `$C$3` is still a name whose meaning is a parse of itself.
+(name) => {
+  const m = /^(\$?)([A-Z]+)(\$?)([0-9]+)$/.exec(String(name ?? ""));
+  return m ? { col: colIndex(m[2]), row: +m[4] - 1, colAbs: m[1] === "$", rowAbs: m[3] === "$" } : null;
+}
+)};
+const _shfmtref = function _formatRef(colName){return(
+(col, row, colAbs, rowAbs) => (colAbs ? "$" : "") + colName(col) + (rowAbs ? "$" : "") + (row + 1)
+)};
 const _shrefs = function _cellRefs(parser){return(
 // Free references WITH spans, straight from the Observable parser's own scope analysis:
 // shadowed names, strings and comments are excluded for us.
@@ -33219,9 +33234,16 @@ const _shrewrite = function _rewriteRefs(cellRefs){return(
   return out;
 }
 )};
-const _shtranspose = function _transposeCell(rewriteRefs,parseAddr,shiftAddr){return(
-// Paste semantics: every A1-shaped name shifts by the delta, every other name is absolute.
-(src, dc, dr) => rewriteRefs(src, (name) => (parseAddr(name) ? shiftAddr(name, dc, dr) : name))
+const _shtranspose = function _transposeCell(rewriteRefs,parseRef,formatRef){return(
+// Paste semantics: an A1-shaped name shifts by the delta unless `$` pins that component; every
+// other name is absolute, which is what makes a named cell behave like a pinned address.
+(src, dc, dr) => rewriteRefs(src, (name) => {
+  const r = parseRef(name);
+  if (!r) return name;
+  const col = r.colAbs ? r.col : r.col + dc;
+  const row = r.rowAbs ? r.row : r.row + dr;
+  return col < 0 || row < 0 ? "#REF" : formatRef(col, row, r.colAbs, r.rowAbs);
+})
 )};
 const _shfmtval = function _formatValue(){return(
 (value, spec) => {
@@ -33334,7 +33356,7 @@ const _shcss = function _sh_css(){return(
   outline: none; display: none;
 }`
 )};
-const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompile,parseAddr,formatAddr,formatValue,transposeCell,rewriteRefs,colName,Inspector,Inputs,codemirror,EditorState,EditorView,myDefaultTheme,observableJS_language,observableJS_highlightStyle,literalCompletions)
+const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompile,parseAddr,parseRef,formatAddr,formatValue,transposeCell,rewriteRefs,colName,Inspector,Inputs,codemirror,EditorState,EditorView,myDefaultTheme,observableJS_language,observableJS_highlightStyle,literalCompletions)
 {
   // notebook-kit spells these `viewof$x`; the legacy spelling is canonical in source
   const canonName = (n) => (typeof n === "string" ? n.replace(/^(viewof|mutable)\$/, "$1 ") : n);
@@ -33346,7 +33368,10 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     st.textContent = sh_css;
     document.head.appendChild(st);
   }
-  return (rt, { invalidation, module = main, format = {}, persist = true, minCols = 8, minRows = 18 } = {}) => {
+  return (rt, { invalidation, module, format = {}, persist = true, minCols = 8, minRows = 18 } = {}) => {
+    // no default: a lens has to be told what it is a lens over, and `main` is the wrong guess
+    // in every notebook that boots more than one module
+    if (!module) throw new Error("sheet(): `module` is required — pass the module whose scope the sheet projects");
     const formatState = { ...format };
 
     const frame = document.createElement("div");
@@ -33573,10 +33598,24 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       runtime._builtin._scope.has(name) || module._scope.get(name)?._type === 1;
     const canonRefs = (src) =>
       rewriteRefs(src, (name, r) => {
-        if (r.id || !/^[a-z]+[0-9]+$/.test(name) || nameIsTaken(name)) return name;
+        if (r.id || !/^\$?[a-z]+\$?[0-9]+$/.test(name) || nameIsTaken(name)) return name;
         const up = name.toUpperCase();
-        return parseAddr(up) ? up : name;
+        return parseRef(up) ? up : name;
       });
+
+    // `$C$3` is a legal JS identifier and its meaning is a parse of the name, exactly like `C3`.
+    // The runtime mints an implicit variable the moment one is referenced; define it as an alias
+    // so pinned references resolve. The alias is an ordinary cell, so it outlives the sheet.
+    const reconcileAliases = () => {
+      for (const [name, v] of [...module._scope]) {
+        if (typeof name !== "string" || !name.includes("$")) continue;
+        const r = parseRef(name);
+        if (!r || (!r.colAbs && !r.rowAbs)) continue;
+        // nothing refers to it any more: the alias is derived, so it goes with its last referrer
+        if (v._type === 1) { if (v._outputs.size === 0) v.delete(); continue; }
+        module.variable(true).define(name, [formatAddr(r.col, r.row)], (x) => x);
+      }
+    };
 
     const commit = async (addr, body) => {
       const existing = variableAt(addr);
@@ -33812,9 +33851,22 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     const SPILL_MAX = 16; // a runaway value must not paint over the whole sheet
     // How many cells of clear space to the right / below, i.e. how far content may
     // spill before it hits an occupied cell. O(1) lookups because scope is sparse.
-    const freeSpan = (occupied, col, row, dc, dr) => {
+    const freeRight = (occupied, col, row) => {
       let n = 1;
-      while (n < SPILL_MAX && !occupied.has(formatAddr(col + dc * n, row + dr * n))) n++;
+      while (n < SPILL_MAX && !occupied.has(formatAddr(col + n, row))) n++;
+      return n;
+    };
+    // vertical spill is a RECTANGLE test: a box two columns wide is stopped by an occupied cell
+    // in either column, not only the one it starts in
+    const freeDown = (occupied, col, row, cols) => {
+      let n = 1;
+      while (n < SPILL_MAX) {
+        let blocked = false;
+        for (let c = col; c < col + cols && !blocked; c++)
+          if (occupied.has(formatAddr(c, row + n))) blocked = true;
+        if (blocked) break;
+        n++;
+      }
       return n;
     };
     const reflow = () => {
@@ -33828,11 +33880,16 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
         node.style.top = yOf(a.row) + "px";
         node.style.minWidth = CW - 1 + "px";
         node.style.minHeight = RH - 1 + "px";
-        node.style.maxWidth = CW * freeSpan(occupied, a.col, a.row, 1, 0) - 1 + "px";
+        node.style.maxWidth = CW * freeRight(occupied, a.col, a.row) - 1 + "px";
         // only an element value asks for height; text always fits its row
         const wantsHeight = !!node.variable?._value?.nodeType;
+        // read the width back before granting height: the rectangle to clear is the one the
+        // content actually takes, not the whole cap it was allowed
+        const cols = wantsHeight
+          ? Math.max(1, Math.ceil(node.getBoundingClientRect().width / CW))
+          : 1;
         node.style.maxHeight = wantsHeight
-          ? RH * freeSpan(occupied, a.col, a.row, 0, 1) - 1 + "px"
+          ? RH * freeDown(occupied, a.col, a.row, cols) - 1 + "px"
           : RH - 1 + "px";
         // a spilling cell must paint over its empty neighbours, not under them
         node.style.zIndex = wantsHeight ? "2" : "1";
@@ -33851,6 +33908,7 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     canvas.appendChild(viz);
 
     const mo = new window.MutationObserver(() => {
+      reconcileAliases();
       measureExtent();
       paint();
       reflow();
@@ -33858,6 +33916,7 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       refreshSources().then(syncBar);
     });
     mo.observe(root, { childList: true });
+    reconcileAliases(); // cells already referencing `$A$1` at boot get their alias immediately
 
     // --- format is the ONLY state the sheet owns, so the sheet cell owns it (editable-md pattern)
     let saveTimer = null;
@@ -33909,7 +33968,7 @@ const _shwidget = function _widget(sheet,runtime,invalidation,sheetModule){retur
 sheet(runtime, {
   invalidation,
   module: sheetModule,
-  format: {"B1":"0.00","B2":"0.00","B3":"0.00","C1":"$","C2":"$","C3":"$","E1":"%"}
+  format: {"A7":"0.00","C10":"%","C13":"$","D13":"$"}
 })
 )};
 const _shmodule = function _sheetModule(thisModule){return(
@@ -33917,48 +33976,77 @@ thisModule()
 )};
 const _shmodulev = (G, _) => G.input(_);
 const _shdemodoc = function _demo(md){return(
-md`Every cell below is an ordinary cell of this module. \`taxRate\` is a named definition;
-\`E1 = taxRate\` is a **placement cell** that puts it on the grid at E1 and labels it. Copy B1:B3
-and paste at D1 — the \`A1\`-shaped references shift, \`taxRate\` does not. Delete the \`widget\`
-cell and every one of them keeps computing.`
+md`The sheet below explains itself: every row of prose in it is an ordinary \`md\` cell placed at
+an address, sitting next to the feature it describes.`
+)};
+const _shsum = function _sum(d3){return(
+// a helper is just a cell — there is no formula library to extend
+(...xs) => d3.sum(xs.flat())
 )};
 const _shtax = function _taxRate(){return(
 0.2
 )};
-const _sha1 = function _A1(){return(
+const _shr1 = function _A1(md){return(
+md`### A spreadsheet as a lens over module scope`
+)};
+const _shr2 = function _A2(md){return(
+md`**1. The coordinate is the name.** \`A4\` below is a variable literally named A4. Position is a
+parse of the name, so nothing about the layout is stored anywhere.`
+)};
+const _sha4 = function _A4(){return(
 120
 )};
-const _sha2 = function _A2(){return(
+const _shb4 = function _B4(){return(
 340
 )};
-const _sha3 = function _A3(){return(
+const _shc4 = function _C4(){return(
 95
 )};
-const _shb1 = function _B1(A1,taxRate){return(
-A1 * taxRate
+const _shr5 = function _A5(md){return(
+md`**2. A formula is an ordinary cell body.** \`A7 = sum(A4, B4, C4)\` — the \`=\` is Observable's
+name binding, \`sum\` is a cell of this module, and recalculation is the reactive runtime.`
 )};
-const _shb2 = function _B2(A2,taxRate){return(
-A2 * taxRate
+const _sha7 = function _A7(sum,A4,B4,C4){return(
+sum(A4, B4, C4)
 )};
-const _shb3 = function _B3(A3,taxRate){return(
-A3 * taxRate
+const _shr8 = function _A8(md){return(
+md`**3. A named cell is absolute.** \`taxRate = 0.2\` is a definition; \`C10 = taxRate\` is a
+*placement* — it puts a named cell on the grid and labels it, and never shifts on copy.`
 )};
-const _shc1 = function _C1(A1,B1){return(
-A1 + B1
-)};
-const _shc2 = function _C2(A2,B2){return(
-A2 + B2
-)};
-const _shc3 = function _C3(A3,B3){return(
-A3 + B3
-)};
-const _she1 = function _E1(taxRate){return(
+const _shc10 = function _C10(taxRate){return(
 taxRate
 )};
-const _she3 = function _E3(Inputs){return(
-Inputs.range([0, 500], { value: 120, step: 5, label: "" })
+const _shr11 = function _A11(md){return(
+md`**4. Copy shifts A1-shaped names only.** Copy C13 and paste at D13: the \`A13\` follows, the
+\`$A$13\` and the \`taxRate\` do not. \`$\` pins a component and is legal in a JS identifier, so the
+pinned form is still just a name.`
 )};
-const _she3v = (G, _) => G.input(_);
+const _sha13 = function _A13(){return(
+200
+)};
+const _shb13 = function _B13(){return(
+50
+)};
+const _shc13 = function _C13(A13,taxRate){return(
+A13 * taxRate
+)};
+const _shd13 = function _D13($A$13,taxRate){return(
+$A$13 * taxRate
+)};
+const _shr14 = function _A14(md){return(
+md`**5. A cell can hold anything.** Drag the view — it is a live cell, so A17 follows. Markdown
+is a DOM node, and every builtin is in scope, including \`d3\`.`
+)};
+const _sha16 = function _A16(Inputs){return(
+Inputs.range([0, 500], { value: 200, step: 10, label: "" })
+)};
+const _sha16v = (G, _) => G.input(_);
+const _sha17 = function _A17(d3,A16){return(
+d3.create("svg").attr("width", 240).attr("height", 16)
+  .call((s) => s.append("rect")
+    .attr("width", (A16 / 500) * 240).attr("height", 16).attr("fill", "currentColor"))
+  .node()
+)};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -33972,28 +34060,37 @@ export default function define(runtime, observer) {
   $def("_shparse", "parseAddr", ["colIndex"], _shparse);
   $def("_shfmtaddr", "formatAddr", ["colName"], _shfmtaddr);
   $def("_shshift", "shiftAddr", ["parseAddr", "formatAddr"], _shshift);
+  $def("_shparseref", "parseRef", ["colIndex"], _shparseref);
+  $def("_shfmtref", "formatRef", ["colName"], _shfmtref);
   $def("_shrefs", "cellRefs", ["parser"], _shrefs);
   $def("_shrewrite", "rewriteRefs", ["cellRefs"], _shrewrite);
-  $def("_shtranspose", "transposeCell", ["rewriteRefs", "parseAddr", "shiftAddr"], _shtranspose);
+  $def("_shtranspose", "transposeCell", ["rewriteRefs", "parseRef", "formatRef"], _shtranspose);
   $def("_shfmtval", "formatValue", [], _shfmtval);
   $def("_shcss", "sh_css", [], _shcss);
-  $def("_shsheet", "sheet", ["main", "runtime", "sh_css", "visualizer", "compile", "decompile", "parseAddr", "formatAddr", "formatValue", "transposeCell", "rewriteRefs", "colName", "Inspector", "Inputs", "codemirror", "EditorState", "EditorView", "myDefaultTheme", "observableJS_language", "observableJS_highlightStyle", "literalCompletions"], _shsheet);
+  $def("_shsheet", "sheet", ["main", "runtime", "sh_css", "visualizer", "compile", "decompile", "parseAddr", "parseRef", "formatAddr", "formatValue", "transposeCell", "rewriteRefs", "colName", "Inspector", "Inputs", "codemirror", "EditorState", "EditorView", "myDefaultTheme", "observableJS_language", "observableJS_highlightStyle", "literalCompletions"], _shsheet);
 
   $def("_shdemodoc", null, ["md"], _shdemodoc);
   $def("_shwidget", "widget", ["sheet", "runtime", "invalidation", "sheetModule"], _shwidget);
+  $def("_shsum", "sum", ["d3"], _shsum);
   $def("_shtax", "taxRate", [], _shtax);
-  $def("_sha1", "A1", [], _sha1);
-  $def("_sha2", "A2", [], _sha2);
-  $def("_sha3", "A3", [], _sha3);
-  $def("_shb1", "B1", ["A1", "taxRate"], _shb1);
-  $def("_shb2", "B2", ["A2", "taxRate"], _shb2);
-  $def("_shb3", "B3", ["A3", "taxRate"], _shb3);
-  $def("_shc1", "C1", ["A1", "B1"], _shc1);
-  $def("_shc2", "C2", ["A2", "B2"], _shc2);
-  $def("_shc3", "C3", ["A3", "B3"], _shc3);
-  $def("_she1", "E1", ["taxRate"], _she1);
-  $def("_she3", "viewof E3", ["Inputs"], _she3);
-  $def("_she3v", "E3", ["Generators", "viewof E3"], _she3v);
+  $def("_shr1", "A1", ["md"], _shr1);
+  $def("_shr2", "A2", ["md"], _shr2);
+  $def("_sha4", "A4", [], _sha4);
+  $def("_shb4", "B4", [], _shb4);
+  $def("_shc4", "C4", [], _shc4);
+  $def("_shr5", "A5", ["md"], _shr5);
+  $def("_sha7", "A7", ["sum", "A4", "B4", "C4"], _sha7);
+  $def("_shr8", "A8", ["md"], _shr8);
+  $def("_shc10", "C10", ["taxRate"], _shc10);
+  $def("_shr11", "A11", ["md"], _shr11);
+  $def("_sha13", "A13", [], _sha13);
+  $def("_shb13", "B13", [], _shb13);
+  $def("_shc13", "C13", ["A13", "taxRate"], _shc13);
+  $def("_shd13", "D13", ["$A$13", "taxRate"], _shd13);
+  $def("_shr14", "A14", ["md"], _shr14);
+  $def("_sha16", "viewof A16", ["Inputs"], _sha16);
+  $def("_sha16v", "A16", ["Generators", "viewof A16"], _sha16v);
+  $def("_sha17", "A17", ["d3", "A16"], _sha17);
   $def("_shmodule", "viewof sheetModule", ["thisModule"], _shmodule);
   $def("_shmodulev", "sheetModule", ["Generators", "viewof sheetModule"], _shmodulev);
 
