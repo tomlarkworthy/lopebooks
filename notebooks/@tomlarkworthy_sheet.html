@@ -33249,17 +33249,27 @@ const _shcss = function _sh_css(){return(
   font: 12px var(--sans-serif, system-ui);
 }
 .sh-bar {
-  display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 6px;
+  display: flex; align-items: stretch; gap: 6px; height: 26px; padding: 0 6px;
   border-bottom: 1px solid var(--theme-foreground-faintest, #ddd);
   background: var(--theme-background-alt, #fafafa);
 }
-.sh-bar .sh-addr { font: 11px var(--code, monospace); min-width: 52px; opacity: 0.7; }
-.sh-bar input {
-  flex: 1 1 auto; font: 12px var(--code, monospace); border: none; outline: none;
-  background: transparent; color: var(--theme-foreground, #111);
+.sh-bar .sh-addr {
+  font: 11px var(--code, monospace); min-width: 52px; opacity: 0.7;
+  display: flex; align-items: center;
 }
-.sh-bar select { font: 11px var(--sans-serif, system-ui); }
-.sh-scroll { position: absolute; inset: 24px 0 0 0; overflow: auto; }
+.sh-bar .sh-eq { display: flex; align-items: center; opacity: 0.5; font: 12px var(--code, monospace); }
+/* the formula bar is ONE editor-5 CodeMirror for the whole sheet, retargeted on
+   selection -- not cellEditor, which clones a hotbar shell per instance */
+.sh-formula { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+.sh-formula .cm-editor { height: 26px; background: transparent; }
+.sh-formula .cm-editor.cm-focused { outline: none; }
+.sh-formula .cm-scroller { overflow-x: auto; font: 12px var(--code, monospace); }
+.sh-formula .cm-content { padding: 4px 0; }
+.sh-formula .cm-gutters { display: none; }
+.sh-fmt { display: flex; align-items: center; }
+.sh-fmt form { margin: 0; display: flex; align-items: center; width: auto; }
+.sh-fmt select { font: 11px var(--sans-serif, system-ui); width: 90px; max-width: 90px; }
+.sh-scroll { position: absolute; inset: 26px 0 0 0; overflow: auto; }
 .sh-canvas { position: relative; }
 /* the grid is PAINTED, not built — no DOM for empty positions */
 .sh-grid { position: absolute; inset: 0; }
@@ -33289,8 +33299,16 @@ const _shcss = function _sh_css(){return(
    (lopepage-2: "#lopepage-2 .lope-viz .observablehq {position: relative}") which
    outrank any class selector. Relative positioning stacks the cells in flow order
    and the top offset then applies on top of that: measured 43px pitch, not 22. */
+/* Overflow is a GENERAL rule, not a format: content spills into neighbouring
+   cells while they are empty and clips at the first occupied one (Excel's rule,
+   generalised from text to DOM nodes). width/height are max-content clamped by
+   max-width/max-height, so CSS does it with no measurement pass and nothing is
+   stored -- the footprint is a function of the content and of which neighbours
+   are empty. A per-cell stored span would be grid-container's layout: literal
+   coming back in. */
 .sh-viz > .observablehq {
   position: absolute !important; margin: 0 !important; box-sizing: border-box; overflow: hidden;
+  width: max-content; height: max-content;
   display: flex; align-items: center; padding: 0 4px;
   pointer-events: auto; background: var(--theme-background, #fff);
 }
@@ -33316,9 +33334,11 @@ const _shcss = function _sh_css(){return(
   outline: none; display: none;
 }`
 )};
-const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseAddr,formatAddr,formatValue,transposeCell,colName,Inspector)
+const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseAddr,formatAddr,formatValue,transposeCell,colName,Inspector,Inputs,codemirror,EditorState,EditorView,myDefaultTheme,observableJS_language,observableJS_highlightStyle,literalCompletions)
 {
-  const CW = 88, RH = 22, HW = 44, HH = 18;
+  // notebook-kit spells these `viewof$x`; the legacy spelling is canonical in source
+  const canonName = (n) => (typeof n === "string" ? n.replace(/^(viewof|mutable)\$/, "$1 ") : n);
+  const CW = 88, RH = 22, HW = 44, HH = 18, BAR = 26;
   const styleId = "sh-style";
   if (!document.getElementById(styleId)) {
     const st = document.createElement("style");
@@ -33338,17 +33358,24 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
     bar.className = "sh-bar";
     const addrLabel = document.createElement("span");
     addrLabel.className = "sh-addr";
-    const formula = document.createElement("input");
-    formula.placeholder = "=";
-    const fmtSel = document.createElement("select");
-    for (const [v, l] of [["", "plain"], ["0.00", "0.00"], ["0.000", "0.000"], ["$", "$"], ["%", "%"]]) {
-      const o = document.createElement("option");
-      o.value = v; o.textContent = l;
-      fmtSel.appendChild(o);
-    }
+    const eq = document.createElement("span");
+    eq.className = "sh-eq";
+    eq.textContent = "=";
+    const formulaHost = document.createElement("div");
+    formulaHost.className = "sh-formula";
+    const FORMATS = ["", "0.00", "0.000", "$", "%"];
+    const fmtSel = Inputs.select(FORMATS, {
+      value: "",
+      format: (f) => f || "plain",
+      width: 90
+    });
+    const fmtWrap = document.createElement("div");
+    fmtWrap.className = "sh-fmt";
+    fmtWrap.appendChild(fmtSel);
     bar.appendChild(addrLabel);
-    bar.appendChild(formula);
-    bar.appendChild(fmtSel);
+    bar.appendChild(eq);
+    bar.appendChild(formulaHost);
+    bar.appendChild(fmtWrap);
 
     const scroll = document.createElement("div");
     scroll.className = "sh-scroll";
@@ -33402,7 +33429,9 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
     };
     let extent = { cols: minCols, rows: minRows };
     const measureExtent = () => {
-      let c = minCols, r = minRows;
+      // at least fill the viewport, so the grid reads as a sheet rather than a table
+      let c = Math.max(minCols, Math.ceil((scroll.clientWidth - HW) / CW));
+      let r = Math.max(minRows, Math.ceil((scroll.clientHeight - HH) / RH));
       for (const addr of scopeAddrs().keys()) {
         const a = parseAddr(addr);
         if (!a) continue;
@@ -33451,9 +33480,9 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
         d.textContent = String(r + 1);
         rowhead.appendChild(d);
       }
-      colhead.style.top = "24px";
+      colhead.style.top = BAR + "px";
       colhead.style.left = "0px";
-      rowhead.style.top = 24 + HH + "px";
+      rowhead.style.top = BAR + HH + "px";
       rowhead.style.left = "0px";
       rowhead.style.height = scroll.clientHeight - HH + "px";
     };
@@ -33463,8 +33492,8 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
     let anchor = null; // range anchor for shift-select
     const placeOverlay = () => {
       const sl = scroll.scrollLeft, st = scroll.scrollTop;
-      selBox.style.left = 24 * 0 + xOf(sel.col) - sl + "px";
-      selBox.style.top = 24 + yOf(sel.row) - st + "px";
+      selBox.style.left = xOf(sel.col) - sl + "px";
+      selBox.style.top = BAR + yOf(sel.row) - st + "px";
       selBox.style.width = CW + "px";
       selBox.style.height = RH + "px";
       const r = selRange();
@@ -33497,10 +33526,42 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
       const i = src.indexOf("=");
       return i < 0 ? src : src.slice(i + 1).trim();
     };
+    // --- the formula bar: ONE editor-5 CodeMirror for the whole sheet, retargeted
+    // on selection. Not cellEditor(variable) -- that clones a hotbar shell per
+    // instance through the sandbox, which is a per-cell component, not a bar.
+    // Completions are the sheet's own domain (addresses and named cells), which is
+    // what a formula bar wants, plus editor-5's exported literalCompletions.
+    const sheetCompletions = (ctx) => {
+      const word = ctx.matchBefore(/[A-Za-z_$][A-Za-z0-9_$]*/);
+      if (!word || (word.from === word.to && !ctx.explicit)) return null;
+      const options = [];
+      for (const [name] of module._scope) {
+        if (typeof name !== "string" || name.startsWith("@") || name.startsWith("module ")) continue;
+        const plain = canonName(name).replace(/^viewof /, "");
+        const a = parseAddr(plain);
+        options.push({
+          label: plain,
+          type: a ? "variable" : "constant",
+          detail: a ? "cell" : "named"
+        });
+      }
+      return { from: word.from, options };
+    };
+    let formulaView = null;
+    const barText = () => (formulaView ? formulaView.state.doc.toString() : "");
+    const setBarText = (text) => {
+      if (!formulaView) return;
+      formulaView.dispatch({
+        changes: { from: 0, to: formulaView.state.doc.length, insert: text }
+      });
+    };
+    const barFocused = () => !!formulaView?.hasFocus;
     const syncBar = () => {
       const addr = formatAddr(sel.col, sel.row);
       addrLabel.textContent = addr;
-      formula.value = bodyOf(sourceOf(addr));
+      // never clobber a caret mid-edit: a scope change elsewhere must not rewrite
+      // the buffer the user is typing into
+      if (!barFocused()) setBarText(bodyOf(sourceOf(addr)));
       fmtSel.value = formatState[addr] || "";
     };
 
@@ -33526,7 +33587,7 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
     const openEditor = (seedText) => {
       const sl = scroll.scrollLeft, st = scroll.scrollTop;
       editor.style.left = xOf(sel.col) - sl + "px";
-      editor.style.top = 24 + yOf(sel.row) - st + "px";
+      editor.style.top = BAR + yOf(sel.row) - st + "px";
       editor.style.width = CW + "px";
       editor.style.height = RH + "px";
       editor.style.display = "block";
@@ -33547,7 +33608,7 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
     // --- clipboard: values as TSV for the outside world, sources for us
     const MIME = "application/vnd.lopecode.sheet+json";
     const onCopy = (e) => {
-      if (editing) return;
+      if (editing || bar.contains(e.target)) return; // a copy in the bar is a text copy
       const r = selRange();
       const rows = [], cells = [];
       for (let row = r.r0; row <= r.r1; row++) {
@@ -33566,7 +33627,7 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
       e.preventDefault();
     };
     const onPaste = async (e) => {
-      if (editing) return;
+      if (editing || bar.contains(e.target)) return;
       const rich = e.clipboardData.getData(MIME);
       e.preventDefault();
       if (rich) {
@@ -33604,6 +33665,9 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
       syncBar();
     };
     frame.addEventListener("keydown", (e) => {
+      // the formula bar owns its own keys; without this, a keystroke in the bar
+      // bubbles here, gets preventDefault()ed and opens the in-cell editor instead
+      if (bar.contains(e.target)) return;
       if (editing) {
         if (e.key === "Enter") { closeEditor(true); move(0, 1, false); e.preventDefault(); }
         else if (e.key === "Escape") { closeEditor(false); e.preventDefault(); }
@@ -33629,10 +33693,36 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
     });
     frame.addEventListener("copy", onCopy);
     frame.addEventListener("paste", onPaste);
-    formula.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { commit(formatAddr(sel.col, sel.row), formula.value); frame.focus(); }
+    formulaView = new EditorView({
+      parent: formulaHost,
+      state: EditorState.create({
+        doc: "",
+        extensions: [
+          // this keymap outranks completionKeymap, so each binding must hand back
+          // to the completion when one is open
+          codemirror.keymap.of([
+            { key: "Enter", run: (v) => codemirror.acceptCompletion(v) || (commitBar(), true) },
+            { key: "Tab", run: (v) => codemirror.acceptCompletion(v) || (commitBar(1, 0), true) },
+            { key: "Escape", run: (v) => codemirror.closeCompletion(v) || (syncBarForce(), frame.focus(), true) }
+          ]),
+          observableJS_language,
+          codemirror.syntaxHighlighting(observableJS_highlightStyle),
+          codemirror.autocompletion({
+            override: [sheetCompletions, literalCompletions]
+          }),
+          EditorView.lineWrapping,
+          myDefaultTheme
+        ]
+      })
     });
-    fmtSel.addEventListener("change", () => {
+    const syncBarForce = () => setBarText(bodyOf(sourceOf(formatAddr(sel.col, sel.row))));
+    const commitBar = (dc = 0, dr = 1) => {
+      const addr = formatAddr(sel.col, sel.row);
+      commit(addr, barText());
+      frame.focus();
+      move(dc, dr, false);
+    };
+    fmtSel.addEventListener("input", () => {
       const addr = formatAddr(sel.col, sel.row);
       if (fmtSel.value) formatState[addr] = fmtSel.value;
       else delete formatState[addr];
@@ -33706,16 +33796,33 @@ const _shsheet = function _sheet(main,sh_css,visualizer,compile,decompile,parseA
         }
       };
     };
+    const SPILL_MAX = 16; // a runaway value must not paint over the whole sheet
+    // How many cells of clear space to the right / below, i.e. how far content may
+    // spill before it hits an occupied cell. O(1) lookups because scope is sparse.
+    const freeSpan = (occupied, col, row, dc, dr) => {
+      let n = 1;
+      while (n < SPILL_MAX && !occupied.has(formatAddr(col + dc * n, row + dr * n))) n++;
+      return n;
+    };
     const reflow = () => {
       if (!root) return;
+      const occupied = new Set(scopeAddrs().keys());
       for (const node of root.children) {
         const a = parseAddr(node.getAttribute("cell"));
         if (!a) { node.style.display = "none"; continue; }
         node.style.display = "";
         node.style.left = xOf(a.col) + "px";
         node.style.top = yOf(a.row) + "px";
-        node.style.width = CW - 1 + "px";
-        node.style.height = RH - 1 + "px";
+        node.style.minWidth = CW - 1 + "px";
+        node.style.minHeight = RH - 1 + "px";
+        node.style.maxWidth = CW * freeSpan(occupied, a.col, a.row, 1, 0) - 1 + "px";
+        // only an element value asks for height; text always fits its row
+        const wantsHeight = !!node.variable?._value?.nodeType;
+        node.style.maxHeight = wantsHeight
+          ? RH * freeSpan(occupied, a.col, a.row, 0, 1) - 1 + "px"
+          : RH - 1 + "px";
+        // a spilling cell must paint over its empty neighbours, not under them
+        node.style.zIndex = wantsHeight ? "2" : "1";
       }
     };
     const viz = visualizer(rt, {
@@ -33857,7 +33964,7 @@ export default function define(runtime, observer) {
   $def("_shtranspose", "transposeCell", ["rewriteRefs", "parseAddr", "shiftAddr"], _shtranspose);
   $def("_shfmtval", "formatValue", [], _shfmtval);
   $def("_shcss", "sh_css", [], _shcss);
-  $def("_shsheet", "sheet", ["main", "sh_css", "visualizer", "compile", "decompile", "parseAddr", "formatAddr", "formatValue", "transposeCell", "colName", "Inspector"], _shsheet);
+  $def("_shsheet", "sheet", ["main", "sh_css", "visualizer", "compile", "decompile", "parseAddr", "formatAddr", "formatValue", "transposeCell", "colName", "Inspector", "Inputs", "codemirror", "EditorState", "EditorView", "myDefaultTheme", "observableJS_language", "observableJS_highlightStyle", "literalCompletions"], _shsheet);
 
   $def("_shdemodoc", null, ["md"], _shdemodoc);
   $def("_shwidget", "widget", ["sheet", "runtime", "invalidation", "sheetModule"], _shwidget);
@@ -33877,6 +33984,8 @@ export default function define(runtime, observer) {
   $def("_shmodule", "viewof sheetModule", ["thisModule"], _shmodule);
   $def("_shmodulev", "sheetModule", ["Generators", "viewof sheetModule"], _shmodulev);
 
+  main.define("module @tomlarkworthy/codemirror-6-v2", async () => runtime.module((await import("/@tomlarkworthy/codemirror-6-v2.js?v=4")).default));
+  main.define("module @tomlarkworthy/editor-5", async () => runtime.module((await import("/@tomlarkworthy/editor-5.js?v=4")).default));
   main.define("module @tomlarkworthy/visualizer", async () => runtime.module((await import("/@tomlarkworthy/visualizer.js?v=4")).default));
   main.define("module @tomlarkworthy/inspector", async () => runtime.module((await import("/@tomlarkworthy/inspector.js?v=4")).default));
   main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
@@ -33889,6 +33998,13 @@ export default function define(runtime, observer) {
   main.define("compile", ["module @tomlarkworthy/observablejs-toolchain", "@variable"], (_, v) => v.import("compile", _));
   main.define("decompile", ["module @tomlarkworthy/observablejs-toolchain", "@variable"], (_, v) => v.import("decompile", _));
   main.define("parser", ["module @tomlarkworthy/observablejs-toolchain", "@variable"], (_, v) => v.import("parser", _));
+  main.define("codemirror", ["module @tomlarkworthy/codemirror-6-v2", "@variable"], (_, v) => v.import("codemirror", _));
+  main.define("EditorState", ["module @tomlarkworthy/codemirror-6-v2", "@variable"], (_, v) => v.import("EditorState", _));
+  main.define("EditorView", ["module @tomlarkworthy/codemirror-6-v2", "@variable"], (_, v) => v.import("EditorView", _));
+  main.define("myDefaultTheme", ["module @tomlarkworthy/codemirror-6-v2", "@variable"], (_, v) => v.import("myDefaultTheme", _));
+  main.define("observableJS_language", ["module @tomlarkworthy/editor-5", "@variable"], (_, v) => v.import("observableJS_language", _));
+  main.define("observableJS_highlightStyle", ["module @tomlarkworthy/editor-5", "@variable"], (_, v) => v.import("observableJS_highlightStyle", _));
+  main.define("literalCompletions", ["module @tomlarkworthy/editor-5", "@variable"], (_, v) => v.import("literalCompletions", _));
   return main;
 }</script>
 
