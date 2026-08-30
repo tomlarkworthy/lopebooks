@@ -33136,8 +33136,9 @@ import {sheet} from '@tomlarkworthy/sheet'
 widget = sheet(runtime, {
   invalidation,     // required for teardown
   module,           // REQUIRED — the module whose scope the sheet projects
-  format: {},       // { B3: "0.00" } — the ONLY state the sheet owns
-  persist: true     // rewrite own source when format changes
+  format: {},       // { B3: "0.00" } — presentation state, owned by this cell
+  size: {},         // { cols: { B: 140 }, rows: { "3": 40 } } — explicit sizes; unnamed = auto
+  persist: true     // rewrite own source when format or size changes
 })
 ~~~
 
@@ -33162,6 +33163,15 @@ relative and shifts on copy; \`= taxRate * 12\` is absolute and never shifts. Pl
 **Pinning a coordinate.** \`$\` is legal in a JS identifier, so \`$A$1\`, \`$A1\` and \`A$1\` are
 names too. The sheet defines each one it sees as an alias to the plain address, and paste leaves
 a pinned component alone — Excel's semantics, still with nothing stored outside the names.
+
+**Ranges.** \`A4:C4\` is not JavaScript, so the bar expands it before parsing into
+\`[A4, B4, C4]\` — an array of ordinary references, every one a real dependency — and reads a
+full-rectangle array literal back as a range for display. \`d3.sum(A4:C4)\` is stored as
+\`d3.sum([A4, B4, C4])\`. Written without spaces round the colon; \`x ? a1 : b2\` stays a ternary.
+
+**Text.** A bare name that resolves to nothing (\`Total\`), or words that do not parse
+(\`Total revenue\`), is stored as a string literal; the bar shows the quotes. A broken formula
+stays broken.
 
 **Sparse.** Only defined cells are variables and only defined cells have DOM. An empty sheet is
 zero of both; the grid is painted, not built.`
@@ -33262,6 +33272,100 @@ const _shfmtval = function _formatValue(){return(
   return String(value);
 }
 )};
+const _shexpand = function _expandRanges(parseRef,formatRef){return(
+// `A4:C4` is not JavaScript. It is expanded BEFORE parsing into `[A4, B4, C4]` (row-major,
+// flat), so the runtime sees an array of ordinary references and every dependency is real.
+// A scan, not a parse: it only has to know where strings and comments are. Written without
+// spaces round the colon -- `x ? a1 : b2` is a ternary and stays one. Pins come from the
+// first endpoint. A range inside an object literal is not supported.
+(src, { max = 4096 } = {}) => {
+  const isId = (ch) => ch != null && /[A-Za-z0-9_$]/.test(ch);
+  const n = src.length;
+  let out = "", i = 0;
+  while (i < n) {
+    const ch = src[i];
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      while (j < n && src[j] !== ch) { if (src[j] === "\\") j++; j++; }
+      out += src.slice(i, j + 1); i = j + 1; continue;
+    }
+    if (ch === "`") {
+      let j = i + 1, d = 0;
+      while (j < n) {
+        if (src[j] === "\\") { j += 2; continue; }
+        if (src[j] === "$" && src[j + 1] === "{") { d++; j += 2; continue; }
+        if (src[j] === "}" && d) { d--; j++; continue; }
+        if (src[j] === "`" && !d) break;
+        j++;
+      }
+      out += src.slice(i, j + 1); i = j + 1; continue;
+    }
+    if (ch === "/" && src[i + 1] === "/") {
+      let j = src.indexOf("\n", i); if (j < 0) j = n;
+      out += src.slice(i, j); i = j; continue;
+    }
+    if (ch === "/" && src[i + 1] === "*") {
+      let j = src.indexOf("*/", i + 2); j = j < 0 ? n : j + 2;
+      out += src.slice(i, j); i = j; continue;
+    }
+    if (/[A-Za-z_$]/.test(ch) && !(i > 0 && (isId(src[i - 1]) || src[i - 1] === "."))) {
+      let j = i; while (j < n && isId(src[j])) j++;
+      const a = src.slice(i, j);
+      if (src[j] === ":") {
+        let l = j + 1; while (l < n && isId(src[l])) l++;
+        const b = src.slice(j + 1, l);
+        const ra = parseRef(a.toUpperCase()), rb = parseRef(b.toUpperCase());
+        if (ra && rb) {
+          const c0 = Math.min(ra.col, rb.col), c1 = Math.max(ra.col, rb.col);
+          const r0 = Math.min(ra.row, rb.row), r1 = Math.max(ra.row, rb.row);
+          const count = (c1 - c0 + 1) * (r1 - r0 + 1);
+          if (count > max) throw new Error(`range ${a}:${b} has ${count} cells; limit ${max}`);
+          const cells = [];
+          for (let r = r0; r <= r1; r++)
+            for (let c = c0; c <= c1; c++) cells.push(formatRef(c, r, ra.colAbs, ra.rowAbs));
+          out += "[" + cells.join(", ") + "]"; i = l; continue;
+        }
+      }
+      out += a; i = j; continue;
+    }
+    out += ch; i++;
+  }
+  return out;
+}
+)};
+const _shcollapse = function _collapseRanges(parser,parseRef,formatRef){return(
+// The inverse, for DISPLAY only: an array literal that is a full rectangle of references in
+// row-major order with uniform pins reads back as `A4:C4`. Nothing is stored in this form.
+(src) => {
+  const cell = parser.parseCell(src, { ranges: true });
+  const edits = [];
+  const visit = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) { node.forEach(visit); return; }
+    if (node.type === "ArrayExpression" && node.elements.length >= 2) {
+      const refs = node.elements.map((e) => (e?.type === "Identifier" ? parseRef(e.name) : null));
+      if (refs.every(Boolean)) {
+        const cols = refs.map((r) => r.col), rows = refs.map((r) => r.row);
+        const c0 = Math.min(...cols), c1 = Math.max(...cols), r0 = Math.min(...rows), r1 = Math.max(...rows);
+        const w = c1 - c0 + 1, h = r1 - r0 + 1;
+        const { colAbs, rowAbs } = refs[0];
+        const ok = refs.length === w * h && refs.every((r, i) =>
+          r.col === c0 + (i % w) && r.row === r0 + Math.floor(i / w) && r.colAbs === colAbs && r.rowAbs === rowAbs);
+        if (ok) {
+          edits.push({ start: node.start, end: node.end,
+            text: formatRef(c0, r0, colAbs, rowAbs) + ":" + formatRef(c1, r1, colAbs, rowAbs) });
+          return;
+        }
+      }
+    }
+    for (const k in node) if (k !== "type" && k !== "start" && k !== "end") visit(node[k]);
+  };
+  visit(cell.body);
+  let out = src;
+  for (const e of edits.sort((a, b) => b.start - a.start)) out = out.slice(0, e.start) + e.text + out.slice(e.end);
+  return out;
+}
+)};
 const _shcss = function _sh_css(){return(
 `.sh-frame {
   position: relative; box-sizing: border-box; width: 100%; height: 420px;
@@ -33293,13 +33397,18 @@ const _shcss = function _sh_css(){return(
 .sh-fmt select { font: 11px var(--sans-serif, system-ui); width: 90px; max-width: 90px; }
 .sh-scroll { position: absolute; inset: 26px 0 0 0; overflow: auto; }
 .sh-canvas { position: relative; }
-/* the grid is PAINTED, not built — no DOM for empty positions */
-.sh-grid { position: absolute; inset: 0; }
+/* the grid is PAINTED, not built: one viewport-sized canvas that sticks to the scrollport
+   and is redrawn on scroll, so a tall sheet costs no more than a short one */
+.sh-grid {
+  position: sticky; top: 0; left: 0; display: block; z-index: 0; pointer-events: none;
+  color: var(--theme-foreground-faintest, #e8e8e8);
+}
 .sh-colhead, .sh-rowhead {
   position: absolute; z-index: 3; box-sizing: border-box;
   background: var(--theme-background-alt, #f4f4f4);
   color: var(--theme-foreground-muted, #666);
   font: 10px var(--sans-serif, system-ui);
+  user-select: none; -webkit-user-select: none;
 }
 .sh-colhead { top: 0; left: 0; height: 18px; }
 .sh-rowhead { top: 0; left: 0; width: 44px; }
@@ -33316,6 +33425,9 @@ const _shcss = function _sh_css(){return(
   border-bottom: 1px solid var(--theme-foreground-faintest, #ddd);
 }
 .sh-h.sh-h-sel { background: var(--theme-foreground-faintest, #ddd); color: var(--theme-foreground, #111); }
+.sh-rs { position: absolute; z-index: 1; }
+.sh-rs-col { top: 0; right: 0; width: 5px; height: 100%; cursor: col-resize; }
+.sh-rs-row { left: 0; bottom: 0; height: 5px; width: 100%; cursor: row-resize; }
 .sh-viz { position: absolute; inset: 0; pointer-events: none; }
 /* !important: hosting frames style .observablehq descendants with ID selectors
    (lopepage-2: "#lopepage-2 .lope-viz .observablehq {position: relative}") which
@@ -33334,6 +33446,9 @@ const _shcss = function _sh_css(){return(
   display: flex; align-items: center; padding: 0 4px;
   pointer-events: auto; background: var(--theme-background, #fff);
 }
+/* a text value never wraps: it is one line that either fits, spills, or clips -- and
+   nowrap is what makes scrollWidth its natural width for column auto-fit */
+.sh-viz > .observablehq.sh-text { white-space: nowrap; }
 .sh-viz > .observablehq.sh-num { justify-content: flex-end; font: 12px var(--code, monospace); }
 .sh-viz > .observablehq.sh-err { color: #d73a49; font: 11px var(--code, monospace); }
 .sh-viz > .observablehq.sh-running { opacity: 0.45; }
@@ -33349,6 +33464,12 @@ const _shcss = function _sh_css(){return(
   border: 2px solid var(--theme-blue, #3b7dd8);
 }
 .sh-range { position: absolute; z-index: 1; pointer-events: none; background: rgba(59,125,216,0.10); }
+.sh-ghost { position: absolute; z-index: 5; pointer-events: none; display: none; box-sizing: border-box; border: 1px dashed var(--theme-blue, #3b7dd8); }
+.sh-fill {
+  position: absolute; z-index: 7; box-sizing: border-box; width: 7px; height: 7px;
+  background: var(--theme-blue, #3b7dd8); border: 1px solid var(--theme-background, #fff);
+  cursor: crosshair;
+}
 .sh-input {
   position: absolute; z-index: 6; box-sizing: border-box; padding: 0 3px;
   font: 12px var(--code, monospace); border: 2px solid var(--theme-blue, #3b7dd8);
@@ -33356,11 +33477,17 @@ const _shcss = function _sh_css(){return(
   outline: none; display: none;
 }`
 )};
-const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompile,parseAddr,parseRef,formatAddr,formatValue,transposeCell,rewriteRefs,colName,Inspector,Inputs,codemirror,EditorState,EditorView,myDefaultTheme,observableJS_language,observableJS_highlightStyle,literalCompletions)
+const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompile,parser,parseAddr,parseRef,formatAddr,formatRef,formatValue,transposeCell,rewriteRefs,expandRanges,collapseRanges,colName,Inspector,Inputs,codemirror,EditorState,EditorView,myDefaultTheme,observableJS_language,observableJS_highlightStyle,literalCompletions)
 {
   // notebook-kit spells these `viewof$x`; the legacy spelling is canonical in source
   const canonName = (n) => (typeof n === "string" ? n.replace(/^(viewof|mutable)\$/, "$1 ") : n);
   const CW = 88, RH = 22, HW = 44, HH = 18, BAR = 26;
+  const AUTO_CAP = 260;   // an auto-fit column stops widening here; past it, content spills
+  const SPILL_MAX = 16;   // a runaway value must not paint over the whole sheet
+  const UNDO_MAX = 200;
+  // undo history lives per MODULE, not per instance: saving a format or size rewrites the sheet
+  // cell, which rebuilds the sheet, and a column resize must not erase what came before it
+  const histories = new WeakMap();
   const styleId = "sh-style";
   if (!document.getElementById(styleId)) {
     const st = document.createElement("style");
@@ -33368,11 +33495,13 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     st.textContent = sh_css;
     document.head.appendChild(st);
   }
-  return (rt, { invalidation, module, format = {}, persist = true, minCols = 8, minRows = 18 } = {}) => {
+  return (rt, { invalidation, module, format = {}, size = {}, persist = true, minCols = 8, minRows = 18 } = {}) => {
     // no default: a lens has to be told what it is a lens over, and `main` is the wrong guess
     // in every notebook that boots more than one module
     if (!module) throw new Error("sheet(): `module` is required — pass the module whose scope the sheet projects");
     const formatState = { ...format };
+    // explicit sizes only; a column with no entry is `auto`
+    const sizeState = { cols: { ...(size.cols || {}) }, rows: { ...(size.rows || {}) } };
 
     const frame = document.createElement("div");
     frame.className = "sh-frame";
@@ -33406,10 +33535,12 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     scroll.className = "sh-scroll";
     const canvas = document.createElement("div");
     canvas.className = "sh-canvas";
-    const grid = document.createElement("div");
+    const grid = document.createElement("canvas");
     grid.className = "sh-grid";
     const rangeBox = document.createElement("div");
     rangeBox.className = "sh-range";
+    const ghost = document.createElement("div");
+    ghost.className = "sh-ghost";
     const colhead = document.createElement("div");
     colhead.className = "sh-colhead";
     const rowhead = document.createElement("div");
@@ -33418,11 +33549,15 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     corner.className = "sh-corner";
     const selBox = document.createElement("div");
     selBox.className = "sh-sel";
+    const fill = document.createElement("div");
+    fill.className = "sh-fill";
+    fill.title = "drag to fill";
     const editor = document.createElement("input");
     editor.className = "sh-input";
 
     canvas.appendChild(grid);
     canvas.appendChild(rangeBox);
+    canvas.appendChild(ghost);
     scroll.appendChild(canvas);
     frame.appendChild(bar);
     frame.appendChild(scroll);
@@ -33430,10 +33565,8 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     frame.appendChild(rowhead);
     frame.appendChild(corner);
     frame.appendChild(selBox);
+    frame.appendChild(fill);
     frame.appendChild(editor);
-
-    const xOf = (col) => HW + col * CW;
-    const yOf = (row) => HH + row * RH;
 
     // --- scope: the sheet's whole model is "which names parse as addresses"
     const scopeAddrs = () => {
@@ -33452,6 +33585,11 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       }
       return null;
     };
+    // every DEFINED variable an address owns: a `viewof` cell is two
+    const variablesAt = (addr) =>
+      ["viewof " + addr, "viewof$" + addr, addr, "mutable " + addr, "initial " + addr]
+        .map((n) => module._scope.get(n))
+        .filter((v) => v && v._type === 1);
     let extent = { cols: minCols, rows: minRows };
     const measureExtent = () => {
       // at least fill the viewport, so the grid reads as a sheet rather than a table
@@ -33466,68 +33604,112 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       extent = { cols: c, rows: r };
     };
 
+    // --- axes. A column is `auto` unless size.cols names it. Auto is the widest TEXT value in
+    // the column, capped: a DOM value does not widen its column, it spills (the overflow rule).
+    // Rows are fixed unless named. Sizes are presentation, so the sheet cell owns them, like format.
+    let autoW = new Map();
+    let colX = [HW], rowY = [HH]; // prefix sums, covering extent + spill
+    const widthOf = (c) => sizeState.cols[colName(c)] ?? Math.max(CW, Math.min(AUTO_CAP, autoW.get(c) ?? 0));
+    const heightOf = (r) => sizeState.rows[r + 1] ?? RH;
+    const layoutAxes = () => {
+      colX = [HW]; rowY = [HH];
+      for (let c = 0; c < extent.cols + SPILL_MAX; c++) colX.push(colX[c] + widthOf(c));
+      for (let r = 0; r < extent.rows + SPILL_MAX; r++) rowY.push(rowY[r] + heightOf(r));
+    };
+    const xOf = (c) => (c < colX.length ? colX[c] : colX[colX.length - 1] + (c - colX.length + 1) * CW);
+    const yOf = (r) => (r < rowY.length ? rowY[r] : rowY[rowY.length - 1] + (r - rowY.length + 1) * RH);
+    const colAt = (x) => { let c = 0; while (xOf(c + 1) <= x) c++; return c; };
+    const rowAt = (y) => { let r = 0; while (yOf(r + 1) <= y) r++; return r; };
+    let root = null;
+    const autoFit = () => {
+      autoW = new Map();
+      if (!root) return;
+      for (const node of root.children) {
+        const a = parseAddr(node.getAttribute("cell"));
+        if (!a || node.variable?._value?.nodeType) continue;
+        // the inner span, not the node: the node is min-width wide already and would feed
+        // its own width back as content, growing 2px per layout
+        const w = (node.lastElementChild?.scrollWidth ?? 0) + 10;
+        if (w > (autoW.get(a.col) ?? 0)) autoW.set(a.col, w);
+      }
+    };
+    const setSize = (axis, index, px) => {
+      const table = axis === "col" ? sizeState.cols : sizeState.rows;
+      const key = axis === "col" ? colName(index) : String(index + 1);
+      if (px == null) delete table[key]; else table[key] = px;
+    };
+
     // --- painted grid + headers. No DOM per empty position.
     const paint = () => {
       const w = xOf(extent.cols), h = yOf(extent.rows);
       canvas.style.width = w + "px";
       canvas.style.height = h + "px";
-      grid.style.backgroundImage =
-        "linear-gradient(to right, var(--theme-foreground-faintest, #e8e8e8) 1px, transparent 1px)," +
-        "linear-gradient(to bottom, var(--theme-foreground-faintest, #e8e8e8) 1px, transparent 1px)";
-      grid.style.backgroundSize = CW + "px " + RH + "px";
-      grid.style.backgroundPosition = HW + "px " + HH + "px";
-      colhead.style.width = scroll.clientWidth + "px";
-      rowhead.style.height = scroll.clientHeight + "px";
+      const sl = scroll.scrollLeft, st = scroll.scrollTop;
+      const vw = scroll.clientWidth, vh = scroll.clientHeight;
+      const dpr = window.devicePixelRatio || 1;
+      grid.style.width = vw + "px";
+      grid.style.height = vh + "px";
+      if (grid.width !== Math.ceil(vw * dpr)) grid.width = Math.ceil(vw * dpr);
+      if (grid.height !== Math.ceil(vh * dpr)) grid.height = Math.ceil(vh * dpr);
+      const ctx = grid.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, vw, vh);
+      ctx.strokeStyle = window.getComputedStyle(grid).color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let c = colAt(Math.max(HW, sl)); c <= extent.cols && xOf(c) - sl < vw; c++) {
+        const x = Math.round(xOf(c) - sl) + 0.5;
+        ctx.moveTo(x, Math.max(0, HH - st)); ctx.lineTo(x, vh);
+      }
+      for (let r = rowAt(Math.max(HH, st)); r <= extent.rows && yOf(r) - st < vh; r++) {
+        const y = Math.round(yOf(r) - st) + 0.5;
+        ctx.moveTo(Math.max(0, HW - sl), y); ctx.lineTo(vw, y);
+      }
+      ctx.stroke();
+
+      colhead.style.width = vw + "px";
       colhead.textContent = "";
       rowhead.textContent = "";
-      const sl = scroll.scrollLeft, st = scroll.scrollTop;
-      const c0 = Math.max(0, Math.floor((sl - HW) / CW));
-      const c1 = Math.min(extent.cols, c0 + Math.ceil(scroll.clientWidth / CW) + 2);
-      for (let c = c0; c < c1; c++) {
+      const sr = selRange();
+      for (let c = colAt(Math.max(HW, sl)); c < extent.cols && xOf(c) - sl < vw; c++) {
         const d = document.createElement("div");
-        d.className = "sh-h" + (sel && c === sel.col ? " sh-h-sel" : "");
+        d.className = "sh-h" + (c >= sr.c0 && c <= sr.c1 ? " sh-h-sel" : "");
         d.style.left = xOf(c) - sl + "px";
         d.style.top = "0px";
-        d.style.width = CW + "px";
+        d.style.width = widthOf(c) + "px";
         d.style.height = HH + "px";
         d.textContent = colName(c);
+        const rs = document.createElement("div");
+        rs.className = "sh-rs sh-rs-col";
+        rs.dataset.index = c;
+        d.appendChild(rs);
         colhead.appendChild(d);
       }
-      const r0 = Math.max(0, Math.floor((st - HH) / RH));
-      const r1 = Math.min(extent.rows, r0 + Math.ceil(scroll.clientHeight / RH) + 2);
-      for (let r = r0; r < r1; r++) {
+      for (let r = rowAt(Math.max(HH, st)); r < extent.rows && yOf(r) - st < vh; r++) {
         const d = document.createElement("div");
-        d.className = "sh-h" + (sel && r === sel.row ? " sh-h-sel" : "");
-        d.style.top = r * RH - st + "px"; // the strip already starts below the column header
+        d.className = "sh-h" + (r >= sr.r0 && r <= sr.r1 ? " sh-h-sel" : "");
+        d.style.top = yOf(r) - HH - st + "px"; // the strip already starts below the column header
         d.style.left = "0px";
         d.style.width = HW + "px";
-        d.style.height = RH + "px";
+        d.style.height = heightOf(r) + "px";
         d.textContent = String(r + 1);
+        const rs = document.createElement("div");
+        rs.className = "sh-rs sh-rs-row";
+        rs.dataset.index = r;
+        d.appendChild(rs);
         rowhead.appendChild(d);
       }
       colhead.style.top = BAR + "px";
       colhead.style.left = "0px";
       rowhead.style.top = BAR + HH + "px";
       rowhead.style.left = "0px";
-      rowhead.style.height = scroll.clientHeight - HH + "px";
+      rowhead.style.height = vh - HH + "px";
     };
 
-    // --- selection
+    // --- selection. `sel` is the active cell and moves; `anchor` is the fixed corner of a range.
     let sel = { col: 0, row: 0 };
-    let anchor = null; // range anchor for shift-select
-    const placeOverlay = () => {
-      const sl = scroll.scrollLeft, st = scroll.scrollTop;
-      selBox.style.left = xOf(sel.col) - sl + "px";
-      selBox.style.top = BAR + yOf(sel.row) - st + "px";
-      selBox.style.width = CW + "px";
-      selBox.style.height = RH + "px";
-      const r = selRange();
-      rangeBox.style.left = xOf(r.c0) + "px";
-      rangeBox.style.top = yOf(r.r0) + "px";
-      rangeBox.style.width = (r.c1 - r.c0 + 1) * CW + "px";
-      rangeBox.style.height = (r.r1 - r.r0 + 1) * RH + "px";
-      rangeBox.style.display = anchor ? "block" : "none";
-    };
+    let anchor = null;
+    let tabOrigin = null; // Enter after a run of Tabs returns to the column the run started in
     const selRange = () => {
       const a = anchor || sel;
       return {
@@ -33535,8 +33717,44 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
         r0: Math.min(a.row, sel.row), r1: Math.max(a.row, sel.row)
       };
     };
+    const rectOf = (r) => ({
+      x: xOf(r.c0), y: yOf(r.r0), w: xOf(r.c1 + 1) - xOf(r.c0), h: yOf(r.r1 + 1) - yOf(r.r0)
+    });
+    const placeOverlay = () => {
+      const sl = scroll.scrollLeft, st = scroll.scrollTop;
+      selBox.style.left = xOf(sel.col) - sl + "px";
+      selBox.style.top = BAR + yOf(sel.row) - st + "px";
+      selBox.style.width = widthOf(sel.col) + "px";
+      selBox.style.height = heightOf(sel.row) + "px";
+      const r = rectOf(selRange());
+      rangeBox.style.left = r.x + "px";
+      rangeBox.style.top = r.y + "px";
+      rangeBox.style.width = r.w + "px";
+      rangeBox.style.height = r.h + "px";
+      rangeBox.style.display = anchor ? "block" : "none";
+      fill.style.left = r.x + r.w - sl - 4 + "px";
+      fill.style.top = BAR + r.y + r.h - st - 4 + "px";
+      fill.style.display = editing || barFocused() ? "none" : "block";
+    };
+    const showGhost = (r) => {
+      if (!r) { ghost.style.display = "none"; return; }
+      const b = rectOf(r);
+      ghost.style.left = b.x + "px";
+      ghost.style.top = b.y + "px";
+      ghost.style.width = b.w + "px";
+      ghost.style.height = b.h + "px";
+      ghost.style.display = "block";
+    };
+    const relayout = () => { measureExtent(); autoFit(); layoutAxes(); paint(); reflow(); placeOverlay(); };
+    let layoutTimer = 0;
+    const scheduleLayout = () => {
+      if (layoutTimer) return;
+      layoutTimer = window.requestAnimationFrame(() => { layoutTimer = 0; relayout(); });
+    };
+
     // decompile is async, but the clipboard handler and the formula bar must read
     // sources synchronously — so keep a cache, refreshed whenever the scope changes.
+    // The writer sets it directly, so an edit is readable the instant it is made.
     const srcCache = new Map();
     const refreshSources = async () => {
       const wanted = scopeAddrs();
@@ -33551,6 +33769,17 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       const i = src.indexOf("=");
       return i < 0 ? src : src.slice(i + 1).trim();
     };
+    // what the user reads: ranges collapsed, name stripped
+    const displayBody = (src) => {
+      if (src == null) return "";
+      try { return bodyOf(collapseRanges(src)); } catch { return bodyOf(src); }
+    };
+    // re-address a source: keep a `viewof`/`mutable` prefix, replace the name
+    const retarget = (src, addr) => {
+      const m = /^\s*((?:viewof|mutable)\s+)?[^=\s]+\s*=/.exec(src);
+      return m ? (m[1] || "") + addr + " =" + src.slice(m[0].length) : addr + " = " + src;
+    };
+
     // --- the formula bar: ONE editor-5 CodeMirror for the whole sheet, retargeted
     // on selection. Not cellEditor(variable) -- that clones a hotbar shell per
     // instance through the sandbox, which is a per-cell component, not a bar.
@@ -33581,16 +33810,20 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       });
     };
     const barFocused = () => !!formulaView?.hasFocus;
+    const barDirty = () => barText() !== displayBody(sourceOf(formatAddr(sel.col, sel.row)));
     const syncBar = () => {
       const addr = formatAddr(sel.col, sel.row);
-      addrLabel.textContent = addr;
+      addrLabel.textContent = anchor ? addr + ":" : addr;
+      if (anchor) { const r = selRange(); addrLabel.textContent = formatAddr(r.c0, r.r0) + ":" + formatAddr(r.c1, r.r1); }
       // never clobber a caret mid-edit: a scope change elsewhere must not rewrite
       // the buffer the user is typing into
-      if (!barFocused()) setBarText(bodyOf(sourceOf(addr)));
+      if (!barFocused()) setBarText(displayBody(sourceOf(addr)));
       fmtSel.value = formatState[addr] || "";
     };
 
-    // --- the writer: compile the typed body into a real cell of the module
+    // --- the writer. Two layers: `writeSource` puts an exact source into the module (undo and
+    // redo go through it unchanged); `commit` is the user-facing path that turns typed text into
+    // a source first. Every user mutation is a `transact`, which is what makes it undoable.
     // `c2` is a spreadsheet reflex and means C2 -- but `d3` is a real builtin and must stay
     // lowercase. Promote an address-shaped reference only when the typed name resolves to
     // nothing, so a name that is actually defined always wins over the coordinate reading.
@@ -33617,22 +33850,88 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       }
     };
 
-    const commit = async (addr, body) => {
-      const existing = variableAt(addr);
-      const text = String(body ?? "").trim();
-      if (!text) {
-        if (existing) existing.delete();
+    const writeSource = (addr, src) => {
+      const vars = variablesAt(addr);
+      if (src == null) {
+        for (const v of vars) v.delete();
+        srcCache.delete(addr);
         return;
       }
-      let src = addr + " = " + text.replace(/^=+\s*/, "");
-      try { src = canonRefs(src); } catch { /* unparseable: let compile report it */ }
-      const specs = compile(src);
-      const spec = specs[0];
-      let fn;
-      // eslint-disable-next-line no-eval
-      eval("fn = " + spec._definition.toString());
-      if (existing) existing.define(spec._name, spec._inputs, fn);
-      else module.variable(true).define(spec._name, spec._inputs, fn);
+      const defs = compile(src).map((spec) => {
+        let fn;
+        // eslint-disable-next-line no-eval
+        eval("fn = " + spec._definition.toString());
+        return { name: spec._name, inputs: spec._inputs, fn };
+      });
+      if (!defs.length) throw new Error("sheet: nothing compiled from " + src);
+      // a plain cell over a plain cell REDEFINES the variable -- same pid, same node -- which is
+      // what makes a caret edit in the bar an update rather than a replacement. Anything
+      // involving `viewof` swaps the whole set.
+      if (vars.length === 1 && defs.length === 1 && vars[0]._name === defs[0].name) {
+        vars[0].define(defs[0].name, defs[0].inputs, defs[0].fn);
+      } else {
+        for (const v of vars) v.delete();
+        for (const d of defs) module.variable(true).define(d.name, d.inputs, d.fn);
+      }
+      srcCache.set(addr, src);
+    };
+    if (!histories.has(module)) histories.set(module, { undo: [], redo: [] });
+    const { undo: undoStack, redo: redoStack } = histories.get(module);
+    // an edit is [{addr, before, after}]; both directions are plain writes of a stored source
+    const transact = (changes) => {
+      const edit = changes
+        .map(({ addr, src }) => ({ addr, before: sourceOf(addr), after: src }))
+        .filter((c) => c.before !== c.after);
+      for (const c of edit) writeSource(c.addr, c.after);
+      if (!edit.length) return;
+      undoStack.push(edit);
+      if (undoStack.length > UNDO_MAX) undoStack.shift();
+      redoStack.length = 0;
+    };
+    const jumpTo = (addr) => {
+      const a = parseAddr(addr);
+      if (!a) return;
+      anchor = null; sel = { col: a.col, row: a.row };
+      relayout(); syncBar();
+    };
+    const undo = () => {
+      const e = undoStack.pop();
+      if (!e) return;
+      for (const c of e) writeSource(c.addr, c.before);
+      redoStack.push(e);
+      jumpTo(e[0].addr);
+    };
+    const redo = () => {
+      const e = redoStack.pop();
+      if (!e) return;
+      for (const c of e) writeSource(c.addr, c.after);
+      undoStack.push(e);
+      jumpTo(e[0].addr);
+    };
+
+    // typed text that is words, not code -- the candidates for being a label
+    const LABELISH = /^[\p{L}\p{N}_\s.,;'!?-]+$/u;
+    const commit = (addr, body) => {
+      const text = String(body ?? "").trim();
+      if (!text) return transact([{ addr, src: null }]);
+      const head = variablesAt(addr).some((v) => /^viewof/.test(v._name)) ? "viewof " + addr : addr;
+      let src;
+      try {
+        src = head + " = " + expandRanges(text.replace(/^=+\s*/, ""));
+        src = canonRefs(src);
+        const cell = parser.parseCell(src);
+        // A bare name that resolves to nothing is a label, not a reference: `Total` is what a
+        // spreadsheet user types into a heading. An address-shaped name stays a reference so
+        // a forward reference still works.
+        if (cell.body?.type === "Identifier" && !parseRef(cell.body.name) && !nameIsTaken(cell.body.name)) {
+          src = head + " = " + JSON.stringify(text);
+        }
+      } catch (e) {
+        // `Total revenue` does not parse; `A1 +` does not parse either, and only the first is
+        // text. A broken formula stays broken rather than being quietly turned into a string.
+        src = head + " = " + (LABELISH.test(text) ? JSON.stringify(text) : text);
+      }
+      return transact([{ addr, src }]);
     };
 
     let editing = false; // NOT readable off editor.style.display — `none` comes from the class
@@ -33640,13 +33939,14 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       const sl = scroll.scrollLeft, st = scroll.scrollTop;
       editor.style.left = xOf(sel.col) - sl + "px";
       editor.style.top = BAR + yOf(sel.row) - st + "px";
-      editor.style.width = CW + "px";
-      editor.style.height = RH + "px";
+      editor.style.width = widthOf(sel.col) + "px";
+      editor.style.height = heightOf(sel.row) + "px";
       editor.style.display = "block";
       editing = true;
-      editor.value = seedText != null ? seedText : bodyOf(sourceOf(formatAddr(sel.col, sel.row)));
+      editor.value = seedText != null ? seedText : displayBody(sourceOf(formatAddr(sel.col, sel.row)));
       editor.focus();
       if (seedText == null) editor.select();
+      placeOverlay();
     };
     const closeEditor = (commitIt) => {
       if (!editing) return;
@@ -33655,6 +33955,7 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       editor.style.display = "none";
       frame.focus();
       if (commitIt) commit(formatAddr(sel.col, sel.row), text);
+      placeOverlay();
     };
 
     // --- clipboard: values as TSV for the outside world, sources for us
@@ -33678,19 +33979,32 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       e.clipboardData.setData(MIME, JSON.stringify(cells));
       e.preventDefault();
     };
-    const onPaste = async (e) => {
+    const deleteRange = (r) => {
+      const changes = [];
+      for (let row = r.r0; row <= r.r1; row++)
+        for (let col = r.c0; col <= r.c1; col++) changes.push({ addr: formatAddr(col, row), src: null });
+      transact(changes);
+    };
+    const onCut = (e) => {
+      if (editing || bar.contains(e.target)) return;
+      onCopy(e);
+      deleteRange(selRange());
+    };
+    const onPaste = (e) => {
       if (editing || bar.contains(e.target)) return;
       const rich = e.clipboardData.getData(MIME);
       e.preventDefault();
+      const changes = [];
       if (rich) {
         for (const { dc, dr, src } of JSON.parse(rich)) {
           const from = parseAddr(src.slice(0, src.indexOf("=")).trim());
           if (!from) continue;
           const col = sel.col + dc, row = sel.row + dr;
+          const addr = formatAddr(col, row);
           // every A1-shaped reference shifts by the same delta as the cell itself
-          const shifted = transposeCell(src, col - from.col, row - from.row);
-          await commit(formatAddr(col, row), bodyOf(shifted));
+          changes.push({ addr, src: retarget(transposeCell(src, col - from.col, row - from.row), addr) });
         }
+        transact(changes);
         return;
       }
       const text = e.clipboardData.getData("text/plain");
@@ -33701,9 +34015,42 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
           const raw = parts[j].trim();
           if (!raw) continue;
           const lit = Number.isFinite(+raw) ? raw : JSON.stringify(raw);
-          await commit(formatAddr(sel.col + j, sel.row + i), lit);
+          changes.push({ addr: formatAddr(sel.col + j, sel.row + i), src: formatAddr(sel.col + j, sel.row + i) + " = " + lit });
         }
       }
+      transact(changes);
+    };
+
+    // --- fill: drag the handle and the source range repeats along one axis, each copy shifted
+    // by its offset -- paste in a loop, so `$` pins and named cells behave as they do on paste
+    const fillRect = (src, end) => {
+      const dy = end.row > src.r1 ? end.row - src.r1 : end.row < src.r0 ? end.row - src.r0 : 0;
+      const dx = end.col > src.c1 ? end.col - src.c1 : end.col < src.c0 ? end.col - src.c0 : 0;
+      if (!dx && !dy) return null;
+      if (Math.abs(dy) >= Math.abs(dx)) {
+        return dy > 0 ? { c0: src.c0, c1: src.c1, r0: src.r1 + 1, r1: end.row }
+                      : { c0: src.c0, c1: src.c1, r0: end.row, r1: src.r0 - 1 };
+      }
+      return dx > 0 ? { c0: src.c1 + 1, c1: end.col, r0: src.r0, r1: src.r1 }
+                    : { c0: end.col, c1: src.c0 - 1, r0: src.r0, r1: src.r1 };
+    };
+    const applyFill = (src, end) => {
+      const t = fillRect(src, end);
+      if (!t) return;
+      const w = src.c1 - src.c0 + 1, h = src.r1 - src.r0 + 1;
+      const mod = (n, m) => ((n % m) + m) % m;
+      const changes = [];
+      for (let row = t.r0; row <= t.r1; row++) {
+        for (let col = t.c0; col <= t.c1; col++) {
+          const sc = src.c0 + mod(col - src.c0, w), sr = src.r0 + mod(row - src.r0, h);
+          const s = sourceOf(formatAddr(sc, sr));
+          const addr = formatAddr(col, row);
+          changes.push({ addr, src: s ? retarget(transposeCell(s, col - sc, row - sr), addr) : null });
+        }
+      }
+      transact(changes);
+      anchor = { col: Math.min(src.c0, t.c0), row: Math.min(src.r0, t.r0) };
+      sel = { col: Math.max(src.c1, t.c1), row: Math.max(src.r1, t.r1) };
     };
 
     // --- keyboard
@@ -33711,39 +34058,45 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       if (!extend) anchor = null;
       else if (!anchor) anchor = { ...sel };
       sel = { col: Math.max(0, sel.col + dc), row: Math.max(0, sel.row + dr) };
-      measureExtent();
-      paint();
-      placeOverlay();
+      relayout();
       syncBar();
+    };
+    // Enter after Tab, Tab, Tab goes to the next row at the column the run started in
+    const enterMove = () => {
+      const dc = tabOrigin == null ? 0 : tabOrigin - sel.col;
+      tabOrigin = null;
+      move(dc, 1, false);
+    };
+    const tabMove = () => {
+      if (tabOrigin == null) tabOrigin = sel.col;
+      move(1, 0, false);
     };
     frame.addEventListener("keydown", (e) => {
       // the formula bar owns its own keys; without this, a keystroke in the bar
       // bubbles here, gets preventDefault()ed and opens the in-cell editor instead
       if (bar.contains(e.target)) return;
       if (editing) {
-        if (e.key === "Enter") { closeEditor(true); move(0, 1, false); e.preventDefault(); }
+        if (e.key === "Enter") { closeEditor(true); enterMove(); e.preventDefault(); }
         else if (e.key === "Escape") { closeEditor(false); e.preventDefault(); }
-        else if (e.key === "Tab") { closeEditor(true); move(1, 0, false); e.preventDefault(); }
+        else if (e.key === "Tab") { closeEditor(true); tabMove(); e.preventDefault(); }
         return;
       }
-      const shift = e.shiftKey;
-      if (e.key === "ArrowUp") { move(0, -1, shift); e.preventDefault(); }
-      else if (e.key === "ArrowDown") { move(0, 1, shift); e.preventDefault(); }
-      else if (e.key === "ArrowLeft") { move(-1, 0, shift); e.preventDefault(); }
-      else if (e.key === "ArrowRight") { move(1, 0, shift); e.preventDefault(); }
+      const shift = e.shiftKey, mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "z") { shift ? redo() : undo(); e.preventDefault(); return; }
+      if (mod && e.key.toLowerCase() === "y") { redo(); e.preventDefault(); return; }
+      if (mod) return; // copy / cut / paste arrive as their own events
+      if (e.key === "ArrowUp") { tabOrigin = null; move(0, -1, shift); e.preventDefault(); }
+      else if (e.key === "ArrowDown") { tabOrigin = null; move(0, 1, shift); e.preventDefault(); }
+      else if (e.key === "ArrowLeft") { tabOrigin = null; move(-1, 0, shift); e.preventDefault(); }
+      else if (e.key === "ArrowRight") { tabOrigin = null; move(1, 0, shift); e.preventDefault(); }
+      else if (e.key === "Tab") { tabMove(); e.preventDefault(); }
       else if (e.key === "Enter" || e.key === "F2") { openEditor(); e.preventDefault(); }
-      else if (e.key === "Delete" || e.key === "Backspace") {
-        const r = selRange();
-        for (let row = r.r0; row <= r.r1; row++)
-          for (let col = r.c0; col <= r.c1; col++)
-            variableAt(formatAddr(col, row))?.delete();
-        e.preventDefault();
-      } else if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) {
-        openEditor(e.key);
-        e.preventDefault();
-      }
+      else if (e.key === "Escape") { anchor = null; relayout(); syncBar(); }
+      else if (e.key === "Delete" || e.key === "Backspace") { deleteRange(selRange()); e.preventDefault(); }
+      else if (e.key.length === 1) { openEditor(e.key); e.preventDefault(); }
     });
     frame.addEventListener("copy", onCopy);
+    frame.addEventListener("cut", onCut);
     frame.addEventListener("paste", onPaste);
     formulaView = new EditorView({
       parent: formulaHost,
@@ -33754,49 +34107,179 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
           // to the completion when one is open
           codemirror.keymap.of([
             { key: "Enter", run: (v) => codemirror.acceptCompletion(v) || (commitBar(), true) },
-            { key: "Tab", run: (v) => codemirror.acceptCompletion(v) || (commitBar(1, 0), true) },
+            { key: "Tab", run: (v) => codemirror.acceptCompletion(v) || (commitBar(true), true) },
             { key: "Escape", run: (v) => codemirror.closeCompletion(v) || (syncBarForce(), frame.focus(), true) }
           ]),
           observableJS_language,
           codemirror.syntaxHighlighting(observableJS_highlightStyle),
           codemirror.autocompletion({
-            override: [sheetCompletions, literalCompletions]
+            // literalCompletions is (state, pos), not a CompletionSource
+            override: [sheetCompletions, (ctx) => literalCompletions(ctx.state, ctx.pos)]
           }),
+          codemirror.minimalSetup, // history + historyKeymap: Cmd+Z inside the bar is text undo
           EditorView.lineWrapping,
           myDefaultTheme
         ]
       })
     });
-    const syncBarForce = () => setBarText(bodyOf(sourceOf(formatAddr(sel.col, sel.row))));
-    const commitBar = (dc = 0, dr = 1) => {
+    formulaView.contentDOM.addEventListener("focus", placeOverlay);
+    formulaView.contentDOM.addEventListener("blur", placeOverlay);
+    const syncBarForce = () => setBarText(displayBody(sourceOf(formatAddr(sel.col, sel.row))));
+    const commitBar = (tab = false) => {
       const addr = formatAddr(sel.col, sel.row);
       commit(addr, barText());
       frame.focus();
-      move(dc, dr, false);
+      tab ? tabMove() : enterMove();
     };
     fmtSel.addEventListener("input", () => {
-      const addr = formatAddr(sel.col, sel.row);
-      if (fmtSel.value) formatState[addr] = fmtSel.value;
-      else delete formatState[addr];
+      const r = selRange();
+      for (let row = r.r0; row <= r.r1; row++)
+        for (let col = r.c0; col <= r.c1; col++) {
+          const addr = formatAddr(col, row);
+          if (fmtSel.value) formatState[addr] = fmtSel.value;
+          else delete formatState[addr];
+        }
       reflow();
       if (persist) scheduleSave();
     });
-    scroll.addEventListener("pointerdown", (e) => {
+
+    // --- pointer. One of: select-drag, reference-insert (the cursor writes into the editor
+    // that has focus), fill-drag, header resize.
+    const cellAtEvent = (e) => {
       const rect = scroll.getBoundingClientRect();
-      const x = e.clientX - rect.left + scroll.scrollLeft - HW;
-      const y = e.clientY - rect.top + scroll.scrollTop - HH;
-      if (x < 0 || y < 0) return;
-      closeEditor(true);
-      const next = { col: Math.floor(x / CW), row: Math.floor(y / RH) };
-      if (e.shiftKey) { if (!anchor) anchor = { ...sel }; } else anchor = null;
-      sel = next;
-      frame.focus();
-      paint();
-      placeOverlay();
-      syncBar();
+      const x = e.clientX - rect.left + scroll.scrollLeft;
+      const y = e.clientY - rect.top + scroll.scrollTop;
+      if (x < HW || y < HH) return null;
+      return { col: colAt(x), row: rowAt(y) };
+    };
+    const rangeOf = (a, b) => ({
+      c0: Math.min(a.col, b.col), c1: Math.max(a.col, b.col), r0: Math.min(a.row, b.row), r1: Math.max(a.row, b.row)
     });
-    scroll.addEventListener("dblclick", () => openEditor());
+    const rangeText = (r) =>
+      r.c0 === r.c1 && r.r0 === r.r1 ? formatAddr(r.c0, r.r0) : formatAddr(r.c0, r.r0) + ":" + formatAddr(r.c1, r.r1);
+    // whichever editor has the caret, presented uniformly
+    const refTarget = () => {
+      if (barFocused()) {
+        const s = formulaView.state.selection.main;
+        return {
+          text: barText(), from: s.from, to: s.to,
+          replace: (span, text) => {
+            formulaView.dispatch({ changes: { from: span.from, to: span.to, insert: text }, selection: { anchor: span.from + text.length } });
+            return { from: span.from, to: span.from + text.length };
+          }
+        };
+      }
+      if (editing) {
+        return {
+          text: editor.value, from: editor.selectionStart, to: editor.selectionEnd,
+          replace: (span, text) => {
+            editor.setRangeText(text, span.from, span.to, "end");
+            return { from: span.from, to: span.from + text.length };
+          }
+        };
+      }
+      return null;
+    };
+    // a click means "reference this" only where a reference can go: after an operator,
+    // an open bracket or a comma. Anywhere else it is a plain click and commits the edit.
+    const wantsRef = (t) => /[(,+\-*\/=\[<>?:%&|^!{;]\s*$/.test(t.text.slice(0, t.from));
+    let drag = null;
+    // a pointer released mid-handler has no id to capture; that is not an error
+    const capture = (el, e) => { try { el.setPointerCapture(e.pointerId); } catch { /* not active */ } };
+    scroll.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      const cell = cellAtEvent(e);
+      if (!cell) return;
+      const t = refTarget();
+      if (t && wantsRef(t)) {
+        e.preventDefault(); // keep the editor's focus: the click writes into it
+        const span = t.replace({ from: t.from, to: t.to }, formatAddr(cell.col, cell.row));
+        drag = { kind: "ref", start: cell, span, target: t };
+        showGhost(rangeOf(cell, cell));
+        capture(scroll, e);
+        return;
+      }
+      if (barFocused() && barDirty()) commit(formatAddr(sel.col, sel.row), barText());
+      closeEditor(true);
+      if (e.shiftKey) { if (!anchor) anchor = { ...sel }; } else anchor = null;
+      sel = cell;
+      tabOrigin = null;
+      frame.focus();
+      relayout();
+      syncBar();
+      drag = { kind: "select", start: cell };
+      capture(scroll, e);
+    });
+    scroll.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const cell = cellAtEvent(e);
+      if (!cell) return;
+      if (drag.kind === "select") {
+        if (cell.col === sel.col && cell.row === sel.row) return;
+        if (!anchor) anchor = { ...drag.start };
+        sel = cell;
+        paint(); placeOverlay(); syncBar();
+      } else if (drag.kind === "ref") {
+        const r = rangeOf(drag.start, cell);
+        drag.span = drag.target.replace(drag.span, rangeText(r));
+        showGhost(r);
+      } else if (drag.kind === "fill") {
+        drag.end = cell;
+        showGhost(fillRect(drag.src, cell));
+      }
+    });
+    const endDrag = () => {
+      if (!drag) return;
+      if (drag.kind === "fill" && drag.end) { applyFill(drag.src, drag.end); relayout(); syncBar(); }
+      drag = null;
+      showGhost(null);
+    };
+    scroll.addEventListener("pointerup", endDrag);
+    scroll.addEventListener("pointercancel", endDrag);
+    scroll.addEventListener("dblclick", (e) => { if (cellAtEvent(e)) openEditor(); });
     scroll.addEventListener("scroll", () => { paint(); placeOverlay(); });
+    fill.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault(); e.stopPropagation();
+      drag = { kind: "fill", src: selRange(), end: null };
+      capture(scroll, e);
+    });
+    // header resize: drag the divider; double-click it to go back to auto
+    const startResize = (e, axis, index) => {
+      e.preventDefault(); e.stopPropagation();
+      const head = axis === "col" ? colhead : rowhead;
+      const start = axis === "col" ? widthOf(index) : heightOf(index);
+      const origin = axis === "col" ? e.clientX : e.clientY;
+      const floor = axis === "col" ? 24 : 12;
+      capture(head, e);
+      const onMove = (ev) => {
+        const d = (axis === "col" ? ev.clientX : ev.clientY) - origin;
+        setSize(axis, index, Math.max(floor, Math.round(start + d)));
+        relayout();
+      };
+      const onUp = () => {
+        head.removeEventListener("pointermove", onMove);
+        head.removeEventListener("pointerup", onUp);
+        head.removeEventListener("pointercancel", onUp);
+        if (persist) scheduleSave();
+      };
+      head.addEventListener("pointermove", onMove);
+      head.addEventListener("pointerup", onUp);
+      head.addEventListener("pointercancel", onUp);
+    };
+    for (const [head, axis] of [[colhead, "col"], [rowhead, "row"]]) {
+      head.addEventListener("pointerdown", (e) => {
+        const rs = e.target.closest?.(".sh-rs");
+        if (rs) startResize(e, axis, +rs.dataset.index);
+      });
+      head.addEventListener("dblclick", (e) => {
+        const rs = e.target.closest?.(".sh-rs");
+        if (!rs) return;
+        setSize(axis, +rs.dataset.index, null);
+        relayout();
+        if (persist) scheduleSave();
+      });
+    }
 
     // A placement cell is `B1 = taxRate`: one input, and a body that is just that name.
     // Read off _inputs rather than the source, so it stays synchronous during render.
@@ -33809,7 +34292,6 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     };
 
     // --- projection: the visualizer renders only DEFINED cells; we position them by name
-    let root = null;
     const cellFactory = () => (variable) => {
       const node = document.createElement("div");
       node.className = "observablehq";
@@ -33824,6 +34306,7 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
         const addr = parseAddr(variable._name);
         const spec = addr ? formatState[formatAddr(addr.col, addr.row)] : null;
         const text = formatValue(value, spec);
+        node.classList.toggle("sh-text", text !== null);
         if (text === null) {
           body.textContent = "";
           node.classList.remove("sh-num");
@@ -33838,17 +34321,21 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       return {
         _node: node,
         pending() { node.classList.add("sh-running"); },
-        fulfilled(value) { try { render(value); } catch { inner.fulfilled(value); } },
+        fulfilled(value) {
+          try { render(value); } catch { inner.fulfilled(value); }
+          scheduleLayout(); // a new value can change its column's auto width
+        },
         rejected(error) {
           node.classList.add("sh-err");
           node.classList.remove("sh-running");
+          node.classList.add("sh-text");
           while (body.firstChild) body.removeChild(body.firstChild);
           body.textContent = /is not defined/.test(String(error?.message)) ? "#NAME?" : "#ERR";
           node.title = String(error?.message ?? error);
+          scheduleLayout();
         }
       };
     };
-    const SPILL_MAX = 16; // a runaway value must not paint over the whole sheet
     // How many cells of clear space to the right / below, i.e. how far content may
     // spill before it hits an occupied cell. O(1) lookups because scope is sparse.
     const freeRight = (occupied, col, row) => {
@@ -33876,21 +34363,22 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
         const a = parseAddr(node.getAttribute("cell"));
         if (!a) { node.style.display = "none"; continue; }
         node.style.display = "";
-        node.style.left = xOf(a.col) + "px";
-        node.style.top = yOf(a.row) + "px";
-        node.style.minWidth = CW - 1 + "px";
-        node.style.minHeight = RH - 1 + "px";
-        node.style.maxWidth = CW * freeRight(occupied, a.col, a.row) - 1 + "px";
+        const x = xOf(a.col), y = yOf(a.row);
+        node.style.left = x + "px";
+        node.style.top = y + "px";
+        node.style.minWidth = widthOf(a.col) - 1 + "px";
+        node.style.minHeight = heightOf(a.row) - 1 + "px";
+        node.style.maxWidth = xOf(a.col + freeRight(occupied, a.col, a.row)) - x - 1 + "px";
         // only an element value asks for height; text always fits its row
         const wantsHeight = !!node.variable?._value?.nodeType;
         // read the width back before granting height: the rectangle to clear is the one the
         // content actually takes, not the whole cap it was allowed
         const cols = wantsHeight
-          ? Math.max(1, Math.ceil(node.getBoundingClientRect().width / CW))
+          ? Math.max(1, colAt(x + node.getBoundingClientRect().width - 1) - a.col + 1)
           : 1;
         node.style.maxHeight = wantsHeight
-          ? RH * freeDown(occupied, a.col, a.row, cols) - 1 + "px"
-          : RH - 1 + "px";
+          ? yOf(a.row + freeDown(occupied, a.col, a.row, cols)) - y - 1 + "px"
+          : heightOf(a.row) - 1 + "px";
         // a spilling cell must paint over its empty neighbours, not under them
         node.style.zIndex = wantsHeight ? "2" : "1";
       }
@@ -33909,40 +34397,43 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
 
     const mo = new window.MutationObserver(() => {
       reconcileAliases();
-      measureExtent();
-      paint();
-      reflow();
-      placeOverlay();
+      relayout();
       refreshSources().then(syncBar);
     });
     mo.observe(root, { childList: true });
     reconcileAliases(); // cells already referencing `$A$1` at boot get their alias immediately
 
-    // --- format is the ONLY state the sheet owns, so the sheet cell owns it (editable-md pattern)
+    // --- format and size are the ONLY state the sheet owns, so the sheet cell owns them
+    // (editable-md pattern): rewrite the literals in our own source
     let saveTimer = null;
     const scheduleSave = () => {
       if (saveTimer) window.clearTimeout(saveTimer);
-      saveTimer = window.setTimeout(saveFormat, 300);
+      saveTimer = window.setTimeout(saveState, 300);
     };
     // the defining variable is the one whose value IS this element (grid-container's findSelf)
     const findSelf = () => [...rt._variables].find((v) => v._value === frame);
-    const saveFormat = async () => {
+    const setOption = (src, key, literal) => {
+      const i = src.search(new RegExp("\\b" + key + "\\s*:"));
+      if (i < 0) return null;
+      let d = 0, j = src.indexOf("{", i), k = j;
+      for (; k < src.length; k++) {
+        if (src[k] === "{") d++;
+        else if (src[k] === "}" && !--d) { k++; break; }
+      }
+      return src.slice(0, j) + literal + src.slice(k);
+    };
+    const saveState = async () => {
       const v = findSelf();
       if (!v) return;
       try {
         const src = await decompile([v]);
-        const i = src.indexOf("format:");
-        const literal = JSON.stringify(formatState);
-        let next;
-        if (i >= 0) {
-          let d = 0, j = src.indexOf("{", i);
-          let k = j;
-          for (; k < src.length; k++) {
-            if (src[k] === "{") d++;
-            else if (src[k] === "}" && !--d) { k++; break; }
-          }
-          next = src.slice(0, j) + literal + src.slice(k);
-        } else return;
+        let next = setOption(src, "format", JSON.stringify(formatState));
+        if (next == null) return;
+        const sizeLit = JSON.stringify(sizeState);
+        const withSize = setOption(next, "size", sizeLit);
+        if (withSize != null) next = withSize;
+        else if (Object.keys(sizeState.cols).length || Object.keys(sizeState.rows).length)
+          next = next.replace(/\bformat\s*:/, "size: " + sizeLit + ",\n  format:");
         if (v._value !== frame) return; // a newer instance took over during the await
         const spec = compile(next)[0];
         let fn;
@@ -33950,7 +34441,7 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
         eval("fn = " + spec._definition.toString());
         v.define(spec._name, spec._inputs, fn);
       } catch (e) {
-        console.warn("sheet: format save failed", e);
+        console.warn("sheet: state save failed", e);
       }
     };
 
@@ -33959,7 +34450,9 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     if (invalidation) invalidation.then(() => { mo.disconnect(); ro.disconnect(); });
 
     measureExtent();
-    window.requestAnimationFrame(() => { paint(); reflow(); placeOverlay(); syncBar(); });
+    layoutAxes();
+    refreshSources().then(syncBar);
+    window.requestAnimationFrame(() => { relayout(); syncBar(); });
     return frame;
   };
 };
@@ -33999,9 +34492,9 @@ const _shc4 = function _C4(){return(
 95
 )};
 const _shr5 = function _A5(md){return(
-md`**2. A formula is an ordinary cell body.** \`A7 = d3.sum([A4, B4, C4])\` — the \`=\` is
-Observable's name binding, and there is no formula language to learn: d3 and the rest of the
-standard library are already in scope.`
+md`**2. A formula is an ordinary cell body.** Select A7: the bar reads \`d3.sum(A4:C4)\`, and what
+is stored is \`d3.sum([A4, B4, C4])\` — the \`=\` is Observable's name binding, the range is an
+array of references, and there is no formula language to learn: d3 is already in scope.`
 )};
 const _sha7 = function _A7(d3,A4,B4,C4){return(
 d3.sum([A4, B4, C4])
@@ -34063,8 +34556,10 @@ export default function define(runtime, observer) {
   $def("_shrewrite", "rewriteRefs", ["cellRefs"], _shrewrite);
   $def("_shtranspose", "transposeCell", ["rewriteRefs", "parseRef", "formatRef"], _shtranspose);
   $def("_shfmtval", "formatValue", [], _shfmtval);
+  $def("_shexpand", "expandRanges", ["parseRef", "formatRef"], _shexpand);
+  $def("_shcollapse", "collapseRanges", ["parser", "parseRef", "formatRef"], _shcollapse);
   $def("_shcss", "sh_css", [], _shcss);
-  $def("_shsheet", "sheet", ["main", "runtime", "sh_css", "visualizer", "compile", "decompile", "parseAddr", "parseRef", "formatAddr", "formatValue", "transposeCell", "rewriteRefs", "colName", "Inspector", "Inputs", "codemirror", "EditorState", "EditorView", "myDefaultTheme", "observableJS_language", "observableJS_highlightStyle", "literalCompletions"], _shsheet);
+  $def("_shsheet", "sheet", ["main", "runtime", "sh_css", "visualizer", "compile", "decompile", "parser", "parseAddr", "parseRef", "formatAddr", "formatRef", "formatValue", "transposeCell", "rewriteRefs", "expandRanges", "collapseRanges", "colName", "Inspector", "Inputs", "codemirror", "EditorState", "EditorView", "myDefaultTheme", "observableJS_language", "observableJS_highlightStyle", "literalCompletions"], _shsheet);
 
   $def("_shdemodoc", null, ["md"], _shdemodoc);
   $def("_shwidget", "widget", ["sheet", "runtime", "invalidation", "sheetModule"], _shwidget);
