@@ -6419,12 +6419,15 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
   // cell, which rebuilds the sheet, and a column resize must not erase what came before it
   const histories = new WeakMap();
   const styleId = "sh-style";
-  if (!document.getElementById(styleId)) {
-    const st = document.createElement("style");
+  // a save-in-place bakes this <style> into the prerender snapshot, so "inject if absent"
+  // would leave a saved notebook on the CSS of whatever module version it was saved from
+  let st = document.getElementById(styleId);
+  if (!st) {
+    st = document.createElement("style");
     st.id = styleId;
-    st.textContent = sh_css;
     document.head.appendChild(st);
   }
+  st.textContent = sh_css;
   return (rt, { invalidation, module, format = {}, size = {}, persist = true, minCols = 8, minRows = 18 } = {}) => {
     // no default: a lens has to be told what it is a lens over, and `main` is the wrong guess
     // in every notebook that boots more than one module
@@ -6893,6 +6896,7 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       placeOverlay();
     };
     const closeEditor = (commitIt) => {
+      endPoint();
       if (!editing) return;
       editing = false;
       const text = editor.value;
@@ -7021,6 +7025,9 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       // bubbles here, gets preventDefault()ed and opens the in-cell editor instead
       if (bar.contains(e.target)) return;
       if (editing) {
+        const arrow = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+        if (arrow) { if (pointKey(arrow[0], arrow[1], e.shiftKey)) e.preventDefault(); return; }
+        if (!MODIFIERS.has(e.key)) endPoint();
         if (e.key === "Enter") { closeEditor(true); enterMove(); e.preventDefault(); }
         else if (e.key === "Escape") { closeEditor(false); e.preventDefault(); }
         else if (e.key === "Tab") { closeEditor(true); tabMove(); e.preventDefault(); }
@@ -7051,6 +7058,10 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
           // this keymap outranks completionKeymap, so each binding must hand back
           // to the completion when one is open
           codemirror.keymap.of([
+            { key: "ArrowLeft", run: () => pointKey(-1, 0, false), shift: () => pointKey(-1, 0, true) },
+            { key: "ArrowRight", run: () => pointKey(1, 0, false), shift: () => pointKey(1, 0, true) },
+            { key: "ArrowUp", run: () => pointKey(0, -1, false), shift: () => pointKey(0, -1, true) },
+            { key: "ArrowDown", run: () => pointKey(0, 1, false), shift: () => pointKey(0, 1, true) },
             { key: "Enter", run: (v) => codemirror.acceptCompletion(v) || (commitBar(), true) },
             { key: "Tab", run: (v) => codemirror.acceptCompletion(v) || (commitBar(true), true) },
             { key: "Escape", run: (v) => codemirror.closeCompletion(v) || (syncBarForce(), frame.focus(), true) }
@@ -7069,10 +7080,14 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     });
     // a focused bar grows over the grid, so a multi-line cell (an md cell) can be read and
     // edited whole; unfocused it is one line again
+    formulaView.contentDOM.addEventListener("keydown", (e) => {
+      if (!e.key.startsWith("Arrow") && !MODIFIERS.has(e.key)) endPoint();
+    });
     formulaView.contentDOM.addEventListener("focus", () => { frame.classList.add("sh-bar-open"); placeOverlay(); });
     formulaView.contentDOM.addEventListener("blur", () => { frame.classList.remove("sh-bar-open"); placeOverlay(); });
     const syncBarForce = () => setBarText(displayBody(sourceOf(formatAddr(sel.col, sel.row))));
     const commitBar = (tab = false) => {
+      endPoint();
       const addr = formatAddr(sel.col, sel.row);
       commit(addr, barText());
       frame.focus();
@@ -7130,6 +7145,26 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
     // a click means "reference this" only where a reference can go: after an operator,
     // an open bracket or a comma. Anywhere else it is a plain click and commits the edit.
     const wantsRef = (t) => /[(,+\-*\/=\[<>?:%&|^!{;]\s*$/.test(t.text.slice(0, t.from));
+    // point mode: `=` then an arrow selects a reference instead of moving the caret, further
+    // arrows move it, shift extends it to a range, and any other key goes back to typing
+    let point = null;
+    const pointKey = (dc, dr, shift) => {
+      const t = refTarget();
+      if (!t) return false;
+      if (!point) {
+        if (!wantsRef(t)) return false;
+        point = { cell: { ...sel }, anchor: null, span: { from: t.from, to: t.to }, target: t };
+      }
+      const p = point;
+      if (shift) { if (!p.anchor) p.anchor = { ...p.cell }; } else p.anchor = null;
+      p.cell = { col: Math.max(0, p.cell.col + dc), row: Math.max(0, p.cell.row + dr) };
+      const r = rangeOf(p.anchor || p.cell, p.cell);
+      p.span = p.target.replace(p.span, rangeText(r));
+      showGhost(r);
+      return true;
+    };
+    const endPoint = () => { if (point) { point = null; showGhost(null); } };
+    const MODIFIERS = new Set(["Shift", "Meta", "Control", "Alt"]);
     let drag = null;
     // a pointer released mid-handler has no id to capture; that is not an error
     const capture = (el, e) => { try { el.setPointerCapture(e.pointerId); } catch { /* not active */ } };
@@ -7137,6 +7172,7 @@ const _shsheet = function _sheet(main,runtime,sh_css,visualizer,compile,decompil
       if (e.button !== 0) return;
       const cell = cellAtEvent(e);
       if (!cell) return;
+      endPoint();
       const t = refTarget();
       if (t && wantsRef(t)) {
         e.preventDefault(); // keep the editor's focus: the click writes into it
