@@ -2395,7 +2395,7 @@ const _1bqkaa9 = function _cc_chat(cc_ws,cc_messages,Event,$0,cc_activity,md,Nod
         row.append(tokenInput, connectBtn);
         var guide = document.createElement('details');
         guide.style.cssText = 'padding:0 16px 16px;font-size:13px;color:var(--theme-foreground);';
-        guide.innerHTML = '<summary style="cursor:pointer;font-weight:600;font-size:14px;">Setup guide</summary>' + '<ol style="margin:8px 0 0;padding-left:20px;line-height:1.8;">' + '<li>Install <a href="https://bun.sh" target="_blank">Bun</a> if needed, then:<br>' + '<code style="background:var(--theme-background-alt);padding:2px 6px;border-radius:3px;font-size:12px;">bun install -g @lopecode/channel</code><br>' + '<code style="background:var(--theme-background-alt);padding:2px 6px;border-radius:3px;font-size:12px;">claude mcp add lopecode bunx @lopecode/channel</code></li>' + '<li>Start Claude Code:<br><code style="background:var(--theme-background-alt);padding:2px 6px;border-radius:3px;font-size:12px;">claude --dangerously-load-development-channels server:lopecode</code></li>' + '<li>Ask Claude for a pairing token, then paste it above</li>' + '</ol>';
+        guide.innerHTML = '<summary style="cursor:pointer;font-weight:600;font-size:14px;">Setup guide</summary>' + '<ol style="margin:8px 0 0;padding-left:20px;line-height:1.8;">' + '<li>In Claude Code, install the plugin:<br>' + '<code style=\"background:var(--theme-background-alt);padding:2px 6px;border-radius:3px;font-size:12px;overflow-wrap:anywhere;\">/plugin marketplace add tomlarkworthy/lopecode-plugin</code><br>' + '<code style=\"background:var(--theme-background-alt);padding:2px 6px;border-radius:3px;font-size:12px;overflow-wrap:anywhere;\">/plugin install lopecode-channel@lopecode-plugins</code></li>' + '<li>Restart Claude Code with the channel enabled:<br>' + '<code style=\"background:var(--theme-background-alt);padding:2px 6px;border-radius:3px;font-size:12px;overflow-wrap:anywhere;\">claude --dangerously-load-development-channels plugin:lopecode-channel@lopecode-plugins</code><br>' + '<span style="opacity:0.75;">Without this flag Claude can still drive the notebook, but this chat box reaches nobody.</span></li>' + '<li>Ask Claude for a pairing token, then paste it above</li>' + '</ol>' + '<div style="margin-top:10px;opacity:0.75;">From npm instead of the plugin: ' + '<code style=\"background:var(--theme-background-alt);padding:2px 6px;border-radius:3px;font-size:12px;overflow-wrap:anywhere;\">claude mcp add lopecode -- npx -y @lopecode/channel</code>, then start with ' + '<code style=\"background:var(--theme-background-alt);padding:2px 6px;border-radius:3px;font-size:12px;overflow-wrap:anywhere;\">--dangerously-load-development-channels server:lopecode</code>.</div>';
         var container = document.createElement('div');
         container.append(row, guide);
         return container;
@@ -2794,7 +2794,7 @@ function serializeValue(value, maxLen) {
 const _em1684 = function _cc_doc_watchers(md){return(
 md`---
 ### Variable watcher
-Subscribes to Observable variables via \`observe()\`, debounces updates (1s), and forwards changes to Claude Code over the WebSocket. Also maintains the \`cc_watches\` table UI.`
+Subscribes to Observable variables via \`observe()\`, debounces updates (1s), and forwards changes to Claude Code over the WebSocket. A value whose serialization did not change is not sent. An array that only grew since the last send is sent as its appended tail with a \`delta: {from, length}\` field; the first send after a (re)connect is always the whole value. Also maintains the \`cc_watches\` table UI.`
 )};
 const _aaoorg = function _cc_watchers(cc_find_module,cc_module,lookupVariable,cc_serialize_value,$0,Event,observe,invalidation){return(
 function () {
@@ -2802,6 +2802,10 @@ function () {
     var sendFn = null;
     function setSend(fn) {
         sendFn = fn;
+        if (fn)
+            watchers.forEach(function (w) {
+                w.reset();
+            });
     }
     function watchVariable(runtime, name, moduleName) {
         var key = (moduleName || 'main') + ':' + name;
@@ -2829,9 +2833,33 @@ function () {
             var debounceTimer = null;
             var latestValue = undefined;
             var latestError = undefined;
+            var received = false;
+            var lastSent = null;
+            function arrayDelta(value) {
+                if (!Array.isArray(value) || !lastSent || !lastSent.items)
+                    return null;
+                var prev = lastSent.items;
+                if (prev.length > value.length)
+                    return null;
+                for (var i = 0; i < prev.length; i++)
+                    if (prev[i] !== value[i])
+                        return null;
+                return {
+                    from: prev.length,
+                    length: value.length
+                };
+            }
             function flush() {
                 debounceTimer = null;
-                var serialized = latestError ? 'Error: ' + (latestError.message || String(latestError)) : cc_serialize_value(latestValue, 2000);
+                var delta = latestError ? null : arrayDelta(latestValue);
+                var serialized = latestError ? 'Error: ' + (latestError.message || String(latestError)) : cc_serialize_value(delta ? latestValue.slice(delta.from) : latestValue, 2000);
+                if (lastSent && (delta ? delta.from === delta.length : lastSent.serialized === serialized))
+                    return;
+                lastSent = {
+                    serialized: delta ? null : serialized,
+                    items: !latestError && Array.isArray(latestValue) ? latestValue.slice() : null
+                };
+                var shown = (delta ? '[+' + (delta.length - delta.from) + ' @' + delta.from + '] ' : '') + serialized;
                 var now = new Date().toLocaleTimeString();
                 var watches = $0.value.slice();
                 var found = false;
@@ -2840,7 +2868,7 @@ function () {
                         watches[i] = {
                             name: name,
                             module: resolvedModule,
-                            value: serialized.slice(0, 200),
+                            value: shown.slice(0, 200),
                             updated: now
                         };
                         found = true;
@@ -2851,7 +2879,7 @@ function () {
                     watches.push({
                         name: name,
                         module: resolvedModule,
-                        value: serialized.slice(0, 200),
+                        value: shown.slice(0, 200),
                         updated: now
                     });
                 $0.value = watches;
@@ -2866,11 +2894,14 @@ function () {
                         msg.error = latestError.message || String(latestError);
                     } else {
                         msg.value = serialized;
+                        if (delta)
+                            msg.delta = delta;
                     }
                     sendFn(msg);
                 }
             }
             function scheduleUpdate(value, error) {
+                received = true;
                 latestValue = value;
                 latestError = error;
                 if (!debounceTimer) {
@@ -2889,6 +2920,11 @@ function () {
                 }
             }, { invalidation: invalidation });
             watchers.set(key, {
+                reset: function () {
+                    lastSent = null;
+                    if (received)
+                        scheduleUpdate(latestValue, latestError);
+                },
                 dispose: function () {
                     if (debounceTimer)
                         clearTimeout(debounceTimer);
@@ -3466,11 +3502,41 @@ const _40i496 = function _mcpTools(Inputs){return(
 Inputs.input(new Map())
 )};
 const _1mh3bpb = (G, _) => G.input(_);
-const _bzq7u5 = function _33($0,fileSyncTools,Event)
+const _mcpprov = function _mcpToolProviders(plugins){return(
+plugins.get("mcp-tools")
+)};
+const _bzq7u5 = function _33($0,mcpToolProviders,Event)
 {
-    $0.value = new Map([...fileSyncTools || []]);
+    const next = new Map((mcpToolProviders || []).filter(Boolean));
+    // A provider re-running clears then re-adds, so the registry reads empty in between.
+    // Publishing that would wipe the tool list; keep the last non-empty set instead.
+    if (next.size === 0 && $0.value && $0.value.size > 0)
+        return;
+    $0.value = next;
     $0.dispatchEvent(new Event('input'));
 };
+const _mcpfsync = function _fileSyncToolProvider(plugins,directory,syncStatus,invalidation){return(
+plugins.add("mcp-tools", ["setup_file_sync", {
+    description: "Enable file sync to edit notebook modules as .js files on disk. File-sync works at the define_variable level (compiled JS functions) — you get full LSP support, easy cell reordering, and standard file editing tools. Use get_variable/watch_variable to read runtime state. Once active, edit .js files in the returned sync path and changes appear in the notebook within 1 second. Requires the user to click the directory picker if not already active.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+        if (!directory)
+            return {
+                content: [{
+                    type: "text",
+                    text: "File sync is not active. Ask the user to click 'Pick sync directory' in the notebook, then call this tool again."
+                }]
+            };
+        return {
+            content: [{
+                type: "text",
+                text: "File sync active." + String(syncStatus && syncStatus.textContent || syncStatus || "\n  Directory: " + (directory.name || "(unnamed)") + "\n") + "Watching syncStatus; edits to the .js files apply to the live notebook."
+            }],
+            watches: [{ name: "syncStatus", module: "@tomlarkworthy/file-sync" }]
+        };
+    }
+}], { invalidation })
+)};
 const _npplqm = function _cc_handle_call_tool($0,cc_watchers,runtime)
 {
     return async function cc_handle_call_tool(cmd) {
@@ -3557,9 +3623,8 @@ function handleCommand(cmd) {
     return handler(cmd, rt);
 }
 )};
-const _1s8ywlt = function _cc_ws(cc_config,sessionStorage,location,cc_status,Event,$0,cc_notebook_id,cc_watchers,$1,cc_messages,cc_activity,cc_command_handlers,invalidation)
-{
-    return function () {
+const _1g08tci = function _cc_ws(cc_config,location,cc_status,Event,$0,cc_notebook_id,cc_watchers,$1,cc_messages,cc_activity,cc_command_handlers,invalidation){return(
+function () {
         var port = cc_config.port, host = cc_config.host;
         var ws = null;
         var paired = false;
@@ -3570,7 +3635,7 @@ const _1s8ywlt = function _cc_ws(cc_config,sessionStorage,location,cc_status,Eve
             }
             if (token) {
                 try {
-                    sessionStorage.setItem('lopecode_cc_token', token);
+                    window.sessionStorage.setItem('lopecode_cc_token', token);
                 } catch (e) {
                 }
                 var hash = location.hash || '#';
@@ -3736,7 +3801,7 @@ const _1s8ywlt = function _cc_ws(cc_config,sessionStorage,location,cc_status,Eve
             }
             if (!token) {
                 try {
-                    token = sessionStorage.getItem('lopecode_cc_token');
+                    token = window.sessionStorage.getItem('lopecode_cc_token');
                 } catch (e) {
                 }
             }
@@ -3762,30 +3827,71 @@ const _1s8ywlt = function _cc_ws(cc_config,sessionStorage,location,cc_status,Eve
                 return ws;
             }
         };
-    }();
-};
-const _agu8h7 = function _cc_doc_side_effects(md){return(
-md`---
-### Side effects
-\`cc_change_forwarder\` polls the local-change-history and streams new cell edits to Claude Code. \`cc_voice\` provides optional speech recognition input and TTS output for hands-free pairing.`
+    }()
 )};
-const _d9cyj2 = function _cc_change_forwarder(cc_ws,history,invalidation){return(
+const _mcpsend = function _cc_tools_sync(cc_ws,$0,invalidation){return(
 function () {
-    var highWaterMark = 0;
-    var initializing = true;
+    // Tools registered after the pair handshake (a provider cell settling, file-sync arriving)
+    // are pushed with register-tools, which replaces the notebook's whole set server-side.
+    // Depends on `viewof mcpTools`, not `mcpTools`, so a tool change never re-runs cc_ws.
+    var lastSent = null;
     var interval = setInterval(function () {
         if (!cc_ws.paired || !cc_ws.ws)
             return;
-        if (!history || !Array.isArray(history))
+        var tools = [];
+        var val = $0.value;
+        if (val)
+            val.forEach(function (t, name) {
+                tools.push({
+                    name: name,
+                    description: t.description,
+                    inputSchema: t.inputSchema
+                });
+            });
+        var sig = JSON.stringify(tools.map(function (t) {
+            return t.name;
+        }).sort());
+        if (sig === lastSent)
             return;
-        var total = history.length;
-        if (initializing) {
-            highWaterMark = total;
-            initializing = false;
+        if (tools.length === 0 && lastSent !== null)
+            return;  // never replace a live set with an empty one
+        lastSent = sig;
+        cc_ws.ws.send(JSON.stringify({
+            type: 'register-tools',
+            tools: tools
+        }));
+    }, 1000);
+    invalidation.then(function () {
+        clearInterval(interval);
+    });
+    return {
+        get lastSent() {
+            return lastSent;
+        }
+    };
+}()
+)};
+const _agu8h7 = function _cc_doc_side_effects(md){return(
+md`---
+### Side effects
+\`cc_change_forwarder\` listens to the local-change-history input and streams new cell edits to Claude Code (1s debounce). \`cc_voice\` provides optional speech recognition input and TTS output for hands-free pairing.`
+)};
+const _d9cyj2 = function _cc_change_forwarder(cc_ws,$0,cc_status,invalidation){return(
+function () {
+    // depends on the viewof element, not the value: history is mutated in
+    // place and re-dispatched, so a value dependency re-runs this cell on
+    // every edit and the high-water mark never advances past "initial"
+    var highWaterMark = ($0.value || []).length;
+    var timer = null;
+    function flush() {
+        timer = null;
+        var history = $0.value;
+        if (!Array.isArray(history))
+            return;
+        if (!cc_ws.paired || !cc_ws.ws || history.length <= highWaterMark) {
+            highWaterMark = history.length;
             return;
         }
-        if (total <= highWaterMark)
-            return;
         var newEntries = history.slice(highWaterMark).map(function (e) {
             return {
                 t: e.t,
@@ -3796,14 +3902,29 @@ function () {
                 _definition: typeof e._definition === 'function' ? e._definition.toString().slice(0, 500) : String(e._definition || '').slice(0, 500)
             };
         });
-        highWaterMark = total;
+        highWaterMark = history.length;
         cc_ws.ws.send(JSON.stringify({
             type: 'cell-change',
             changes: newEntries
         }));
-    }, 1000);
+    }
+    function onInput() {
+        if (timer)
+            clearTimeout(timer);
+        timer = setTimeout(flush, 1000);
+    }
+    function onStatus() {
+        // a new consumer starts from now; boot-time entries are not edits
+        if (cc_status.value === 'connected')
+            highWaterMark = ($0.value || []).length;
+    }
+    $0.addEventListener('input', onInput);
+    cc_status.addEventListener('input', onStatus);
     invalidation.then(function () {
-        clearInterval(interval);
+        $0.removeEventListener('input', onInput);
+        cc_status.removeEventListener('input', onStatus);
+        if (timer)
+            clearTimeout(timer);
     });
     return 'change forwarder active';
 }()
@@ -3964,10 +4085,6 @@ Inputs.input([
     },
     {
         name: 'currentModules',
-        module: null
-    },
-    {
-        name: 'history',
         module: null
     }
 ])
@@ -4195,7 +4312,8 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));  
   main.define("module d/57d79353bac56631@44", async () => runtime.module((await import("/d/57d79353bac56631@44.js?v=4")).default));  
   main.define("module @tomlarkworthy/summarizejs", async () => runtime.module((await import("/@tomlarkworthy/summarizejs.js?v=4")).default));  
-  main.define("module @tomlarkworthy/file-sync", async () => runtime.module((await import("/@tomlarkworthy/file-sync.js?v=4")).default));  
+  main.define("module @tomlarkworthy/file-sync", async () => runtime.module((await import("/@tomlarkworthy/file-sync.js?v=4")).default));
+  main.define("module @tomlarkworthy/plugin-registry", async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
   $def("_1bqkaa9", "cc_chat", ["cc_ws","cc_messages","Event","viewof voiceEnabled","cc_activity","md","Node","cc_status"], _1bqkaa9);  
   $def("_3pyde8", "fileSyncPanel", ["htl","viewof directory","viewof syncEnabled","viewof disassemble","syncStatus"], _3pyde8);  
   $def("_89yhhv", "cc_doc_watches", ["md"], _89yhhv);  
@@ -4229,12 +4347,15 @@ export default function define(runtime, observer) {
   $def("_1x4zt14", "cc_doc_dispatch", ["md"], _1x4zt14);  
   $def("_40i496", "viewof mcpTools", ["Inputs"], _40i496);  
   $def("_1mh3bpb", "mcpTools", ["Generators","viewof mcpTools"], _1mh3bpb);  
-  $def("_bzq7u5", null, ["viewof mcpTools","fileSyncTools","Event"], _bzq7u5);  
+  $def("_mcpprov", "mcpToolProviders", ["plugins"], _mcpprov);
+  $def("_bzq7u5", null, ["viewof mcpTools","mcpToolProviders","Event"], _bzq7u5);
+  $def("_mcpfsync", "fileSyncToolProvider", ["plugins","directory","syncStatus","invalidation"], _mcpfsync);
+  $def("_mcpsend", "cc_tools_sync", ["cc_ws","viewof mcpTools","invalidation"], _mcpsend);
   $def("_npplqm", "cc_handle_call_tool", ["viewof mcpTools","cc_watchers","runtime"], _npplqm);  
   $def("_ptgn2x", "cc_command_handlers", ["runtime","cc_handle_get_variable","cc_handle_define_variable","cc_handle_define_cell","cc_handle_delete_variable","cc_handle_delete_cell","cc_handle_update_cell","cc_handle_list_variables","cc_handle_list_cells","cc_handle_run_tests","cc_handle_create_module","cc_handle_delete_module","cc_handle_eval","cc_handle_fork","cc_handle_export_module","cc_handle_watch","cc_handle_unwatch","cc_handle_call_tool"], _ptgn2x);  
-  $def("_1s8ywlt", "cc_ws", ["cc_config","sessionStorage","location","cc_status","Event","viewof mcpTools","cc_notebook_id","cc_watchers","viewof cc_watches","cc_messages","cc_activity","cc_command_handlers","invalidation"], _1s8ywlt);  
+  $def("_1g08tci", "cc_ws", ["cc_config","location","cc_status","Event","viewof mcpTools","cc_notebook_id","cc_watchers","viewof cc_watches","cc_messages","cc_activity","cc_command_handlers","invalidation"], _1g08tci);  
   $def("_agu8h7", "cc_doc_side_effects", ["md"], _agu8h7);  
-  $def("_d9cyj2", "cc_change_forwarder", ["cc_ws","history","invalidation"], _d9cyj2);  
+  $def("_d9cyj2", "cc_change_forwarder", ["cc_ws","viewof history","cc_status","invalidation"], _d9cyj2);  
   $def("_56tjlo", "cc_voice", ["voiceEnabled","KeyboardEvent","SpeechSynthesisUtterance","invalidation"], _56tjlo);  
   $def("_jynll5", "viewof cc_watches", ["Inputs"], _jynll5);  
   $def("_p3qul6", "cc_watches", ["Generators","viewof cc_watches"], _p3qul6);  
@@ -4267,7 +4388,7 @@ export default function define(runtime, observer) {
   main.define("directory", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("directory", _));  
   main.define("viewof disassemble", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("viewof disassemble", _));  
   main.define("disassemble", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("disassemble", _));  
-  main.define("fileSyncTools", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("fileSyncTools", _));  
+  main.define("plugins", ["module @tomlarkworthy/plugin-registry", "@variable"], (_, v) => v.import("plugins", _));
   main.define("viewof syncEnabled", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("viewof syncEnabled", _));  
   main.define("syncEnabled", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("syncEnabled", _));  
   main.define("syncStatus", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("syncStatus", _));
@@ -31764,6 +31885,247 @@ export default function define(runtime, observer) {
   return main;
 }
 </script>
+
+<script id="@tomlarkworthy/plugin-registry" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _1ej2r92 = function _intro(md){return(
+md`# Plugin Registry
+
+A foundational notebook for **decoupled reactive plugin wiring**.
+
+Consumers get a realtime stream of all registered providers under a name. Providers can register themselves under a name. Neither has direct references between each other. This allows you to add more consumers and providers without changing individual providers and consumers. Useful for reactive plugin systems like audio instruments, dyamic menus, LLM tools and entity component systems.
+`
+)};
+const _16jmxgh = function _diagram(htl){return(
+htl.html`<svg viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:system-ui,sans-serif">
+  <defs>
+    <marker id="pr-arr" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="var(--theme-foreground,#333)"></path>
+    </marker>
+    <style>
+      .pr-box{fill:var(--theme-background-alt,#f4f4f6);stroke:var(--theme-foreground-faint,#bbb);stroke-width:1.5}
+      .pr-hub{fill:var(--theme-foreground-faintest,#eef);stroke:var(--theme-foreground,#556);stroke-width:2}
+      .pr-t{fill:var(--theme-foreground,#222);font-size:13px}
+      .pr-s{fill:var(--theme-foreground-muted,#666);font-size:11px}
+      .pr-e{stroke:var(--theme-foreground,#333);stroke-width:1.5;fill:none;marker-end:url(#pr-arr)}
+    </style>
+  </defs>
+
+  <rect class="pr-box" x="10"  y="30"  width="170" height="48" rx="8"></rect>
+  <text class="pr-t" x="95" y="52" text-anchor="middle">Provider A</text>
+  <text class="pr-s" x="95" y="68" text-anchor="middle">plugins.add("x", v)</text>
+  <rect class="pr-box" x="10"  y="120" width="170" height="48" rx="8"></rect>
+  <text class="pr-t" x="95" y="142" text-anchor="middle">Provider B</text>
+  <text class="pr-s" x="95" y="158" text-anchor="middle">plugins.add("x", v, {invalidation})</text>
+  <text class="pr-s" x="95" y="215" text-anchor="middle">…N providers</text>
+
+  <rect class="pr-hub" x="270" y="78"  width="180" height="112" rx="10"></rect>
+  <text class="pr-t" x="360" y="104" text-anchor="middle" style="font-weight:600">plugins</text>
+  <text class="pr-s" x="360" y="128" text-anchor="middle">Map&lt;name, Set&lt;value&gt;&gt;</text>
+  <text class="pr-s" x="360" y="150" text-anchor="middle">add(name, value)</text>
+  <text class="pr-s" x="360" y="168" text-anchor="middle">get(name) → Generator</text>
+
+  <rect class="pr-box" x="540" y="30"  width="170" height="48" rx="8"></rect>
+  <text class="pr-t" x="625" y="52" text-anchor="middle">Consumer 1</text>
+  <text class="pr-s" x="625" y="68" text-anchor="middle">plugins.get("x")</text>
+  <rect class="pr-box" x="540" y="120" width="170" height="48" rx="8"></rect>
+  <text class="pr-t" x="625" y="142" text-anchor="middle">Consumer 2 (V2)</text>
+  <text class="pr-s" x="625" y="158" text-anchor="middle">plugins.get("x")</text>
+  <text class="pr-s" x="625" y="215" text-anchor="middle">…M consumers</text>
+
+  <path class="pr-e" d="M180,54 C225,54 235,116 268,126"></path>
+  <path class="pr-e" d="M180,144 C225,144 240,138 268,140"></path>
+  <path class="pr-e" d="M452,128 C500,116 510,54 538,54"></path>
+  <path class="pr-e" d="M452,142 C500,144 510,144 538,144"></path>
+</svg>`
+)};
+const _xnvzuh = function _contracts(md){return(
+md`## Contracts
+
+| Guarantee | How |
+|---|---|
+| **Named sets** | \`plugins\` maps a name → a set of values. Providers \`add\`, consumers \`get\`; they coordinate only by name. |
+| **Reactive** | \`get(name)\` is a Generator that yields the current set and re-yields on every add/remove for that name. |
+| **N↔M decoupling** | Providers and consumers share only \`plugins\`. Any number of each; a name is the whole contract. |
+| **Auto-cleanup** | \`add\` returns \`remove()\`. Pass \`{invalidation}\` (a cell's disposal promise) to remove automatically when the provider cell re-runs. |
+| **No leaks** | \`get\`'s Generator unsubscribes on disposal; per-name listeners are dropped when the last consumer leaves. |
+| **Eventual convergence** | Each consumer gets the current set immediately on \`get\`, then a full-set snapshot on every change — so any interleaving of add/remove/get converges. |`
+)};
+const _1ua5hud = function _apiReference(md){return(
+md`## API reference
+
+The whole API is two methods on \`plugins\`.
+
+**\`plugins.add(name, value, options?)\`** → \`remove()\`
+Add \`value\` to the set stored under \`name\` (creating the set on first use). Returns a \`remove()\` function
+that takes this value back out. \`options.invalidation\` (optional, may be null/omitted) is a promise — when
+it settles the value is removed automatically; pass a provider cell's built-in \`invalidation\` so re-running
+the cell replaces rather than duplicates. \`value\` is anything; for shared views it is commonly a factory
+\`() => element\` that each consumer calls to get its own instance.
+
+**\`plugins.get(name)\`** → Generator&lt;value[]&gt;
+Return a reactive Generator of the values currently in \`name\`'s set. It yields the current set immediately
+(so a late consumer still converges), then re-yields the full set on every add/remove. Use it from a cell
+and that cell recomputes on each change. Call it from as many consumers as you like (e.g. a module and its
+V2) — each call is an independent Generator that cleans up when its cell is torn down.`
+)};
+const _1pzt22q = function _createPlugins(Generators)
+{
+  return function createPlugins() {
+    const sets = new Map();
+    // name -> Set<value>
+    const listeners = new Map();
+    // name -> Set<() => void>
+    const notify = name => {
+      const ls = listeners.get(name);
+      if (ls)
+        for (const l of [...ls])
+          l();  // copy: a consumer may (un)subscribe while notifying
+    };
+    const add = (name, value, options) => {
+      let set = sets.get(name);
+      if (!set)
+        sets.set(name, set = new Set());
+      set.add(value);
+      notify(name);
+      const remove = () => {
+        const s = sets.get(name);
+        if (s && s.delete(value)) {
+          if (s.size === 0)
+            sets.delete(name);
+          notify(name);
+        }
+      };
+      const invalidation = options && options.invalidation;
+      if (invalidation)
+        Promise.resolve(invalidation).then(remove, remove);
+      return remove;
+    };
+    const get = name => Generators.observe(change => {
+      const push = () => change([...sets.get(name) ?? []]);
+      push();
+      // current set immediately → converges
+      let ls = listeners.get(name);
+      if (!ls)
+        listeners.set(name, ls = new Set());
+      ls.add(push);
+      return () => {
+        ls.delete(push);
+        if (ls.size === 0)
+          listeners.delete(name);
+      };  // leak-safe
+    });
+    return {
+      add,
+      get,
+      listenerCount: name => listeners.get(name)?.size ?? 0
+    };
+  };
+};
+const _1qu8dwj = function _plugins(createPlugins){return(
+createPlugins()
+)};
+const _a7p1z5 = function _testsHeader(md){return(
+md`## Tests`
+)};
+const _15xl311 = function _test_get_reflects_add(createPlugins){return(
+(async () => {
+  const p = createPlugins();
+  const gen = p.get('x');
+  if ((await (await gen.next()).value).length !== 0)
+    throw new Error('new set should start empty');
+  p.add('x', 1);
+  const after = await (await gen.next()).value;
+  if (after.length !== 1 || after[0] !== 1)
+    throw new Error('get did not reflect the add');
+  gen.return();
+  return '\u2705 get(name) yields the named set and updates on add';
+})()
+)};
+const _122zyhz = function _test_multi_provider_and_convergence(createPlugins)
+{
+  return (async () => {
+    const p = createPlugins();
+    const a = p.get('x'), b = p.get('x');
+    // two independent consumers
+    await (await a.next()).value;
+    await (await b.next()).value;
+    p.add('x', 'one');
+    // provider 1
+    p.add('x', 'two');
+    // provider 2
+    const va = (await (await a.next()).value).slice().sort().join(',');
+    const vb = (await (await b.next()).value).slice().sort().join(',');
+    if (va !== 'one,two' || vb !== 'one,two')
+      throw new Error('consumers did not converge to the full set');
+    a.return();
+    b.return();
+    return '\u2705 multiple providers accumulate; all consumers converge';
+  })();
+};
+const _1lojas7 = function _test_remove_and_names_isolated(createPlugins){return(
+(async () => {
+  const p = createPlugins();
+  const gx = p.get('x'), gy = p.get('y');
+  await (await gx.next()).value;
+  await (await gy.next()).value;
+  const remove = p.add('x', 1);
+  p.add('y', 2);
+  if ((await (await gx.next()).value).join() !== '1')
+    throw new Error('x set wrong');
+  if ((await (await gy.next()).value).join() !== '2')
+    throw new Error('names are not isolated');
+  remove();
+  if ((await (await gx.next()).value).length !== 0)
+    throw new Error('remove() did not take the value out');
+  gx.return();
+  gy.return();
+  return '\u2705 remove() works and names are isolated';
+})()
+)};
+const _8240yg = function _test_invalidation_and_no_leak(createPlugins){return(
+(async () => {
+  const p = createPlugins();
+  let settle;
+  p.add('x', 1, { invalidation: new Promise(r => settle = r) });
+  const gen = p.get('x');
+  if ((await (await gen.next()).value).length !== 1)
+    throw new Error('value should be present before invalidation');
+  if (p.listenerCount('x') !== 1)
+    throw new Error('get should have registered a listener');
+  settle();
+  await Promise.resolve();
+  await Promise.resolve();
+  if ((await (await gen.next()).value).length !== 0)
+    throw new Error('invalidation did not remove the value');
+  gen.return();
+  if (p.listenerCount('x') !== 0)
+    throw new Error('disposing the Generator leaked a listener');
+  return '\u2705 {invalidation} auto-removes and get() leaks no listeners';
+})()
+)};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+
+  $def("_1ej2r92", "intro", ["md"], _1ej2r92);  
+  $def("_16jmxgh", "diagram", ["htl"], _16jmxgh);  
+  $def("_xnvzuh", "contracts", ["md"], _xnvzuh);  
+  $def("_1ua5hud", "apiReference", ["md"], _1ua5hud);  
+  $def("_1pzt22q", "createPlugins", ["Generators"], _1pzt22q);  
+  $def("_1qu8dwj", "plugins", ["createPlugins"], _1qu8dwj);  
+  $def("_a7p1z5", "testsHeader", ["md"], _a7p1z5);  
+  $def("_15xl311", "test_get_reflects_add", ["createPlugins"], _15xl311);  
+  $def("_122zyhz", "test_multi_provider_and_convergence", ["createPlugins"], _122zyhz);  
+  $def("_1lojas7", "test_remove_and_names_isolated", ["createPlugins"], _1lojas7);  
+  $def("_8240yg", "test_invalidation_and_no_leak", ["createPlugins"], _8240yg);
+  return main;
+}</script>
 
 <!-- Bootloader -->
 <script id="bootconf.json"
