@@ -4882,7 +4882,7 @@ YOU are a set of these modules, all readable under /src/:
 - robocoop-5-tools — the live tool registry (any notebook can registerTool its own tools in).
 - robocoop-5 — the chat app/UI.
 
-Your filesystem mirrors the notebook in three trees:
+Your filesystem mirrors the notebook in three trees, plus one mounted folder:
 - /src/<id>.js — your EDITABLE live modules (writing/editing one applies to the runtime, as above). These keep
   your EXACT text and are never reformatted, so they are the surface you edit.
 - /notebook/<id>.js — the canonical, auto-formatted mirror of each module (a compile→decompile of the live
@@ -4891,9 +4891,20 @@ Your filesystem mirrors the notebook in three trees:
   config — its \`mains\` list), the bootloader, the bundled libraries, and every FILE ATTACHMENT, stored as
   its on-disk bytes (gzip attachments stay COMPRESSED). The file's presence tells you the ingredient exists;
   glob/grep/read_file inspect it. To read a gzipped block, decompress it with eval_js + DecompressionStream (recipe below).
+- /local-disk/** — a folder on the user's machine, mounted with the "Mount local folder" control (empty until
+  they do). These are REAL files read where they are and written back in place: the user's data lives here and
+  expects results written here. read_file/glob/grep/write_file/edit_file work on it directly. For computation,
+  do not paste data through your context: in a cell or eval_js (module "@tomlarkworthy/local-disk"), use
+  \`await localDisk.readText(path)\` / \`readBytes(path)\` / \`read(path)\` (a lazy File), and write a computed
+  result with \`await localDisk.write(path, data)\` (string, Blob or bytes); or attach_file({module, name, path})
+  to make a disk file a FileAttachment of your module (binary is fine). A module of yours imports it with
+  these two lines inside define(), verbatim:
+    main.define("module @tomlarkworthy/local-disk", async () => runtime.module((await import("@tomlarkworthy/local-disk")).default));
+    main.define("localDisk", ["module @tomlarkworthy/local-disk", "@variable"], (_, v) => v.import("localDisk", _));
+  (in eval_js, \`localDisk\` needs no import at all).
 
 You can study every aspect of yourself; INVESTIGATE rather than guess. Your tools, by what they reveal:
-- glob / grep — find files and search their contents across /src, /notebook and /content. Read your own modules and the libraries they use under /src and /content (exporter-3 is the reference for how a notebook serializes itself into \`<script>\` blocks; fileattachments and runtime-sdk explain attachment resolution and runtime access). There is NO network access through files — for any network access use eval_js + fetch (see below), or define a cell that fetches.
+- glob / grep — find files and search their contents across /src, /notebook, /content and /local-disk. Read your own modules and the libraries they use under /src and /content (exporter-3 is the reference for how a notebook serializes itself into \`<script>\` blocks; fileattachments and runtime-sdk explain attachment resolution and runtime access). There is NO network access through files — for any network access use eval_js + fetch (see below), or define a cell that fetches.
 - read_file / write_file / edit_file — Claude-Code-style file access. edit_file is the reliable way to change a
   module (exact literal replacement); writing/editing a /src module applies it and reports whether it compiled.
   /src files keep your exact bytes, so edit_file old_strings keep matching — build up a module with small edits.
@@ -4913,6 +4924,44 @@ You can study every aspect of yourself; INVESTIGATE rather than guess. Your tool
   This is also how you do NETWORK access:
   \`await (await fetch(url)).json()\` (or \`.text()\`). The notebook's networking layer handles the request; the
   result comes back as the eval_js output. To make a fetched value reactive/reusable, write_file a cell instead.
+  \`localDisk\` and \`py\` are in scope in every eval_js snippet with no import. fetch() and FileAttachment do
+  NOT reach /local-disk — only localDisk and the file tools do.
+- run_python (when registered) — Python 3.13 in a worker (Pyodide, needs network), numpy preloaded, other
+  packages via \`packages\`; /local-disk is mirrored in before the call and files written under it are copied
+  back after; a call over timeout_ms (default 300 s) is killed and Python restarts with its state lost. Use it
+  only when a shipped Python script must run verbatim (a checker); the analysis itself belongs in cells.
+
+ANALYSIS IS A DATAFLOW, NOT A SCRIPT. When the task is to analyse data and produce a result, build it as
+cells in a module of yours (write_file /src/@user/<name>.js), in this shape:
+  1. DATA cells — parse each input ONCE (from /local-disk via localDisk.readText, or a FileAttachment);
+     the runtime caches the parsed value and every later cell reuses it.
+  2. SUMMARY cells — per-item statistics, quantiles, counts, a text histogram; inspect_value them BEFORE you
+     model anything. A scientist looks at the data first; the structure of a dataset is usually visible in one
+     summary and invisible in a head -5.
+     For a detection, vetting or classification task the null model (no signal, constant, no effect) is
+     the default class: an item leaves it only when its signal exceeds the noise implied by the data's
+     own uncertainty columns (chi-square against a constant, a false-alarm probability), and the
+     summary reports how many items pass that test before any model is fitted.
+  3. FEATURE / MODEL cells that depend on the data cells.
+  4. A CANDIDATE cell — your current answer in the required output format.
+  5. A SCORE cell — the task's own metric applied to the candidate AND to the trivial baseline (do nothing,
+     every item in the null class, the uncorrected data), both on data you did not tune on. If the candidate
+     does not beat the baseline there, ship the baseline. A shipped metric/checker script IS the score: port
+     it line by line (its predicate, its complexity rule, its tolerance); a version rewritten from the task
+     text measures something else. A number labelled advisory or public in the task files is not the hidden
+     gate; a model tuned to it beats the baseline there and loses on the hidden set.
+     watch_variable it ONCE; from then on every edit streams the new score to you with no tool call.
+  6. A WRITER cell — writes the candidate to the required output path (localDisk.write) whenever it changes.
+     DATA -> CANDIDATE -> WRITER goes in your FIRST write_file, with a placeholder candidate in the exact
+     output format before you model anything; confirm the file is on disk, then improve it. A run cut off
+     with no file scores zero however good the model in your head is.
+Iterate by editing ONE cell with edit_file — a threshold, a parameter, a term in a library — and only what
+depends on it recomputes; never re-emit code the runtime already holds. Before task_complete, re-read the
+required outputs and every gate or threshold the task states and check each against your score cell; a
+thin margin on a visible gate is a failed hidden gate, so while time remains, use it on the thinnest one. Never overwrite a checkpoint with a
+candidate you have not measured to be better: the score cell is the measurement. eval_js is for one-off
+probes, not for the analysis. The notebook you leave behind IS the deliverable the user reads: data, summaries,
+model, score and the parameters you swept, all live.
 
 Work incrementally: inspect before editing, make the change, then TRUST THE APPLY REPORT — it tells you, in
 the same step, whether the edit COMPILED and whether any cell ERRORS at runtime. That report IS your
@@ -5263,7 +5312,8 @@ export default function define(runtime, observer) {
 const _yyrxg4 = function _1(md){return(
 md`# robocoop-5 srctools
 File tools over a virtual /src (byte-stable, stored on each module's compiled define function as \`.src\`),
-/notebook (canonical decompile, synthesized per read) and /content (raw blocks + attachments, read direct).
+/notebook (canonical decompile, synthesized per read), /content (raw blocks + attachments, read direct) and
+/local-disk (a folder on the user's machine mounted through \`@tomlarkworthy/local-disk\`, real files read and written in place).
 No shell, no filesystem, no sync loop. Tools register through \`@tomlarkworthy/robocoop-5-tools\`.`
 )};
 const _76otvk = function _cellHelpers(currentModules,runtime)
@@ -5296,7 +5346,7 @@ const _19x8b93 = function _rc5_store(){return(
   scratch: new Map()
 }
 )};
-const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module_files, exportModuleJS, importShim) {
+const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module_files, exportModuleJS, importShim, localDisk) {
     const isStyle = id => /^https?:\/\//.test(id) || /\.css$/.test(id);
     const isAttachment = id => /^@?[^/]+\/[^/]+\/.+/.test(id) || /^file:/.test(id);
     const moduleIds = () => {
@@ -5366,7 +5416,18 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         rc5_store.srcFns.set(id, fn);
         return ex.source;
     };
+    // /local-disk/** is the mounted folder (@tomlarkworthy/local-disk); listed on demand, never cached
+    const isDisk = path => path === '/local-disk' || String(path).startsWith('/local-disk/');
+    const listPathsAsync = async () => {
+        const out = listPaths();
+        if (localDisk.mounted) {
+            try { out.push(...await localDisk.walk()); } catch (e) { }
+        }
+        return out.sort();
+    };
     const readPath = async path => {
+        if (isDisk(path))
+            return localDisk.mounted ? localDisk.readText(path) : null;
         if (rc5_store.scratch.has(path))
             return rc5_store.scratch.get(path);
         let m = /^\/src\/(.+)\.js$/.exec(path);
@@ -5424,6 +5485,8 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
     return {
         moduleIds,
         listPaths,
+        listPathsAsync,
+        isDisk,
         readPath,
         seedSrc,
         globToRe
@@ -5882,7 +5945,7 @@ const _190yjiu = function _applyLib(jbApply, currentModules, runtime, probeDefin
         moduleExists
     };
 };
-const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus,srcContext)
+const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus,srcContext,localDisk,py)
 {
   const {resolveModule, varsOf, isStructural, label, oneLine, watchKey} = cellHelpers;
   const nudge = mod => {
@@ -5981,7 +6044,11 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     'Error'
   ]);
   const esc = n => String(n).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const evalInModule = (mod, code, timeoutMs = 8000) => new Promise(resolve => {
+  // Always in scope for a snippet, unless the module defines the same name: the mounted disk and
+  // the Python runtime. Observed 2026-09-02: four of five science runs lost 1-6 steps to
+  // "localDisk is not defined" because eval_js only sees what the module imports.
+  const EXTRAS = { localDisk, py };
+  const evalInModule = (mod, code, timeoutMs = 60000) => new Promise(resolve => {
     const names = new Set();
     // A `viewof x` cell's element is bound to the natural identifier `viewof_x`, so
     // `viewof_x.value = 30; viewof_x.dispatchEvent(new Event('input'))` drives the live control.
@@ -6012,9 +6079,11 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const usedViews = aliases.filter(x => !names.has(x.alias) && refs(x.alias));
     const t = code.trim();
     const isExpr = t && !/[;\n]/.test(t) && !/^\s*(return|const|let|var|throw|if|for|while|async|function|\{|await)\b/.test(t);
+    const extraNames = Object.keys(EXTRAS).filter(n => !names.has(n) && refs(n));
     const params = [
       ...inputs,
-      ...usedViews.map(x => x.alias)
+      ...usedViews.map(x => x.alias),
+      ...extraNames
     ];
     const deps = [
       ...inputs,
@@ -6022,7 +6091,8 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     ];
     let fn;
     try {
-      fn = new AsyncFunction(...params, isExpr ? 'return (' + t + ');' : code);
+      const inner = new AsyncFunction(...params, isExpr ? 'return (' + t + ');' : code);
+      fn = (...depVals) => inner(...depVals, ...extraNames.map(n => EXTRAS[n]));
     } catch (e) {
       return resolve({ error: 'syntax error: ' + (e && e.message || e) });
     }
@@ -6161,7 +6231,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   });
   const eval_js = defineTool({
     id: 'eval_js',
-    description: 'Run a snippet of native JavaScript in the browser, scoped to a module. The module\'s builtins ' + '(md, html, Inputs, Plot, d3, Generators, and crucially FileAttachment) and its named cells are in ' + 'scope by name \u2014 a `viewof x` cell\'s live element is in scope as `viewof_x`, so you can DRIVE a ' + 'control without editing it: `viewof_x.value = 30; viewof_x.dispatchEvent(new Event("input"))`. ' + 'Page globals (window, document, DecompressionStream, \u2026) are available too. A bare ' + 'expression is returned automatically; multi-statement code needs an explicit `return`; top-level await ' + 'works. Use this for computed transforms \u2014 above all, to DECODE a bundled file attachment: ' + 'scope to the module that owns it and do `new Response((await FileAttachment("name.gz").stream())' + '.pipeThrough(new DecompressionStream("gzip"))).text()`. An attachment at /content/@user/mod/name belongs ' + 'to module "@user/mod" with FileAttachment name "name". Also good for computing over live cell values.',
+    description: 'Run a snippet of native JavaScript in the browser, scoped to a module. The module\'s builtins ' + '(md, html, Inputs, Plot, d3, Generators, and crucially FileAttachment) and its named cells are in ' + 'scope by name, and so are `localDisk` (the mounted /local-disk folder: readText/readBytes/read/write) and `py` (Python via run_python) without any import; 60 s budget per call;  \u2014 a `viewof x` cell\'s live element is in scope as `viewof_x`, so you can DRIVE a ' + 'control without editing it: `viewof_x.value = 30; viewof_x.dispatchEvent(new Event("input"))`. ' + 'Page globals (window, document, DecompressionStream, \u2026) are available too. A bare ' + 'expression is returned automatically; multi-statement code needs an explicit `return`; top-level await ' + 'works. Use this for computed transforms \u2014 above all, to DECODE a bundled file attachment: ' + 'scope to the module that owns it and do `new Response((await FileAttachment("name.gz").stream())' + '.pipeThrough(new DecompressionStream("gzip"))).text()`. An attachment at /content/@user/mod/name belongs ' + 'to module "@user/mod" with FileAttachment name "name". Also good for computing over live cell values.',
     parameters: {
       type: 'object',
       properties: {
@@ -6342,14 +6412,14 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     unwatch_variable
   ];
 };
-const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_module_files,cellHelpers,setFileAttachment)
+const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_module_files,cellHelpers,setFileAttachment,localDisk)
 {
-  const {listPaths, readPath, globToRe} = pathLib;
+  const {listPathsAsync, readPath, globToRe, isDisk} = pathLib;
   const {applyModuleSrc} = applyLib;
   const MODULE_PATH = /^\/(?:notebook|src)\/(.+)\.js$/;
   const read_file = defineTool({
     id: 'read_file',
-    description: 'Read a file from the virtual notebook filesystem, returned with line numbers (cat -n style). ' + 'Use offset/limit for large files. Mirrors Claude Code\'s Read. /src/<id>.js is your byte-stable editable ' + 'copy; /notebook/<id>.js is the canonical live form; /content/<id> are the raw blocks/attachments.',
+    description: 'Read a file from the virtual notebook filesystem, returned with line numbers (cat -n style). ' + 'Use offset/limit for large files. Mirrors Claude Code\'s Read. /src/<id>.js is your byte-stable editable ' + 'copy; /notebook/<id>.js is the canonical live form; /content/<id> are the raw blocks/attachments; ' + '/local-disk/** is the mounted folder on the user\'s machine (real files, read where they are).',
     parameters: {
       type: 'object',
       required: ['file_path'],
@@ -6376,7 +6446,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         return { output: 'ERROR: cannot read ' + file_path + ': ' + (e && e.message || e) };
       }
       if (text == null)
-        return { output: 'ERROR: cannot read ' + file_path + ': not found (glob to see what exists)' };
+        return { output: 'ERROR: cannot read ' + file_path + ': not found (glob to see what exists' + (isDisk(file_path) && !localDisk.mounted ? '; no local folder is mounted at /local-disk' : '') + ')' };
       const lines = text.split('\n');
       const start = Math.max(0, offset ? offset - 1 : 0);
       const end = Math.min(lines.length, start + (limit || 2000));
@@ -6386,7 +6456,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
   });
   const write_file = defineTool({
     id: 'write_file',
-    description: 'Create or overwrite a file. Mirrors Claude Code\'s Write. Writing a module file under ' + '/src/<id>.js APPLIES it to the live runtime and reports whether it compiled; your file keeps your ' + 'EXACT text (it is never reformatted), so you can keep editing it with edit_file.',
+    description: 'Create or overwrite a file. Mirrors Claude Code\'s Write. Writing a module file under ' + '/src/<id>.js APPLIES it to the live runtime and reports whether it compiled; your file keeps your ' + 'EXACT text (it is never reformatted), so you can keep editing it with edit_file. A path under ' + '/local-disk/ is written to the user\'s mounted folder on disk (directories created as needed); ' + 'for a LARGE computed result, write it from a cell with localDisk.write(path, data) instead of ' + 'pasting it through this tool.',
     parameters: {
       type: 'object',
       required: [
@@ -6405,6 +6475,14 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
       }
     },
     execute: async ({file_path, content}) => {
+      if (isDisk(file_path)) {
+        try {
+          const r = await localDisk.write(file_path, String(content ?? ''));
+          return { output: 'Wrote ' + file_path + ' (' + r.size + ' bytes, on disk)' };
+        } catch (e) {
+          return { output: 'ERROR: cannot write ' + file_path + ': ' + (e && e.message || e) };
+        }
+      }
       const m = MODULE_PATH.exec(file_path);
       if (!m) {
         rc5_store.scratch.set(file_path, String(content ?? ''));
@@ -6462,6 +6540,14 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         return { output: 'ERROR: old_string is not unique (' + count + ' matches). Add more surrounding context, or set replace_all:true.' };
       const updated = replace_all ? parts.join(new_string) : parts[0] + new_string + parts.slice(1).join(old_string);
       const n = replace_all ? count : 1;
+      if (isDisk(file_path)) {
+        try {
+          await localDisk.write(file_path, updated);
+          return { output: 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ', on disk)' };
+        } catch (e) {
+          return { output: 'ERROR: cannot write ' + file_path + ': ' + (e && e.message || e) };
+        }
+      }
       const m = MODULE_PATH.exec(file_path);
       if (!m) {
         rc5_store.scratch.set(file_path, updated);
@@ -6473,7 +6559,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
   });
   const globTool = defineTool({
     id: 'glob',
-    description: 'Find files by glob pattern over the virtual notebook filesystem. \'**\' spans directories. ' + 'Examples: /src/**/*.js (all editable modules), /content/*, **/store.js. Returns matching paths.',
+    description: 'Find files by glob pattern over the virtual notebook filesystem. \'**\' spans directories. ' + 'Examples: /src/**/*.js (all editable modules), /content/*, /local-disk/** (the mounted folder), **/store.js. Returns matching paths.',
     parameters: {
       type: 'object',
       required: ['pattern'],
@@ -6494,7 +6580,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
       } catch (e) {
         return { output: 'ERROR: bad pattern: ' + (e && e.message || e) };
       }
-      const hits = listPaths().filter(p => re.test(p));
+      const hits = (await listPathsAsync()).filter(p => re.test(p));
       if (!hits.length)
         return { output: '(no files match ' + pattern + ')' };
       const shown = hits.slice(0, 200);
@@ -6546,7 +6632,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         return { output: 'ERROR: bad regex: ' + (e && e.message || e) };
       }
       const base = String(path || '/');
-      let files = listPaths().filter(p => p === base || p.startsWith(base.endsWith('/') ? base : base + '/'));
+      let files = (await listPathsAsync()).filter(p => p === base || p.startsWith(base.endsWith('/') ? base : base + '/'));
       if (glob) {
         let gre;
         try {
@@ -6659,7 +6745,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
   });
   const attach_file = defineTool({
     id: 'attach_file',
-    description: 'Attach a file to a module as a FileAttachment \u2014 the write side of /content. Cells in that ' + 'module read it with FileAttachment(name) (.text()/.json()/.blob()/.url()); cells already erroring with ' + 'File not found recompute automatically. Give content (text) OR url (fetched in-page, bytes preserved \u2014 ' + 'use url for binary/gzip and to keep big libraries out of your context). This is how to vendor a library; ' + 'do NOT hand-roll setFileAttachment through eval_js.',
+    description: 'Attach a file to a module as a FileAttachment \u2014 the write side of /content. Cells in that ' + 'module read it with FileAttachment(name) (.text()/.json()/.blob()/.url()); cells already erroring with ' + 'File not found recompute automatically. Give content (text) OR url (fetched in-page, bytes preserved \u2014 ' + 'use url for binary/gzip and to keep big libraries out of your context), OR path (a file under ' + '/local-disk/, any format, bytes preserved). This is how to vendor a library; ' + 'do NOT hand-roll setFileAttachment through eval_js.',
     parameters: {
       type: 'object',
       required: ['module', 'name'],
@@ -6674,7 +6760,11 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         },
         content: {
           type: 'string',
-          description: 'Text contents. Provide exactly one of content or url.'
+          description: 'Text contents. Provide exactly one of content, url or path.'
+        },
+        path: {
+          type: 'string',
+          description: 'A file in the notebook filesystem to attach as-is, e.g. /local-disk/data/eeg.npy.'
         },
         url: {
           type: 'string',
@@ -6686,12 +6776,12 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         }
       }
     },
-    execute: async ({module: moduleId, name, content, url, mime}) => {
+    execute: async ({module: moduleId, name, content, url, mime, path}) => {
       const mod = cellHelpers.resolveModule(moduleId);
       if (!mod)
         return { output: 'ERROR: no live module ' + moduleId + ' (glob /src/*.js to see module ids; write the module first)' };
-      if ((content == null) === (url == null))
-        return { output: 'ERROR: provide exactly one of content or url' };
+      if ([content, url, path].filter(x => x != null).length !== 1)
+        return { output: 'ERROR: provide exactly one of content, url or path' };
       const extMime = ({js: 'text/javascript', mjs: 'text/javascript', cjs: 'text/javascript', css: 'text/css', json: 'application/json', gz: 'application/gzip', wasm: 'application/wasm', svg: 'image/svg+xml', txt: 'text/plain', md: 'text/markdown'})[(name.split('.').pop() || '').toLowerCase()];
       let file;
       if (url != null) {
@@ -6705,6 +6795,16 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
           return { output: 'ERROR: fetch ' + url + ' \u2192 HTTP ' + res.status };
         const blob = await res.blob();
         file = new File([blob], name, { type: mime || extMime || blob.type || 'application/octet-stream' });
+      } else if (path != null) {
+        if (!isDisk(path))
+          return { output: 'ERROR: path must be under /local-disk/ (got ' + path + ')' };
+        let src;
+        try {
+          src = await localDisk.read(path);
+        } catch (e) {
+          return { output: 'ERROR: cannot read ' + path + ': ' + (e && e.message || e) };
+        }
+        file = new File([src], name, { type: mime || extMime || src.type || 'application/octet-stream' });
       } else {
         file = new File([String(content)], name, { type: mime || extMime || 'text/plain' });
       }
@@ -6726,9 +6826,86 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
     attach_file
   ];
 };
-const _qc0bl = function _rc5_host(rc5_store,applyLib,pathLib,exportModuleJS)
+const _pytl01 = function _pythonTools(defineTool,py)
+{
+  const CAP = 30000;
+  const fmt = (v) => {
+    if (typeof v === 'string') return v;
+    try { return JSON.stringify(v); } catch (e) { return String(v); }
+  };
+  const tail = (s, n) => s.length > n ? '…' + s.slice(-n) : s;
+  const run_python = defineTool({
+    id: 'run_python',
+    description: 'Run Python 3.13 in the page (Pyodide, CPython on wasm). numpy is preloaded; ask for more with ' + '`packages` (scipy, pandas, scikit-learn, sympy, matplotlib…, ~1-5 s each the first time). The mounted ' + '/local-disk folder is mirrored into Python\'s filesystem at the SAME paths before the call, and any file ' + 'Python writes under /local-disk is copied back to the real disk afterwards — so run the task\'s own metric ' + 'or checker scripts verbatim, and do numeric work here rather than by hand in JS. Returns stdout, stderr ' + 'and the value of the last expression. The same interpreter is reused, so globals and files persist ' + 'between calls. Python runs in a worker; a call over timeout_ms (default 300 s) is killed and Python ' + 'restarts with state lost, so checkpoint to /local-disk. The first call pays ~3 s to load.',
+    parameters: {
+      type: 'object',
+      required: ['code'],
+      properties: {
+        code: {
+          type: 'string',
+          description: 'Python source. The value of the last expression is returned.'
+        },
+        packages: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Extra pyodide packages to load first, e.g. ["pandas","scipy"].'
+        },
+        out: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Filesystem paths to read back and include in the output, e.g. ["/work/out.json"].'
+        },
+        disk: {
+          type: 'boolean',
+          description: 'Mirror /local-disk in and copy writes back out (default true). Set false for a pure computation.'
+        },
+        timeout_ms: {
+          type: 'integer',
+          description: 'Kill the run after this many ms (default 300000, max 1800000). The worker is terminated and Python restarts empty.'
+        }
+      }
+    },
+    execute: async ({code, packages, out, disk, timeout_ms}) => {
+      let r;
+      try {
+        r = await py.run(String(code ?? ''), {
+          packages: packages || [],
+          out: out || [],
+          disk: disk !== false,
+          timeoutMs: Math.min(1800000, Number(timeout_ms) > 0 ? Number(timeout_ms) : 300000)
+        });
+      } catch (e) {
+        return { output: 'ERROR: pyodide could not load (network?): ' + (e && e.message || e) };
+      }
+      if (r.loadError)
+        return { output: 'ERROR: pyodide could not load (network?): ' + r.stderr };
+      const parts = [];
+      if (!r.ok) {
+        parts.push('ERROR (python):\n' + tail(r.stderr, 8000));
+        if (r.stdout) parts.push('stdout:\n' + r.stdout);
+      } else {
+        if (r.result !== undefined && r.result !== null) parts.push('result: ' + fmt(r.result));
+        if (r.stdout) parts.push('stdout:\n' + r.stdout);
+        if (r.stderr) parts.push('stderr:\n' + r.stderr);
+        for (const [p, t] of Object.entries(r.files || {})) parts.push(p + ':\n' + t);
+        for (const w of r.wrote || []) parts.push(w.error ? 'FAILED to write ' + w.path + ': ' + w.error : 'wrote: ' + w.path + ' (' + w.size + ' bytes)');
+        if (r.skipped && r.skipped.length) parts.push('not mirrored: ' + r.skipped.join(', '));
+      }
+      parts.push('(' + r.ms + ' ms)');
+      const text = parts.join('\n');
+      return { output: text.length > CAP ? text.slice(0, CAP) + '\n[truncated]' : text };
+    }
+  });
+  return [run_python];
+};
+const _qc0bl = function _rc5_host(rc5_store,applyLib,pathLib,exportModuleJS,mountLocalDisk)
 {
   const MODULE_PATH = /^\/(?:notebook|src)\/(.+)\.js$/;
+  // mount(): the picker path an eval driver takes with a faked showDirectoryPicker; mount(handle) skips it
+  const mount = async (handle) => {
+    const h = handle || await window.showDirectoryPicker({ mode: 'readwrite' });
+    return { ok: true, name: mountLocalDisk(h) };
+  };
   const seedFile = async (path, src) => {
     const m = MODULE_PATH.exec(path);
     if (!m) {
@@ -6761,14 +6938,16 @@ const _qc0bl = function _rc5_host(rc5_store,applyLib,pathLib,exportModuleJS)
   };
   return {
     seedFile,
-    snapshotFiles
+    snapshotFiles,
+    mount
   };
 };
-const _1nb19yl = function _hostSetup(valueTools,fileTools,registerTool,invalidation,unregisterTool)
+const _1nb19yl = function _hostSetup(valueTools,fileTools,pythonTools,registerTool,invalidation,unregisterTool)
 {
   const tools = [
     ...valueTools,
-    ...fileTools
+    ...fileTools,
+    ...pythonTools
   ];
   tools.forEach(t => registerTool(t));
   invalidation.then(() => tools.forEach(t => unregisterTool(t.id)));
@@ -6793,10 +6972,11 @@ const _55ati1 = function _watchTable(html,rc5_watchBus,invalidation)
   invalidation.then(() => clearInterval(t));
   return wrap;
 };
-const _115mvzc = function _11(html,hostSetup,watchTable){return(
+const _115mvzc = function _11(html,hostSetup,watchTable,$0){return(
 html`<div style="font:12px ui-monospace,Menlo,monospace;color:#7ee787;display:flex;flex-direction:column;gap:6px">
-    <div>● srctools active — no shell, no fs: /src rides on each module's define function</div>
-    <div style="color:#8b949e">tools: ${ hostSetup.join(', ') } · /src = byte-stable editable modules, /notebook = canonical (synthesized), /content = raw blocks + attachments (read direct)</div>
+    <div>● srctools active — no shell: /src rides on each module's define function, /local-disk is a mounted folder</div>
+    <div style="color:#8b949e">tools: ${ hostSetup.join(', ') } · /src = byte-stable editable modules, /notebook = canonical (synthesized), /content = raw blocks + attachments (read direct), /local-disk = the user's folder (real files)</div>
+    ${ $0 }
     ${ watchTable }
   </div>`
 )};
@@ -6816,18 +6996,21 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/robocoop-5-tools", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-tools.js?v=4")).default));  
   main.define("module @tomlarkworthy/summarizejs", async () => runtime.module((await import("/@tomlarkworthy/summarizejs.js?v=4")).default));  
   main.define("module @tomlarkworthy/fileattachments", async () => runtime.module((await import("/@tomlarkworthy/fileattachments.js?v=4")).default));  
+  main.define("module @tomlarkworthy/local-disk", async () => runtime.module((await import("/@tomlarkworthy/local-disk.js?v=4")).default));
+  main.define("module @tomlarkworthy/pyodide", async () => runtime.module((await import("/@tomlarkworthy/pyodide.js?v=4")).default));  
   $def("_yyrxg4", null, ["md"], _yyrxg4);  
   $def("_76otvk", "cellHelpers", ["currentModules","runtime"], _76otvk);  
   $def("_19x8b93", "rc5_store", [], _19x8b93);  
-  $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim"], _o37ix1);  
+  $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim","localDisk"], _o37ix1);  
   $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
   $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","importShim","location","navigate","rc5_store","descendants","srcContext"], _190yjiu);
-  $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext"], _ual70b);
-  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment"], _6aumvx);  
-  $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS"], _qc0bl);  
-  $def("_1nb19yl", "hostSetup", ["valueTools","fileTools","registerTool","invalidation","unregisterTool"], _1nb19yl);  
+  $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py"], _ual70b);
+  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment","localDisk"], _6aumvx);  
+  $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS","mountLocalDisk"], _qc0bl);  
+  $def("_pytl01", "pythonTools", ["defineTool","py"], _pytl01);
+  $def("_1nb19yl", "hostSetup", ["valueTools","fileTools","pythonTools","registerTool","invalidation","unregisterTool"], _1nb19yl);  
   $def("_55ati1", "watchTable", ["html","rc5_watchBus","invalidation"], _55ati1);  
-  $def("_115mvzc", null, ["html","hostSetup","watchTable"], _115mvzc);  
+  $def("_115mvzc", null, ["html","hostSetup","watchTable","viewof localDiskHandle"], _115mvzc);  
   main.define("exportModuleJS", ["module @tomlarkworthy/exporter-3", "@variable"], (_, v) => v.import("exportModuleJS", _));  
   main.define("probeDefine", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("probeDefine", _));  
   main.define("jbApply", ["module @tomlarkworthy/file-sync", "@variable"], (_, v) => v.import("jbApply", _));  
@@ -6845,6 +7028,10 @@ export default function define(runtime, observer) {
   main.define("summarizeJS", ["module @tomlarkworthy/summarizejs", "@variable"], (_, v) => v.import("summarizeJS", _));  
   main.define("all_module_files", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("all_module_files", _));  
   main.define("setFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("setFileAttachment", _));
+  main.define("localDisk", ["module @tomlarkworthy/local-disk", "@variable"], (_, v) => v.import("localDisk", _));
+  main.define("py", ["module @tomlarkworthy/pyodide", "@variable"], (_, v) => v.import("py", _));
+  main.define("mountLocalDisk", ["module @tomlarkworthy/local-disk", "@variable"], (_, v) => v.import("mountLocalDisk", _));
+  main.define("viewof localDiskHandle", ["module @tomlarkworthy/local-disk", "@variable"], (_, v) => v.import("viewof localDiskHandle", _));
   return main;
 }</script>
 
@@ -9061,7 +9248,7 @@ function serializeValue(value, maxLen) {
 const _em1684 = function _cc_doc_watchers(md){return(
 md`---
 ### Variable watcher
-Subscribes to Observable variables via \`observe()\`, debounces updates (1s), and forwards changes to Claude Code over the WebSocket. Also maintains the \`cc_watches\` table UI.`
+Subscribes to Observable variables via \`observe()\`, debounces updates (1s), and forwards changes to Claude Code over the WebSocket. A value whose serialization did not change is not sent. An array that only grew since the last send is sent as its appended tail with a \`delta: {from, length}\` field; the first send after a (re)connect is always the whole value. Also maintains the \`cc_watches\` table UI.`
 )};
 const _aaoorg = function _cc_watchers(cc_find_module,cc_module,lookupVariable,cc_serialize_value,$0,Event,observe,invalidation){return(
 function () {
@@ -9069,6 +9256,10 @@ function () {
     var sendFn = null;
     function setSend(fn) {
         sendFn = fn;
+        if (fn)
+            watchers.forEach(function (w) {
+                w.reset();
+            });
     }
     function watchVariable(runtime, name, moduleName) {
         var key = (moduleName || 'main') + ':' + name;
@@ -9096,9 +9287,33 @@ function () {
             var debounceTimer = null;
             var latestValue = undefined;
             var latestError = undefined;
+            var received = false;
+            var lastSent = null;
+            function arrayDelta(value) {
+                if (!Array.isArray(value) || !lastSent || !lastSent.items)
+                    return null;
+                var prev = lastSent.items;
+                if (prev.length > value.length)
+                    return null;
+                for (var i = 0; i < prev.length; i++)
+                    if (prev[i] !== value[i])
+                        return null;
+                return {
+                    from: prev.length,
+                    length: value.length
+                };
+            }
             function flush() {
                 debounceTimer = null;
-                var serialized = latestError ? 'Error: ' + (latestError.message || String(latestError)) : cc_serialize_value(latestValue, 2000);
+                var delta = latestError ? null : arrayDelta(latestValue);
+                var serialized = latestError ? 'Error: ' + (latestError.message || String(latestError)) : cc_serialize_value(delta ? latestValue.slice(delta.from) : latestValue, 2000);
+                if (lastSent && (delta ? delta.from === delta.length : lastSent.serialized === serialized))
+                    return;
+                lastSent = {
+                    serialized: delta ? null : serialized,
+                    items: !latestError && Array.isArray(latestValue) ? latestValue.slice() : null
+                };
+                var shown = (delta ? '[+' + (delta.length - delta.from) + ' @' + delta.from + '] ' : '') + serialized;
                 var now = new Date().toLocaleTimeString();
                 var watches = $0.value.slice();
                 var found = false;
@@ -9107,7 +9322,7 @@ function () {
                         watches[i] = {
                             name: name,
                             module: resolvedModule,
-                            value: serialized.slice(0, 200),
+                            value: shown.slice(0, 200),
                             updated: now
                         };
                         found = true;
@@ -9118,7 +9333,7 @@ function () {
                     watches.push({
                         name: name,
                         module: resolvedModule,
-                        value: serialized.slice(0, 200),
+                        value: shown.slice(0, 200),
                         updated: now
                     });
                 $0.value = watches;
@@ -9133,11 +9348,14 @@ function () {
                         msg.error = latestError.message || String(latestError);
                     } else {
                         msg.value = serialized;
+                        if (delta)
+                            msg.delta = delta;
                     }
                     sendFn(msg);
                 }
             }
             function scheduleUpdate(value, error) {
+                received = true;
                 latestValue = value;
                 latestError = error;
                 if (!debounceTimer) {
@@ -9156,6 +9374,11 @@ function () {
                 }
             }, { invalidation: invalidation });
             watchers.set(key, {
+                reset: function () {
+                    lastSent = null;
+                    if (received)
+                        scheduleUpdate(latestValue, latestError);
+                },
                 dispose: function () {
                     if (debounceTimer)
                         clearTimeout(debounceTimer);
@@ -10105,25 +10328,24 @@ function () {
 const _agu8h7 = function _cc_doc_side_effects(md){return(
 md`---
 ### Side effects
-\`cc_change_forwarder\` polls the local-change-history and streams new cell edits to Claude Code. \`cc_voice\` provides optional speech recognition input and TTS output for hands-free pairing.`
+\`cc_change_forwarder\` listens to the local-change-history input and streams new cell edits to Claude Code (1s debounce). \`cc_voice\` provides optional speech recognition input and TTS output for hands-free pairing.`
 )};
-const _d9cyj2 = function _cc_change_forwarder(cc_ws,history,invalidation){return(
+const _d9cyj2 = function _cc_change_forwarder(cc_ws,$0,cc_status,invalidation){return(
 function () {
-    var highWaterMark = 0;
-    var initializing = true;
-    var interval = setInterval(function () {
-        if (!cc_ws.paired || !cc_ws.ws)
+    // depends on the viewof element, not the value: history is mutated in
+    // place and re-dispatched, so a value dependency re-runs this cell on
+    // every edit and the high-water mark never advances past "initial"
+    var highWaterMark = ($0.value || []).length;
+    var timer = null;
+    function flush() {
+        timer = null;
+        var history = $0.value;
+        if (!Array.isArray(history))
             return;
-        if (!history || !Array.isArray(history))
-            return;
-        var total = history.length;
-        if (initializing) {
-            highWaterMark = total;
-            initializing = false;
+        if (!cc_ws.paired || !cc_ws.ws || history.length <= highWaterMark) {
+            highWaterMark = history.length;
             return;
         }
-        if (total <= highWaterMark)
-            return;
         var newEntries = history.slice(highWaterMark).map(function (e) {
             return {
                 t: e.t,
@@ -10134,14 +10356,29 @@ function () {
                 _definition: typeof e._definition === 'function' ? e._definition.toString().slice(0, 500) : String(e._definition || '').slice(0, 500)
             };
         });
-        highWaterMark = total;
+        highWaterMark = history.length;
         cc_ws.ws.send(JSON.stringify({
             type: 'cell-change',
             changes: newEntries
         }));
-    }, 1000);
+    }
+    function onInput() {
+        if (timer)
+            clearTimeout(timer);
+        timer = setTimeout(flush, 1000);
+    }
+    function onStatus() {
+        // a new consumer starts from now; boot-time entries are not edits
+        if (cc_status.value === 'connected')
+            highWaterMark = ($0.value || []).length;
+    }
+    $0.addEventListener('input', onInput);
+    cc_status.addEventListener('input', onStatus);
     invalidation.then(function () {
-        clearInterval(interval);
+        $0.removeEventListener('input', onInput);
+        cc_status.removeEventListener('input', onStatus);
+        if (timer)
+            clearTimeout(timer);
     });
     return 'change forwarder active';
 }()
@@ -10302,10 +10539,6 @@ Inputs.input([
     },
     {
         name: 'currentModules',
-        module: null
-    },
-    {
-        name: 'history',
         module: null
     }
 ])
@@ -10576,7 +10809,7 @@ export default function define(runtime, observer) {
   $def("_ptgn2x", "cc_command_handlers", ["runtime","cc_handle_get_variable","cc_handle_define_variable","cc_handle_define_cell","cc_handle_delete_variable","cc_handle_delete_cell","cc_handle_update_cell","cc_handle_list_variables","cc_handle_list_cells","cc_handle_run_tests","cc_handle_create_module","cc_handle_delete_module","cc_handle_eval","cc_handle_fork","cc_handle_export_module","cc_handle_watch","cc_handle_unwatch","cc_handle_call_tool"], _ptgn2x);  
   $def("_1g08tci", "cc_ws", ["cc_config","location","cc_status","Event","viewof mcpTools","cc_notebook_id","cc_watchers","viewof cc_watches","cc_messages","cc_activity","cc_command_handlers","invalidation"], _1g08tci);  
   $def("_agu8h7", "cc_doc_side_effects", ["md"], _agu8h7);  
-  $def("_d9cyj2", "cc_change_forwarder", ["cc_ws","history","invalidation"], _d9cyj2);  
+  $def("_d9cyj2", "cc_change_forwarder", ["cc_ws","viewof history","cc_status","invalidation"], _d9cyj2);  
   $def("_56tjlo", "cc_voice", ["voiceEnabled","KeyboardEvent","SpeechSynthesisUtterance","invalidation"], _56tjlo);  
   $def("_jynll5", "viewof cc_watches", ["Inputs"], _jynll5);  
   $def("_p3qul6", "cc_watches", ["Generators","viewof cc_watches"], _p3qul6);  
@@ -31689,19 +31922,30 @@ const _createOpenRouterClient = function _createOpenRouterClient(){
       };
       // Transient failures (network drops, 429 rate limits, 5xx) are retried with exponential backoff —
       // a single throttled request must not kill a whole agent turn. Aborts (steer/interrupt) never retry.
-      const retriable = (e) => /Failed to fetch|NetworkError|load failed|OpenRouter (408|429|5\d\d)/i.test(String(e && e.message || e));
+      const retriable = (e) => /Failed to fetch|NetworkError|network error|load failed|stream error|stream idle|Upstream error|overloaded|ECONNRESET|OpenRouter (408|429|5\d\d)/i.test(String(e && e.message || e));
       let lastErr;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        if (attempt) await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt + Math.random() * 1000));
+      // 8 attempts, backoff capped at 60 s (~4 min total): a provider outage of a few minutes exhausted
+      // the old 5 × ≤16 s budget mid-turn (2026-09-03). steer/interrupt still aborts a waiting retry.
+      const STREAM_IDLE_MS = 180000;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        if (attempt) await new Promise((r) => setTimeout(r, Math.min(60000, 1000 * 2 ** attempt) + Math.random() * 1000));
         if (signal && signal.aborted) throw (lastErr || new Error('aborted'));
         try {
           // STREAMING (SSE): long generations over proxied networks die if the connection looks idle —
           // a non-streaming completion is silent for the entire generation. Streamed deltas keep the
           // socket alive; the message (content + tool_calls) is reassembled here so callers see the
           // same shape as the non-streaming API.
-          const res = await fetch(`${baseUrl}/chat/completions`, {
-            method: 'POST', headers: headers(), body: JSON.stringify({ ...body, stream: true }), signal
-          });
+          // A stream that stops delivering bytes never errors on its own (OpenRouter keeps a live stream
+          // fed with comment lines while the model reasons). A silent 3 min is a dead request: abort it
+          // and retry instead of holding the step until the turn's wall clock runs out.
+          const ctrl = new AbortController();
+          const onAbort = () => ctrl.abort();
+          if (signal) signal.addEventListener('abort', onAbort, { once: true });
+          let idleTimer;
+          const idle = (p) => Promise.race([p, new Promise((_, rej) => { idleTimer = setTimeout(() => { rej(new Error('OpenRouter stream idle for ' + STREAM_IDLE_MS + 'ms')); ctrl.abort(); }, STREAM_IDLE_MS); })]).finally(() => clearTimeout(idleTimer));
+          const res = await idle(fetch(`${baseUrl}/chat/completions`, {
+            method: 'POST', headers: headers(), body: JSON.stringify({ ...body, stream: true }), signal: ctrl.signal
+          })).catch((e) => { if (signal) signal.removeEventListener('abort', onAbort); throw e; });
           if (!res.ok) {
             const text = await res.text().catch(() => '');
             let detail = text;
@@ -31713,8 +31957,8 @@ const _createOpenRouterClient = function _createOpenRouterClient(){
           let buf = '', sawChoice = false, finish = null, native = null, usage = null;
           const acc = { content: '', tool_calls: [] };
           for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
+            const { done, value } = await idle(reader.read()).catch((e) => { if (signal) signal.removeEventListener('abort', onAbort); throw e; });
+            if (done) { if (signal) signal.removeEventListener('abort', onAbort); break; }
             buf += decoder.decode(value, { stream: true });
             let nl;
             while ((nl = buf.indexOf('\n')) >= 0) {
@@ -38635,6 +38879,550 @@ export default function define(runtime, observer) {
   main.define("unregisterTool", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("unregisterTool", _));
   main.define("onCodeChange", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("onCodeChange", _));
   main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
+  return main;
+}</script>
+
+<script id="@tomlarkworthy/local-disk" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _ld_doc = function _1(md){return(
+md`# local-disk
+Mounts one folder from this machine at \`/local-disk\` for the notebook and its agents, through the
+File System Access API (\`showDirectoryPicker({mode:'readwrite'})\`, works from a \`file://\` notebook).
+Reads are lazy \`File\` objects and writes go back through the folder's own handles, so a scientist's
+data folder is read where it is and results land beside it. The handle is remembered in IndexedDB;
+after a reload one click re-grants permission. \`mountLocalDisk(handle)\` is the programmatic seam
+(tests hand it a synthetic handle; the picker cannot be driven headlessly).`
+)};
+const _ld_viewof = function _viewofLocalDiskHandle(htl){
+  const IDB_NAME = 'lopecode-local-disk', STORE = 'handles', KEY = 'root';
+  const openDB = () => new Promise((resolve, reject) => {
+    const req = window.indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  const idb = async (mode, fn) => {
+    let db;
+    try { db = await openDB(); } catch (e) { return undefined; }
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, mode);
+      const r = fn(tx.objectStore(STORE));
+      tx.oncomplete = () => resolve(r && r.result);
+      tx.onerror = () => reject(tx.error);
+    });
+  };
+  const container = htl.html`<div style="display:flex;gap:6px;align-items:center;font:12px ui-monospace,Menlo,monospace">
+    <button class="main" style="padding:4px 10px;cursor:pointer">Mount local folder</button>
+    <span class="status" style="color:#8b949e"></span>
+    <button class="forget" style="padding:2px 8px;cursor:pointer;display:none">Unmount</button>
+  </div>`;
+  const btn = container.querySelector('.main'), status = container.querySelector('.status'), forget = container.querySelector('.forget');
+  container.value = null;
+  const emit = () => container.dispatchEvent(new window.Event('input', { bubbles: true }));
+  const setMounted = (handle) => {
+    container.value = handle;
+    btn.textContent = '● /local-disk ← ' + handle.name;
+    btn.onclick = pick;
+    forget.style.display = '';
+    status.textContent = '';
+    emit();
+  };
+  const setUnmounted = (msg) => {
+    container.value = null;
+    btn.textContent = 'Mount local folder';
+    btn.onclick = pick;
+    forget.style.display = 'none';
+    status.textContent = msg || '';
+    emit();
+  };
+  async function pick() {
+    if (typeof window.showDirectoryPicker !== 'function') { status.textContent = 'File System Access API unavailable in this browser'; return; }
+    try {
+      const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      await idb('readwrite', s => s.put(handle, KEY)).catch(() => {});
+      setMounted(handle);
+    } catch (e) {
+      if (!(e && e.name === 'AbortError')) status.textContent = String(e && e.message || e);
+    }
+  }
+  forget.onclick = async () => { await idb('readwrite', s => s.delete(KEY)).catch(() => {}); setUnmounted(); };
+  // programmatic seam: hand in a handle (real or synthetic) without the picker
+  container.mount = (handle) => { if (!handle || handle.kind !== 'directory') throw new Error('mount needs a FileSystemDirectoryHandle'); setMounted(handle); };
+  btn.onclick = pick;
+  (async () => {
+    const saved = await idb('readonly', s => s.get(KEY)).catch(() => undefined);
+    if (!saved) return;
+    let perm = 'prompt';
+    try { perm = await saved.queryPermission({ mode: 'readwrite' }); } catch (e) {}
+    if (perm === 'granted') setMounted(saved);
+    else {
+      btn.textContent = 'Remount ' + saved.name;
+      btn.onclick = async () => {
+        try { if ((await saved.requestPermission({ mode: 'readwrite' })) === 'granted') setMounted(saved); else await pick(); }
+        catch (e) { await pick(); }
+      };
+    }
+  })();
+  return container;
+};
+const _ld_value = function _localDiskHandle(Generators,$0){return(
+Generators.input($0)
+)};
+const _ld_mount = function _mountLocalDisk($0){return(
+(handle) => { $0.mount(handle); return handle.name; }
+)};
+const _ld_api = function _localDisk(localDiskHandle){
+  const ROOT = '/local-disk';
+  const SKIP = new Set(['.git', 'node_modules', '.venv', '__pycache__', '.DS_Store', 'target', 'dist', '.cache']);
+  const handle = localDiskHandle || null;
+  const need = () => { if (!handle) throw new Error('no local folder mounted at /local-disk (click "Mount local folder")'); return handle; };
+  const parts = (path) => {
+    let p = String(path || '');
+    if (p === ROOT) p = '';
+    else if (p.startsWith(ROOT + '/')) p = p.slice(ROOT.length + 1);
+    else if (p.startsWith('/')) throw new Error(path + ' is outside ' + ROOT);
+    const out = p.split('/').filter(Boolean);
+    if (out.some(s => s === '..')) throw new Error('".." is not allowed in ' + path);
+    return out;
+  };
+  const dir = async (path, { create = false } = {}) => {
+    let cur = need();
+    for (const seg of parts(path)) cur = await cur.getDirectoryHandle(seg, { create });
+    return cur;
+  };
+  const fileHandle = async (path, { create = false } = {}) => {
+    const segs = parts(path);
+    if (!segs.length) throw new Error(ROOT + ' is a directory');
+    const name = segs.pop();
+    let cur = need();
+    for (const seg of segs) cur = await cur.getDirectoryHandle(seg, { create });
+    return cur.getFileHandle(name, { create });
+  };
+  const join = (base, name) => (base === ROOT ? ROOT : base.replace(/\/$/, '')) + '/' + name;
+  const exists = async (path) => {
+    try { await fileHandle(path); return 'file'; } catch (e) {}
+    try { await dir(path); return 'directory'; } catch (e) {}
+    return null;
+  };
+  const list = async (path = ROOT) => {
+    const d = await dir(path);
+    const out = [];
+    for await (const [name, h] of d.entries()) out.push({ name, kind: h.kind, path: join(path, name) });
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  };
+  const walk = async (path = ROOT, { maxDepth = 8, maxEntries = 5000, skip = SKIP } = {}) => {
+    const out = [];
+    const rec = async (p, d, depth) => {
+      if (depth > maxDepth || out.length >= maxEntries) return;
+      for await (const [name, h] of d.entries()) {
+        if (out.length >= maxEntries) return;
+        if (skip.has(name)) continue;
+        const full = join(p, name);
+        if (h.kind === 'file') out.push(full);
+        else await rec(full, h, depth + 1);
+      }
+    };
+    await rec(path, await dir(path), 0);
+    return out.sort();
+  };
+  const read = async (path) => (await fileHandle(path)).getFile();
+  const readBytes = async (path) => new Uint8Array(await (await read(path)).arrayBuffer());
+  const readText = async (path) => {
+    const f = await read(path);
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(await f.arrayBuffer()); }
+    catch (e) { throw new Error(path + ' is not UTF-8 text (' + f.size + ' bytes) — attach it with attach_file({path}) or read bytes in a cell with localDisk.readBytes'); }
+  };
+  const write = async (path, data) => {
+    const fh = await fileHandle(path, { create: true });
+    const w = await fh.createWritable();
+    try { await w.write(data instanceof Blob || data instanceof ArrayBuffer || ArrayBuffer.isView(data) ? data : String(data ?? '')); }
+    finally { await w.close(); }
+    const f = await fh.getFile();
+    return { path, size: f.size };
+  };
+  const remove = async (path, { recursive = false } = {}) => {
+    const segs = parts(path);
+    if (!segs.length) throw new Error('refusing to remove ' + ROOT);
+    const name = segs.pop();
+    const d = await dir(ROOT + (segs.length ? '/' + segs.join('/') : ''));
+    await d.removeEntry(name, { recursive });
+  };
+  return { root: ROOT, mounted: !!handle, name: handle ? handle.name : null, handle, SKIP, parts, dir, fileHandle, exists, list, walk, read, readBytes, readText, write, remove };
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  $def("_ld_doc", null, ["md"], _ld_doc);
+  $def("_ld_viewof", "viewof localDiskHandle", ["htl"], _ld_viewof);
+  $def("_ld_value", "localDiskHandle", ["Generators","viewof localDiskHandle"], _ld_value);
+  $def("_ld_mount", "mountLocalDisk", ["viewof localDiskHandle"], _ld_mount);
+  $def("_ld_api", "localDisk", ["localDiskHandle"], _ld_api);
+  return main;
+}</script>
+
+<script id="@tomlarkworthy/pyodide" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _py_doc = function _1(md,pyodideVersion){return(
+md`# pyodide
+Python 3.13 in the page — [Pyodide](https://pyodide.org) v${ pyodideVersion } (CPython on wasm), fetched from
+jsDelivr on first use. ~8 MB over the network, so it needs connectivity and cannot be baked into a
+notebook file; nothing is fetched at boot. The interpreter lives in a **Web Worker**, so a long run leaves
+the page responsive and can be killed: a run over its budget terminates the worker, and the next call
+starts a fresh one (globals, loaded packages and files outside /local-disk are lost). Within a worker's
+life the same interpreter is reused, so globals and files persist across runs.
+
+The worker is classic, not \`type:"module"\` — a blob module worker cannot start on a \`file://\` page
+(opaque origin), so pyodide comes in through \`importScripts\`.
+
+~~~js
+py.ready()                        // start the worker, loadPyodide, load numpy, mkdir /work; memoised
+py.status()                       // {ready, running, since}
+py.loadPackages(["scipy"])        // any pyodide package name (pandas, scikit-learn, sympy, matplotlib…)
+py.run(code, {                    // → {ok, result, stdout, stderr, files, wrote, ms}
+  files: {"/work/x.csv": "a,b"},  // written into the FS first (string | Uint8Array | Blob | File)
+  packages: ["pandas"],           // loaded before the run
+  out: ["/work/out.json"],        // extra FS paths returned in .files (text, or "<binary N bytes>")
+  disk: true,                     // mirror the mounted folder in at /local-disk/**, copy writes back out
+  timeoutMs: 300000               // over budget → worker terminated, {ok:false, timedOut:true}
+})
+~~~`
+)};
+const _py_ver = function _pyodideVersion(){return(
+"0.29.3"
+)};
+const _py_api = function _py(pyodideVersion,localDisk)
+{
+  const CDN = 'https://cdn.jsdelivr.net/pyodide/v' + pyodideVersion + '/full/';
+  const MAX_MIRROR = 50 * 1024 * 1024;
+  const CAP = 20000;
+  const DEFAULT_TIMEOUT = 300000;
+
+  // Classic worker: a blob worker with {type:'module'} fails to start on a file:// page (opaque
+  // origin), so pyodide is pulled in with importScripts. SharedArrayBuffer is unavailable here, so
+  // there is no interruptBuffer — terminate-and-restart is the only way to stop a run.
+  const WORKER_SRC = `
+let py = null;
+const send = (msg, transfer) => self.postMessage(msg, transfer || []);
+const mtimeOf = (p) => { try { return +py.FS.stat(p).mtime; } catch (e) { return 0; } };
+const writeFS = (path, data) => {
+  const i = path.lastIndexOf('/');
+  if (i > 0) py.FS.mkdirTree(path.slice(0, i));
+  py.FS.writeFile(path, data);
+};
+const walk = (root) => {
+  const out = [];
+  const rec = (p) => {
+    let names;
+    try { names = py.FS.readdir(p); } catch (e) { return; }
+    for (const n of names) {
+      if (n === '.' || n === '..') continue;
+      const full = (p === '/' ? '' : p) + '/' + n;
+      let st;
+      try { st = py.FS.stat(full); } catch (e) { continue; }
+      if (py.FS.isDir(st.mode)) rec(full); else out.push({ path: full, mtime: +st.mtime });
+    }
+  };
+  rec(root);
+  return out;
+};
+const readText = (p) => {
+  let b;
+  try { b = py.FS.readFile(p); } catch (e) { return 'ERROR: not found in the python filesystem'; }
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(b); }
+  catch (e) { return '<binary ' + b.length + ' bytes>'; }
+};
+// A PyProxy that survived toJs is not structured-cloneable; posting it would kill the reply.
+const cloneable = (v) => {
+  if (v === null || v === undefined) return v;
+  const t = typeof v;
+  if (t === 'number' || t === 'string' || t === 'boolean') return v;
+  try { structuredClone(v); return v; } catch (e) { return String(v); }
+};
+self.onmessage = async (e) => {
+  const msg = e.data || {}, id = msg.id;
+  try {
+    if (msg.op === 'init') {
+      importScripts(msg.cdn + 'pyodide.js');
+      py = await self.loadPyodide({ indexURL: msg.cdn });
+      await py.loadPackage(['numpy']);
+      py.FS.mkdirTree('/work');
+      send({ id: id, ok: true, value: py.version });
+    } else if (msg.op === 'loadPackages') {
+      await py.loadPackage(msg.names);
+      send({ id: id, ok: true, value: msg.names });
+    } else if (msg.op === 'writeFiles') {
+      const stamps = {}, missing = [];
+      for (const f of msg.files || []) { writeFS(f.path, f.data); stamps[f.path] = mtimeOf(f.path); }
+      for (const p of msg.verify || []) {
+        const m = mtimeOf(p);
+        if (m) stamps[p] = m; else missing.push(p);
+      }
+      send({ id: id, ok: true, value: { stamps: stamps, missing: missing } });
+    } else if (msg.op === 'readFiles') {
+      const out = {};
+      for (const p of msg.paths || []) out[p] = readText(p);
+      send({ id: id, ok: true, value: out });
+    } else if (msg.op === 'listDir') {
+      const out = [], transfer = [], stamps = msg.stamps || {};
+      let exists = true;
+      try { py.FS.stat(msg.root); } catch (err) { exists = false; }
+      if (exists) for (const ent of walk(msg.root)) {
+        if (ent.mtime < msg.since) continue;
+        if (stamps[ent.path] === ent.mtime) continue;
+        let b;
+        try { b = py.FS.readFile(ent.path).slice(); } catch (err) { continue; }
+        out.push({ path: ent.path, mtime: ent.mtime, data: b });
+        transfer.push(b.buffer);
+      }
+      send({ id: id, ok: true, value: out }, transfer);
+    } else if (msg.op === 'run') {
+      let stdout = '', stderr = '';
+      py.setStdout({ batched: (s) => { if (stdout.length < 20000) stdout += s + '\\n'; } });
+      py.setStderr({ batched: (s) => { if (stderr.length < 20000) stderr += s + '\\n'; } });
+      const since = Date.now();
+      let ok = true, result;
+      try {
+        const raw = await py.runPythonAsync(msg.code);
+        if (raw && typeof raw.toJs === 'function') {
+          try { result = raw.toJs({ dict_converter: Object.fromEntries }); }
+          finally { try { raw.destroy(); } catch (err) {} }
+        } else result = raw;
+        result = cloneable(result);
+      } catch (err) {
+        ok = false;
+        stderr += String(err && err.message || err);
+      } finally {
+        try { py.setStdout({}); py.setStderr({}); } catch (err) {}
+      }
+      send({ id: id, ok: true, value: { ok: ok, result: result, stdout: stdout, stderr: stderr, since: since } });
+    } else {
+      send({ id: id, ok: false, error: 'unknown op ' + msg.op });
+    }
+  } catch (err) {
+    send({ id: id, ok: false, error: String(err && err.stack || err && err.message || err) });
+  }
+};
+`;
+
+  // Survives this cell recomputing (it does, every time localDisk mounts) — reloading 8 MB of wasm per
+  // mount is not affordable, and concurrent callers must share the one worker.
+  let G = globalThis.__lope_pyodide;
+  if (!G || G.v !== 2) G = globalThis.__lope_pyodide = {
+    v: 2, worker: null, url: null, ready: null, up: false, running: false, since: null,
+    seq: 0, pending: new Map(), mirror: new Map()
+  };
+
+  const kill = (reason) => {
+    const w = G.worker, url = G.url, pending = G.pending;
+    G.worker = null; G.url = null; G.ready = null; G.up = false; G.running = false; G.since = null;
+    G.pending = new Map();
+    G.mirror.clear();                       // the next worker boots with an empty FS
+    for (const p of pending.values()) p.reject(new Error(reason || 'python worker terminated'));
+    if (w) { try { w.terminate(); } catch (e) {} }
+    if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
+  };
+
+  const rpc = (op, payload, transfer) => new Promise((resolve, reject) => {
+    const worker = G.worker;
+    if (!worker) return reject(new Error('python worker is not running'));
+    const id = ++G.seq;
+    G.pending.set(id, { resolve, reject });
+    try { worker.postMessage(Object.assign({ id: id, op: op }, payload || {}), transfer || []); }
+    catch (e) { G.pending.delete(id); reject(e); }
+  });
+
+  const ensure = () => G.ready || (G.ready = (async () => {
+    const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
+    const worker = new Worker(url);
+    G.url = url;
+    G.worker = worker;
+    worker.onmessage = (e) => {
+      const d = e.data || {};
+      const p = G.pending.get(d.id);
+      if (!p) return;
+      G.pending.delete(d.id);
+      if (d.ok) p.resolve(d.value); else p.reject(new Error(d.error || 'python worker error'));
+    };
+    worker.onerror = (e) => kill('python worker failed: ' + (e && e.message || 'unknown'));
+    const version = await rpc('init', { cdn: CDN }).catch((e) => { kill('init failed'); throw e; });
+    G.up = true;
+    return version;
+  })());
+
+  const toBytes = async (data) => {
+    if (data == null) return '';
+    if (typeof data === 'string') return data;
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (typeof data.arrayBuffer === 'function') return new Uint8Array(await data.arrayBuffer());
+    return String(data);
+  };
+
+  // Copy the mounted folder into the worker FS at the SAME paths. Cached on (size, lastModified) so a
+  // second run only re-copies what changed on disk; `stamps` records what we wrote so the write-back
+  // pass can tell our own copy from a file python actually touched. The cache is per worker — kill()
+  // clears it, because the replacement worker has an empty filesystem.
+  const mirrorIn = async () => {
+    const report = { copied: 0, skipped: [], stamps: {} };
+    if (!localDisk || !localDisk.mounted) return report;
+    let paths;
+    try { paths = await localDisk.walk(localDisk.root); }
+    catch (e) { report.skipped.push(localDisk.root + ' (walk failed: ' + (e && e.message || e) + ')'); return report; }
+    const files = [], transfer = [], fresh = [], verify = [];
+    for (const p of paths) {
+      let f;
+      try { f = await localDisk.read(p); } catch (e) { report.skipped.push(p + ' (' + (e && e.message || e) + ')'); continue; }
+      if (f.size > MAX_MIRROR) { report.skipped.push(p + ' (' + f.size + ' bytes > 50 MB)'); continue; }
+      const key = f.size + ':' + f.lastModified;
+      if (G.mirror.get(p) === key) { verify.push(p); continue; }
+      let bytes;
+      try { bytes = new Uint8Array(await f.arrayBuffer()); }
+      catch (e) { report.skipped.push(p + ' (' + (e && e.message || e) + ')'); continue; }
+      files.push({ path: p, data: bytes });
+      transfer.push(bytes.buffer);
+      fresh.push([p, key]);
+    }
+    let r;
+    try { r = await rpc('writeFiles', { files: files, verify: verify }, transfer); }
+    catch (e) { report.skipped.push('mirror-in failed: ' + (e && e.message || e)); return report; }
+    for (const [p, key] of fresh) G.mirror.set(p, key);
+    report.copied = files.length;
+    Object.assign(report.stamps, r.stamps);
+    // A path we believed was mirrored is gone (python deleted it) — re-copy it.
+    if (r.missing && r.missing.length) {
+      const again = [], xfer = [];
+      for (const p of r.missing) {
+        G.mirror.delete(p);
+        try {
+          const f = await localDisk.read(p);
+          const bytes = new Uint8Array(await f.arrayBuffer());
+          again.push({ path: p, data: bytes });
+          xfer.push(bytes.buffer);
+          G.mirror.set(p, f.size + ':' + f.lastModified);
+        } catch (e) { report.skipped.push(p + ' (' + (e && e.message || e) + ')'); }
+      }
+      if (again.length) {
+        try {
+          const r2 = await rpc('writeFiles', { files: again, verify: [] }, xfer);
+          Object.assign(report.stamps, r2.stamps);
+          report.copied += again.length;
+        } catch (e) { report.skipped.push('mirror-in retry failed: ' + (e && e.message || e)); }
+      }
+    }
+    return report;
+  };
+
+  const mirrorOut = async (stamps, since) => {
+    const wrote = [];
+    if (!localDisk || !localDisk.mounted) return wrote;
+    let entries;
+    try { entries = await rpc('listDir', { root: localDisk.root, since: since, stamps: stamps }); }
+    catch (e) { return wrote; }
+    for (const ent of entries) {
+      try {
+        const r = await localDisk.write(ent.path, ent.data);
+        G.mirror.delete(ent.path);
+        wrote.push({ path: ent.path, size: r.size });
+      } catch (err) { wrote.push({ path: ent.path, error: String(err && err.message || err) }); }
+    }
+    return wrote;
+  };
+
+  const fail = (t0, extra) => Object.assign(
+    { ok: false, result: undefined, stdout: '', stderr: '', files: {}, wrote: [], ms: Date.now() - t0 },
+    extra
+  );
+
+  const run = async (code, opts) => {
+    const { files = {}, packages = [], out = [], disk = true, timeoutMs } = opts || {};
+    const t0 = Date.now();
+    try { await ensure(); }
+    catch (e) { return fail(t0, { loadError: true, stderr: String(e && e.message || e) }); }
+    if (packages && packages.length) {
+      try { await rpc('loadPackages', { names: packages }); }
+      catch (e) { return fail(t0, { stderr: 'loadPackage(' + JSON.stringify(packages) + ') failed: ' + (e && e.message || e) }); }
+    }
+    const stamps = {};
+    const explicit = [];
+    for (const [p, data] of Object.entries(files || {})) explicit.push({ path: p, data: await toBytes(data) });
+    if (explicit.length) {
+      try { Object.assign(stamps, (await rpc('writeFiles', { files: explicit, verify: [] })).stamps); }
+      catch (e) { return fail(t0, { stderr: 'writing files failed: ' + (e && e.message || e) }); }
+    }
+    const mirror = disk ? await mirrorIn() : { copied: 0, skipped: [], stamps: {} };
+    Object.assign(stamps, mirror.stamps);
+
+    const budget = Math.max(1000, Number(timeoutMs) > 0 ? Number(timeoutMs) : DEFAULT_TIMEOUT);
+    G.running = true;
+    G.since = Date.now();
+    let res, timer = null;
+    try {
+      res = await new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject({ __timeout: true }), budget);
+        rpc('run', { code: String(code ?? '') }).then(resolve, reject);
+      });
+    } catch (e) {
+      if (timer) clearTimeout(timer);
+      G.running = false; G.since = null;
+      if (e && e.__timeout) {
+        kill('run exceeded the time budget');
+        return fail(t0, {
+          timedOut: true,
+          stderr: 'run exceeded ' + Math.round(budget / 1000) + ' s; the Python worker was killed and ' +
+            'restarted — state (variables, packages, files not on /local-disk) is lost; keep runs shorter ' +
+            'or write intermediate results to /local-disk',
+          mirrored: mirror.copied, skipped: mirror.skipped
+        });
+      }
+      return fail(t0, { stderr: String(e && e.message || e), mirrored: mirror.copied, skipped: mirror.skipped });
+    }
+    if (timer) clearTimeout(timer);
+    G.running = false; G.since = null;
+
+    const cap = (s) => s.length > CAP ? s.slice(0, CAP) + '\n[truncated]' : s;
+    let outFiles = {};
+    if (out && out.length) {
+      try { outFiles = await rpc('readFiles', { paths: out }); }
+      catch (e) { for (const p of out) outFiles[p] = 'ERROR: ' + (e && e.message || e); }
+    }
+    const wrote = disk ? await mirrorOut(stamps, res.since) : [];
+    return {
+      ok: res.ok, result: res.result, stdout: cap(res.stdout || ''), stderr: cap(res.stderr || ''),
+      files: outFiles, wrote: wrote, ms: Date.now() - t0, mirrored: mirror.copied, skipped: mirror.skipped
+    };
+  };
+
+  const status = () => ({ ready: G.up, running: G.running, since: G.since });
+
+  const loadPackages = async (names) => {
+    await ensure();
+    const list = Array.isArray(names) ? names : [names];
+    await rpc('loadPackages', { names: list });
+    return list;
+  };
+
+  const ready = async () => { await ensure(); return status(); };
+
+  return { version: pyodideVersion, cdn: CDN, ready, status, loadPackages, run, terminate: kill };
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  $def("_py_doc", null, ["md","pyodideVersion"], _py_doc);
+  $def("_py_ver", "pyodideVersion", [], _py_ver);
+  $def("_py_api", "py", ["pyodideVersion","localDisk"], _py_api);
+  main.define("module @tomlarkworthy/local-disk", async () => runtime.module((await import("/@tomlarkworthy/local-disk.js?v=4")).default));
+  main.define("localDisk", ["module @tomlarkworthy/local-disk", "@variable"], (_, v) => v.import("localDisk", _));
   return main;
 }</script>
 
