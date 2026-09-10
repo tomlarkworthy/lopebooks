@@ -5251,6 +5251,13 @@ test_rate_drives_total = ui.scenario(async (t) => {
 | \`ui.value(cell, {of: el})\` | current value of a cell, scoped to the module that owns \`el\` |
 | \`ui.settle()\` | resolves when the runtime has been idle for two macrotasks |
 | \`t.scenario(fn)\` | a nested scenario; never call \`ui.scenario\` inside one, it queues behind itself |
+| \`ui.can\` | what this environment can actually do: \`layout\`, \`dragData\`, \`pointer\`, \`keyboard\` |
+
+\`ui.scenario(fn, {requires: ["layout"]})\` resolves to a \`skipped:\` string instead of running when a
+capability is missing. \`ui.can\` is measured at boot, not inferred from the constructors that exist:
+a headless DOM defines \`DragEvent\` and \`getBoundingClientRect\` and still reports every box as
+0×0 and drops the \`dataTransfer\` off a synthetic drag. A scenario that asserts on geometry it
+never measured reports a failure that says nothing about the code under test.
 
 Cell names are resolved in the module that owns the element passed as \`of\` (the \`viewof\` whose value it is, or the visualizer node it sits in). An ambiguous name without a scope is an error, not a guess.
 
@@ -5258,9 +5265,39 @@ Why "idle then read" rather than "next fulfilment": attaching an observer to an 
 
 Every wait is bounded. A cell whose promise never settles is wedged for the rest of the session, because the runtime chains each recompute on the previous promise; redefining the cell does not help, only deleting it does.
 `);};
-const _gcwjml = function _ui(base,scenario) {return ({...base, scenario});};
+const _gcwjml = function _ui(base,scenario,ui_capabilities) {return ({...base, scenario, can: ui_capabilities});};
+const _uicap1 = function _ui_capabilities() {
+  // Measured, not assumed: a headless DOM can define every constructor and still lay
+  // nothing out. Each entry is what a scenario actually needs to be meaningful.
+  const can = {layout: false, dragData: false, pointer: false, keyboard: false};
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:fixed;left:0;top:0;width:120px;height:40px";
+  document.body.appendChild(probe);
+  try {
+    can.layout = probe.getBoundingClientRect().width > 0;
+    can.pointer = typeof PointerEvent === "function";
+    can.keyboard = typeof KeyboardEvent === "function";
+    if (typeof DragEvent === "function" && typeof DataTransfer === "function") {
+      let carried;
+      probe.addEventListener("dragstart", (e) => (carried = e.dataTransfer));
+      const dt = new DataTransfer();
+      dt.setData("text/plain", "probe");
+      probe.dispatchEvent(new DragEvent("dragstart", {dataTransfer: dt}));
+      can.dragData = carried?.getData("text/plain") === "probe";
+    }
+  } finally {
+    probe.remove();
+  }
+  return can;
+};
 const _gebu7h = function _base(byLabel,byText,set,click,next,value,settle,serial,findVariable,ownerModule) {return ({byLabel, byText, set, click, next, value, settle, serial, findVariable, ownerModule});};
-const _cgte9o = function _scenario(serial,runScenario) {return ((fn, opts) => serial(() => runScenario(fn), opts));};
+const _cgte9o = function _scenario(serial,runScenario,ui_capabilities) {return ((fn, opts = {}) => {
+  // A scenario the environment cannot drive must say so, not fail an assertion about
+  // geometry that was never measured. `requires` names capabilities from `ui.can`.
+  const missing = (opts.requires ?? []).filter((c) => !ui_capabilities[c]);
+  if (missing.length) return Promise.resolve(`skipped: this environment has no ${missing.join(" or ")}`);
+  return serial(() => runScenario(fn), opts);
+});};
 const _1k4w68a = function _runScenario(eventFor,base,set,click) {return (async function run(fn) {
   const touched = [];
   const remember = (el) => {
@@ -5357,12 +5394,14 @@ const _1a9k83 = function _eventFor() {return ((el) => {
   }
 });};
 const _qa2y3b = function _findVariable(ownerModule,runtime) {return ((name, {module, of} = {}) => {
+  // `mains` is installed by the lopecode bootloader; off-platform (observablehq.com) there is none.
+  const mains = runtime.mains ?? new Map();
   let mod = module ?? (of ? ownerModule(of) : undefined);
   if (typeof mod === "string") {
-    mod = runtime.mains.get(mod) ?? [...runtime._modules.values()].find((m) => m._name === mod);
+    mod = mains.get(mod) ?? [...runtime._modules.values()].find((m) => m._name === mod);
     if (!mod) throw new Error(`ui: no module "${module}"`);
   }
-  const modName = (m) => [...runtime.mains].find(([, v]) => v === m)?.[0] ?? m._name ?? "its module";
+  const modName = (m) => [...mains].find(([, v]) => v === m)?.[0] ?? m._name ?? "its module";
   const all = [...runtime._variables].filter((v) => v._name === name && (!mod || v._module === mod));
   if (all.length === 0) throw new Error(`ui: no cell named "${name}"${mod ? ` in ${modName(mod)}` : ""}`);
   if (all.length > 1) throw new Error(`ui: "${name}" is defined in ${all.length} modules; pass {module} or {of: element}`);
@@ -5453,16 +5492,20 @@ const _dnn7q3 = async function _test_ui_scenario_that_hangs_is_bounded(expect,ui
   await expect(ui.scenario(() => new Promise(() => {}), {timeout: 300})).rejects.toThrow(/still running after 300ms/);
   return "a stuck scenario fails instead of wedging the queue";
 };
-const _6osc6 = function _test_ui_ambiguous_name_asks_for_scope(expect,ui,$0) {
+const _6osc6 = function _test_ui_ambiguous_name_asks_for_scope(expect,ui,$0,runtime) {
   // `md` exists in every module; without a scope the lookup must refuse rather than guess.
   expect(() => ui.findVariable("md")).toThrow(/pass \{module\} or \{of: element\}/);
   expect(ui.findVariable("total", {of: $0})._name).toBe("total");
+  // Naming a module needs the bootloader's `mains` registry; Observable modules carry no name.
+  if (!runtime.mains) return "scoping works by element (no module registry off-platform)";
   expect(ui.findVariable("total", {module: "@tomlarkworthy/ui-testing"})._name).toBe("total");
   return "scoping works by element and by module name";
 };
-const _im7zgh = async function _test_ui_unknown_cell_is_a_clear_error(expect,ui,$0) {
-  await expect(ui.next("nope", {of: $0})).rejects.toThrow(/no cell named "nope" in @tomlarkworthy\/ui-testing/);
-  return "the error names the cell and the module it looked in";
+const _im7zgh = async function _test_ui_unknown_cell_is_a_clear_error(expect,ui,$0,runtime) {
+  // The module's NAME comes from the bootloader's `mains` registry; off-platform there is none.
+  const scope = runtime.mains ? " in @tomlarkworthy/ui-testing" : "";
+  await expect(ui.next("nope", {of: $0})).rejects.toThrow(new RegExp(`no cell named "nope"${scope}`));
+  return "the error names the cell" + (scope ? " and the module it looked in" : "");
 };
 
 export default function define(runtime, observer) {
@@ -5472,9 +5515,10 @@ export default function define(runtime, observer) {
   };
 
   $def("_d6mx4", null, ["md"], _d6mx4);  
-  $def("_gcwjml", "ui", ["base","scenario"], _gcwjml);  
+  $def("_gcwjml", "ui", ["base","scenario","ui_capabilities"], _gcwjml);  
+  $def("_uicap1", "ui_capabilities", [], _uicap1);  
   $def("_gebu7h", "base", ["byLabel","byText","set","click","next","value","settle","serial","findVariable","ownerModule"], _gebu7h);  
-  $def("_cgte9o", "scenario", ["serial","runScenario"], _cgte9o);  
+  $def("_cgte9o", "scenario", ["serial","runScenario","ui_capabilities"], _cgte9o);  
   $def("_1k4w68a", "runScenario", ["eventFor","base","set","click"], _1k4w68a);  
   $def("_oak8nz", "serial", ["queue"], _oak8nz);  
   $def("_2cy94x", "queue", [], _2cy94x);  
@@ -5512,8 +5556,8 @@ export default function define(runtime, observer) {
   $def("_ji57tb", "test_ui_byLabel_in_the_live_page", ["viewof qty","expect","ui"], _ji57tb);  
   $def("_1pdy5kk", "test_ui_scenario_restores_what_it_touched", ["ui","viewof rate","viewof enabled","expect","viewof qty"], _1pdy5kk);  
   $def("_dnn7q3", "test_ui_scenario_that_hangs_is_bounded", ["expect","ui"], _dnn7q3);  
-  $def("_6osc6", "test_ui_ambiguous_name_asks_for_scope", ["expect","ui","viewof rate"], _6osc6);  
-  $def("_im7zgh", "test_ui_unknown_cell_is_a_clear_error", ["expect","ui","viewof rate"], _im7zgh);  
+  $def("_6osc6", "test_ui_ambiguous_name_asks_for_scope", ["expect","ui","viewof rate","runtime"], _6osc6);  
+  $def("_im7zgh", "test_ui_unknown_cell_is_a_clear_error", ["expect","ui","viewof rate","runtime"], _im7zgh);  
   main.define("module @tomlarkworthy/testing", async () => runtime.module((await import("/@tomlarkworthy/testing.js?v=4")).default));  
   main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));  
   main.define("observe", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observe", _));  
