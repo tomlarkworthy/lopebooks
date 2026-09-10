@@ -3952,9 +3952,12 @@ const _cwdash01 = function _cwDashboard(){
   const widgetQueries = (widget) => {
     const used = new Set();
     const queries = [], legend = {};
+    // CloudWatch writes "." for "same value as the metric above, by position" — resolve against prev.
+    let prevParts = [];
     (widget.metrics || []).forEach((entry, n) => {
       const opts = entry.find((e) => e && typeof e === 'object') || {};
-      const parts = entry.filter((e) => typeof e === 'string');
+      const parts = entry.filter((e) => typeof e === 'string').map((p, k) => (p === '.' ? prevParts[k] : p));
+      prevParts = parts;
       const id = mkId(opts.id || 'm' + n, n, used);
       legend[id] = opts.label || (parts.length > 1 ? parts[1] : id);
       if (opts.expression) {
@@ -3965,7 +3968,7 @@ const _cwdash01 = function _cwDashboard(){
       const dims = [];
       for (let k = 2; k + 1 < parts.length; k += 2) dims.push({ Name: parts[k], Value: parts[k + 1] });
       queries.push({
-        Id: id, Label: opts.label, ReturnData: true,
+        Id: id, Label: opts.label, ReturnData: true, Region: opts.region || null,
         MetricStat: {
           Metric: { Namespace: parts[0], MetricName: parts[1], Dimensions: dims },
           Period: opts.period || widget.period,
@@ -3990,14 +3993,17 @@ const _cwdash01 = function _cwDashboard(){
   const tidy = (result, legend = {}) => {
     const results = (result && (result.MetricDataResults || result.MetricData || result.MetricDataResult)) || [];
     const list = Array.isArray(results) ? results : [results];
+    const sharedTs = (result && result.Defaults && result.Defaults.Timestamps) || [];
     const rows = [];
     for (const r of list) {
       if (!r) continue;
-      const ts = [].concat(r.Timestamps || []);
       const vs = [].concat(r.Values || []);
+      // Console `MetricData` shares one timestamp axis in `Defaults.Timestamps`; per-element
+      // `Timestamps` is only present on the public `MetricDataResults` shape.
+      const ts = [].concat(r.Timestamps && r.Timestamps.length ? r.Timestamps : sharedTs);
       const key = r.Id || r.Alias;
       const label = r.Label || legend[key] || key;
-      for (let k = 0; k < ts.length; k++) {
+      for (let k = 0; k < vs.length; k++) {
         rows.push({ id: key, series: label, time: toDate(ts[k]), value: Number(vs[k]) });
       }
     }
@@ -4074,10 +4080,15 @@ async function cwFetchWidget(widget, { credentials, start, end, region, maxDatap
   const { queries, legend } = cwDashboard.widgetQueries(widget);
   if (!queries.length) return { rows: [], legend, empty: true };
   // Console GetMetricData wants `Metrics` (Alias-keyed), not the public `MetricDataQueries` (Id-keyed).
-  const Metrics = queries.map((q) => q.Expression
-    ? { Alias: q.Id, Expression: q.Expression, Period: q.Period, ReturnData: true }
-    : { Alias: q.Id, Namespace: q.MetricStat.Metric.Namespace, MetricName: q.MetricStat.Metric.MetricName,
-        Dimensions: q.MetricStat.Metric.Dimensions, Stat: q.MetricStat.Stat, Period: q.MetricStat.Period, ReturnData: true });
+  // Console GetMetricData rejects a per-metric `Stat` (returns empty Values) — Stat lives in Defaults.
+  // A per-metric `Region` is required when the metric lives in a different region than the dashboard.
+  const Metrics = queries.map((q) => {
+    if (q.Expression) return { Alias: q.Id, Expression: q.Expression, Period: q.Period, ReturnData: true };
+    const m = { Alias: q.Id, Namespace: q.MetricStat.Metric.Namespace, MetricName: q.MetricStat.Metric.MetricName,
+        Dimensions: q.MetricStat.Metric.Dimensions, Period: q.MetricStat.Period, ReturnData: true };
+    if (q.Region) m.Region = q.Region;
+    return m;
+  });
   const body = JSON.stringify({
     Metrics,
     Defaults: { Period: widget.period || 60, Stat: widget.stat || 'Average',
@@ -4123,9 +4134,10 @@ function cwPlotWidget(widget, result, { width = 420, height = 180 } = {}) {
   ];
   frame.append(Plot.plot({
     width, height,
-    marginLeft: 48, marginBottom: 24,
+    marginLeft: 44, marginBottom: 24,
     x: { label: null, grid: false },
-    y: { label: null, grid: true, nice: true },
+    // SI ticks ("22M", "58") keep big byte counts from overflowing the left margin and clipping.
+    y: { label: null, grid: true, nice: true, tickFormat: "~s" },
     // SEARCH() widgets can expand to dozens of series; a legend then costs more than it gives.
     color: nSeries > 1 && nSeries <= 8 ? { legend: true } : undefined,
     marks
@@ -4422,6 +4434,27 @@ const _1kcoqko = function _exchangeForAwsCredentials(cognitoCall) {return (async
     expiresAt: new Date(Credentials.Expiration * 1000)
   };
 });};
+const _pubcred01 = function _publicCredentials(cognitoCall) {return (async function publicCredentials(cfg) {
+  // Public share (cfg.mode === "Public"): NO login and NO CustomRoleArn. The identity pool's default
+  // unauthenticated role IS the read-only share role, so an anonymous GetId/GetCredentialsForIdentity
+  // returns exactly the creds the shared dashboard reads with. Passing CustomRoleArn here is rejected
+  // ("Only SAML providers and providers with RoleMappings support custom role ARN").
+  const endpoint = 'https://cognito-identity.' + cfg.region + '.amazonaws.com/';
+  const { IdentityId } = await cognitoCall(endpoint, 'AWSCognitoIdentityService.GetId', {
+    IdentityPoolId: cfg.identityPoolId,
+    AccountId: cfg.accountId
+  });
+  const { Credentials } = await cognitoCall(endpoint, 'AWSCognitoIdentityService.GetCredentialsForIdentity', {
+    IdentityId
+  });
+  return {
+    identityId: IdentityId,
+    accessKeyId: Credentials.AccessKeyId,
+    secretAccessKey: Credentials.SecretKey,
+    sessionToken: Credentials.SessionToken,
+    expiresAt: new Date(Credentials.Expiration * 1000)
+  };
+});};
 const _1midnbu = function _FILE_KEY() {return ("cw-share-auth/v1/9f3c1a7e5b2d48c6a0e7f41b8d3629ae");};
 const _9ed1rh = function _tokenStore(srp,FILE_KEY) {
   const { enc, subtle, b64ToBytes, bytesToB64 } = srp;
@@ -4651,7 +4684,8 @@ export default function define(runtime, observer) {
   $def("_z95ahf", "parseShareLink", [], _z95ahf);  
   $def("_55krvq", "srpLogin", ["srp","cognitoCall"], _55krvq);  
   $def("_76tvfy", "refreshLogin", ["cognitoCall"], _76tvfy);  
-  $def("_1kcoqko", "exchangeForAwsCredentials", ["cognitoCall"], _1kcoqko);  
+  $def("_1kcoqko", "exchangeForAwsCredentials", ["cognitoCall"], _1kcoqko);
+  $def("_pubcred01", "publicCredentials", ["cognitoCall"], _pubcred01);
   $def("_1midnbu", "FILE_KEY", [], _1midnbu);  
   $def("_9ed1rh", "tokenStore", ["srp","FILE_KEY"], _9ed1rh);  
   $def("_uq1e1s", "defaultShareLink", [], _uq1e1s);  
