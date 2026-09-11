@@ -6101,9 +6101,15 @@ const _1gx7l2b = function _focChatView(focChatCss,focTabLabels,focChatTarget,arc
   h1.textContent = "Chat";
   const sub = document.createElement("span");
   sub.className = "foc-sub";
+  // The archive walk runs behind the first paint, so say so: the counts above are
+  // a moving number until archive.progress.complete.
+  const p = archive.progress || {};
   sub.textContent = "Feeling of Computing · " + archive.messages.length + " messages, " + archive.reactions.length +
     " reactions, read from " +
-    (archive.source === "indexeddb" ? "the local IndexedDB copy (refreshing…)" : archive.source === "loading" ? "the PDS…" : "the PDS " + focFmt.rel(archive.fetchedAt));
+    (archive.source === "indexeddb" ? "the local IndexedDB copy (refreshing…)" : archive.source === "loading" ? "the PDS…" : "the PDS " + focFmt.rel(archive.fetchedAt)) +
+    (p.crawling ? " · loading older messages, " + p.records.toLocaleString() + " so far" : "");
+  if (p.crawling) sub.title = "Walking " + p.collection + " backwards from the newest record, 100 per request. " +
+    "It resumes where it stopped if you close this page.";
   const mock = document.createElement("span");
   mock.className = "foc-mockup";
   mock.textContent = "mockup: avatars";
@@ -6838,8 +6844,7 @@ export default function define(runtime, observer) {
   $def("_13s1lf3", "focComposerCss", ["focStyle","editor_theme_css"], _13s1lf3);  
   $def("_16iylcv", "focComposer", ["focComposerCss","prosemirror","editableSchema","currentSession","focPostMessage","linkifyPastedUrl","invalidation"], _16iylcv);
   return main;
-}
-</script><!--/-->
+}</script><!--/-->
 
 <script id="@tomlarkworthy/robocoop-5-engine" 
   type="text/plain"
@@ -13248,6 +13253,143 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
+const _focdoc1 = function _focDoc1(md){return(
+md`# foc-data — how the archive is assembled
+
+Every tab in this notebook reads one value, \`archive\`: \`{messages, reactions, fetchedAt, source, error, progress}\`.
+It is built from two collections in the bridge bot's repo — \`social.colibri.message\` and
+\`social.colibri.reaction\` — plus an event feed, \`com.feelingofcomputing.bridge.event\`, which
+points at posts written natively in Colibri and so living in their authors' own repos.
+
+Sizes, measured against \`did:plc:4gcxakknd6hxtnhf33miwsob\` on 2026-09-11:
+
+\`\`\`
+social.colibri.message   55,587 records   557 pages   186.1 s
+social.colibri.reaction  22,870 records   230 pages    49.2 s
+\`\`\`
+
+\`com.atproto.repo.listRecords\` pages at **100 records, which is the PDS maximum and not a
+tuning choice** — \`limit=200\` answers \`InvalidRequest: integer too big (maximum 100, got 200)\`.
+More records means more requests; the whole archive is 787 of them.
+
+Until 2026-09-11 the walk was capped at 200 pages and ran \`reverse: true\`, which is
+**oldest** first. The cap therefore kept the oldest 20,000 messages and stopped at
+\`3h5apv2jzz222\`, 2020-04-14 — the viewer held 2017 to April 2020 and nothing after it except
+what the live event tail had seen. The cap is gone and the walk now runs newest-first.`
+)};
+const _focdoc2 = function _focDoc2(md){return(
+md`## The walk is resumable, and it is not on the boot path
+
+\`archive\` yields the IndexedDB copy first and starts everything that touches the network behind
+it — the feed bootstrap (2,164 events, 23 pages) and both collection walks — so the first paint
+never waits on any of it. \`focStore\` keeps one row per record under the key
+\`"<collection>/<rkey>"\`. An rkey is a TID, so that key sorts by creation time and a prefix range
+over one collection comes back in order with no index — 212 ms for 54,633 rows against 332 ms
+through \`index('collection')\` (Chromium, \`tools/foc-viewer/idb-load-bench.mjs\`, 2026-09-11).
+
+The same TID property is why two rkeys per collection are enough state to resume. \`focStore\`'s
+\`meta\` store holds \`walk\`:
+
+| field | meaning |
+|---|---|
+| \`top\` | newest rkey held contiguously from the head of the repo |
+| \`cursor\` | where the downward walk stopped; \`null\` once the repo is exhausted |
+| \`complete\` | the downward walk reached the end |
+
+Each collection is walked in two segments:
+
+- **head** — newest-first, stopping at the first rkey \`<= top\`. A reader returning after a week
+  pays one or two requests. \`top\` advances only when the segment finishes, so an interrupted
+  head segment re-covers records instead of leaving a hole behind it.
+- **tail** — resume at \`cursor\` and keep walking down, writing a new \`cursor\` after every page.
+  Closing the tab mid-walk costs at most the page in flight.
+
+Both writes are idempotent: a record fetched twice is \`put\` twice under the same key. That is
+what makes "re-cover rather than leave a hole" a safe choice rather than a wasteful one.
+
+Measured in Chromium against the real PDS on 2026-09-11
+(\`node tools/foc-viewer/crawl-check.mjs\`):
+
+\`\`\`
+cold boot, empty cache   archive-start +282 ms, idb-load 25 ms
+                         837 messages on screen at +5 s, newest first
+walk rate                1.3-1.5 pages/s; 620 pages in 420 s
+closed at page 60        watermark {cursor: 3l6fvacmra522, complete: false}
+reopened                 6,037 messages out of IndexedDB in 53 ms, walk resumed
+                         at 3l6fvacmra522, nothing re-fetched
+walk finished            55,624 messages + 22,882 reactions, both complete
+reopened again           idb-load 264 ms, and the catch-up cost 2 requests for
+                         0 new records — 3 listRecords in total at boot, then
+                         one every 5 s for the tail
+\`\`\`
+
+The event feed carries its own cursor in the same record (\`eventCursor\`), so the 23-page walk
+is a first-visit cost: 33 listRecords requests over the first 30 s on the visit that stores it,
+13 on the next.
+
+**Not covered:** a record edited in place keeps its rkey, so the collection walk cannot see the
+edit and neither can a watermark built out of rkeys. The feed is what catches those, which is
+why \`eventCursor\` is persisted and why a warm boot applies *every* event since it rather than
+only the native ones. What remains uncovered is an edit or a delete from before this browser
+first read the feed, or further back than \`focListEvents\`' 4,000-event ceiling. The feed itself
+only starts at 2026-09-07.`
+)};
+const _focdoc3 = function _focDoc3(md){return(
+md`## Rate limits, errors, memory
+
+The PDS publishes its read budget and lets a browser read it — the response carries
+\`access-control-expose-headers: RateLimit-Limit, RateLimit-Reset, RateLimit-Remaining, RateLimit-Policy\`
+and \`ratelimit-policy: 3000;w=300\`. A listRecords page costs 1 point, measured: 557 pages took
+\`ratelimit-remaining\` from 2992 to 2394.
+
+So that budget is not what bounds the walk. A full crawl is 787 points, 26% of one five-minute
+window.
+
+**That published budget is not the only limiter, and the other one is invisible.** While this
+rewrite was being measured, roughly 1,400 pages inside fifteen minutes started answering:
+
+\`\`\`
+HTTP/2 429
+content-type: text/html
+<html><body><h1>429 Too Many Requests</h1>
+\`\`\`
+
+An HTML body, no \`ratelimit-*\` headers and no \`Retry-After\` — an edge in front of the PDS, not
+the XRPC policy, which still reported ~2,900 of 3,000 points remaining. It cleared in under
+four minutes. Nothing in the response lets a client pace against it, so the only defence is a
+fixed gap: \`focCrawlDelayMs\` is 250 ms, which walks at 1.3 pages/s and puts the whole repo at
+about ten minutes instead of the 186 s a flat-out crawl takes. \`focCrawl\` also sleeps until
+\`ratelimit-reset\` when \`ratelimit-remaining\` drops under its reserve of 300, since nothing else
+in the page knows what else is spending that budget.
+
+\`focPage\` retries, and \`focListEvents\` goes through it too so a throttled poll is a wait rather
+than a dropped one. A 429 or 503 waits out \`Retry-After\` (or \`ratelimit-reset\`, or 60 s) and does
+**not** spend an attempt, because a rate limit is a wait and not a failure; 5xx and network
+errors back off exponentially with jitter to a 60 s cap and give up after 8. An error ends the
+walk without throwing — the watermark is already on disk, so a reload resumes where it stopped
+rather than starting over. Before this, \`if (!r.ok) throw\` propagated to the bootstrap's
+\`catch\`, which yielded \`source: "error"\` and returned: one blip lost the whole crawl.
+
+\`focCrawl\` yields an array of pages that grows as it walks and nulls each slot once the
+consumer has had it, so the walker never holds a second copy of the repo. The records
+themselves live in \`archive.messages\` (77 MB of heap for the full corpus, CDP
+\`Runtime.getHeapUsage\`, 2026-09-11) and in IndexedDB.`
+)};
+const _focdoc4 = function _focDoc4(md){return(
+md`## Search, and what a yield costs
+
+\`searchIndex\` is one lowercased haystack per message — author, channel, body — scanned with
+\`String.includes\`. On the full 54,633-message archive in Chromium: 14 ms to build, 11 ms for a
+query; a three-term query over the 55,624 rows the walk now produces took 36 ms end to end. The inverted index it replaced cost 2,175,229 postings and still matched only whole
+tokens and prefixes; a trigram index for true substring needs 12,367,220 postings, larger than
+the 17.8 M characters it indexes.
+
+A background crawl makes \`archive\` yield repeatedly, and every yield rebuilds \`searchIndex\`,
+\`people\`, \`topLevelByChannel\` and \`linkIndex\` over the whole corpus. Two things keep that
+affordable: haystacks are cached by rkey in \`focHayCache\`, so a rebuild only builds rows that
+are new, and \`focYieldMs\` (2000 ms) throttles yields while \`progress.crawling\` is set. Outside a
+crawl the tail yields as soon as anything changes.`
+)};
 const _1ocuwnz = function _focConfig() {return ({
   botDid: "did:plc:4gcxakknd6hxtnhf33miwsob",
   botPds: "https://jellybaby.us-east.host.bsky.network",
@@ -13277,59 +13419,160 @@ const _1ocuwnz = function _focConfig() {return ({
   idbStore: "payload",
   idbKey: "archive-v1"
 });};
-const _1wbyida = async function _focIdb(focConfig) {
-  const noop = { get: async () => undefined, put: async () => {}, ok: false };
+const _focstore = async function _focStore(focConfig) {
+  const noop = { ok: false, getAll: async () => [], putRows: async () => {}, delRow: async () => {}, getMeta: async () => undefined, setMeta: async () => {} };
   try {
     const idb = window.indexedDB;
     if (!idb) return noop;
     const db = await new Promise((res, rej) => {
-      const req = idb.open(focConfig.idbName, 1);
+      const req = idb.open(focConfig.idbName, 2);
       req.onupgradeneeded = (e) => {
         const d = e.target.result;
-        if (!d.objectStoreNames.contains(focConfig.idbStore)) d.createObjectStore(focConfig.idbStore);
+        // v1 held the whole archive as one blob, written by a walk capped at the
+        // OLDEST 20,000 records. `walk` below describes a region contiguous from
+        // the newest end, which that blob cannot fill, so it is dropped.
+        if (d.objectStoreNames.contains(focConfig.idbStore)) d.deleteObjectStore(focConfig.idbStore);
+        if (!d.objectStoreNames.contains("rows")) d.createObjectStore("rows");
+        if (!d.objectStoreNames.contains("meta")) d.createObjectStore("meta");
       };
       req.onsuccess = () => res(req.result);
       req.onerror = () => rej(req.error);
       req.onblocked = () => rej(new Error("idb blocked"));
     });
+    const tx = (store, mode, fn) => new Promise((res, rej) => {
+      const t = db.transaction(store, mode);
+      const r = fn(t.objectStore(store));
+      t.oncomplete = () => res(r ? r.result : undefined);
+      t.onerror = () => rej(t.error);
+      t.onabort = () => rej(t.error);
+    });
     return {
       ok: true,
-      get: (key) => new Promise((res, rej) => {
-        const r = db.transaction(focConfig.idbStore, "readonly").objectStore(focConfig.idbStore).get(key);
-        r.onsuccess = () => res(r.result);
-        r.onerror = () => rej(r.error);
+      // One row per record, keyed "<collection>/<rkey>". An rkey is a TID, so a
+      // prefix range over one collection already comes back in time order and no
+      // index is needed: 212 ms for 54,633 rows against 332 ms through
+      // index('collection') (Chromium, tools/foc-viewer/idb-load-bench.mjs,
+      // 2026-09-11).
+      getAll: (collection) => tx("rows", "readonly", (s) =>
+        s.getAll(window.IDBKeyRange.bound(collection + "/", collection + "/￿"))),
+      putRows: (collection, records) => tx("rows", "readwrite", (s) => {
+        for (const r of records) s.put(r, collection + "/" + r.rkey);
       }),
-      put: (key, value) => new Promise((res, rej) => {
-        const r = db.transaction(focConfig.idbStore, "readwrite").objectStore(focConfig.idbStore).put(value, key);
-        r.onsuccess = () => res();
-        r.onerror = () => rej(r.error);
-      })
+      delRow: (collection, rkey) => tx("rows", "readwrite", (s) => s.delete(collection + "/" + rkey)),
+      getMeta: (key) => tx("meta", "readonly", (s) => s.get(key)),
+      setMeta: (key, value) => tx("meta", "readwrite", (s) => s.put(value, key))
     };
   } catch (e) {
     return noop;
   }
 };
-const _12iqz0 = function _focListRecords() {return ((pds, repo, collection, opts = {}) => {
-  const out = [];
-  const run = async () => {
-    let cursor = null;
-    for (let page = 0; page < 200; page++) {
-      const u = new URL("/xrpc/com.atproto.repo.listRecords", pds);
-      u.searchParams.set("repo", repo);
-      u.searchParams.set("collection", collection);
-      u.searchParams.set("limit", String(opts.limit || 100));
-      if (opts.reverse) u.searchParams.set("reverse", "true");
-      if (cursor) u.searchParams.set("cursor", cursor);
-      const r = await fetch(u.toString());
+const _focpage = function _focPage() {
+  const jitter = () => 1 + Math.random() * 0.3;
+  const backoffMs = (attempt) => Math.min(1000 * Math.pow(2, attempt - 1), 60000) * jitter();
+  return async (pds, repo, collection, opts = {}) => {
+    const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+    const maxAttempts = opts.maxAttempts || 8;
+    const u = new URL("/xrpc/com.atproto.repo.listRecords", pds);
+    u.searchParams.set("repo", repo);
+    u.searchParams.set("collection", collection);
+    // 100 is the PDS maximum, not a tuning choice: limit=200 answers
+    // InvalidRequest "integer too big (maximum 100, got 200)".
+    u.searchParams.set("limit", "100");
+    if (opts.reverse) u.searchParams.set("reverse", "true");
+    if (opts.cursor) u.searchParams.set("cursor", opts.cursor);
+    let attempt = 0;
+    for (;;) {
+      let r = null;
+      try {
+        r = await fetch(u.toString());
+      } catch (e) {
+        if (++attempt > maxAttempts) throw e;
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      if (r.status === 429 || r.status === 503) {
+        // A rate limit is a wait, not a failure, so it does not spend an attempt.
+        const ra = Number(r.headers.get("retry-after"));
+        const reset = Number(r.headers.get("ratelimit-reset"));
+        const wait = Number.isFinite(ra) && ra > 0 ? ra * 1000
+          : Number.isFinite(reset) && reset > 0 ? Math.max(0, reset * 1000 - Date.now()) + 1000
+          : 60000;
+        await sleep(Math.min(wait, 300000));
+        continue;
+      }
+      if (r.status >= 500) {
+        if (++attempt > maxAttempts) throw new Error(collection + " listRecords " + r.status);
+        await sleep(backoffMs(attempt));
+        continue;
+      }
       if (!r.ok) throw new Error(collection + " listRecords " + r.status);
       const j = await r.json();
-      for (const rec of j.records || []) out.push({ rkey: rec.uri.split("/").pop(), cid: rec.cid, value: rec.value });
-      cursor = j.cursor;
-      if (!cursor || !(j.records || []).length) break;
+      return {
+        records: (j.records || []).map((rec) => ({ rkey: rec.uri.split("/").pop(), cid: rec.cid, value: rec.value })),
+        cursor: j.cursor || null,
+        // The PDS names these in access-control-expose-headers, so a browser can
+        // pace itself against its own read budget (3000 points per 300 s; one
+        // listRecords page costs 1).
+        limit: {
+          remaining: Number(r.headers.get("ratelimit-remaining")),
+          reset: Number(r.headers.get("ratelimit-reset")),
+          limit: Number(r.headers.get("ratelimit-limit"))
+        }
+      };
     }
-    return out;
   };
-  return run();
+};
+const _foccrawl = function _focCrawl(focPage,focCrawlDelayMs) {return (async function* (pds, repo, collection, opts = {}) {
+  const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const delay = opts.delayMs == null ? focCrawlDelayMs : opts.delayMs;
+  const reserve = opts.reserve == null ? 300 : opts.reserve;
+  const pages = [];
+  const out = { pages, records: 0, requests: 0, cursor: opts.cursor || null, done: false, error: null, limit: null };
+  let released = 0;
+  for (;;) {
+    if (opts.stopped && opts.stopped()) return out;
+    let page;
+    try {
+      page = await focPage(pds, repo, collection, { cursor: out.cursor, reverse: opts.reverse, sleep, maxAttempts: opts.maxAttempts });
+    } catch (e) {
+      out.error = String(e);
+      yield out;
+      return out;
+    }
+    out.requests++;
+    out.limit = page.limit;
+    // The walk is descending, so the first rkey at or below the watermark ends
+    // it: everything past that point is already held.
+    let recs = page.records;
+    let caughtUp = false;
+    if (opts.stopAt) {
+      const i = recs.findIndex((r) => r.rkey <= opts.stopAt);
+      if (i >= 0) { recs = recs.slice(0, i); caughtUp = true; }
+    }
+    pages.push(recs);
+    out.records += recs.length;
+    out.cursor = page.cursor;
+    out.done = caughtUp || !page.cursor || !page.records.length;
+    yield out;
+    // The consumer has had its turn with every page up to here; drop the
+    // references so the walker never holds a second copy of the repo.
+    while (released < pages.length) pages[released++] = null;
+    if (out.done) return out;
+    if (page.limit && Number.isFinite(page.limit.remaining) && page.limit.remaining < reserve) {
+      const wait = Math.max(0, page.limit.reset * 1000 - Date.now()) + 1000;
+      await sleep(Math.min(wait, 300000));
+    } else if (delay) {
+      await sleep(delay);
+    }
+  }
+});};
+const _12iqz0 = function _focListRecords(focCrawl) {return (async (pds, repo, collection, opts = {}) => {
+  const out = [];
+  for await (const p of focCrawl(pds, repo, collection, opts)) {
+    const page = p.pages[p.pages.length - 1];
+    if (page) for (const r of page) out.push(r);
+  }
+  return out;
 });};
 const _1ogqf1u = async function _structure(focConfig,focListRecords) {
   const cfg = focConfig;
@@ -13361,7 +13604,7 @@ const _18jukin = function _channelsByRkey(structure) {
   }
   return m;
 };
-const _lqdytk = function _archive(focConfig,invalidation,focListRecords,focFetchSubject,focIdb,focListEvents,focPollMs) {return (async function* () {
+const _lqdytk = function _archive(focConfig,invalidation,focCrawl,focFetchSubject,focStore,focListEvents,focPollMs,focYieldMs) {return (async function* () {
   const cfg = focConfig;
   const MSG = "social.colibri.message";
   const RXN = "social.colibri.reaction";
@@ -13374,9 +13617,9 @@ const _lqdytk = function _archive(focConfig,invalidation,focListRecords,focFetch
   mark("archive-start");
 
   // A generator suspended inside `await` cannot be closed by the runtime's own
-  // gen.return() until it reaches a yield, and this one yields only when the
-  // feed changed. Without an explicit flag every redefinition leaks a polling
-  // loop that outlives its cell.
+  // gen.return() until it reaches a yield, and this one yields only when
+  // something changed. Without an explicit flag every redefinition leaks a
+  // polling loop and a crawl that outlive their cell.
   let dead = false;
   invalidation.then(() => { dead = true; });
 
@@ -13391,30 +13634,62 @@ const _lqdytk = function _archive(focConfig,invalidation,focListRecords,focFetch
     const t = setTimeout(() => { wakeResolve = null; r(); }, ms);
     wakeResolve = () => { clearTimeout(t); wakeResolve = null; wakePending = false; r(); };
   });
-  const drainOutbox = (state) => {
+  const wake = () => { if (window.__focWake) window.__focWake(); };
+
+  const lists = { [MSG]: [], [RXN]: [] };
+  const at = { [MSG]: new Map(), [RXN]: new Map() };
+  const newest = { [MSG]: null, [RXN]: null };
+  let dirty = false;
+  const absorb = (coll, records) => {
+    const list = lists[coll], m = at[coll];
+    let n = 0;
+    for (const r of records) {
+      if (!newest[coll] || r.rkey > newest[coll]) newest[coll] = r.rkey;
+      const i = m.get(r.rkey);
+      if (i === undefined) { m.set(r.rkey, list.length); list.push(r); n++; }
+      else { list[i] = r; n++; }
+    }
+    if (n) dirty = true;
+    return n;
+  };
+  const drop = (coll, rkey) => {
+    const list = lists[coll], m = at[coll];
+    const i = m.get(rkey);
+    if (i === undefined) return 0;
+    list.splice(i, 1);
+    m.clear();
+    for (let k = 0; k < list.length; k++) m.set(list[k].rkey, k);
+    dirty = true;
+    return 1;
+  };
+
+  const store = focStore;
+  const progress = { crawling: false, collection: null, pages: 0, records: 0, cursor: null, complete: false, error: null };
+  window.__focProgress = progress;
+  let fetchedAt = null;
+  const snapshot = (source) => ({
+    messages: lists[MSG].slice(),
+    reactions: lists[RXN].slice(),
+    fetchedAt,
+    source,
+    error: progress.error,
+    progress: { ...progress }
+  });
+
+  const drainOutbox = () => {
     const box = window.__focOutbox;
     if (!box || !box.length) return 0;
     let n = 0;
     for (const rec of box.splice(0)) {
-      const list = rec.value && rec.value.targetMessage ? state.reactions : state.messages;
-      if (list.some((r) => r.rkey === rec.rkey)) continue;
-      list.push(rec);
-      n++;
+      const coll = rec.value && rec.value.targetMessage ? RXN : MSG;
+      n += absorb(coll, [rec]);
     }
     return n;
   };
 
-  const crawlBot = async () => {
-    const [messages, reactions] = await Promise.all([
-      focListRecords(cfg.botPds, cfg.botDid, MSG, { reverse: true }),
-      focListRecords(cfg.botPds, cfg.botDid, RXN, { reverse: true })
-    ]);
-    return { messages, reactions };
-  };
-
-  // Apply feed events onto the two lists. Content is fetched from whichever repo
-  // holds it; the pointer only says where.
-  const apply = async (state, events) => {
+  // Apply feed events. Content is fetched from whichever repo holds it; the
+  // pointer only says where.
+  const apply = async (events) => {
     const wanted = events.filter((e) => {
       const c = String(e.value.subject || "").split("/")[3];
       return c === MSG || c === RXN;
@@ -13431,100 +13706,172 @@ const _lqdytk = function _archive(focConfig,invalidation,focListRecords,focFetch
       const uri = e.value.subject;
       const coll = uri.split("/")[3];
       const rkey = uri.split("/").pop();
-      const list = coll === MSG ? state.messages : state.reactions;
-      const at = list.findIndex((r) => r.rkey === rkey);
       if (e.value.op === "delete") {
-        if (at >= 0) { list.splice(at, 1); changed++; }
+        changed += drop(coll, rkey);
+        await store.delRow(coll, rkey).catch(() => {});
         continue;
       }
       const rec = fetched.get(uri);
       if (!rec) continue;
-      if (at >= 0) list[at] = rec; else list.push(rec);
-      changed++;
+      changed += absorb(coll, [rec]);
+      await store.putRows(coll, [rec]).catch(() => {});
     }
     return changed;
   };
 
-  const cached = await focIdb.get(cfg.idbKey).catch(() => undefined);
-  let state = null;
+  // --- boot: the local copy, before any network ---------------------------
+  const t0 = Date.now();
+  const [m0, r0, meta] = await Promise.all([
+    store.getAll(MSG).catch(() => []),
+    store.getAll(RXN).catch(() => []),
+    store.getMeta("walk").catch(() => null)
+  ]);
+  absorb(MSG, m0);
+  absorb(RXN, r0);
+  dirty = false;
+  const walk = meta || {};
+  fetchedAt = walk.fetchedAt || null;
+  progress.complete = !!(walk[MSG] && walk[MSG].complete && walk[RXN] && walk[RXN].complete);
+  mark("idb-load", { messages: m0.length, reactions: r0.length, ms: Date.now() - t0, complete: progress.complete });
+  yield snapshot(m0.length ? "indexeddb" : "loading");
+
+  // --- background: walk whatever the local copy is missing -----------------
+  // Two rkeys per collection are enough state because an rkey is a TID and
+  // listRecords walks in key order: `top` is the newest record held
+  // contiguously from the head of the repo, `cursor` is where the downward walk
+  // stopped. See the prose cells above.
+  const saveWalk = async () => {
+    walk.fetchedAt = fetchedAt;
+    await store.setMeta("walk", walk).catch(() => {});
+  };
+  const runWalk = async (coll, opts) => {
+    let top = null, done = false;
+    for await (const p of focCrawl(cfg.botPds, cfg.botDid, coll, { ...opts, sleep, stopped: () => dead })) {
+      const page = p.pages[p.pages.length - 1] || [];
+      if (page.length) {
+        if (!top) top = page[0].rkey;
+        await store.putRows(coll, page).catch(() => {});
+        absorb(coll, page);
+        fetchedAt = new Date().toISOString();
+      }
+      progress.pages++;
+      progress.records += page.length;
+      progress.cursor = p.cursor;
+      window.__focProgress = progress;
+      if (p.error) { progress.error = p.error; mark("walk-error", { coll, error: p.error, pages: progress.pages }); }
+      if (progress.pages % 50 === 0) mark("walk-progress", { coll, pages: progress.pages, records: progress.records, cursor: p.cursor });
+      if (opts.trackCursor && p.cursor) {
+        walk[coll] = { ...(walk[coll] || {}), cursor: p.cursor, complete: false };
+        await saveWalk();
+      }
+      done = p.done && !p.error;
+      wake();
+      if (dead) return { top, done: false };
+    }
+    return { top, done };
+  };
+  // The feed is 2,164 records / 23 pages (2026-09-11) and a cold boot has to walk
+  // all of it to find the native posts, so it runs behind the first yield like
+  // everything else that touches the network.
   let cursor = null;
-  // A cache older than a day, or one written before the feed existed, is not
-  // trusted to be catchable by the tail alone.
-  const fresh = cached && cached.cursor && cached.fetchedAt &&
-    Date.now() - Date.parse(cached.fetchedAt) < 864e5;
-  if (cached && cached.messages && cached.messages.length) {
-    state = { messages: cached.messages.slice(), reactions: (cached.reactions || []).slice() };
-    cursor = fresh ? cached.cursor : null;
-    mark("yield-cache", { messages: state.messages.length, cursor });
-    yield { messages: state.messages, reactions: state.reactions, fetchedAt: cached.fetchedAt, source: "indexeddb", error: null };
-  } else {
-    mark("no-cache");
-    yield { messages: [], reactions: [], fetchedAt: null, source: "loading", error: null };
-  }
-
-  if (!cursor) {
-    // Bootstrap: the bot repo holds the Slack side, and the feed points at the
-    // native posts, which live in their authors' own repos.
+  let feedReady = false;
+  const bootstrapFeed = async () => {
+    const since = walk.eventCursor || null;
     try {
-      const bot = await crawlBot();
-      state = { messages: bot.messages, reactions: bot.reactions };
-      const events = await focListEvents(null);
-      cursor = events.length ? events[events.length - 1].rkey : null;
-      const native = events.filter((e) => !String(e.value.subject).startsWith("at://" + cfg.botDid + "/"));
-      const n = await apply(state, native);
-      const fetchedAt = new Date().toISOString();
-      await focIdb.put(cfg.idbKey, { messages: state.messages, reactions: state.reactions, fetchedAt, cursor }).catch(() => {});
-      mark("bootstrap", { messages: state.messages.length, reactions: state.reactions.length, native: n, cursor });
-      yield { messages: state.messages, reactions: state.reactions, fetchedAt, source: "network", error: null };
+      const events = await focListEvents(since);
+      cursor = events.length ? events[events.length - 1].rkey : since;
+      // Cold, with no cursor: the collection walk covers the bot's own records, so
+      // only the posts living in someone else's repo are worth fetching. Warm:
+      // everything since the cursor is a handful, and it is the only thing that
+      // catches an edit or a delete below `top`, which the walk cannot see.
+      const wanted = since ? events : events.filter((e) => !String(e.value.subject).startsWith("at://" + cfg.botDid + "/"));
+      const n = await apply(wanted);
+      if (cursor && cursor !== since) { walk.eventCursor = cursor; await saveWalk(); }
+      mark("feed-bootstrap", { since, events: events.length, fetched: wanted.length, applied: n, cursor });
     } catch (e) {
-      const error = String(e);
-      mark("bootstrap-failed", { error });
-      yield {
-        messages: state ? state.messages : [],
-        reactions: state ? state.reactions : [],
-        fetchedAt: cached ? cached.fetchedAt : null,
-        source: state ? "indexeddb" : "error",
-        error
-      };
-      return;
+      mark("feed-bootstrap-failed", { error: String(e) });
     }
-  }
+    feedReady = true;
+    wake();
+  };
+  const crawl = async () => {
+    await bootstrapFeed();
+    for (const coll of [MSG, RXN]) {
+      if (dead) return;
+      const w = walk[coll] || {};
+      progress.crawling = true;
+      progress.collection = coll;
+      // Head segment. Cheap for a reader returning after a week: it stops at the
+      // first rkey already held. `top` moves only once the segment finishes, so
+      // an interrupted head segment re-covers records rather than leaving a hole.
+      if (w.top) {
+        mark("walk-head", { coll, top: w.top });
+        const head = await runWalk(coll, { stopAt: w.top });
+        if (head.done) {
+          walk[coll] = { ...(walk[coll] || {}), top: head.top || w.top };
+          await saveWalk();
+        }
+      }
+      // Tail segment: resume the downward walk, persisting a cursor per page.
+      const w2 = walk[coll] || {};
+      if (!w2.complete) {
+        mark("walk-tail", { coll, cursor: w2.cursor || null });
+        const tail = await runWalk(coll, { cursor: w2.cursor || null, trackCursor: true });
+        if (tail.done) {
+          walk[coll] = { top: newest[coll] || w2.top || tail.top, cursor: null, complete: true };
+          await saveWalk();
+        }
+      }
+      mark("walk-done", { coll, held: lists[coll].length, complete: !!(walk[coll] && walk[coll].complete) });
+    }
+    progress.crawling = false;
+    progress.collection = null;
+    progress.complete = !!(walk[MSG] && walk[MSG].complete && walk[RXN] && walk[RXN].complete);
+    dirty = true;
+    wake();
+  };
+  crawl().catch((e) => { progress.error = String(e); progress.crawling = false; dirty = true; wake(); });
 
-  // Tail: one listRecords per poll, stopping at the rkey we already hold. While
-  // the tab is hidden this parks at the first yield after a change, because the
-  // runtime pulls generators on requestAnimationFrame and that does not fire.
+  // --- foreground: the event tail, and one yield per change ----------------
+  // The feed carries deletes and posts written natively in Colibri, which live
+  // in their authors' own repos and so are invisible to the bot-repo walk.
   let stamped = false;
+  let nextPoll = 0;
+  let lastYield = 0;
   while (!dead) {
-    const echoed = drainOutbox(state);
-    if (echoed) {
-      mark("outbox", { echoed });
-      stamped = true;
-      yield { messages: state.messages.slice(), reactions: state.reactions.slice(), fetchedAt: new Date().toISOString(), source: "network", error: null };
-    }
-    let events;
-    try {
-      events = await focListEvents(cursor);
-      window.__focPolls = (window.__focPolls || 0) + 1;
-      window.__focPollAt = new Date().toISOString();
-    } catch (e) {
-      mark("tail-failed", { error: String(e) });
-      await sleep(focPollMs);
-      continue;
+    drainOutbox();
+    if (feedReady && Date.now() >= nextPoll) {
+      try {
+        const events = await focListEvents(cursor);
+        window.__focPolls = (window.__focPolls || 0) + 1;
+        window.__focPollAt = new Date().toISOString();
+        if (events.length) {
+          cursor = events[events.length - 1].rkey;
+          const changed = await apply(events);
+          if (changed) fetchedAt = new Date().toISOString();
+          walk.eventCursor = cursor;
+          await saveWalk();
+          mark("tail", { events: events.length, changed, cursor });
+        }
+        if (!fetchedAt) fetchedAt = new Date().toISOString();
+      } catch (e) {
+        mark("tail-failed", { error: String(e) });
+      }
+      nextPoll = Date.now() + focPollMs;
     }
     if (dead) break;
-    let changed = 0;
-    if (events.length) {
-      cursor = events[events.length - 1].rkey;
-      changed = await apply(state, events);
-    }
-    if (changed || !stamped) {
-      const fetchedAt = new Date().toISOString();
-      if (changed) await focIdb.put(cfg.idbKey, { messages: state.messages, reactions: state.reactions, fetchedAt, cursor }).catch(() => {});
-      if (events.length) mark("tail", { events: events.length, changed, cursor });
+    const now = Date.now();
+    // Every yield recomputes people, topLevelByChannel, linkIndex and the search
+    // haystacks downstream, so a 557-page crawl must not yield 557 times.
+    if (!stamped || (dirty && (!progress.crawling || now - lastYield >= focYieldMs))) {
+      dirty = false;
       stamped = true;
-      yield { messages: state.messages.slice(), reactions: state.reactions.slice(), fetchedAt, source: "network", error: null };
+      lastYield = now;
+      yield snapshot(lists[MSG].length ? "network" : progress.error ? "error" : "loading");
     }
-    await sleep(focPollMs);
+    const wait = !feedReady ? 250
+      : Math.min(nextPoll - Date.now(), progress.crawling ? 250 : focPollMs);
+    await sleep(Math.max(50, wait));
   }
   mark("tail-stopped");
 }());};
@@ -13672,23 +14019,28 @@ const _h49ht1 = function _profiles() {
     return out;
   };
 };
-const _uf9ces = function _searchIndex(archive,parseByline,channelsByRkey,bodyText) {
+const _fochaycache = function _focHayCache() {return (new Map());};
+const _uf9ces = function _searchIndex(archive,parseByline,channelsByRkey,bodyText,focHayCache) {
   // One lowercased haystack per message — author, channel, body — scanned with
   // String.includes. Measured on the full 54,633-message archive in Chromium
-  // (tools/foc-viewer/idb-load-bench.mjs, 2026-09-11): 14 ms to build, 11 ms
-  // for a query. The inverted index this replaces cost 2,175,229 postings and
-  // still only matched whole tokens and prefixes; a trigram index for true
-  // substring needs 12,367,220 postings, larger than the 17.8 M characters it
-  // indexes. Rebuilt per archive yield, which 14 ms makes affordable.
+  // (tools/foc-viewer/idb-load-bench.mjs, 2026-09-11): 14 ms to build, 11 ms for
+  // a query. The inverted index this replaces cost 2,175,229 postings and still
+  // only matched whole tokens and prefixes; a trigram index for true substring
+  // needs 12,367,220 postings, larger than the 17.8 M characters it indexes.
+  //
+  // A background crawl makes `archive` yield repeatedly, so the haystacks are
+  // kept by rkey in focHayCache and a rebuild only builds what is new.
   const msgs = archive.messages;
   const rows = new Array(msgs.length);
   for (let i = 0; i < msgs.length; i++) {
     const r = msgs[i];
-    const ch = channelsByRkey.get(r.value.channel);
-    rows[i] = {
-      rkey: r.rkey,
-      hay: ((parseByline(r).name || "") + "\n" + (ch ? ch.name : "") + "\n" + bodyText(r)).toLowerCase()
-    };
+    let hay = focHayCache.get(r.rkey);
+    if (hay === undefined) {
+      const ch = channelsByRkey.get(r.value.channel);
+      hay = ((parseByline(r).name || "") + "\n" + (ch ? ch.name : "") + "\n" + bodyText(r)).toLowerCase();
+      focHayCache.set(r.rkey, hay);
+    }
+    rows[i] = { rkey: r.rkey, hay };
   }
   return { rows };
 };
@@ -14172,6 +14524,8 @@ const _1jgfnkl = function _mentionsOf(linkIndex) {return ((url) => {
   return { host, count: 0, last: null, entries: [], mode: hasPath && multiTenant.has(host) ? "url" : "host", label: hasPath && multiTenant.has(host) ? "this link" : host, query: hasPath ? prefix : host };
 });};
 const _1svt6dd = function _focPollMs() {return (5000);};
+const _foccrawldelayms = function _focCrawlDelayMs() {return (250);};
+const _focyieldms = function _focYieldMs() {return (2000);};
 const _fyhtmq = function _focRepoPds(focConfig) {
   // A repo's records are served by its own PDS; the bot's is the only one we know.
   const cache = new Map([[focConfig.botDid, focConfig.botPds]]);
@@ -14226,30 +14580,24 @@ const _4syc8e = function _focAdopt(focConfig,focProfileName) {return (async (uri
   }
   return rec;
 });};
-const _76phxl = function _focListEvents(focConfig) {return (async (afterRkey, max = 4000) => {
+const _76phxl = function _focListEvents(focConfig,focPage) {return (async (afterRkey, max = 4000) => {
   // com.feelingofcomputing.bridge.event, newest first, stopping at the rkey we
   // already hold. Returned oldest first, which is the order to apply them in.
+  // Goes through focPage so a 429 from the edge in front of the PDS is a wait
+  // rather than a dropped poll.
   const cfg = focConfig;
   const out = [];
   let cursor = null;
   for (let page = 0; page < 60; page++) {
-    const u = new URL(cfg.botPds + "/xrpc/com.atproto.repo.listRecords");
-    u.searchParams.set("repo", cfg.botDid);
-    u.searchParams.set("collection", cfg.eventCollection);
-    u.searchParams.set("limit", "100");
-    if (cursor) u.searchParams.set("cursor", cursor);
-    const r = await fetch(u.toString());
-    if (!r.ok) throw new Error("listRecords events " + r.status);
-    const j = await r.json();
+    const p = await focPage(cfg.botPds, cfg.botDid, cfg.eventCollection, { cursor });
     let done = false;
-    for (const rec of j.records || []) {
-      const rkey = rec.uri.split("/").pop();
-      if (afterRkey && rkey <= afterRkey) { done = true; break; }
-      out.push({ rkey, value: rec.value });
+    for (const rec of p.records) {
+      if (afterRkey && rec.rkey <= afterRkey) { done = true; break; }
+      out.push({ rkey: rec.rkey, value: rec.value });
       if (out.length >= max) { done = true; break; }
     }
-    cursor = j.cursor;
-    if (done || !cursor || !(j.records || []).length) break;
+    cursor = p.cursor;
+    if (done || !cursor || !p.records.length) break;
   }
   return out.reverse();
 });};
@@ -14389,12 +14737,18 @@ export default function define(runtime, observer) {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
 
+  $def("_focdoc1", null, ["md"], _focdoc1);  
+  $def("_focdoc2", null, ["md"], _focdoc2);  
+  $def("_focdoc3", null, ["md"], _focdoc3);  
+  $def("_focdoc4", null, ["md"], _focdoc4);  
   $def("_1ocuwnz", "focConfig", [], _1ocuwnz);  
-  $def("_1wbyida", "focIdb", ["focConfig"], _1wbyida);  
-  $def("_12iqz0", "focListRecords", [], _12iqz0);  
+  $def("_focstore", "focStore", ["focConfig"], _focstore);  
+  $def("_focpage", "focPage", [], _focpage);  
+  $def("_foccrawl", "focCrawl", ["focPage","focCrawlDelayMs"], _foccrawl);  
+  $def("_12iqz0", "focListRecords", ["focCrawl"], _12iqz0);  
   $def("_1ogqf1u", "structure", ["focConfig","focListRecords"], _1ogqf1u);  
   $def("_18jukin", "channelsByRkey", ["structure"], _18jukin);  
-  $def("_lqdytk", "archive", ["focConfig","invalidation","focListRecords","focFetchSubject","focIdb","focListEvents","focPollMs"], _lqdytk);  
+  $def("_lqdytk", "archive", ["focConfig","invalidation","focCrawl","focFetchSubject","focStore","focListEvents","focPollMs","focYieldMs"], _lqdytk);  
   $def("_1l64rhq", "byRkey", ["archive"], _1l64rhq);  
   $def("_1yv3u9u", "topLevelByChannel", ["archive","orphanThreadRoots","channelsByRkey"], _1yv3u9u);  
   $def("_12od4yw", "repliesByParent", ["archive","orphanThreadRoots"], _12od4yw);  
@@ -14406,7 +14760,8 @@ export default function define(runtime, observer) {
   $def("_aaqg0h", "renderBody", ["parseByline","renderFacets","bodyText"], _aaqg0h);  
   $def("_1ogx4fw", "blobUrl", ["focConfig"], _1ogx4fw);  
   $def("_h49ht1", "profiles", [], _h49ht1);  
-  $def("_uf9ces", "searchIndex", ["archive","parseByline","channelsByRkey","bodyText"], _uf9ces);  
+  $def("_fochaycache", "focHayCache", [], _fochaycache);  
+  $def("_uf9ces", "searchIndex", ["archive","parseByline","channelsByRkey","bodyText","focHayCache"], _uf9ces);  
   $def("_709amv", "search", ["searchIndex","byRkey"], _709amv);  
   $def("_focpeoplefake", "peopleFake", [], _focpeoplefake);  
   $def("_focdemosfake", "demosFake", [], _focdemosfake);  
@@ -14432,10 +14787,12 @@ export default function define(runtime, observer) {
   $def("_1wtqfrz", "linkIndex", ["archive","parseByline"], _1wtqfrz);  
   $def("_1jgfnkl", "mentionsOf", ["linkIndex"], _1jgfnkl);  
   $def("_1svt6dd", "focPollMs", [], _1svt6dd);  
+  $def("_foccrawldelayms", "focCrawlDelayMs", [], _foccrawldelayms);  
+  $def("_focyieldms", "focYieldMs", [], _focyieldms);  
   $def("_fyhtmq", "focRepoPds", ["focConfig"], _fyhtmq);  
   $def("_ur7m8n", "focProfileName", ["focConfig"], _ur7m8n);  
   $def("_4syc8e", "focAdopt", ["focConfig","focProfileName"], _4syc8e);  
-  $def("_76phxl", "focListEvents", ["focConfig"], _76phxl);  
+  $def("_76phxl", "focListEvents", ["focConfig","focPage"], _76phxl);  
   $def("_vmpxn4", "focFetchSubject", ["focRepoPds","focAdopt"], _vmpxn4);  
   $def("_cd97z8", "orphanThreadRoots", ["archive"], _cd97z8);  
   main.define("module @tomlarkworthy/at-login", async () => runtime.module((await import("/@tomlarkworthy/at-login.js?v=4")).default));  
