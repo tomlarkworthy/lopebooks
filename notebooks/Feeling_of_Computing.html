@@ -6088,7 +6088,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _1gx7l2b = function _focChatView(focChatCss,focTabLabels,focChatTarget,archive,focFmt,focConfig,focLoginHost,focChatState,visibleChannels,focSearchResults,focChannelList,focChatSide,focThreadPane,focFitPane,invalidation) {
+const _1gx7l2b = function _focChatView(focChatCss,focTabLabels,focChatTarget,archive,focFmt,focConfig,focLoginHost,focChatState,focChatKeep,visibleChannels,focSearchResults,focChannelList,focChatSide,focThreadPane,focFitPane,invalidation) {
   focChatCss;
   focTabLabels;
   const t = focChatTarget;
@@ -6191,12 +6191,43 @@ const _1gx7l2b = function _focChatView(focChatCss,focTabLabels,focChatTarget,arc
     }
     const list = q ? focSearchResults(q) : focChannelList(t.chanRkey, t.highlight);
     slot.replaceChildren(list);
-    if (!q) stick(list);
+    const key = q ? "q:" + q : "c:" + t.chanRkey + "|" + (t.highlight || "");
+    let restoredAt = 0;
+    list.addEventListener("scroll", () => {
+      if (Date.now() - restoredAt < 200) return;
+      focChatKeep.gap.set(key, list.scrollHeight - list.scrollTop - list.clientHeight);
+    }, { passive: true });
+    if (focChatKeep.lastKey === key && focChatKeep.gap.has(key)) {
+      const gap = focChatKeep.gap.get(key);
+      // renderMain runs while the tree is still detached, where scrollHeight is 0
+      // and the assignment silently clamps to the top. Wait for layout, then hold
+      // the position for a few frames while images settle.
+      let tries = 0;
+      const put = () => {
+        if (tries++ > 24) return;
+        if (list.isConnected && list.scrollHeight > list.clientHeight) {
+          restoredAt = Date.now();
+          list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight - gap);
+          if (tries > 4) return;
+        }
+        requestAnimationFrame(put);
+      };
+      requestAnimationFrame(put);
+    } else {
+      focChatKeep.gap.delete(key);
+      if (!q) stick(list);
+    }
+    focChatKeep.lastKey = key;
   };
 
   const sideParts = focChatSide(t.chanRkey, (v) => {
     focChatState.q = v;
     renderMain();
+  });
+  if (focChatKeep.searchFocus) requestAnimationFrame(() => {
+    if (!sideParts.box.isConnected || document.activeElement !== document.body) return;
+    sideParts.box.focus();
+    sideParts.box.setSelectionRange(focChatKeep.searchCaret, focChatKeep.searchCaret);
   });
   cols.append(sideParts.side, main);
   if (t.threadRoot) cols.appendChild(focThreadPane(t.threadRoot, t.highlight));
@@ -6288,7 +6319,16 @@ const _1bpmi5z = function _focChatTarget(focHash,byRkey,channelsByRkey,visibleCh
   return { chanRkey, msgRkey, threadRoot, highlight: msgRkey, channel: channelsByRkey.get(chanRkey) || null };
 };
 const _1ton846 = function _focChatState() {return (window.__focChatState || (window.__focChatState = { q: "" }));};
-const _1alze6d = function _focChatSide(archive,focChatState,visibleChannels,focFmt,focWriteHash) {return ((activeRkey, onSearch) => {
+const _fockeep = function _focChatKeep() {
+  // focChatView is rebuilt on every archive yield, which during the background
+  // crawl is every focYieldMs. Anything the reader is in the middle of doing that
+  // lives in the DOM has to be handed to the next tree through here.
+  // Scroll is kept as distance from the bottom, not scrollTop: the crawl walks
+  // backwards, so each yield prepends older messages and shifts absolute
+  // positions.
+  return window.__focChatKeep || (window.__focChatKeep = { gap: new Map(), lastKey: null, searchFocus: false, searchCaret: 0 });
+};
+const _1alze6d = function _focChatSide(archive,focChatState,focChatKeep,visibleChannels,focFmt,focWriteHash) {return ((activeRkey, onSearch) => {
   const side = document.createElement("div");
   side.className = "fc-side";
   const box = document.createElement("input");
@@ -6296,7 +6336,10 @@ const _1alze6d = function _focChatSide(archive,focChatState,visibleChannels,focF
   box.type = "search";
   box.placeholder = "Search " + archive.messages.length + " messages";
   box.value = focChatState.q;
-  box.oninput = () => onSearch(box.value);
+  box.oninput = () => { focChatKeep.searchCaret = box.selectionStart; onSearch(box.value); };
+  box.onkeyup = () => { focChatKeep.searchCaret = box.selectionStart; };
+  box.onfocus = () => { focChatKeep.searchFocus = true; };
+  box.onblur = () => { if (box.isConnected) focChatKeep.searchFocus = false; };
   side.appendChild(box);
   const h = document.createElement("h3");
   h.textContent = "Channels";
@@ -6709,7 +6752,28 @@ const _16iylcv = function _focComposer(focComposerCss,prosemirror,editableSchema
     new prosemirror.Plugin({ props: { attributes: { class: "ProseMirror-example-setup-style" } } })
   ];
 
+  // focChatView depends on `archive`, so the background crawl rebuilds the whole
+  // chat DOM every focYieldMs and a composer built fresh each time loses whatever
+  // the reader had typed. One editor per target instead, re-adopted into each new
+  // tree. Keyed in this closure rather than a no-dep cell so signing in or out
+  // rebuilds the editors, which is the one case where a stale one is wrong.
+  const cache = new Map();
+  invalidation.then(() => { for (const e of cache.values()) e.view.destroy(); cache.clear(); });
+
   return (opts = {}) => {
+    const key = opts.parent ? "p:" + opts.parent.rkey : "c:" + opts.channelRkey;
+    const hit = cache.get(key);
+    if (hit) {
+      Object.assign(hit.opts, opts);
+      // Moving a node in the DOM removes and re-inserts it, which blurs whatever
+      // was focused inside. Put it back on the frame after the caller mounts.
+      if (hit.wrap.contains(document.activeElement)) {
+        requestAnimationFrame(() => {
+          if (hit.wrap.isConnected && document.activeElement === document.body) hit.view.focus();
+        });
+      }
+      return hit.wrap;
+    }
     const wrap = document.createElement("div");
     wrap.className = "fc-composer lope-editable-md";
     if (!currentSession) {
@@ -6734,6 +6798,7 @@ const _16iylcv = function _focComposer(focComposerCss,prosemirror,editableSchema
     bar.append(hint, status, send);
     wrap.append(host, bar);
 
+    const live = { parent: opts.parent || null, channelRkey: opts.channelRkey, onPosted: opts.onPosted };
     const blank = () => prosemirror.EditorState.create({ schema: editableSchema, plugins: plugins() });
     let busy = false;
     const submit = async () => {
@@ -6743,11 +6808,11 @@ const _16iylcv = function _focComposer(focComposerCss,prosemirror,editableSchema
       status.classList.remove("err");
       status.textContent = "Posting…";
       try {
-        const res = await focPostMessage({ parent: opts.parent || null, channelRkey: opts.channelRkey, doc: view.state.doc });
+        const res = await focPostMessage({ parent: live.parent, channelRkey: live.channelRkey, doc: view.state.doc });
         view.updateState(blank());
         status.textContent = "Posted";
         setTimeout(() => { if (status.isConnected) status.textContent = ""; }, 4000);
-        if (opts.onPosted) opts.onPosted(res);
+        if (live.onPosted) live.onPosted(res);
       } catch (e) {
         status.classList.add("err");
         status.textContent = String((e && e.message) || e);
@@ -6769,7 +6834,17 @@ const _16iylcv = function _focComposer(focComposerCss,prosemirror,editableSchema
       handlePaste(v, event) { return linkifyPastedUrl(v, event); }
     });
     send.onclick = submit;
-    invalidation.then(() => view.destroy());
+    cache.set(key, { wrap, view, opts: live });
+    // Browsing threads would otherwise leave one live EditorView per thread
+    // visited. Drop the oldest empty ones; anything with a draft in it stays.
+    if (cache.size > 12) {
+      for (const [k, e] of cache) {
+        if (cache.size <= 12) break;
+        if (k === key || e.view.state.doc.textContent.trim()) continue;
+        e.view.destroy();
+        cache.delete(k);
+      }
+    }
     return wrap;
   };
 };
@@ -6780,11 +6855,12 @@ export default function define(runtime, observer) {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
 
-  $def("_1gx7l2b", "focChatView", ["focChatCss","focTabLabels","focChatTarget","archive","focFmt","focConfig","focLoginHost","focChatState","visibleChannels","focSearchResults","focChannelList","focChatSide","focThreadPane","focFitPane","invalidation"], _1gx7l2b);  
+  $def("_1gx7l2b", "focChatView", ["focChatCss","focTabLabels","focChatTarget","archive","focFmt","focConfig","focLoginHost","focChatState","focChatKeep","visibleChannels","focSearchResults","focChannelList","focChatSide","focThreadPane","focFitPane","invalidation"], _1gx7l2b);  
   $def("_ab1nor", "focChatCss", ["focBaseStyle","focStyle"], _ab1nor);  
   $def("_1bpmi5z", "focChatTarget", ["focHash","byRkey","channelsByRkey","visibleChannels"], _1bpmi5z);  
   $def("_1ton846", "focChatState", [], _1ton846);  
-  $def("_1alze6d", "focChatSide", ["archive","focChatState","visibleChannels","focFmt","focWriteHash"], _1alze6d);  
+  $def("_fockeep", "focChatKeep", [], _fockeep);  
+  $def("_1alze6d", "focChatSide", ["archive","focChatState","focChatKeep","visibleChannels","focFmt","focWriteHash"], _1alze6d);  
   $def("_pxphc6", "focDaySeparator", ["focFmt"], _pxphc6);  
   $def("_35e51i", "focChannelList", ["topLevelByChannel","archive","focFmt","focDaySeparator","focMsgNode"], _35e51i);  
   $def("_10j9tur", "focThreadPane", ["repliesByParent","focWriteHash","byRkey","focMsgNode","channelsByRkey","focComposer"], _10j9tur);  
