@@ -6095,7 +6095,7 @@ const _1gx7l2b = function _focChatView(focChatCss,focTabLabels,focChatTarget,foc
   // painted one frame of the new list at scrollTop 0 before the restore landed,
   // and re-created every image: the flicker on each poll that brought a change.
   // `this` is the previous value; BUILD changes when the skeleton does.
-  const BUILD = 1;
+  const BUILD = 2;
   const t = focChatTarget;
   const el = (tag, cls) => {
     const n = document.createElement(tag);
@@ -6130,8 +6130,16 @@ const _1gx7l2b = function _focChatView(focChatCss,focTabLabels,focChatTarget,foc
     cols.append(side, main);
     root.append(head, cols);
     const d = { build: BUILD, root, sub, err, box, chans, chanRows: new Map(), cols, bar, barSig: null, slot,
-      list: null, listKey: null, rows: new Map(), thread: null, renderMain: null };
+      list: null, listKey: null, rows: new Map(), thread: null, renderMain: null,
+      win: {}, res: null, lastHit: null };
     box.oninput = () => { focChatState.q = box.value; d.renderMain(); };
+    d.loadMore = (dir) => {
+      const r = d.res;
+      if (!r || (dir === "older" && !r.olderCount) || (dir === "newer" && !r.newerCount)) return;
+      d.win = dir === "older" ? r.moreOlder() : dir === "newer" ? r.moreNewer() : r.toLatest();
+      d.renderMain({ pin: false });
+      if (dir === "latest" && d.list) d.list.scrollTop = d.list.scrollHeight;
+    };
     root.__foc = d;
     return d;
   })();
@@ -6201,7 +6209,7 @@ const _1gx7l2b = function _focChatView(focChatCss,focTabLabels,focChatTarget,foc
     setTimeout(tick, 50);
   };
 
-  dom.renderMain = () => {
+  dom.renderMain = (opts = {}) => {
     const q = focChatState.q.trim();
     const c = !q && t.channel ? visibleChannels.find((x) => x.rkey === t.channel.rkey) : null;
     const barSig = [q, t.channel ? t.channel.name : "?", c ? c.top + "/" + c.all : ""].join("|");
@@ -6228,17 +6236,42 @@ const _1gx7l2b = function _focChatView(focChatCss,focTabLabels,focChatTarget,foc
     // message. The same one is patched and keeps its place, including when only
     // the highlighted message changed because the reader opened a thread.
     const key = q ? "q:" + q : "c:" + t.chanRkey;
-    const items = q ? focSearchRows(q) : focChannelRows(t.chanRkey, t.highlight);
-    if (dom.listKey !== key) {
+    let fresh = dom.listKey !== key;
+    let items;
+    if (q) {
+      dom.res = null;
+      items = focSearchRows(q);
+    } else {
+      if (fresh) dom.win = {};
+      const more = (dir) => dom.loadMore(dir);
+      let res = focChannelRows(t.chanRkey, t.highlight, dom.win, more);
+      // A link to a post outside the window re-centres on it, once per link, so a
+      // reader who then scrolls the linked post out of the window is not pulled back.
+      if (res.hitOutside && dom.lastHit !== t.highlight) {
+        res = focChannelRows(t.chanRkey, t.highlight, {}, more);
+        fresh = true;
+      }
+      dom.lastHit = t.highlight;
+      dom.res = res;
+      dom.win = { from: res.from, to: res.to };
+      items = res.items;
+    }
+    if (fresh) {
       const list = el("div", "fc-list");
       dom.rows = new Map();
       focKeyed.patch(list, focKeyed.rows(dom.rows, items));
+      list.addEventListener("scroll", () => {
+        const r = dom.res;
+        if (dom.list !== list || !r) return;
+        if (list.scrollTop < 400 && r.olderCount) dom.loadMore("older");
+        else if (list.scrollHeight - list.scrollTop - list.clientHeight < 400 && r.newerCount) dom.loadMore("newer");
+      }, { passive: true });
       dom.slot.replaceChildren(list);
       dom.list = list;
       dom.listKey = key;
       if (!q) stick(list);
     } else {
-      focKeyed.keepPlace(dom.list, () => focKeyed.patch(dom.list, focKeyed.rows(dom.rows, items)));
+      focKeyed.keepPlace(dom.list, () => focKeyed.patch(dom.list, focKeyed.rows(dom.rows, items)), opts.pin !== false);
     }
   };
   dom.renderMain();
@@ -6790,21 +6823,27 @@ const _r9yd3x = function _focKeyed() {
   // Hold the first visible row at the same screen offset across a mutation, or
   // stay pinned to the bottom if the reader was there. The crawl prepends older
   // messages, the tail appends new ones; both must leave the reader where they were.
-  const keepPlace = (list, mutate) => {
+  // pin=false for a page the reader asked for: pinning there would load the next
+  // page at once, and the next, to the end of the channel.
+  const keepPlace = (list, mutate, pin = true) => {
     if (!list.isConnected || list.scrollHeight <= list.clientHeight + 1) { mutate(); return; }
-    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 8;
+    const atBottom = pin && list.scrollHeight - list.scrollTop - list.clientHeight < 8;
     const top = list.getBoundingClientRect().top;
     const kids = list.children;
-    let lo = 0, hi = kids.length - 1, anchor = null;
+    let lo = 0, hi = kids.length - 1, first = kids.length;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      if (kids[mid].getBoundingClientRect().bottom > top) { anchor = kids[mid]; hi = mid - 1; }
+      if (kids[mid].getBoundingClientRect().bottom > top) { first = mid; hi = mid - 1; }
       else lo = mid + 1;
     }
-    const off = anchor ? anchor.getBoundingClientRect().top - top : 0;
+    // Several candidates, because the first visible row can itself be replaced:
+    // the "Load older posts" button is, whenever its count changes.
+    const marks = [];
+    for (let i = first; i < kids.length && marks.length < 8; i++) marks.push([kids[i], kids[i].getBoundingClientRect().top - top]);
     mutate();
-    if (atBottom) list.scrollTop = list.scrollHeight;
-    else if (anchor && anchor.parentNode === list) list.scrollTop += anchor.getBoundingClientRect().top - top - off;
+    if (atBottom) { list.scrollTop = list.scrollHeight; return; }
+    const kept = marks.find(([n]) => n.parentNode === list);
+    if (kept) list.scrollTop += kept[0].getBoundingClientRect().top - top - kept[1];
   };
   return { rows, patch, keepPlace };
 };
@@ -6820,30 +6859,88 @@ const _iqoxhe = function _focMsgSig(reactionsByTarget,repliesByParent,focFmt) {r
     rp && rp.length ? rp.length + ":" + focFmt.rel(rp[rp.length - 1].value.createdAt) : ""
   ].join("|");
 });};
-const _i0s42i = function _focChannelRows(topLevelByChannel,archive,focFmt,focDaySeparator,focMsgSig,focMsgNode) {return ((chanRkey, highlightRkey) => {
+const _i0s42i = function _focChannelRows(focMoreCss,topLevelByChannel,archive,focFmt,focDaySeparator,focMsgSig,focMsgNode) {return ((chanRkey, highlightRkey, win = {}, onMore = () => {}) => {
+  // Only a window of the channel is in the DOM. #thinking-together rendered whole
+  // was 3,841 rows / 71,263 elements; a window is PAGE posts, grows a PAGE per
+  // scroll to either end, and never holds more than MAX. It is addressed by rkey,
+  // not index, so the crawl prepending older posts does not shift it.
+  focMoreCss;
+  const PAGE = 150, MAX = 450;
   const msgs = topLevelByChannel.get(chanRkey) || [];
-  if (!msgs.length) {
+  const n = msgs.length;
+  if (!n) {
     const text = archive.source === "loading" ? "Loading the archive from the PDS…" : "No top-level posts in this channel.";
-    return [{ key: "empty", sig: text, make: () => {
+    return { items: [{ key: "empty", sig: text, make: () => {
       const e = document.createElement("div");
       e.className = "foc-empty";
       e.textContent = text;
       return e;
-    } }];
+    } }], from: null, to: null, olderCount: 0, newerCount: 0, hitOutside: false,
+      moreOlder: () => ({}), moreNewer: () => ({}), toLatest: () => ({}) };
   }
+  const lower = (rkey) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; if (msgs[m].rkey < rkey) lo = m + 1; else hi = m; } return lo; };
+  const upper = (rkey) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; if (msgs[m].rkey <= rkey) lo = m + 1; else hi = m; } return lo; };
+  const h = highlightRkey ? lower(highlightRkey) : n;
+  const hit = h < n && msgs[h].rkey === highlightRkey ? h : -1;
+  let a, b; // rendered [a, b)
+  if (win.from == null) {
+    if (hit >= 0) { b = Math.min(n, hit + (PAGE >> 1)); a = Math.max(0, b - PAGE); b = Math.min(n, a + PAGE); }
+    else { b = n; a = Math.max(0, n - PAGE); }
+  } else {
+    a = lower(win.from);
+    b = win.to == null ? n : upper(win.to);
+    if (b <= a) { b = n; a = Math.max(0, n - PAGE); }
+    // A window opened while the crawl had only a few posts of this channel would
+    // otherwise stay that size, too short to scroll and so never load more.
+    if (b - a < PAGE) { a = Math.max(0, b - PAGE); b = Math.min(n, a + PAGE); }
+  }
+  const winFor = (x, y) => ({ from: msgs[x].rkey, to: y >= n ? null : msgs[y - 1].rkey });
+
   const items = [];
+  if (a > 0) items.push({ key: "older", sig: String(a), make: () => {
+    const b1 = document.createElement("button");
+    b1.className = "fc-more";
+    b1.textContent = "Load older posts (" + a.toLocaleString() + " more)";
+    b1.onclick = () => onMore("older");
+    return b1;
+  } });
   let day = null;
-  for (const m of msgs) {
+  for (let i = a; i < b; i++) {
+    const m = msgs[i];
     const iso = m.value.createdAt;
     const k = focFmt.dayKey(iso);
     if (k !== day) {
       day = k;
       items.push({ key: "d:" + k, sig: focFmt.day(iso), make: () => focDaySeparator(iso) });
     }
-    const hit = m.rkey === highlightRkey;
-    items.push({ key: "m:" + m.rkey, sig: focMsgSig(m) + (hit ? "|hit" : ""), make: () => focMsgNode(m, { highlight: hit }) });
+    const isHit = m.rkey === highlightRkey;
+    items.push({ key: "m:" + m.rkey, sig: focMsgSig(m) + (isHit ? "|hit" : ""), make: () => focMsgNode(m, { highlight: isHit }) });
   }
-  return items;
+  if (b < n) items.push({ key: "newer", sig: String(n - b), make: () => {
+    const row = document.createElement("div");
+    row.className = "fc-more-row";
+    const b1 = document.createElement("button");
+    b1.className = "fc-more";
+    b1.textContent = "Load newer posts (" + (n - b).toLocaleString() + " more)";
+    b1.onclick = () => onMore("newer");
+    const b2 = document.createElement("button");
+    b2.className = "fc-more";
+    b2.textContent = "Jump to latest";
+    b2.onclick = () => onMore("latest");
+    row.append(b1, b2);
+    return row;
+  } });
+  return {
+    items,
+    from: msgs[a].rkey,
+    to: b >= n ? null : msgs[b - 1].rkey,
+    olderCount: a,
+    newerCount: n - b,
+    hitOutside: hit >= 0 && (hit < a || hit >= b),
+    moreOlder: () => { const x = Math.max(0, a - PAGE); return winFor(x, Math.min(b, x + MAX)); },
+    moreNewer: () => { const y = Math.min(n, b + PAGE); return winFor(Math.max(a, y - MAX), y); },
+    toLatest: () => winFor(Math.max(0, n - PAGE), n)
+  };
 });};
 const _1xqjb87 = function _focThreadRows(repliesByParent,byRkey,focMsgSig,focMsgNode,channelsByRkey) {return ((rootRkey, highlightRkey) => {
   const replies = repliesByParent.get(rootRkey) || [];
@@ -6900,6 +6997,14 @@ const _gyesf1 = function _focSearchRows(search,focMsgSig,focMsgNode,channelsByRk
   } });
   return items;
 });};
+const _zn9s54 = function _focMoreCss(focStyle) {return (focStyle("foc-more-css", `
+.foc-chat .fc-more { display: block; margin: 10px auto; font: inherit; font-size: 12px; padding: 3px 12px;
+  border-radius: 12px; border: 1px solid var(--theme-foreground-fainter, #ddd);
+  background: var(--theme-background-a, #fff); color: var(--theme-foreground-focus, #0a58ca); cursor: pointer; }
+.foc-chat .fc-more:hover { background: var(--theme-background-b, #f3f3f3); }
+.foc-chat .fc-more-row { display: flex; gap: 8px; justify-content: center; margin: 10px 12px; }
+.foc-chat .fc-more-row .fc-more { margin: 0; }
+`));};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -6968,9 +7073,10 @@ export default function define(runtime, observer) {
   $def("_16iylcv", "focComposer", ["focComposerCss","prosemirror","editableSchema","currentSession","focPostMessage","linkifyPastedUrl","invalidation"], _16iylcv);  
   $def("_r9yd3x", "focKeyed", [], _r9yd3x);  
   $def("_iqoxhe", "focMsgSig", ["reactionsByTarget","repliesByParent","focFmt"], _iqoxhe);  
-  $def("_i0s42i", "focChannelRows", ["topLevelByChannel","archive","focFmt","focDaySeparator","focMsgSig","focMsgNode"], _i0s42i);  
+  $def("_i0s42i", "focChannelRows", ["focMoreCss","topLevelByChannel","archive","focFmt","focDaySeparator","focMsgSig","focMsgNode"], _i0s42i);  
   $def("_1xqjb87", "focThreadRows", ["repliesByParent","byRkey","focMsgSig","focMsgNode","channelsByRkey"], _1xqjb87);  
-  $def("_gyesf1", "focSearchRows", ["search","focMsgSig","focMsgNode","channelsByRkey","focChatState","focWriteHash"], _gyesf1);
+  $def("_gyesf1", "focSearchRows", ["search","focMsgSig","focMsgNode","channelsByRkey","focChatState","focWriteHash"], _gyesf1);  
+  $def("_zn9s54", "focMoreCss", ["focStyle"], _zn9s54);
   return main;
 }</script><!--/-->
 
