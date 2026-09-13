@@ -30661,7 +30661,11 @@ const _1pxteeb = function _test_e5_factory_change_reaches_attached_editors(e5_te
   // The reviewer's report (LIVE 2026, #8C): a change to the editor reached only editors
   // created after it. Everything attached is memoised in `editors`, so a redefined
   // `cellEditor` must evict and rebuild them.
-  const attached = [...(await t.value("editors")).values()];
+  const settled = async (pred) => { for (let i = 0; i < 100 && !pred(); i++) await new Promise((r) => setTimeout(r, 200)); };
+  // editors are attached by auto_attach after boot; this test can start before that
+  const editorsMap = await t.value("editors");
+  await settled(() => editorsMap.size > 0);
+  const attached = [...editorsMap.values()];
   expect(attached.length).toBeGreaterThan(0);
   const v = t.findVariable("cellEditor");
   const inputs = v._inputs.map((i) => i._name);
@@ -30685,7 +30689,7 @@ const _1pxteeb = function _test_e5_factory_change_reaches_attached_editors(e5_te
     v.define("cellEditor", inputs, definition);
     await t.settle();
   }
-}));};
+}, {timeout: 40000}));};
 const _1864toh = function _test_e5_factory_change_keeps_an_open_editor_open(e5_tests_enabled,ui,expect) {return (!e5_tests_enabled ? "skipped" : ui.scenario(async (t) => {
   // Rebuilding on a factory change must not close an editor the reader had open.
   // Open state is persisted per cell via getOption/setOption("pinned"), so a rebuilt
@@ -30701,7 +30705,10 @@ const _1864toh = function _test_e5_factory_change_keeps_an_open_editor_open(e5_t
     }
     return fn();
   };
-  const entry = [...(await t.value("editors")).entries()].find(([, h]) => h.querySelector(".cell-editor-body") && !isOpen(h));
+  const settled = async (pred) => { for (let i = 0; i < 100 && !pred(); i++) await new Promise((r) => setTimeout(r, 200)); };
+  const editorsMap = await t.value("editors");
+  await settled(() => [...editorsMap.values()].some((h) => h.querySelector(".cell-editor-body") && !isOpen(h)));
+  const entry = [...editorsMap.entries()].find(([, h]) => h.querySelector(".cell-editor-body") && !isOpen(h));
   expect(!!entry).toBe(true);
   const [variable, host] = entry;
   const v = t.findVariable("cellEditor");
@@ -30723,7 +30730,7 @@ const _1864toh = function _test_e5_factory_change_keeps_an_open_editor_open(e5_t
     const back = (await t.value("editors")).get(variable);
     if (isOpen(back)) await t.click(back.querySelector(".hotbar"));
   }
-}));};
+}, {timeout: 40000}));};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -30733,8 +30740,8 @@ export default function define(runtime, observer) {
 
   main.define("module @tomlarkworthy/ui-testing", async () => runtime.module((await import("/@tomlarkworthy/ui-testing.js?v=4")).default));  
   main.define("ui", ["module @tomlarkworthy/ui-testing", "@variable"], (_, v) => v.import("ui", _));  
-  main.define("module @tomlarkworthy/testing", async () => runtime.module((await import("/@tomlarkworthy/testing.js?v=4")).default));  
-  main.define("expect", ["module @tomlarkworthy/testing", "@variable"], (_, v) => v.import("expect", _));  
+  main.define("module @tomlarkworthy/jest-expect-standalone", async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));  
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone", "@variable"], (_, v) => v.import("expect", _));  
   $def("_17gav8v", "viewof e5_tests_enabled", ["Inputs"], _17gav8v);  
   $def("_pchmem", "e5_tests_enabled", ["Generators","viewof e5_tests_enabled"], _pchmem);  
   $def("_1pxteeb", "test_e5_factory_change_reaches_attached_editors", ["e5_tests_enabled","ui","expect"], _1pxteeb);  
@@ -30746,7 +30753,8 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _d6mx4 = function _anonymous(md) {return (md`# UI testing
+const _2b0oex = function _1(md){return(
+md`# UI testing
 
 Helpers for driving views from \`test_*\` cells, with \`expect\` from [@tomlarkworthy/testing](#open=@tomlarkworthy/testing).
 
@@ -30781,9 +30789,295 @@ Cell names are resolved in the module that owns the element passed as \`of\` (th
 Why "idle then read" rather than "next fulfilment": attaching an observer to an unobserved cell dirties it, and the runtime fulfils it once with the old inputs before the new value propagates. And a \`viewof\` value cell is a generator whose version never advances on a yield.
 
 Every wait is bounded. A cell whose promise never settles is wedged for the rest of the session, because the runtime chains each recompute on the previous promise; redefining the cell does not help, only deleting it does.
-`);};
-const _gcwjml = function _ui(base,scenario,ui_capabilities) {return ({...base, scenario, can: ui_capabilities});};
-const _uicap1 = function _ui_capabilities() {
+`
+)};
+const _3gs1o6 = function _ui(base,scenario,ui_capabilities){return(
+{...base, scenario, can: ui_capabilities}
+)};
+const _1yve19y = function _base(byLabel,byText,set,click,next,value,settle,serial,findVariable,ownerModule){return(
+{byLabel, byText, set, click, next, value, settle, serial, findVariable, ownerModule}
+)};
+const _1mif4u8 = function _scenario(ui_capabilities,serial,runScenario){return(
+(fn, opts = {}) => {
+  // A scenario the environment cannot drive must say so, not fail an assertion about
+  // geometry that was never measured. `requires` names capabilities from `ui.can`.
+  const missing = (opts.requires ?? []).filter((c) => !ui_capabilities[c]);
+  if (missing.length) return Promise.resolve(`skipped: this environment has no ${missing.join(" or ")}`);
+  return serial(() => runScenario(fn), opts);
+}
+)};
+const _11uyoe3 = function _runScenario(eventFor,base,set,click){return(
+async function run(fn) {
+  const touched = [];
+  const remember = (el) => {
+    const view = el.closest?.("form") ?? el;
+    // only inputs whose value can be put back; a button or a link has no state to restore
+    if (!("value" in view) || (eventFor(view) === "click" && view.type !== "checkbox")) return;
+    if (!touched.some((t) => t.el === view)) touched.push({el: view, value: view.value});
+  };
+  const t = {
+    ...base,
+    set: (el, value, name, opts) => { remember(el); return set(el, value, name, opts); },
+    click: (el, name, opts) => { remember(el); return click(el, name, opts); },
+    scenario: run
+  };
+  try {
+    return await fn(t);
+  } finally {
+    for (const {el, value} of touched.reverse()) await set(el, value);
+  }
+}
+)};
+const _gifw4m = function _serial(queue){return(
+(fn, {timeout = 10000} = {}) => {
+  // Reactive tests all start at once; anything that drives live views must take turns.
+  // Every turn is bounded: a cell whose promise never settles is wedged for the rest of
+  // the session (the runtime chains each recompute on the previous promise), and an
+  // unbounded turn would also block every scenario queued behind it.
+  const timed = () => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`ui.serial: scenario still running after ${timeout}ms`)), timeout);
+    Promise.resolve().then(fn).then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+  const run = queue.tail.then(timed, timed);
+  queue.tail = run.catch(() => {});
+  return run;
+}
+)};
+const _11wlwuv = function _queue(){return(
+{tail: Promise.resolve(), note: "one scenario at a time"}
+)};
+const _igt5cc = function _set(eventFor,next,settle){return(
+(el, value, name, opts = {}) => {
+  // Write a value into a view the way a user would, then optionally read a downstream cell.
+  const type = eventFor(el);
+  if (type === "click") {
+    if (el.type === "checkbox" && !!el.checked !== !!value) el.click();
+    else if (el.type !== "checkbox") el.click();
+  } else {
+    el.value = value;
+    el.dispatchEvent(new window.Event(type, {bubbles: true}));
+  }
+  return name ? next(name, {of: el, ...opts}) : settle().then(() => el);
+}
+)};
+const _1pg58uf = function _click(next,settle){return(
+(el, name, opts = {}) => {
+  el.click();
+  return name ? next(name, {of: el, ...opts}) : settle().then(() => el);
+}
+)};
+const _15gviqa = function _next(settle,value){return(
+async (name, opts = {}) => {
+  // The value of a cell once propagation has finished. Waits for the runtime to go
+  // idle, then reads through module.value(), which also forces a lazy cell to compute.
+  // (Observing the cell and taking its "next" fulfilment is wrong: attaching an
+  // observer dirties an unobserved cell, which then fulfils once with the OLD inputs.)
+  await settle(opts);
+  return value(name, opts);
+}
+)};
+const _lgg8ym = function _value(findVariable){return(
+(name, opts = {}) => {
+  const v = findVariable(name, opts);
+  return v._module.value(name);
+}
+)};
+const _lru75a = function _settle(runtime){return(
+async ({idle = 2, max = 500} = {}) => {
+  // Resolves once the runtime has been idle for `idle` consecutive macrotasks.
+  // The first yield lets the input event's microtasks mark cells dirty.
+  let quiet = 0;
+  for (let i = 0; i < max && quiet < idle; i++) {
+    await new Promise((r) => setTimeout(r, 0));
+    if (runtime._computing) { quiet = 0; await runtime._computing; }
+    else if (runtime._dirty?.size || runtime._updates?.size) quiet = 0;
+    else quiet++;
+  }
+}
+)};
+const _1jkk3l0 = function _byLabel(){return(
+(text, root = window.document) => {
+  // The view (Inputs form) whose <label> reads `text`. Falls back to the labelled control.
+  const match = (s) => typeof text === "string" ? s.trim() === text : text.test(s.trim());
+  const label = [...root.querySelectorAll("label")].find((l) => match(l.textContent));
+  if (!label) throw new Error(`ui.byLabel: no <label> "${text}"`);
+  return label.closest("form") ?? label.control ?? label;
+}
+)};
+const _1rznzg2 = function _byText(){return(
+(text, root = window.document) => {
+  // A clickable element by its visible text: buttons, links, summaries.
+  const match = (s) => typeof text === "string" ? s.trim() === text : text.test(s.trim());
+  const el = [...root.querySelectorAll("button, a, summary, [role=button]")].find((e) => match(e.textContent));
+  if (!el) throw new Error(`ui.byText: nothing clickable reads "${text}"`);
+  return el;
+}
+)};
+const _2a8ko4 = function _eventFor(){return(
+(el) => {
+  // Mirrors Observable stdlib Generators.input: which event a viewof listens for.
+  switch (el.type) {
+    case "button": case "submit": case "checkbox": return "click";
+    case "file": return "change";
+    default: return "input";
+  }
+}
+)};
+const _hoz291 = function _findVariable(runtime,ownerModule){return(
+(name, {module, of} = {}) => {
+  // `mains` is installed by the lopecode bootloader; off-platform (observablehq.com) there is none.
+  const mains = runtime.mains ?? new Map();
+  let mod = module ?? (of ? ownerModule(of) : undefined);
+  if (typeof mod === "string") {
+    mod = mains.get(mod) ?? [...runtime._modules.values()].find((m) => m._name === mod);
+    if (!mod) throw new Error(`ui: no module "${module}"`);
+  }
+  const modName = (m) => [...mains].find(([, v]) => v === m)?.[0] ?? m._name ?? "its module";
+  const all = [...runtime._variables].filter((v) => v._name === name && (!mod || v._module === mod));
+  if (all.length === 0) throw new Error(`ui: no cell named "${name}"${mod ? ` in ${modName(mod)}` : ""}`);
+  if (all.length > 1) throw new Error(`ui: "${name}" is defined in ${all.length} modules; pass {module} or {of: element}`);
+  return all[0];
+}
+)};
+const _1wh52y0 = function _ownerModule(runtime){return(
+(el) => {
+  // The module that owns a DOM node: the viewof whose value is the node, an ancestor
+  // that is, the visualizer's inspector node (.variable) or its root (.module).
+  const byValue = new Map();
+  for (const v of runtime._variables) if (v._value instanceof window.Node) byValue.set(v._value, v);
+  for (let n = el; n; n = n.parentNode) {
+    const v = byValue.get(n);
+    if (v) return v._module;
+    if (n.variable?._module) return n.variable._module;
+    if (n.module?._scope) return n.module;
+  }
+  return undefined;
+}
+)};
+const _5co5xs = function _18(md){return(
+md`## Example: a small form
+
+Fixtures for the tests below.`
+)};
+const _15xdrmu = function _rate(Inputs){return(
+Inputs.range([0, 3], {label: "Rate", step: 0.01, value: 0.1})
+)};
+const _1ofwtde = (G, _) => G.input(_);
+const _1s52ncl = function _qty(Inputs){return(
+Inputs.range([0, 10], {label: "Quantity", step: 1, value: 3})
+)};
+const _1oe48ra = (G, _) => G.input(_);
+const _bwjoox = function _enabled(Inputs){return(
+Inputs.toggle({label: "Enabled", value: true})
+)};
+const _uj1q4r = (G, _) => G.input(_);
+const _1dv8tls = function _name(Inputs){return(
+Inputs.text({label: "Name", value: "world"})
+)};
+const _14o5f83 = (G, _) => G.input(_);
+const _11s7uhe = function _choice(Inputs){return(
+Inputs.select(["a", "b", "c"], {label: "Choice", value: "a"})
+)};
+const _1apj80z = (G, _) => G.input(_);
+const _slhhjw = function _clicks(Inputs){return(
+Inputs.button("Go", {value: 0, reduce: (n) => n + 1})
+)};
+const _ko9u8t = (G, _) => G.input(_);
+const _1sphckz = function _total(enabled,qty,rate){return(
+enabled ? qty * rate : 0
+)};
+const _1yz5v34 = function _greeting(name,choice){return(
+`Hello ${name}, ${choice}`
+)};
+const _3nrhso = function _27(md){return(
+md`## Tests
+
+Each test depends on the \`viewof\`, never on the value it drives, so it does not re-run itself. \`invalidation\` puts the notebook back.`
+)};
+const _1ylfvnz = function _test_ui_set_range_awaits_downstream(ui,$0,expect){return(
+ui.scenario(async (t) => {
+  const total = await t.set($0, 0.5, "total");
+  expect(total).toBeCloseTo(1.5);
+  return `total → ${total}`;
+})
+)};
+const _3p580o = function _test_ui_toggle_off_zeroes_total(ui,$0,expect){return(
+ui.scenario(async (t) => {
+  const total = await t.set($0, false, "total");
+  expect(total).toBe(0);
+  return `total → ${total}`;
+})
+)};
+const _j75yiy = function _test_ui_text_then_select(ui,$0,$1,expect){return(
+ui.scenario(async (t) => {
+  await t.set($0, "Tom", "greeting");
+  const greeting = await t.set($1, "b", "greeting");
+  expect(greeting).toBe("Hello Tom, b");
+  return greeting;
+})
+)};
+const _h3ur94 = function _test_ui_button_by_text(ui,$0,expect){return(
+ui.scenario(async (t) => {
+  const before = await t.value("clicks", {of: $0});
+  const after = await t.click(t.byText("Go", $0), "clicks");
+  expect(after).toBe(before + 1);
+  return `clicks ${before} → ${after}`;
+})
+)};
+const _6g3i2h = async function _test_ui_byLabel_on_an_in_memory_form(Inputs,htl,expect,ui)
+{
+  const volume = Inputs.range([0, 10], {label: "Volume", step: 1});
+  const host = htl.html`<div>${Inputs.text({label: "Other"})}${volume}</div>`;
+  expect(ui.byLabel("Volume", host)).toBe(volume);
+  await ui.set(ui.byLabel("Volume", host), 7);
+  expect(volume.value).toBe(7);
+  expect(() => ui.byLabel("Missing", host)).toThrow(/no <label> "Missing"/);
+  return "byLabel resolves the Inputs form";
+};
+const _im60fd = function _test_ui_byLabel_in_the_live_page($0,expect,ui)
+{
+  // Only meaningful when this module is on screen; otherwise report and pass.
+  if (!$0.isConnected) return "skipped: module not mounted";
+  expect(ui.byLabel("Quantity")).toBe($0);
+  return "live label resolves to the viewof element";
+};
+const _1mvj5qv = function _test_ui_scenario_restores_what_it_touched(ui,$0,$1,expect,$2){return(
+ui.scenario(async (t) => {
+  const rate0 = $0.value, enabled0 = $1.value;
+  await t.scenario(async (inner) => {
+    await inner.set($0, 2, "total");
+    await inner.set($1, false, "total");
+  });
+  expect($0.value).toBe(rate0);
+  expect($1.value).toBe(enabled0);
+  expect(await t.value("total", {of: $0})).toBeCloseTo(rate0 * $2.value);
+  return "views and downstream cells are back to their starting values";
+})
+)};
+const _pzqj5p = async function _test_ui_scenario_that_hangs_is_bounded(expect,ui)
+{
+  await expect(ui.scenario(() => new Promise(() => {}), {timeout: 300})).rejects.toThrow(/still running after 300ms/);
+  return "a stuck scenario fails instead of wedging the queue";
+};
+const _1uay1il = function _test_ui_ambiguous_name_asks_for_scope(expect,ui,$0,runtime)
+{
+  // `md` exists in every module; without a scope the lookup must refuse rather than guess.
+  expect(() => ui.findVariable("md")).toThrow(/pass \{module\} or \{of: element\}/);
+  expect(ui.findVariable("total", {of: $0})._name).toBe("total");
+  // Naming a module needs the bootloader's `mains` registry; Observable modules carry no name.
+  if (!runtime.mains) return "scoping works by element (no module registry off-platform)";
+  expect(ui.findVariable("total", {module: "@tomlarkworthy/ui-testing"})._name).toBe("total");
+  return "scoping works by element and by module name";
+};
+const _15gz4mu = async function _test_ui_unknown_cell_is_a_clear_error(runtime,expect,ui,$0)
+{
+  // The module's NAME comes from the bootloader's `mains` registry; off-platform there is none.
+  const scope = runtime.mains ? " in @tomlarkworthy/ui-testing" : "";
+  await expect(ui.next("nope", {of: $0})).rejects.toThrow(new RegExp(`no cell named "nope"${scope}`));
+  return "the error names the cell" + (scope ? " and the module it looked in" : "");
+};
+const _uzmnz3 = function _ui_capabilities(PointerEvent,KeyboardEvent,DragEvent,DataTransfer)
+{
   // Measured, not assumed: a headless DOM can define every constructor and still lay
   // nothing out. Each entry is what a scenario actually needs to be meaningful.
   const can = {layout: false, dragData: false, pointer: false, keyboard: false};
@@ -30807,223 +31101,6 @@ const _uicap1 = function _ui_capabilities() {
   }
   return can;
 };
-const _gebu7h = function _base(byLabel,byText,set,click,next,value,settle,serial,findVariable,ownerModule) {return ({byLabel, byText, set, click, next, value, settle, serial, findVariable, ownerModule});};
-const _cgte9o = function _scenario(serial,runScenario,ui_capabilities) {return ((fn, opts = {}) => {
-  // A scenario the environment cannot drive must say so, not fail an assertion about
-  // geometry that was never measured. `requires` names capabilities from `ui.can`.
-  const missing = (opts.requires ?? []).filter((c) => !ui_capabilities[c]);
-  if (missing.length) return Promise.resolve(`skipped: this environment has no ${missing.join(" or ")}`);
-  return serial(() => runScenario(fn), opts);
-});};
-const _1k4w68a = function _runScenario(eventFor,base,set,click) {return (async function run(fn) {
-  const touched = [];
-  const remember = (el) => {
-    const view = el.closest?.("form") ?? el;
-    // only inputs whose value can be put back; a button or a link has no state to restore
-    if (!("value" in view) || (eventFor(view) === "click" && view.type !== "checkbox")) return;
-    if (!touched.some((t) => t.el === view)) touched.push({el: view, value: view.value});
-  };
-  const t = {
-    ...base,
-    set: (el, value, name, opts) => { remember(el); return set(el, value, name, opts); },
-    click: (el, name, opts) => { remember(el); return click(el, name, opts); },
-    scenario: run
-  };
-  try {
-    return await fn(t);
-  } finally {
-    for (const {el, value} of touched.reverse()) await set(el, value);
-  }
-});};
-const _oak8nz = function _serial(queue) {return ((fn, {timeout = 10000} = {}) => {
-  // Reactive tests all start at once; anything that drives live views must take turns.
-  // Every turn is bounded: a cell whose promise never settles is wedged for the rest of
-  // the session (the runtime chains each recompute on the previous promise), and an
-  // unbounded turn would also block every scenario queued behind it.
-  const timed = () => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`ui.serial: scenario still running after ${timeout}ms`)), timeout);
-    Promise.resolve().then(fn).then(resolve, reject).finally(() => clearTimeout(timer));
-  });
-  const run = queue.tail.then(timed, timed);
-  queue.tail = run.catch(() => {});
-  return run;
-});};
-const _2cy94x = function _queue() {return ({tail: Promise.resolve(), note: "one scenario at a time"});};
-const _pkur23 = function _set(eventFor,next,settle) {return ((el, value, name, opts = {}) => {
-  // Write a value into a view the way a user would, then optionally read a downstream cell.
-  const type = eventFor(el);
-  if (type === "click") {
-    if (el.type === "checkbox" && !!el.checked !== !!value) el.click();
-    else if (el.type !== "checkbox") el.click();
-  } else {
-    el.value = value;
-    el.dispatchEvent(new window.Event(type, {bubbles: true}));
-  }
-  return name ? next(name, {of: el, ...opts}) : settle().then(() => el);
-});};
-const _1y9jceo = function _click(next,settle) {return ((el, name, opts = {}) => {
-  el.click();
-  return name ? next(name, {of: el, ...opts}) : settle().then(() => el);
-});};
-const _59gt62 = function _next(settle,value) {return (async (name, opts = {}) => {
-  // The value of a cell once propagation has finished. Waits for the runtime to go
-  // idle, then reads through module.value(), which also forces a lazy cell to compute.
-  // (Observing the cell and taking its "next" fulfilment is wrong: attaching an
-  // observer dirties an unobserved cell, which then fulfils once with the OLD inputs.)
-  await settle(opts);
-  return value(name, opts);
-});};
-const _ctgvev = function _value(findVariable) {return ((name, opts = {}) => {
-  const v = findVariable(name, opts);
-  return v._module.value(name);
-});};
-const _10b4j5 = function _settle(runtime) {return (async ({idle = 2, max = 500} = {}) => {
-  // Resolves once the runtime has been idle for `idle` consecutive macrotasks.
-  // The first yield lets the input event's microtasks mark cells dirty.
-  let quiet = 0;
-  for (let i = 0; i < max && quiet < idle; i++) {
-    await new Promise((r) => setTimeout(r, 0));
-    if (runtime._computing) { quiet = 0; await runtime._computing; }
-    else if (runtime._dirty?.size || runtime._updates?.size) quiet = 0;
-    else quiet++;
-  }
-});};
-const _9ayqcj = function _byLabel() {return ((text, root = window.document) => {
-  // The view (Inputs form) whose <label> reads `text`. Falls back to the labelled control.
-  const match = (s) => typeof text === "string" ? s.trim() === text : text.test(s.trim());
-  const label = [...root.querySelectorAll("label")].find((l) => match(l.textContent));
-  if (!label) throw new Error(`ui.byLabel: no <label> "${text}"`);
-  return label.closest("form") ?? label.control ?? label;
-});};
-const _1j4u6h5 = function _byText() {return ((text, root = window.document) => {
-  // A clickable element by its visible text: buttons, links, summaries.
-  const match = (s) => typeof text === "string" ? s.trim() === text : text.test(s.trim());
-  const el = [...root.querySelectorAll("button, a, summary, [role=button]")].find((e) => match(e.textContent));
-  if (!el) throw new Error(`ui.byText: nothing clickable reads "${text}"`);
-  return el;
-});};
-const _1a9k83 = function _eventFor() {return ((el) => {
-  // Mirrors Observable stdlib Generators.input: which event a viewof listens for.
-  switch (el.type) {
-    case "button": case "submit": case "checkbox": return "click";
-    case "file": return "change";
-    default: return "input";
-  }
-});};
-const _qa2y3b = function _findVariable(ownerModule,runtime) {return ((name, {module, of} = {}) => {
-  // `mains` is installed by the lopecode bootloader; off-platform (observablehq.com) there is none.
-  const mains = runtime.mains ?? new Map();
-  let mod = module ?? (of ? ownerModule(of) : undefined);
-  if (typeof mod === "string") {
-    mod = mains.get(mod) ?? [...runtime._modules.values()].find((m) => m._name === mod);
-    if (!mod) throw new Error(`ui: no module "${module}"`);
-  }
-  const modName = (m) => [...mains].find(([, v]) => v === m)?.[0] ?? m._name ?? "its module";
-  const all = [...runtime._variables].filter((v) => v._name === name && (!mod || v._module === mod));
-  if (all.length === 0) throw new Error(`ui: no cell named "${name}"${mod ? ` in ${modName(mod)}` : ""}`);
-  if (all.length > 1) throw new Error(`ui: "${name}" is defined in ${all.length} modules; pass {module} or {of: element}`);
-  return all[0];
-});};
-const _gvuvb3 = function _ownerModule(runtime) {return ((el) => {
-  // The module that owns a DOM node: the viewof whose value is the node, an ancestor
-  // that is, the visualizer's inspector node (.variable) or its root (.module).
-  const byValue = new Map();
-  for (const v of runtime._variables) if (v._value instanceof window.Node) byValue.set(v._value, v);
-  for (let n = el; n; n = n.parentNode) {
-    const v = byValue.get(n);
-    if (v) return v._module;
-    if (n.variable?._module) return n.variable._module;
-    if (n.module?._scope) return n.module;
-  }
-  return undefined;
-});};
-const _1ctd37v = function _anonymous(md) {return (md`## Example: a small form
-
-Fixtures for the tests below.`);};
-const _xref37 = function _rate(Inputs) {return (Inputs.range([0, 3], {label: "Rate", step: 0.01, value: 0.1}));};
-const _1ofwtde = (G, _) => G.input(_);
-const _xs9ij4 = function _qty(Inputs) {return (Inputs.range([0, 10], {label: "Quantity", step: 1, value: 3}));};
-const _1oe48ra = (G, _) => G.input(_);
-const _hh4seg = function _enabled(Inputs) {return (Inputs.toggle({label: "Enabled", value: true}));};
-const _uj1q4r = (G, _) => G.input(_);
-const _1ebujll = function _name(Inputs) {return (Inputs.text({label: "Name", value: "world"}));};
-const _14o5f83 = (G, _) => G.input(_);
-const _9s37u7 = function _choice(Inputs) {return (Inputs.select(["a", "b", "c"], {label: "Choice", value: "a"}));};
-const _1apj80z = (G, _) => G.input(_);
-const _6vag49 = function _clicks(Inputs) {return (Inputs.button("Go", {value: 0, reduce: (n) => n + 1}));};
-const _ko9u8t = (G, _) => G.input(_);
-const _1a8dc2i = function _total(enabled,qty,rate) {return (enabled ? qty * rate : 0);};
-const _1nu4tpj = function _greeting(name,choice) {return (`Hello ${name}, ${choice}`);};
-const _16gr0gt = function _anonymous(md) {return (md`## Tests
-
-Each test depends on the \`viewof\`, never on the value it drives, so it does not re-run itself. \`invalidation\` puts the notebook back.`);};
-const _1lcj3qm = function _test_ui_set_range_awaits_downstream(ui,$0,expect) {return (ui.scenario(async (t) => {
-  const total = await t.set($0, 0.5, "total");
-  expect(total).toBeCloseTo(1.5);
-  return `total → ${total}`;
-}));};
-const _d48qjp = function _test_ui_toggle_off_zeroes_total(ui,$0,expect) {return (ui.scenario(async (t) => {
-  const total = await t.set($0, false, "total");
-  expect(total).toBe(0);
-  return `total → ${total}`;
-}));};
-const _1jdhnnt = function _test_ui_text_then_select(ui,$0,$1,expect) {return (ui.scenario(async (t) => {
-  await t.set($0, "Tom", "greeting");
-  const greeting = await t.set($1, "b", "greeting");
-  expect(greeting).toBe("Hello Tom, b");
-  return greeting;
-}));};
-const _1jnl1dh = function _test_ui_button_by_text(ui,$0,expect) {return (ui.scenario(async (t) => {
-  const before = await t.value("clicks", {of: $0});
-  const after = await t.click(t.byText("Go", $0), "clicks");
-  expect(after).toBe(before + 1);
-  return `clicks ${before} → ${after}`;
-}));};
-const _qh7267 = async function _test_ui_byLabel_on_an_in_memory_form(Inputs,htl,expect,ui) {
-  const volume = Inputs.range([0, 10], {label: "Volume", step: 1});
-  const host = htl.html`<div>${Inputs.text({label: "Other"})}${volume}</div>`;
-  expect(ui.byLabel("Volume", host)).toBe(volume);
-  await ui.set(ui.byLabel("Volume", host), 7);
-  expect(volume.value).toBe(7);
-  expect(() => ui.byLabel("Missing", host)).toThrow(/no <label> "Missing"/);
-  return "byLabel resolves the Inputs form";
-};
-const _ji57tb = function _test_ui_byLabel_in_the_live_page($0,expect,ui) {
-  // Only meaningful when this module is on screen; otherwise report and pass.
-  if (!$0.isConnected) return "skipped: module not mounted";
-  expect(ui.byLabel("Quantity")).toBe($0);
-  return "live label resolves to the viewof element";
-};
-const _1pdy5kk = function _test_ui_scenario_restores_what_it_touched(ui,$0,$1,expect,$2) {return (ui.scenario(async (t) => {
-  const rate0 = $0.value, enabled0 = $1.value;
-  await t.scenario(async (inner) => {
-    await inner.set($0, 2, "total");
-    await inner.set($1, false, "total");
-  });
-  expect($0.value).toBe(rate0);
-  expect($1.value).toBe(enabled0);
-  expect(await t.value("total", {of: $0})).toBeCloseTo(rate0 * $2.value);
-  return "views and downstream cells are back to their starting values";
-}));};
-const _dnn7q3 = async function _test_ui_scenario_that_hangs_is_bounded(expect,ui) {
-  await expect(ui.scenario(() => new Promise(() => {}), {timeout: 300})).rejects.toThrow(/still running after 300ms/);
-  return "a stuck scenario fails instead of wedging the queue";
-};
-const _6osc6 = function _test_ui_ambiguous_name_asks_for_scope(expect,ui,$0,runtime) {
-  // `md` exists in every module; without a scope the lookup must refuse rather than guess.
-  expect(() => ui.findVariable("md")).toThrow(/pass \{module\} or \{of: element\}/);
-  expect(ui.findVariable("total", {of: $0})._name).toBe("total");
-  // Naming a module needs the bootloader's `mains` registry; Observable modules carry no name.
-  if (!runtime.mains) return "scoping works by element (no module registry off-platform)";
-  expect(ui.findVariable("total", {module: "@tomlarkworthy/ui-testing"})._name).toBe("total");
-  return "scoping works by element and by module name";
-};
-const _im7zgh = async function _test_ui_unknown_cell_is_a_clear_error(expect,ui,$0,runtime) {
-  // The module's NAME comes from the bootloader's `mains` registry; off-platform there is none.
-  const scope = runtime.mains ? " in @tomlarkworthy/ui-testing" : "";
-  await expect(ui.next("nope", {of: $0})).rejects.toThrow(new RegExp(`no cell named "nope"${scope}`));
-  return "the error names the cell" + (scope ? " and the module it looked in" : "");
-};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -31031,55 +31108,55 @@ export default function define(runtime, observer) {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
 
-  $def("_d6mx4", null, ["md"], _d6mx4);  
-  $def("_gcwjml", "ui", ["base","scenario","ui_capabilities"], _gcwjml);  
-  $def("_uicap1", "ui_capabilities", [], _uicap1);  
-  $def("_gebu7h", "base", ["byLabel","byText","set","click","next","value","settle","serial","findVariable","ownerModule"], _gebu7h);  
-  $def("_cgte9o", "scenario", ["serial","runScenario","ui_capabilities"], _cgte9o);  
-  $def("_1k4w68a", "runScenario", ["eventFor","base","set","click"], _1k4w68a);  
-  $def("_oak8nz", "serial", ["queue"], _oak8nz);  
-  $def("_2cy94x", "queue", [], _2cy94x);  
-  $def("_pkur23", "set", ["eventFor","next","settle"], _pkur23);  
-  $def("_1y9jceo", "click", ["next","settle"], _1y9jceo);  
-  $def("_59gt62", "next", ["settle","value"], _59gt62);  
-  $def("_ctgvev", "value", ["findVariable"], _ctgvev);  
-  $def("_10b4j5", "settle", ["runtime"], _10b4j5);  
-  $def("_9ayqcj", "byLabel", [], _9ayqcj);  
-  $def("_1j4u6h5", "byText", [], _1j4u6h5);  
-  $def("_1a9k83", "eventFor", [], _1a9k83);  
-  $def("_qa2y3b", "findVariable", ["ownerModule","runtime"], _qa2y3b);  
-  $def("_gvuvb3", "ownerModule", ["runtime"], _gvuvb3);  
-  $def("_1ctd37v", null, ["md"], _1ctd37v);  
-  $def("_xref37", "viewof rate", ["Inputs"], _xref37);  
-  $def("_1ofwtde", "rate", ["Generators","viewof rate"], _1ofwtde);  
-  $def("_xs9ij4", "viewof qty", ["Inputs"], _xs9ij4);  
-  $def("_1oe48ra", "qty", ["Generators","viewof qty"], _1oe48ra);  
-  $def("_hh4seg", "viewof enabled", ["Inputs"], _hh4seg);  
-  $def("_uj1q4r", "enabled", ["Generators","viewof enabled"], _uj1q4r);  
-  $def("_1ebujll", "viewof name", ["Inputs"], _1ebujll);  
-  $def("_14o5f83", "name", ["Generators","viewof name"], _14o5f83);  
-  $def("_9s37u7", "viewof choice", ["Inputs"], _9s37u7);  
-  $def("_1apj80z", "choice", ["Generators","viewof choice"], _1apj80z);  
-  $def("_6vag49", "viewof clicks", ["Inputs"], _6vag49);  
-  $def("_ko9u8t", "clicks", ["Generators","viewof clicks"], _ko9u8t);  
-  $def("_1a8dc2i", "total", ["enabled","qty","rate"], _1a8dc2i);  
-  $def("_1nu4tpj", "greeting", ["name","choice"], _1nu4tpj);  
-  $def("_16gr0gt", null, ["md"], _16gr0gt);  
-  $def("_1lcj3qm", "test_ui_set_range_awaits_downstream", ["ui","viewof rate","expect"], _1lcj3qm);  
-  $def("_d48qjp", "test_ui_toggle_off_zeroes_total", ["ui","viewof enabled","expect"], _d48qjp);  
-  $def("_1jdhnnt", "test_ui_text_then_select", ["ui","viewof name","viewof choice","expect"], _1jdhnnt);  
-  $def("_1jnl1dh", "test_ui_button_by_text", ["ui","viewof clicks","expect"], _1jnl1dh);  
-  $def("_qh7267", "test_ui_byLabel_on_an_in_memory_form", ["Inputs","htl","expect","ui"], _qh7267);  
-  $def("_ji57tb", "test_ui_byLabel_in_the_live_page", ["viewof qty","expect","ui"], _ji57tb);  
-  $def("_1pdy5kk", "test_ui_scenario_restores_what_it_touched", ["ui","viewof rate","viewof enabled","expect","viewof qty"], _1pdy5kk);  
-  $def("_dnn7q3", "test_ui_scenario_that_hangs_is_bounded", ["expect","ui"], _dnn7q3);  
-  $def("_6osc6", "test_ui_ambiguous_name_asks_for_scope", ["expect","ui","viewof rate","runtime"], _6osc6);  
-  $def("_im7zgh", "test_ui_unknown_cell_is_a_clear_error", ["expect","ui","viewof rate","runtime"], _im7zgh);  
-  main.define("module @tomlarkworthy/testing", async () => runtime.module((await import("/@tomlarkworthy/testing.js?v=4")).default));  
   main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));  
+  main.define("module @tomlarkworthy/jest-expect-standalone", async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));  
+  $def("_2b0oex", null, ["md"], _2b0oex);  
+  $def("_3gs1o6", "ui", ["base","scenario","ui_capabilities"], _3gs1o6);  
+  $def("_1yve19y", "base", ["byLabel","byText","set","click","next","value","settle","serial","findVariable","ownerModule"], _1yve19y);  
+  $def("_1mif4u8", "scenario", ["ui_capabilities","serial","runScenario"], _1mif4u8);  
+  $def("_11uyoe3", "runScenario", ["eventFor","base","set","click"], _11uyoe3);  
+  $def("_gifw4m", "serial", ["queue"], _gifw4m);  
+  $def("_11wlwuv", "queue", [], _11wlwuv);  
+  $def("_igt5cc", "set", ["eventFor","next","settle"], _igt5cc);  
+  $def("_1pg58uf", "click", ["next","settle"], _1pg58uf);  
+  $def("_15gviqa", "next", ["settle","value"], _15gviqa);  
+  $def("_lgg8ym", "value", ["findVariable"], _lgg8ym);  
+  $def("_lru75a", "settle", ["runtime"], _lru75a);  
+  $def("_1jkk3l0", "byLabel", [], _1jkk3l0);  
+  $def("_1rznzg2", "byText", [], _1rznzg2);  
+  $def("_2a8ko4", "eventFor", [], _2a8ko4);  
+  $def("_hoz291", "findVariable", ["runtime","ownerModule"], _hoz291);  
+  $def("_1wh52y0", "ownerModule", ["runtime"], _1wh52y0);  
+  $def("_5co5xs", null, ["md"], _5co5xs);  
+  $def("_15xdrmu", "viewof rate", ["Inputs"], _15xdrmu);  
+  $def("_1ofwtde", "rate", ["Generators","viewof rate"], _1ofwtde);  
+  $def("_1s52ncl", "viewof qty", ["Inputs"], _1s52ncl);  
+  $def("_1oe48ra", "qty", ["Generators","viewof qty"], _1oe48ra);  
+  $def("_bwjoox", "viewof enabled", ["Inputs"], _bwjoox);  
+  $def("_uj1q4r", "enabled", ["Generators","viewof enabled"], _uj1q4r);  
+  $def("_1dv8tls", "viewof name", ["Inputs"], _1dv8tls);  
+  $def("_14o5f83", "name", ["Generators","viewof name"], _14o5f83);  
+  $def("_11s7uhe", "viewof choice", ["Inputs"], _11s7uhe);  
+  $def("_1apj80z", "choice", ["Generators","viewof choice"], _1apj80z);  
+  $def("_slhhjw", "viewof clicks", ["Inputs"], _slhhjw);  
+  $def("_ko9u8t", "clicks", ["Generators","viewof clicks"], _ko9u8t);  
+  $def("_1sphckz", "total", ["enabled","qty","rate"], _1sphckz);  
+  $def("_1yz5v34", "greeting", ["name","choice"], _1yz5v34);  
+  $def("_3nrhso", null, ["md"], _3nrhso);  
+  $def("_1ylfvnz", "test_ui_set_range_awaits_downstream", ["ui","viewof rate","expect"], _1ylfvnz);  
+  $def("_3p580o", "test_ui_toggle_off_zeroes_total", ["ui","viewof enabled","expect"], _3p580o);  
+  $def("_j75yiy", "test_ui_text_then_select", ["ui","viewof name","viewof choice","expect"], _j75yiy);  
+  $def("_h3ur94", "test_ui_button_by_text", ["ui","viewof clicks","expect"], _h3ur94);  
+  $def("_6g3i2h", "test_ui_byLabel_on_an_in_memory_form", ["Inputs","htl","expect","ui"], _6g3i2h);  
+  $def("_im60fd", "test_ui_byLabel_in_the_live_page", ["viewof qty","expect","ui"], _im60fd);  
+  $def("_1mvj5qv", "test_ui_scenario_restores_what_it_touched", ["ui","viewof rate","viewof enabled","expect","viewof qty"], _1mvj5qv);  
+  $def("_pzqj5p", "test_ui_scenario_that_hangs_is_bounded", ["expect","ui"], _pzqj5p);  
+  $def("_1uay1il", "test_ui_ambiguous_name_asks_for_scope", ["expect","ui","viewof rate","runtime"], _1uay1il);  
+  $def("_15gz4mu", "test_ui_unknown_cell_is_a_clear_error", ["runtime","expect","ui","viewof rate"], _15gz4mu);  
   main.define("observe", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("observe", _));  
-  main.define("expect", ["module @tomlarkworthy/testing", "@variable"], (_, v) => v.import("expect", _));  
-  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
+  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));  
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone", "@variable"], (_, v) => v.import("expect", _));  
+  $def("_uzmnz3", "ui_capabilities", ["PointerEvent","KeyboardEvent","DragEvent","DataTransfer"], _uzmnz3);
   return main;
 }</script>
 
