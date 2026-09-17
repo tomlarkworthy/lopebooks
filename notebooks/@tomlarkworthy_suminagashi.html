@@ -13479,7 +13479,7 @@ export default function define(runtime, observer) {
 const _wfxnwj = function _1(md){return(
 md`# Suminagashi`
 )};
-const _fosw8y = function _canvas(DOM,width,height,sequence,$0,$1,$2)
+const _fosw8y = function _canvas(DOM,width,height,sequence,$0,$1,$2,$3,$4)
 {
   const canvas = DOM.canvas(
     width * devicePixelRatio,
@@ -13491,6 +13491,12 @@ const _fosw8y = function _canvas(DOM,width,height,sequence,$0,$1,$2)
   canvas.style["touch-action"] = "none";
 
   canvas.addEventListener("pointerdown", (evt) => {
+    if ($3.value) {
+      // A finished picture: this touch only empties the tray. Not in the first
+      // two seconds, or the stroke that was meant to follow the last one does it.
+      if (performance.now() - $3.value.at > 2000) $4.querySelector("button").click();
+      return;
+    }
     canvas.setPointerCapture(evt.pointerId);
     const tool = $2.value;
     if (tool === "brush") $0.value = $0.value + 1; // rotate fluids every click
@@ -13514,8 +13520,10 @@ const _fosw8y = function _canvas(DOM,width,height,sequence,$0,$1,$2)
   canvas.addEventListener("pointercancel", release);
   return canvas;
 };
-const _s01 = function _nextFluid(fluids,sequence,turn,html)
+const _s01 = function _nextFluid(fluids,sequence,turn,finished,html)
 {
+  if (finished)
+    return html`<div style="font: 13px var(--sans-serif, sans-serif)"><b>The picture is finished.</b> Its lines grew past what this machine redraws smoothly (${finished.why}). Touch it to start another.</div>`;
   const next = fluids[sequence[turn % sequence.length]];
   return html`<div style="font: 13px var(--sans-serif, sans-serif); display: flex; align-items: center; gap: 0.5em">
     <span style="display:inline-block; box-sizing: border-box; width: 1.2em; height: 1.2em; border-radius: 50%; border: 0.3em solid #f6f1e6; background: ${next.color ?? "#f6f1e6"}"></span>
@@ -13531,7 +13539,7 @@ Inputs.button("empty the tray")
 )};
 const _s05 = (G, _) => G.input(_);
 const _s06 = function _view(Inputs){return(
-Inputs.radio(["print", "surface pressure"], { value: "print", label: "view" })
+Inputs.radio(["lines", "print", "surface pressure"], { value: "lines", label: "view" })
 )};
 const _s07 = (G, _) => G.input(_);
 const _cskxmi = function _height(Inputs){return(
@@ -13572,6 +13580,11 @@ const _s27 = function _turn(){return(
 )};
 const _s28 = (M, _) => new M(_);
 const _s29 = _ => _.generator;
+const _s85 = function _finished(){return(
+false
+)};
+const _s86 = (M, _) => new M(_);
+const _s87 = _ => _.generator;
 const _s30 = function _pointer(){return(
 undefined
 )};
@@ -13582,8 +13595,8 @@ const _s33 = function _ctx(canvas,invalidation)
   const gl = canvas.getContext("webgl2", {
     alpha: false,
     depth: false,
-    stencil: false,
-    antialias: false
+    stencil: true, // the lines view fills its polygons through the stencil
+    antialias: true
   });
   if (!gl) throw new Error("This notebook needs WebGL2");
   invalidation.then(() => {
@@ -14246,9 +14259,10 @@ function createTray(width, height) {
     },
     // Float32Array of the film, 8 fluids per cell, row 0 at the bottom
     // "velocity" and "pressure" read those instead, 4 numbers per cell
-    read(what = "film") {
+    // `into` is reused when given, which matters at 60 reads a second
+    read(what = "film", into) {
       const pixels = ({ fbo }) => {
-        const data = new Float32Array(width * height * 4);
+        const data = into || new Float32Array(width * height * 4);
         gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
         gl.readPixels(0, 0, width, height, gl.RGBA, gl.FLOAT, data);
         return data;
@@ -14263,6 +14277,10 @@ function createTray(width, height) {
         data.set(b.subarray(4 * i, 4 * i + 4), 8 * i + 4);
       }
       return data;
+    },
+    // the water's velocity, as the texture the transport step reads
+    get velocity() {
+      return velocity[0];
     },
     dispose() {
       for (const { fbo } of film) gl.deleteFramebuffer(fbo);
@@ -14281,7 +14299,522 @@ function createTray(width, height) {
   };
 }
 )};
-const _s42 = function _tray(createTray,width,height,cellSize,fluids,backgroundFilm,reset,invalidation)
+const _s80 = function _createContours(){return(
+function createContours(width, height, { spacing = 1 } = {}) {
+  // Every drop is a closed polyline, in cells, vertex after vertex in x, y.
+  const curves = [];
+  // spacing scales every length the re-spacing works to, cells
+  let version = 0;
+  const W = width;
+  const H = height;
+
+  // the velocity texture is staggered: texel (i, j) holds u on its west
+  // face and v on its south face. Walls carry no normal flow.
+  const out = [0, 0];
+  const sample = (vel, x, y) => {
+    let fy = y - 0.5;
+    let i0 = Math.floor(x);
+    let j0 = Math.floor(fy);
+    let tx = x - i0;
+    let ty = fy - j0;
+    let a = 4 * W * (j0 < 0 ? 0 : j0 > H - 1 ? H - 1 : j0);
+    let b = 4 * W * (j0 + 1 < 0 ? 0 : j0 + 1 > H - 1 ? H - 1 : j0 + 1);
+    const west = i0 <= 0 || i0 >= W;
+    const east = i0 + 1 <= 0 || i0 + 1 >= W;
+    out[0] =
+      (1 - ty) * ((1 - tx) * (west ? 0 : vel[a + 4 * i0]) + tx * (east ? 0 : vel[a + 4 * i0 + 4])) +
+      ty * ((1 - tx) * (west ? 0 : vel[b + 4 * i0]) + tx * (east ? 0 : vel[b + 4 * i0 + 4]));
+    const fx = x - 0.5;
+    i0 = Math.floor(fx);
+    j0 = Math.floor(y);
+    tx = fx - i0;
+    ty = y - j0;
+    a = 4 * (i0 < 0 ? 0 : i0 > W - 1 ? W - 1 : i0) + 1;
+    b = 4 * (i0 + 1 < 0 ? 0 : i0 + 1 > W - 1 ? W - 1 : i0 + 1) + 1;
+    const south = j0 <= 0 || j0 >= H;
+    const north = j0 + 1 <= 0 || j0 + 1 >= H;
+    out[1] =
+      (1 - ty) * ((1 - tx) * (south ? 0 : vel[4 * W * j0 + a]) + tx * (south ? 0 : vel[4 * W * j0 + b])) +
+      ty * ((1 - tx) * (north ? 0 : vel[4 * W * (j0 + 1) + a]) + tx * (north ? 0 : vel[4 * W * (j0 + 1) + b]));
+  };
+
+  // Vertices go where the curve bends. A segment is split where a Catmull-Rom
+  // curve through its neighbours leaves the chord by more than `bend`, or when
+  // it is longer than `longest`; a vertex is dropped when the curve is as
+  // straight without it, or when it crowds the one before.
+  const resample = (curve) => {
+    const { n, xy } = curve;
+    const longest2 = 9 * spacing * spacing;
+    const shortest2 = 0.09 * spacing * spacing;
+    const bend = 0.08 * spacing;
+    const bend2 = bend * bend;
+    if (curve.spare.length < 4 * n) curve.spare = new Float32Array(6 * n);
+    const to = curve.spare;
+    let m = 0;
+    let lastX = 0;
+    let lastY = 0;
+    // the vertices before, at, after and two after the one being looked at
+    let x0 = xy[2 * n - 2], y0 = xy[2 * n - 1];
+    let x1 = xy[0], y1 = xy[1];
+    let x2 = xy[2 % (2 * n)], y2 = xy[3 % (2 * n)];
+    for (let i = 0; i < n; i++) {
+      const d = i + 2 < n ? i + 2 : i + 2 - n;
+      const x3 = xy[2 * d], y3 = xy[2 * d + 1];
+      let keep = true;
+      if (m && n - i + m > 8) {
+        // how far this vertex stands off the line from the last kept to the next
+        const ex = x2 - lastX, ey = y2 - lastY;
+        const span2 = ex * ex + ey * ey;
+        if (span2 < longest2) {
+          const cross = ex * (y1 - lastY) - ey * (x1 - lastX);
+          const off2 = (cross * cross) / (span2 + 1e-12);
+          const gx = x1 - lastX, gy = y1 - lastY;
+          keep = !(off2 < 0.25 * bend2 || (gx * gx + gy * gy < shortest2 && off2 < 16 * bend2));
+        }
+      }
+      if (keep) {
+        to[2 * m] = lastX = x1;
+        to[2 * m + 1] = lastY = y1;
+        m++;
+      }
+      // the Catmull-Rom midpoint stands off the chord by this much
+      const mx = (x1 + x2 - x0 - x3) / 16;
+      const my = (y1 + y2 - y0 - y3) / 16;
+      const sx = x2 - x1, sy = y2 - y1;
+      const length2 = sx * sx + sy * sy;
+      if (length2 > longest2 || (length2 > 4 * shortest2 && mx * mx + my * my > bend2)) {
+        to[2 * m] = lastX = (x1 + x2) / 2 + mx;
+        to[2 * m + 1] = lastY = (y1 + y2) / 2 + my;
+        m++;
+      }
+      x0 = x1; y0 = y1; x1 = x2; y1 = y2; x2 = x3; y2 = y3;
+    }
+    curve.spare = xy;
+    curve.xy = to;
+    curve.n = m;
+  };
+
+  return {
+    width,
+    height,
+    curves,
+    get version() {
+      return version;
+    },
+    get spacing() {
+      return spacing;
+    },
+    count() {
+      return curves.reduce((sum, curve) => sum + curve.n, 0);
+    },
+    // a new drop: a circle, painted over everything born before it
+    birth({ x, y, radius, color, outline = true }) {
+      const n = Math.max(12, Math.ceil((2 * Math.PI * radius) / spacing));
+      const xy = new Float32Array(2 * n);
+      for (let i = 0; i < n; i++) {
+        xy[2 * i] = x + radius * Math.cos((2 * Math.PI * i) / n);
+        xy[2 * i + 1] = y + radius * Math.sin((2 * Math.PI * i) / n);
+      }
+      curves.push({ color, outline, n, xy, spare: new Float32Array(2 * n) });
+      version++;
+    },
+    // Carry every vertex along for dt, on the CPU. velocity: what
+    // tray.read("velocity") returns. The tray does the same on the GPU, in
+    // contourAdvectShader; this one is what the tests compare that with.
+    advect(velocity, dt) {
+      for (const curve of curves) {
+        const { n, xy } = curve;
+        for (let i = 0; i < n; i++) {
+          let x = xy[2 * i];
+          let y = xy[2 * i + 1];
+          sample(velocity, x, y);
+          // no step longer than half a cell, where the water is fast
+          const steps = Math.min(16, Math.ceil((Math.hypot(out[0], out[1]) * dt) / 0.5)) || 1;
+          const h = dt / steps;
+          for (let s = 0; s < steps; s++) {
+            if (s) sample(velocity, x, y);
+            sample(velocity, x + 0.5 * h * out[0], y + 0.5 * h * out[1]); // midpoint
+            x = Math.min(Math.max(x + h * out[0], 0), W);
+            y = Math.min(Math.max(y + h * out[1], 0), H);
+          }
+          xy[2 * i] = x;
+          xy[2 * i + 1] = y;
+        }
+      }
+      this.resample();
+    },
+    // re-space curve k, or every curve
+    resample(k) {
+      if (k === undefined) curves.forEach(resample);
+      else resample(curves[k]);
+      version++;
+    },
+    // Curve k for the GPU: its vertices and its first vertex again, so that
+    // any run of them is a triangle fan. box: [x0, y0, x1, y1]
+    pack(k) {
+      const { n, xy } = curves[k];
+      const packed = new Float32Array(2 * n + 2);
+      packed.set(xy.subarray(0, 2 * n));
+      packed[2 * n] = xy[0];
+      packed[2 * n + 1] = xy[1];
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = 0; i < n; i++) {
+        const x = xy[2 * i], y = xy[2 * i + 1];
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+      }
+      return { packed, n, box: [x0, y0, x1, y1] };
+    },
+    // take curve k's vertices back from an array laid out by pack()
+    unpack(k, packed) {
+      curves[k].xy.set(packed.subarray(0, 2 * curves[k].n));
+    },
+    // signed area enclosed by curve number k, cells squared
+    area(k) {
+      const { n, xy } = curves[k];
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        sum += xy[2 * i] * xy[2 * j + 1] - xy[2 * j] * xy[2 * i + 1];
+      }
+      return sum / 2;
+    }
+  };
+}
+)};
+const _s81 = function _contourVertexShader(){return(
+`#version 300 es
+layout(location = 0) in vec2 aPosition; // cells
+uniform vec2 uSize;
+uniform vec4 uBox; // the curve's bounding box
+uniform int uCover; // 1: draw the bounding box instead of the vertices
+void main () {
+  vec2 p = aPosition;
+  if (uCover == 1) p = vec2((gl_VertexID & 1) == 0 ? uBox.x : uBox.z, (gl_VertexID & 2) == 0 ? uBox.y : uBox.w);
+  gl_Position = vec4(p / uSize * 2.0 - 1.0, 0.0, 1.0);
+}`
+)};
+const _s82 = function _contourFragmentShader(){return(
+`#version 300 es
+precision highp float;
+uniform vec3 uColor;
+out vec4 outColor;
+void main () {
+  outColor = vec4(uColor, 1.0);
+}`
+)};
+const _s84 = function _contourAdvectShader(){return(
+`#version 300 es
+precision highp float;
+precision highp sampler2D;
+layout(location = 0) in vec2 aPosition; // cells
+uniform sampler2D uVelocity;
+uniform ivec2 uSize;
+uniform float uDt;
+out vec2 vPosition; // captured by transform feedback, nothing is drawn
+
+// The velocity texture is staggered: texel (i, j) holds u on its west face
+// and v on its south face. Walls carry no normal flow.
+float U (ivec2 c) {
+  if (c.x <= 0 || c.x >= uSize.x) return 0.0;
+  return texelFetch(uVelocity, ivec2(c.x, clamp(c.y, 0, uSize.y - 1)), 0).x;
+}
+float V (ivec2 c) {
+  if (c.y <= 0 || c.y >= uSize.y) return 0.0;
+  return texelFetch(uVelocity, ivec2(clamp(c.x, 0, uSize.x - 1), c.y), 0).y;
+}
+vec2 water (vec2 p) {
+  vec2 q = p - vec2(0.0, 0.5);
+  ivec2 i = ivec2(floor(q));
+  vec2 t = q - vec2(i);
+  float u = mix(mix(U(i), U(i + ivec2(1, 0)), t.x), mix(U(i + ivec2(0, 1)), U(i + ivec2(1, 1)), t.x), t.y);
+  q = p - vec2(0.5, 0.0);
+  i = ivec2(floor(q));
+  t = q - vec2(i);
+  float v = mix(mix(V(i), V(i + ivec2(1, 0)), t.x), mix(V(i + ivec2(0, 1)), V(i + ivec2(1, 1)), t.x), t.y);
+  return vec2(u, v);
+}
+void main () {
+  vec2 p = aPosition;
+  vec2 w = water(p);
+  // no step longer than half a cell, where the water is fast
+  int steps = clamp(int(ceil(length(w) * uDt / 0.5)), 1, 16);
+  float h = uDt / float(steps);
+  for (int s = 0; s < 16; s++) {
+    if (s >= steps) break;
+    if (s > 0) w = water(p);
+    w = water(p + 0.5 * h * w); // midpoint
+    p = clamp(p + h * w, vec2(0.0), vec2(uSize));
+  }
+  vPosition = p;
+  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+}`
+)};
+const _s83 = function _contourPainter(gl,contourVertexShader,contourFragmentShader,contourAdvectShader,invalidation)
+{
+  const compile = (type, source) => {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+      throw new Error(gl.getShaderInfoLog(shader));
+    return shader;
+  };
+  const link = (vertex, fragment, captured) => {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, vertex));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragment));
+    if (captured) gl.transformFeedbackVaryings(program, captured, gl.SEPARATE_ATTRIBS);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+      throw new Error(gl.getProgramInfoLog(program));
+    return program;
+  };
+  const locate = (program, names) =>
+    Object.fromEntries(names.map((name) => [name, gl.getUniformLocation(program, name)]));
+  const paintProgram = link(contourVertexShader, contourFragmentShader);
+  const paintAt = locate(paintProgram, ["uSize", "uBox", "uCover", "uColor"]);
+  const advectProgram = link(contourAdvectShader, contourFragmentShader, ["vPosition"]);
+  const advectAt = locate(advectProgram, ["uVelocity", "uSize", "uDt"]);
+  const feedback = gl.createTransformFeedback();
+  const multi = gl.getExtension("WEBGL_multi_draw");
+
+  // A curve is filled as fans of CHUNK vertices, each about its own first
+  // vertex, plus one fan over the chunks' first vertices. The windings add up
+  // to the curve's and the triangles stay small. On 1.3 million vertices
+  // (Apple M5 Max, 2026-09-17, solver off): one fan per curve 25 fps,
+  // chunks of 256 38 fps, of 32 73 fps, of 8 28 fps.
+  const CHUNK = 32;
+  const tended = new Map(); // contours -> curve -> what the GPU holds of it
+  let states;
+  const free = (state) => {
+    for (const { buffer, vao } of state.sides) {
+      gl.deleteBuffer(buffer);
+      gl.deleteVertexArray(vao);
+    }
+    gl.deleteBuffer(state.index);
+  };
+  const tend = (contours) => {
+    if (!tended.has(contours)) tended.set(contours, new Map());
+    states = tended.get(contours);
+  };
+  const forget = (contours) => {
+    if (!tended.has(contours)) return;
+    tended.get(contours).forEach(free);
+    tended.delete(contours);
+  };
+  invalidation.then(() => {
+    [...tended.keys()].forEach(forget);
+    gl.deleteTransformFeedback(feedback);
+    gl.deleteProgram(paintProgram);
+    gl.deleteProgram(advectProgram);
+  });
+
+  // put curve k's CPU vertices on the GPU
+  const upload = (contours, k, state) => {
+    const { packed, n, box } = contours.pack(k);
+    if (state.capacity < packed.length) {
+      state.capacity = 2 * packed.length;
+      for (const { buffer } of state.sides) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, 4 * state.capacity, gl.DYNAMIC_COPY);
+      }
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, state.sides[0].buffer);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, packed);
+    const chunks = Math.ceil(n / CHUNK);
+    state.firsts = Int32Array.from({ length: chunks }, (_, c) => c * CHUNK);
+    state.counts = Int32Array.from({ length: chunks }, (_, c) => Math.min(CHUNK, n - c * CHUNK) + 1);
+    gl.bindVertexArray(state.sides[0].vao);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, Uint32Array.from(state.firsts), gl.DYNAMIC_DRAW);
+    gl.bindVertexArray(null);
+    Object.assign(state, { n, box, since: 0, ahead: false });
+  };
+  const stateOf = (contours, k) => {
+    const curve = contours.curves[k];
+    let state = states.get(curve);
+    if (!state) {
+      const index = gl.createBuffer();
+      const sides = [0, 1].map(() => {
+        const buffer = gl.createBuffer();
+        const vao = gl.createVertexArray();
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index);
+        return { buffer, vao };
+      });
+      gl.bindVertexArray(null);
+      state = { sides, index, capacity: 0 };
+      states.set(curve, state);
+      upload(contours, k, state);
+    }
+    return state;
+  };
+
+  return {
+    forget,
+    // free what the GPU holds of every contours but this one
+    retain(contours) {
+      [...tended.keys()].filter((other) => other !== contours).forEach(forget);
+    },
+    // carry every vertex along with the tray's water for dt
+    advect(contours, tray, dt) {
+      tend(contours);
+      if (!contours.curves.length) return;
+      gl.useProgram(advectProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, tray.velocity.tex);
+      gl.uniform1i(advectAt.uVelocity, 0);
+      gl.uniform2i(advectAt.uSize, tray.width, tray.height);
+      gl.uniform1f(advectAt.uDt, dt);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, feedback);
+      gl.enable(gl.RASTERIZER_DISCARD);
+      contours.curves.forEach((_, k) => {
+        const state = stateOf(contours, k);
+        gl.bindVertexArray(state.sides[0].vao);
+        gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, state.sides[1].buffer);
+        gl.beginTransformFeedback(gl.POINTS);
+        gl.drawArrays(gl.POINTS, 0, state.n + 1);
+        gl.endTransformFeedback();
+        state.sides.reverse();
+        state.since++;
+        state.ahead = true;
+      });
+      gl.disable(gl.RASTERIZER_DISCARD);
+      gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
+      gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+      gl.bindVertexArray(null);
+    },
+    // Only the CPU can insert a vertex. Each call brings back about `share` of
+    // all the vertices and re-spaces them: the curves that have waited longest,
+    // and the two youngest drops ahead of their turn, because a drop that is
+    // still opening stretches fastest.
+    respace(contours, share = 0.12) {
+      tend(contours);
+      let budget = share * contours.count();
+      const last = contours.curves.length - 1;
+      const due = (k) => stateOf(contours, k).since * (k >= last - 1 ? 8 : 1);
+      const order = contours.curves.map((_, k) => k).sort((p, q) => due(q) - due(p));
+      for (const k of order) {
+        const state = stateOf(contours, k);
+        if (!state.ahead || budget <= 0) break;
+        budget -= state.n;
+        const packed = new Float32Array(2 * state.n + 2);
+        gl.bindBuffer(gl.ARRAY_BUFFER, state.sides[0].buffer);
+        gl.getBufferSubData(gl.ARRAY_BUFFER, 0, packed);
+        contours.unpack(k, packed);
+        contours.resample(k);
+        upload(contours, k, state);
+      }
+    },
+    // paper, then every drop in the order it was born
+    paint(contours, paper) {
+      tend(contours);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+      gl.clearColor(paper[0], paper[1], paper[2], 1);
+      gl.clearStencil(0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+      gl.useProgram(paintProgram);
+      gl.uniform2f(paintAt.uSize, contours.width, contours.height);
+      gl.enable(gl.STENCIL_TEST);
+      contours.curves.forEach((curve, k) => {
+        const state = stateOf(contours, k);
+        const { n, box, firsts, counts } = state;
+        gl.bindVertexArray(state.sides[0].vao);
+        // count how many times the curve winds round each pixel
+        gl.colorMask(false, false, false, false);
+        gl.stencilFunc(gl.ALWAYS, 0, 0xff);
+        gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, gl.INCR_WRAP);
+        gl.stencilOpSeparate(gl.BACK, gl.KEEP, gl.KEEP, gl.DECR_WRAP);
+        gl.uniform1i(paintAt.uCover, 0);
+        if (multi) multi.multiDrawArraysWEBGL(gl.TRIANGLE_FAN, firsts, 0, counts, 0, firsts.length);
+        else firsts.forEach((first, c) => gl.drawArrays(gl.TRIANGLE_FAN, first, counts[c]));
+        if (firsts.length > 2) gl.drawElements(gl.TRIANGLE_FAN, firsts.length, gl.UNSIGNED_INT, 0);
+        // colour the pixels it winds round, and wipe the count.
+        // The box dates from the last re-spacing; the water moves at most 7 cells a solve
+        const slack = 2 + 7 * state.since;
+        gl.colorMask(true, true, true, true);
+        gl.stencilFunc(gl.NOTEQUAL, 0, 0xff);
+        gl.stencilOp(gl.ZERO, gl.ZERO, gl.ZERO);
+        gl.uniform3fv(paintAt.uColor, curve.color);
+        gl.uniform4f(paintAt.uBox, box[0] - slack, box[1] - slack, box[2] + slack, box[3] + slack);
+        gl.uniform1i(paintAt.uCover, 1);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        // a band thinner than a pixel has no pixels to fill: keep its edge
+        if (curve.outline) {
+          gl.disable(gl.STENCIL_TEST);
+          gl.uniform1i(paintAt.uCover, 0);
+          gl.drawArrays(gl.LINE_LOOP, 0, n);
+          gl.enable(gl.STENCIL_TEST);
+        }
+      });
+      gl.disable(gl.STENCIL_TEST);
+      gl.bindVertexArray(null);
+    }
+  };
+};
+const _s88 = function _test_lines_keep_their_area(createContours)
+{
+  // a rigid quarter turn about the centre of a 96 cell tray, on the CPU
+  const size = 96;
+  const turn = Math.PI / 2 / 200;
+  const velocity = new Float32Array(size * size * 4);
+  for (let j = 0; j < size; j++)
+    for (let i = 0; i < size; i++) {
+      velocity[4 * (j * size + i)] = -turn * (j + 0.5 - size / 2); // u, west face
+      velocity[4 * (j * size + i) + 1] = turn * (i + 0.5 - size / 2); // v, south face
+    }
+  const contours = createContours(size, size);
+  contours.birth({ x: 64, y: 48, radius: 12, color: [0, 0, 0] });
+  const before = contours.area(0);
+  for (let n = 0; n < 200; n++) contours.advect(velocity, 1);
+  const { n, xy } = contours.curves[0];
+  let x = 0;
+  let y = 0;
+  for (let i = 0; i < n; i++) {
+    x += xy[2 * i] / n;
+    y += xy[2 * i + 1] / n;
+  }
+  const change = contours.area(0) / before - 1;
+  const miss = Math.hypot(x - 48, y - 64);
+  if (!(Math.abs(change) < 0.002)) throw new Error(`area changed by ${change}`);
+  if (!(miss < 0.05)) throw new Error(`the circle ended ${miss} cells from (48, 64)`);
+  return `a quarter turn changed the area by ${change.toExponential(1)} and left the centre ${miss.toExponential(1)} cells off, on ${n} vertices`;
+};
+const _s89 = function _test_gpu_and_cpu_carry_lines_alike(createTray,createContours,contourPainter)
+{
+  // one drop opening on a private tray, its outline carried both ways
+  const size = 128;
+  const tray = createTray(size, size);
+  tray.fill(3, 0.1);
+  const onGpu = createContours(size, size);
+  const onCpu = createContours(size, size);
+  const drop = { x: 64, y: 64, radius: 5.2, color: [0, 0, 0] };
+  onGpu.birth(drop);
+  onCpu.birth(drop);
+  for (let n = 0; n < 60; n++) {
+    if (n < 25) tray.brush({ x: 64, y: 64, fluid: 0, pressure: 5, radius: 4, rate: 0.8 });
+    tray.step();
+    contourPainter.advect(onGpu, tray, 1);
+    contourPainter.respace(onGpu, 1);
+    onCpu.advect(tray.read("velocity"), 1);
+  }
+  contourPainter.forget(onGpu);
+  tray.dispose();
+  const gpu = onGpu.area(0);
+  const cpu = onCpu.area(0);
+  const grew = cpu / (Math.PI * 5.2 * 5.2);
+  if (!(grew > 5)) throw new Error(`the drop only grew ${grew} times`);
+  if (!(Math.abs(gpu / cpu - 1) < 0.005)) throw new Error(`GPU area ${gpu}, CPU area ${cpu}`);
+  return `the drop grew ${grew.toFixed(1)} times; GPU and CPU areas differ by ${(gpu / cpu - 1).toExponential(1)}`;
+};
+const _s42 = function _tray(createTray,createContours,width,height,cellSize,fluids,backgroundFilm,reset,$0,$1,invalidation)
 {
   const tray = createTray(
     Math.max(8, Math.floor(width / cellSize)),
@@ -14294,6 +14827,10 @@ const _s42 = function _tray(createTray,width,height,cellSize,fluids,backgroundFi
   );
   void reset; // pressing the button rebuilds the tray
   tray.demo = { drops: 0, wait: 0.5 };
+  tray.contours = createContours(tray.width, tray.height);
+  // an empty tray is a new picture, and starts from the first ink
+  $0.value = false;
+  $1.value = 0;
   invalidation.then(() => tray.dispose());
   return tray;
 };
@@ -14311,7 +14848,7 @@ const _s43 = function _absorbance(fluids)
   });
   return absorb;
 };
-const _s44 = function* _mainLoop(tray,$0,fluids,sequence,absorbance,cellSize,height,params,view)
+const _s44 = function* _mainLoop(tray,$0,$1,fluids,sequence,absorbance,contourPainter,cellSize,height,params,view)
 {
   const emitters = new Map();
   let lastTouch = $0.value && $0.value.touch;
@@ -14321,9 +14858,38 @@ const _s44 = function* _mainLoop(tray,$0,fluids,sequence,absorbance,cellSize,hei
   let last = performance.now();
   let owed = 0; // solves not yet taken
   const toCell = (p) => [p.x / cellSize, (height - p.y) / cellSize];
+  const paper = [0.965, 0.945, 0.9];
+  const flat = (fluid) => {
+    const hex = (fluids[fluid].color || "#ffffff").replace("#", "");
+    return paper.map((p, k) => (p * parseInt(hex.slice(2 * k, 2 * k + 2), 16)) / 255);
+  };
+  const { contours } = tray;
+  contourPainter.retain(contours);
+  let painted; // the contours version on the canvas
+  let lag = 0; // smoothed milliseconds per frame
   while (true) {
     const now = performance.now();
     const elapsed = Math.min((now - last) / 1000, 0.05);
+    // Stirring folds the lines without limit and nothing here thins them out.
+    // Once they cost more than a frame the picture is finished: the water
+    // stops, and the next touch empties the tray.
+    lag = 0.9 * lag + 0.1 * Math.min(now - last, 50);
+    const vertices = contours.count();
+    if (!$1.value && view === "lines" && ((vertices > 200000 && lag > params.finishAtMs) || vertices > 3000000)) {
+      $1.value = { at: now, why: `${(vertices / 1e6).toFixed(1)} million vertices, ${lag.toFixed(0)} ms a frame` };
+      contourPainter.respace(contours, 1);
+      painted = undefined;
+    }
+    if ($1.value) {
+      last = now;
+      if (view === "lines" && painted !== contours.version) {
+        contourPainter.paint(contours, paper);
+        painted = contours.version;
+      } else if (view !== "lines")
+        tray.render({ absorb: absorbance, strength: params.inkStrength, paper, view: view === "print" ? 0 : 1 });
+      yield ++i;
+      continue;
+    }
     last = now;
     const pointer = $0.value;
     if (pointer && pointer.down && pointer.tool === "brush") {
@@ -14366,6 +14932,19 @@ const _s44 = function* _mainLoop(tray,$0,fluids,sequence,absorbance,cellSize,hei
     for (let n = 1; n <= solves; n++, owed--) {
       for (const emitter of emitters.values()) {
         emitter.fed = true;
+        // the drop's outline starts as a circle round the brush. A brush
+        // dragged out of its own circle starts another in the same colour.
+        const tip = (1.3 * params.brushRadius) / cellSize;
+        if (!emitter.stamp || Math.hypot(emitter.at[0] - emitter.stamp[0], emitter.at[1] - emitter.stamp[1]) > 0.5 * tip) {
+          emitter.stamp = emitter.at;
+          contours.birth({
+            x: emitter.at[0],
+            y: emitter.at[1],
+            radius: tip,
+            color: flat(emitter.fluid),
+            outline: !!fluids[emitter.fluid].color
+          });
+        }
         tray.brush({
           x: emitter.at[0],
           y: emitter.at[1],
@@ -14394,6 +14973,8 @@ const _s44 = function* _mainLoop(tray,$0,fluids,sequence,absorbance,cellSize,hei
         transportSteps: busy > 0 ? params.touchTransportSteps : params.transportSteps,
         stroke
       });
+      contourPainter.advect(contours, tray, params.dt);
+      contourPainter.respace(contours);
     }
     if (solves && stroking) stroked = { touch: pointer.touch, at: target };
     if (!stroking) stroked = undefined;
@@ -14401,12 +14982,18 @@ const _s44 = function* _mainLoop(tray,$0,fluids,sequence,absorbance,cellSize,hei
       if (!emitter.down && (emitter.seconds -= elapsed) <= 0 && emitter.fed)
         emitters.delete(key);
 
-    tray.render({
-      absorb: absorbance,
-      strength: params.inkStrength,
-      paper: [0.965, 0.945, 0.9],
-      view: view === "print" ? 0 : 1
-    });
+    if (view !== "lines")
+      tray.render({
+        absorb: absorbance,
+        strength: params.inkStrength,
+        paper,
+        view: view === "print" ? 0 : 1
+      });
+    else if (solves || painted !== contours.version) {
+      // nothing moved, nothing to repaint: the canvas keeps its last frame
+      contourPainter.paint(contours, paper);
+      painted = contours.version;
+    }
     yield ++i;
   }
 };
@@ -14503,6 +15090,8 @@ footer
 const _m_intro = function _m_intro(md){return(
 md`Touch the water. Each touch leaves the next fluid in turn: an ink, then surfactant, then the next ink. The inks are sumi, indigo, vermilion, viridian and ochre. Film flows from the brush for exactly as long as it is held down. A touch pushes the films already on the water outward, so touching one spot repeatedly builds rings.
 
+The *lines* view draws every drop's outline as a curve carried by the water, so a band keeps its edge however thin it is pulled. *print* draws the same tray from the grid. Stirring folds the lines without limit. Once they cost more than a frame to carry the picture is finished: the water stops, and the next touch empties the tray.
+
 *blow* and *stylus* make the water near the pointer move with the pointer; blow is wide and loose, the stylus narrow and firm.
 
 This is how [suminagashi](https://en.wikipedia.org/wiki/Paper_marbling#Suminagashi) is made: ink and a surfactant are floated in turn on still water and the pattern is lifted off with paper.`
@@ -14583,15 +15172,65 @@ The fluid shares are read through a cubic B-spline over the 4×4 cells around ea
 
 Ink darkness saturates. A film of amount g shows 1 − exp(−*ink darkness* · g) of the fluid's absorbance, so a thick film is the fluid's named colour and never darker. The first version let the density grow with g without limit, and on a heavily inked tray "the blue is *very dark* and looks black" (Tom, 2026-09-17).`
 )};
+const _m_lines = function _m_lines(md){return(
+md`## Lines
+
+Tom, on the beads: "I do wish ring bands would just stay as really thin lines instead of becoming beads." On a grid a band thinner than two cells is a blur or a bead, and the sections above only choose between them. The lines view keeps no bands on the grid.
+
+It can, because which fluid is where never feeds back into the motion. The pressure solve reads the total film in a cell, the brush feeds against the total, and the sharpening moves fluids past each other without moving any total. So a drop is a closed curve carried by the same water, and the print is those curves filled in the order the drops were made. A later drop pushes the earlier ones aside and never overlaps them, which is why painting in birth order is enough.
+
+A drop's curve starts as a circle of 1.3 brush radii round the tip. The brush feeds film as exp(−d²), so exp(−1.69) = 18% of it lands outside that circle and is credited to whatever the drop was made in; a smaller circle credits more. A brush dragged more than 0.65 radii from its last circle starts another in the same colour.
+
+Curves never merge or break. A band has no width to lose, and there are no droplets, including where real ink would make them.`
+)};
+const _m_lines_gpu = function _m_lines_gpu(md){return(
+md`The vertices are carried on the GPU by transform feedback: midpoint steps of at most half a cell through the staggered velocity, in \`contourAdvectShader\`. \`createContours.advect\` is the same arithmetic in JavaScript, and \`test_gpu_and_cpu_carry_lines_alike\` holds the two together.
+
+Only the CPU can insert a vertex. Each solve it reads back about an eighth of the vertices, the curves that have waited longest first and the two youngest drops ahead of their turn, and re-spaces them: a segment is split where a Catmull-Rom curve through its neighbours leaves the chord by more than 0.08 cells or when it is longer than 3 cells, and a vertex is dropped when the curve is as straight without it.
+
+A polygon this folded is filled through the stencil buffer: triangle fans count how many times the curve winds round each sample, then the curve's box is coloured wherever the count is not zero. A band thinner than a pixel covers no sample, so each ink's outline is also drawn as a line one pixel wide.`
+)};
+const _m_lines_evidence = function _m_lines_evidence(md){return(
+md`Measured 2026-09-17 in headless Chromium on an Apple M5 Max, 866×380 cells, canvas 2600×1140 with 4× multisampling.
+
+The first version kept vertices at most a cell apart and carried them in JavaScript, from a velocity read back every solve. Six drops and two strokes of blow:
+
+\`\`\`
+                                   vertices   a solve                      frames a second
+a cell apart, carried by the CPU   378,230    22.7 ms carry, 5.2 ms read   8
+spaced by bend, carried by GPU     119,940    0.7 ms                       120
+\`\`\`
+
+The two runs are not like for like. At 8 frames a second the first took a fraction of the solves the second did, so its water had turned less.
+
+Twelve drops and four hard strokes make 1.3 million vertices, and then the fill is the cost, not the carrying. With the solver switched off, frames a second against how the fans are cut:
+
+\`\`\`
+one fan per curve, about one pivot     25
+fans of 256 vertices                   38
+fans of 32                             73
+fans of 8                              28
+\`\`\`
+
+Every triangle of a fan reaches from its pivot to a segment, so one pivot per curve redraws the whole tray for every few thousand vertices. Short fans about their own first vertex stay local; too short, and the fan over the fans' first vertices becomes the long one.
+
+Nothing thins the lines out, and a spiral that winds for five seconds is that long. The first answer was a vertex budget that widened the spacing when it was hit. At 400,000 it widened the spacing to 8.9 cells, still held 361,397 vertices because a curved line needs vertices as the square root of the tolerance, and drew every curve in facets and zigzags. Tom: "the pictures are beautiful, it ok if it only survives a single stir, maybe we jsut pause the simulation when it get laggy, thats the end of the picture, next click empties it". That is what it does: past 200,000 vertices, once a smoothed frame takes longer than *finish at* (28 ms), the water stops. A touch in the first two seconds after that does nothing. A scripted stir finished mid stroke, and the stroke that followed emptied the tray before the picture had been seen.
+
+Tom also reported "subsequent drawing get slower, like resources are not released between pictures", and then "maybe not, its not doing it now, maybe an earlier version". Four pictures of about 350,000 vertices in a row, each emptied and started again, held 120 frames a second through every stroke with the JavaScript heap flat at 72 MB. Not reproduced; which build showed it is not known.
+
+Lines show what the grid print blurred away. Two things in the water were found this way and are recorded where they were fixed: the sawtooth that *curl* put on every band (The water keeps moving), and steps in the pressure from the multigrid (Finding the flow that does it).`
+)};
 const _m_limits = function _m_limits(md){return(
 md`## Not modelled, not tried
 
 - The depth of the water. The flow is two dimensional and the only trace of the water below is a drag term.
 - Different surface activity per fluid. Every fluid contributes equally to surface pressure; unequal values were not tried.
+- Thinning the lines out. Nothing removes a fold once it is thinner than a pixel; contour surgery (Dritschel 1988, for vortex patches) is the known way and was not tried. A hard stir reaches a million vertices in seconds and the picture finishes there.
+- In the lines view the grid still carries eight fluids that nothing reads. Carrying the total alone would be cheaper; both are kept so the two prints can be compared on one tray.
 - More than eight fluids. The film is two RGBA textures written together; until 2026-09-17 it was one, which left room for three inks and no green.
 - Truly clean water. The expansion rule divides by the amount of film, so the tray starts with at least 0.02 of surfactant on it.
 - The 16 bit fallback was not exercised. The film test skips itself there.
-- Timing was measured on one machine, on an empty tray: 3.4 ms per solve on a 640×380 grid (Apple M5 Max, 2026-09-17), which at 60 solves per second is 20% of the time available. With one film texture it was 2.7 ms. A solve issues about 130 draw calls, most of them on small multigrid and summing levels. Going from 4 to 16 full size flux steps adds 1.5 ms (0.7 ms with one texture). Sharpening is skipped on faces that lie inside one fluid, so a busy tray costs more than an empty one; by how much was not measured. When a machine cannot keep up the simulation slows down rather than dropping solves.`
+- Timing was measured on one machine, on an empty tray: 3.6 to 4.3 ms per solve over three runs on a 640×380 grid (Apple M5 Max, 2026-09-17), which at 60 solves per second is about a quarter of the time available. With 16 flux steps it was 5.4 to 6.4 ms. Earlier the same day single runs gave 3.4 and 4.9 ms, and 2.7 and 3.4 ms with one film texture; the spread between runs was not known then, so those differences are not all the second texture's. A solve issues about 130 draw calls, most of them on small multigrid and summing levels. Sharpening is skipped on faces that lie inside one fluid, so a busy tray costs more than an empty one; by how much was not measured. When a machine cannot keep up the simulation slows down rather than dropping solves.`
 )};
 const _m_settings = function _m_settings(md){return(
 md`## Settings
@@ -14761,7 +15400,16 @@ uniform sampler2D uCoarse;
 out vec4 outColor;
 void main () {
   ivec2 c = ivec2(gl_FragCoord.xy);
-  float correction = texelFetch(uCoarse, c / 2, 0).x;
+  // Bilinear between coarse cell centres. Copying the coarse value into its
+  // four cells left steps in the pressure, and lines drawn through the water
+  // show every one of them.
+  ivec2 C = c / 2;
+  ivec2 top = textureSize(uCoarse, 0) - 1;
+  ivec2 D = clamp(C + (c % 2) * 2 - 1, ivec2(0), top); // the nearer neighbour
+  float correction =
+    0.5625 * texelFetch(uCoarse, C, 0).x +
+    0.1875 * (texelFetch(uCoarse, ivec2(D.x, C.y), 0).x + texelFetch(uCoarse, ivec2(C.x, D.y), 0).x) +
+    0.0625 * texelFetch(uCoarse, D, 0).x;
   outColor = vec4(texelFetch(uPressure, c, 0).x + correction, 0.0, 0.0, 1.0);
 }`
 )};
@@ -14812,6 +15460,8 @@ The wanted expansion goes on the right hand side of the pressure equation that a
 
 The equation is solved by multigrid V-cycles, warm started from the previous solve: smooth with damped Jacobi, hand what is still wrong to a grid of half the resolution, add its answer back.
 
+The coarse grid's answer is added back by bilinear interpolation between coarse cell centres. It used to be copied into the four cells above each coarse cell. In the lines view a fast stroke then left a patch of checks about four cells across in the bands it crossed, the size of a coarse cell two levels down. 6 V-cycles in place of 2 removed the patch, and so did bilinear interpolation at 2 cycles, which costs four fetches in place of one (2026-09-17, one scripted stir each, by eye).
+
 Two earlier versions are recorded because both failed in ways that looked like physics (2026-09-17):
 
 - **Explicit elastic film.** Surface pressure acted as a force on the velocity and the film was compressible. A push travelled through the film as a wave, at a finite speed. Tom's report: "the circles rebound a little after releasing ink. It feels sluggish even after reducing viscosity and drag."
@@ -14843,6 +15493,8 @@ A stroke with *blow* or *stylus* blends the velocity toward the pointer's own ve
 
 Curl is fed only where it is large next to the local speed (|curl| / speed between 0.05 and 0.2 per cell). Fed everywhere, it crinkled the rings: nine rings dropped on one spot came out with wavy edges and a notch at each of the four compass points, mirrored left to right and top to bottom. A drop's flow is radial and has no eddies, but its grid noise has curl. Setting *curl* to 0 gave smooth rings; 8 V-cycles instead of 2, and boundary sharpness 0, each left the crinkles where they were (2026-09-17). With the test in place the rings are smooth and a stir still rolls up into eddies.
 
+*curl* was 0.12 until the lines view existed. Drawn as lines, every band of a stirred tray carried a sawtooth three to four cells long. At curl 0 the same stir drew smooth bands, so the sawtooth is the small vortices this term feeds, which the grid print had blurred away. The default is now 0.05, by eye on one scripted stir (2026-09-17).
+
 Sharp boundaries show velocity noise that a blurred dye hides. At curl 0.25 with viscosity 0.02 rings broke into cell sized curds without any stirring.`
 )};
 const _s67 = function _test_film_settles_flat(ringExperiment)
@@ -14858,7 +15510,7 @@ const _s68 = function _defaults(){return(
   dt: 1,
   stiffness: 1, // share of a cell's excess film it is asked to shed per solve
   cycles: 2, // multigrid V-cycles per solve
-  curl: 0.12,
+  curl: 0.05,
   drag: 0.005,
   viscosity: 0.08,
   transportSteps: 4, // per solve, while nothing is touching the water
@@ -14869,6 +15521,7 @@ const _s68 = function _defaults(){return(
   strokeRadius: 40, // px, for blow
   inkStrength: 3.5,
   compress: true,
+  finishAtMs: 28, // lines view: the picture is finished once frames take this long
   sharpness: 0.4, // how fast boundaries are re-sharpened, as a multiple of the water speed
   wash: 0, // 0: ink stirred below the grid beads up. 1: it is left as a pale wash
   autoDrops: true
@@ -14895,6 +15548,7 @@ const _s69 = function _params(Inputs,defaults,html)
       cycles: range("cycles", [1, 8], 1, "pressure V-cycles"),
       inkStrength: range("inkStrength", [0.1, 20], 0.1, "ink darkness"),
       sharpness: range("sharpness", [0, 4], 0.05, "boundary sharpness"),
+      finishAtMs: range("finishAtMs", [17, 50], 1, "finish at (ms a frame)"),
       wash: range("wash", [0, 1], 0.05, "beads (0) or wash (1)"),
       compress: Inputs.toggle({ label: "keep fluids apart", value: defaults.compress }),
       autoDrops: Inputs.toggle({ label: "demo drops", value: defaults.autoDrops })
@@ -14920,8 +15574,8 @@ export default function define(runtime, observer) {
   };
 
   $def("_wfxnwj", null, ["md"], _wfxnwj);  
-  $def("_fosw8y", "canvas", ["DOM","width","height","sequence","mutable turn","mutable pointer","viewof tool"], _fosw8y);  
-  $def("_s01", "nextFluid", ["fluids","sequence","turn","html"], _s01);  
+  $def("_fosw8y", "canvas", ["DOM","width","height","sequence","mutable turn","mutable pointer","viewof tool","mutable finished","viewof reset"], _fosw8y);  
+  $def("_s01", "nextFluid", ["fluids","sequence","turn","finished","html"], _s01);  
   $def("_s02", "viewof tool", ["Inputs"], _s02);  
   $def("_s03", "tool", ["Generators","viewof tool"], _s03);  
   $def("_s04", "viewof reset", ["Inputs"], _s04);  
@@ -14960,6 +15614,14 @@ export default function define(runtime, observer) {
   $def("_m_display", null, ["md"], _m_display);  
   $def("_s39", "displayShader", [], _s39);  
   $def("_s43", "absorbance", ["fluids"], _s43);  
+  $def("_m_lines", null, ["md"], _m_lines);  
+  $def("_s80", "createContours", [], _s80);  
+  $def("_m_lines_gpu", null, ["md"], _m_lines_gpu);  
+  $def("_s84", "contourAdvectShader", [], _s84);  
+  $def("_s81", "contourVertexShader", [], _s81);  
+  $def("_s82", "contourFragmentShader", [], _s82);  
+  $def("_s83", "contourPainter", ["gl","contourVertexShader","contourFragmentShader","contourAdvectShader","invalidation"], _s83);  
+  $def("_m_lines_evidence", null, ["md"], _m_lines_evidence);  
   $def("_m_limits", null, ["md"], _m_limits);  
   $def("_m_settings", null, ["md"], _m_settings);  
   $def("_s68", "defaults", [], _s68);  
@@ -14967,6 +15629,9 @@ export default function define(runtime, observer) {
   $def("_s27", "initial turn", [], _s27);  
   $def("_s28", "mutable turn", ["Mutable","initial turn"], _s28);  
   $def("_s29", "turn", ["mutable turn"], _s29);  
+  $def("_s85", "initial finished", [], _s85);  
+  $def("_s86", "mutable finished", ["Mutable","initial finished"], _s86);  
+  $def("_s87", "finished", ["mutable finished"], _s87);  
   $def("_s30", "initial pointer", [], _s30);  
   $def("_s31", "mutable pointer", ["Mutable","initial pointer"], _s31);  
   $def("_s32", "pointer", ["mutable pointer"], _s32);  
@@ -14975,8 +15640,8 @@ export default function define(runtime, observer) {
   $def("_s35", "vertexShader", [], _s35);  
   $def("_s40", "programs", ["gl","vertexShader","confinementShader","velocityShader","reduceShader","divergenceShader","shiftShader","pressureShader","restrictShader","prolongShader","projectShader","transportShader","brushShader","displayShader"], _s40);  
   $def("_s41", "createTray", ["gl","ctx","programs","defaults"], _s41);  
-  $def("_s42", "tray", ["createTray","width","height","cellSize","fluids","backgroundFilm","reset","invalidation"], _s42);  
-  $def("_s44", "mainLoop", ["tray","mutable pointer","fluids","sequence","absorbance","cellSize","height","params","view"], _s44);  
+  $def("_s42", "tray", ["createTray","createContours","width","height","cellSize","fluids","backgroundFilm","reset","mutable finished","mutable turn","invalidation"], _s42);  
+  $def("_s44", "mainLoop", ["tray","mutable pointer","mutable finished","fluids","sequence","absorbance","contourPainter","cellSize","height","params","view"], _s44);  
   $def("_m_tests", null, ["md"], _m_tests);  
   $def("_s47", "ringExperiment", ["createTray"], _s47);  
   $def("_s48", "test_film_is_conserved", ["ctx","ringExperiment"], _s48);  
@@ -14984,6 +15649,8 @@ export default function define(runtime, observer) {
   $def("_s50", "test_fluids_stay_apart", ["ringExperiment"], _s50);  
   $def("_s67", "test_film_settles_flat", ["ringExperiment"], _s67);  
   $def("_s72", "test_pressure_stays_centred", ["ringExperiment"], _s72);  
+  $def("_s88", "test_lines_keep_their_area", ["createContours"], _s88);  
+  $def("_s89", "test_gpu_and_cpu_carry_lines_alike", ["createTray","createContours","contourPainter"], _s89);  
   $def("_1u110bc", null, ["footer"], _1u110bc);  
   main.define("module @tomlarkworthy/footer", async () => runtime.module((await import("/@tomlarkworthy/footer.js?v=4")).default));  
   main.define("footer", ["module @tomlarkworthy/footer", "@variable"], (_, v) => v.import("footer", _));  
