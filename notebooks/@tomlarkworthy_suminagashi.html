@@ -14100,11 +14100,16 @@ function createTray(width, height) {
   const velocity = [target(), target()];
   const force = target();
   const scratch = target();
-  // multigrid: level 0 is the tray, each level after it has cells twice as wide
+  // Multigrid: level 0 is the tray, each level after it has cells twice as
+  // wide. Halving an odd size leaves a last cell covering one finer cell, so
+  // `last` is the width of each level's last column and row in its own cells.
+  // Treated as full cells they amplify the error, about 1.26 a level: five
+  // odd levels (450x380) blew the pressure up 3.16x per V-cycle, 2026-09-18.
   const levels = [];
-  for (let w = width, h = height, h2 = 1; ; h2 *= 4) {
-    levels.push({ size: [w, h], h2, p: [target(w, h), target(w, h)], rhs: target(w, h) });
+  for (let w = width, h = height, h2 = 1, last = [1, 1]; ; h2 *= 4) {
+    levels.push({ size: [w, h], h2, last, p: [target(w, h), target(w, h)], rhs: target(w, h) });
     if (Math.min(w, h) <= 4) break;
+    last = [w % 2 ? last[0] / 2 : (1 + last[0]) / 2, h % 2 ? last[1] / 2 : (1 + last[1]) / 2];
     w = Math.ceil(w / 2);
     h = Math.ceil(h / 2);
   }
@@ -14128,6 +14133,7 @@ function createTray(width, height) {
         uPressure: level.p[0],
         uRhs: level.rhs,
         uSize: level.size,
+        uLast: level.last,
         uH2: level.h2
       });
       level.p.reverse();
@@ -14142,6 +14148,7 @@ function createTray(width, height) {
       uPressure: level.p[0],
       uRhs: level.rhs,
       uSize: level.size,
+      uLast: level.last,
       uH2: level.h2
     });
     gl.bindFramebuffer(gl.FRAMEBUFFER, coarse.p[0].fbo);
@@ -15003,15 +15010,15 @@ const _s44 = function* _mainLoop(tray,$0,$1,fluids,sequence,absorbance,contourPa
             strength: pointer.tool === "stylus" ? 1 : 0.6
           };
       }
-      // A GPU that cannot solve inside a frame gets a cheaper solve: one
-      // V-cycle and fewer flux steps. On a Mali-G77 phone a solve was 47 ms,
-      // 13 of them a V-cycle and 5.4 each transport step; touching, 110 ms.
+      // A GPU that cannot solve inside a frame gets fewer flux steps. On a
+      // Mali-G77 phone a solve was 47 ms, 5.4 of them each transport step and
+      // 13 each V-cycle; touching, 110 ms. The V-cycles stay: with one, a
+      // 208x380 tray's water swung between 0.5 and the speed clamp for good.
       // Past the finish rule's floor the lines are the cost, not the solve.
       const economy = lag > 24 && vertices <= 200000;
       const steps = busy > 0 ? params.touchTransportSteps : params.transportSteps;
       tray.step({
         ...params,
-        cycles: economy ? Math.min(params.cycles, 1) : params.cycles,
         transportSteps: economy ? Math.min(steps, busy > 0 ? 4 : 2) : steps,
         stroke
       });
@@ -15404,16 +15411,26 @@ precision highp sampler2D;
 uniform sampler2D uPressure;
 uniform sampler2D uRhs;
 uniform ivec2 uSize;
+uniform vec2 uLast; // width of the last column and row, in cells
 uniform float uH2; // cell width squared on this level
 out vec4 outColor;
 float p (ivec2 c) {
   return texelFetch(uPressure, clamp(c, ivec2(0), uSize - 1), 0).x; // walls mirror
 }
+vec2 width (ivec2 c) {
+  return mix(vec2(1.0), uLast, equal(c, uSize - 1));
+}
 void main () {
   ivec2 c = ivec2(gl_FragCoord.xy);
   float rhs = texelFetch(uRhs, c, 0).x;
-  float jacobi = (p(c + ivec2(1, 0)) + p(c - ivec2(1, 0)) +
-                  p(c + ivec2(0, 1)) + p(c - ivec2(0, 1)) - uH2 * rhs) * 0.25;
+  // finite volume: flow across each face over the distance between centres
+  vec2 w = width(c);
+  vec2 wE = width(c + ivec2(1, 0)), wW = width(c - ivec2(1, 0));
+  vec2 wN = width(c + ivec2(0, 1)), wS = width(c - ivec2(0, 1));
+  float tE = w.y / (0.5 * (w.x + wE.x)), tW = w.y / (0.5 * (w.x + wW.x));
+  float tN = w.x / (0.5 * (w.y + wN.y)), tS = w.x / (0.5 * (w.y + wS.y));
+  float jacobi = (tE * p(c + ivec2(1, 0)) + tW * p(c - ivec2(1, 0)) +
+                  tN * p(c + ivec2(0, 1)) + tS * p(c - ivec2(0, 1)) - uH2 * rhs * w.x * w.y) / (tE + tW + tN + tS);
   // damped: plain Jacobi leaves the checkerboard error untouched
   outColor = vec4(mix(p(c), jacobi, 0.8), 0.0, 0.0, 1.0);
 }`
@@ -15426,25 +15443,35 @@ precision highp sampler2D;
 uniform sampler2D uPressure;
 uniform sampler2D uRhs;
 uniform ivec2 uSize; // of the fine level
+uniform vec2 uLast; // width of its last column and row, in cells
 uniform float uH2;
 out vec4 outColor;
 float p (ivec2 c) {
   return texelFetch(uPressure, clamp(c, ivec2(0), uSize - 1), 0).x;
 }
+vec2 width (ivec2 c) {
+  return mix(vec2(1.0), uLast, equal(c, uSize - 1));
+}
 void main () {
-  // what the fine level still gets wrong, averaged onto the coarse cell
+  // what the fine level still gets wrong, averaged by area onto the coarse cell
   ivec2 base = 2 * ivec2(gl_FragCoord.xy);
   float sum = 0.0;
-  float count = 0.0;
+  float area = 0.0;
   for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) {
     ivec2 c = base + ivec2(x, y);
     if (c.x >= uSize.x || c.y >= uSize.y) continue;
-    float laplacian = (p(c + ivec2(1, 0)) + p(c - ivec2(1, 0)) +
-                       p(c + ivec2(0, 1)) + p(c - ivec2(0, 1)) - 4.0 * p(c)) / uH2;
-    sum += texelFetch(uRhs, c, 0).x - laplacian;
-    count += 1.0;
+    vec2 w = width(c);
+    vec2 wE = width(c + ivec2(1, 0)), wW = width(c - ivec2(1, 0));
+    vec2 wN = width(c + ivec2(0, 1)), wS = width(c - ivec2(0, 1));
+    float flow = w.y * (p(c + ivec2(1, 0)) - p(c)) / (0.5 * (w.x + wE.x)) +
+                 w.y * (p(c - ivec2(1, 0)) - p(c)) / (0.5 * (w.x + wW.x)) +
+                 w.x * (p(c + ivec2(0, 1)) - p(c)) / (0.5 * (w.y + wN.y)) +
+                 w.x * (p(c - ivec2(0, 1)) - p(c)) / (0.5 * (w.y + wS.y));
+    float laplacian = flow / (uH2 * w.x * w.y);
+    sum += (texelFetch(uRhs, c, 0).x - laplacian) * w.x * w.y;
+    area += w.x * w.y;
   }
-  outColor = vec4(sum / max(count, 1.0), 0.0, 0.0, 1.0);
+  outColor = vec4(sum / max(area, 1e-6), 0.0, 0.0, 1.0);
 }`
 )};
 const _s66 = function _prolongShader(){return(
@@ -15460,8 +15487,8 @@ void main () {
   // Bilinear between coarse cell centres. Copying the coarse value into its
   // four cells left steps in the pressure, and lines drawn through the water
   // show every one of them.
-  ivec2 C = c / 2;
   ivec2 top = textureSize(uCoarse, 0) - 1;
+  ivec2 C = min(c / 2, top); // an odd level's last row or column has no coarse cell of its own
   ivec2 D = clamp(C + (c % 2) * 2 - 1, ivec2(0), top); // the nearer neighbour
   float correction =
     0.5625 * texelFetch(uCoarse, C, 0).x +
@@ -15520,6 +15547,23 @@ The equation is solved by multigrid V-cycles, warm started from the previous sol
 
 The coarse grid's answer is added back by bilinear interpolation between coarse cell centres. It used to be copied into the four cells above each coarse cell. In the lines view a fast stroke then left a patch of checks about four cells across in the bands it crossed, the size of a coarse cell two levels down. 6 V-cycles in place of 2 removed the patch, and so did bilinear interpolation at 2 cycles, which costs four fetches in place of one (2026-09-17, one scripted stir each, by eye).
 
+Each level is half the size of the one before, rounded up, so halving an odd size leaves a last column (or row) whose coarse cell covers one finer cell, not two. Those cells were given a full cell's equation. Tom, 2026-09-18: "the latest version has vibrating fluid". On a private tray, one drop then 400 solves, the fastest water by width at 380 tall:
+
+\`\`\`
+width   odd levels   after 400 solves
+350     2            decays to 0.04
+400     2            swings between 0.4 and the 1.6 speed clamp
+450     5            NaN inside 33 solves; the pressure grew 3.16x every V-cycle, 10x a solve
+500     2            decays
+568     3            decays (the Mac's usual tray)
+650     5            NaN
+866     4            NaN
+\`\`\`
+
+With two V-cycles off the multigrid it did not grow; with the depth limited to five levels it grew to 160, with six to 6×10²⁰. Rounding down instead (no partial cells, one finer column uncovered) was worse at every width, and so was giving the coarsest level 64 sweeps instead of 8: a smoother that diverges when run longer is an inconsistent operator, not an unconverged one. Each level now carries the width of its last column and row, and \`pressureShader\` and \`restrictShader\` are finite volume: flow across a face over the distance between centres, divided by the cell's own area. Every width above decays to 0.05 or under; \`test_water_settles_on_an_odd_tray\` holds 450×380 to that and returns NaN on the build before. The solve is 2.4 ms on the Mac's tray (was 3.6 to 4.3 on 2026-09-17, a different day and a wider tray, not the same measurement).
+
+One V-cycle is still not enough on a narrow tray: at 192 to 240 wide (380 tall) the water swings between 0.4 and the clamp; at 200×200, 300×300 and 400×300 it settles. The economy solve keeps both cycles for that reason.
+
 Two earlier versions are recorded because both failed in ways that looked like physics (2026-09-17):
 
 - **Explicit elastic film.** Surface pressure acted as a force on the velocity and the film was compressible. A push travelled through the film as a wave, at a finite speed. Tom's report: "the circles rebound a little after releasing ink. It feels sluggish even after reducing viscosity and drag."
@@ -15561,6 +15605,24 @@ const _s67 = function _test_film_settles_flat(ringExperiment)
   if (!(unevenness < 1.01))
     throw new Error(`most film / least film = ${unevenness}`);
   return `most film / least film = ${unevenness.toFixed(3)} after 300 solves`;
+};
+const _s90 = function _test_water_settles_on_an_odd_tray(createTray,defaults)
+{
+  // 450 wide halves to 225, 113, 57, 29, 15: five levels whose last column is
+  // a partial cell. With those treated as full cells the pressure grew 3.16x
+  // a V-cycle and the water sat at the speed clamp.
+  const tray = createTray(450, 380);
+  tray.fill(3, 0.1);
+  for (let n = 0; n < 60; n++) {
+    if (n < 4) tray.brush({ x: 225, y: 190, fluid: 0, pressure: 5, radius: 6, rate: 0.8 });
+    tray.step(defaults);
+  }
+  const v = tray.read("velocity");
+  let fastest = 0;
+  for (let i = 0; i < v.length; i += 4) fastest = Math.max(fastest, Math.hypot(v[i], v[i + 1]));
+  tray.dispose();
+  if (!(fastest < 0.5)) throw new Error(`fastest water ${fastest} cells a solve, 56 solves after the brush left`);
+  return `fastest water ${fastest.toFixed(3)} cells a solve, 56 solves after the brush left`;
 };
 const _s68 = function _defaults(){return(
 {
@@ -15706,7 +15768,8 @@ export default function define(runtime, observer) {
   $def("_s48", "test_film_is_conserved", ["ctx","ringExperiment"], _s48);  
   $def("_s49", "test_ink_becomes_a_ring", ["ringExperiment"], _s49);  
   $def("_s50", "test_fluids_stay_apart", ["ringExperiment"], _s50);  
-  $def("_s67", "test_film_settles_flat", ["ringExperiment"], _s67);  
+  $def("_s67", "test_film_settles_flat", ["ringExperiment"], _s67);
+  $def("_s90", "test_water_settles_on_an_odd_tray", ["createTray","defaults"], _s90);  
   $def("_s72", "test_pressure_stays_centred", ["ringExperiment"], _s72);  
   $def("_s88", "test_lines_keep_their_area", ["createContours"], _s88);  
   $def("_s89", "test_gpu_and_cpu_carry_lines_alike", ["createTray","createContours","contourPainter"], _s89);  
