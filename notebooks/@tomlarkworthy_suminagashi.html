@@ -13668,6 +13668,7 @@ void main () {
 const _s36 = function _velocityShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uVelocity;
 uniform sampler2D uForce;
@@ -13744,6 +13745,7 @@ void main () {
 const _s37 = function _transportShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uVelocity;
 uniform sampler2D uFilm;  // fluids 0 to 3
@@ -13892,6 +13894,7 @@ void main () {
 const _s38 = function _brushShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uFilm;
 uniform sampler2D uFilmB;
@@ -13919,6 +13922,7 @@ void main () {
 const _s39 = function _displayShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uFilm;
 uniform sampler2D uFilmB;
@@ -14517,6 +14521,7 @@ void main () {
 const _s82 = function _contourFragmentShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 uniform vec3 uColor;
 out vec4 outColor;
 void main () {
@@ -14526,6 +14531,7 @@ void main () {
 const _s84 = function _contourAdvectShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 layout(location = 0) in vec2 aPosition; // cells
 uniform sampler2D uVelocity;
@@ -14604,15 +14610,18 @@ const _s83 = function _contourPainter(gl,contourVertexShader,contourFragmentShad
   // to the curve's and the triangles stay small. On 1.3 million vertices
   // (Apple M5 Max, 2026-09-17, solver off): one fan per curve 25 fps,
   // chunks of 256 38 fps, of 32 73 fps, of 8 28 fps.
-  const CHUNK = 32;
+  // The fan over the chunk starts reads them straight from the vertex buffer
+  // with a stride of one chunk, which WebGL caps at 255 bytes: 31 vertices.
+  // It was an index buffer until a Mali-G77 phone drew stale indices from it.
+  const CHUNK = 31;
   const tended = new Map(); // contours -> curve -> what the GPU holds of it
   let states;
   const free = (state) => {
-    for (const { buffer, vao } of state.sides) {
+    for (const { buffer, vao, coarse } of state.sides) {
       gl.deleteBuffer(buffer);
       gl.deleteVertexArray(vao);
+      gl.deleteVertexArray(coarse);
     }
-    gl.deleteBuffer(state.index);
   };
   const tend = (contours) => {
     if (!tended.has(contours)) tended.set(contours, new Map());
@@ -14645,28 +14654,26 @@ const _s83 = function _contourPainter(gl,contourVertexShader,contourFragmentShad
     const chunks = Math.ceil(n / CHUNK);
     state.firsts = Int32Array.from({ length: chunks }, (_, c) => c * CHUNK);
     state.counts = Int32Array.from({ length: chunks }, (_, c) => Math.min(CHUNK, n - c * CHUNK) + 1);
-    gl.bindVertexArray(state.sides[0].vao);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, Uint32Array.from(state.firsts), gl.DYNAMIC_DRAW);
-    gl.bindVertexArray(null);
     Object.assign(state, { n, box, since: 0, ahead: false });
   };
   const stateOf = (contours, k) => {
     const curve = contours.curves[k];
     let state = states.get(curve);
     if (!state) {
-      const index = gl.createBuffer();
       const sides = [0, 1].map(() => {
         const buffer = gl.createBuffer();
-        const vao = gl.createVertexArray();
-        gl.bindVertexArray(vao);
-        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index);
-        return { buffer, vao };
+        const bind = (stride) => {
+          const vao = gl.createVertexArray();
+          gl.bindVertexArray(vao);
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+          gl.enableVertexAttribArray(0);
+          gl.vertexAttribPointer(0, 2, gl.FLOAT, false, stride, 0);
+          return vao;
+        };
+        return { buffer, vao: bind(0), coarse: bind(8 * CHUNK) };
       });
       gl.bindVertexArray(null);
-      state = { sides, index, capacity: 0 };
+      state = { sides, capacity: 0 };
       states.set(curve, state);
       upload(contours, k, state);
     }
@@ -14753,7 +14760,11 @@ const _s83 = function _contourPainter(gl,contourVertexShader,contourFragmentShad
         gl.uniform1i(paintAt.uCover, 0);
         if (multi) multi.multiDrawArraysWEBGL(gl.TRIANGLE_FAN, firsts, 0, counts, 0, firsts.length);
         else firsts.forEach((first, c) => gl.drawArrays(gl.TRIANGLE_FAN, first, counts[c]));
-        if (firsts.length > 2) gl.drawElements(gl.TRIANGLE_FAN, firsts.length, gl.UNSIGNED_INT, 0);
+        if (firsts.length > 2) {
+          gl.bindVertexArray(state.sides[0].coarse);
+          gl.drawArrays(gl.TRIANGLE_FAN, 0, firsts.length);
+          gl.bindVertexArray(state.sides[0].vao);
+        }
         // colour the pixels it winds round, and wipe the count.
         // The box dates from the last re-spacing; the water moves at most 7 cells a solve
         const slack = 2 + 7 * state.since;
@@ -14945,7 +14956,10 @@ const _s44 = function* _mainLoop(tray,$0,$1,fluids,sequence,absorbance,contourPa
     if (emitters.size || stroking) busy = 0.3;
     else busy -= elapsed;
 
-    owed = Math.min(owed + elapsed * params.solvesPerSecond, 3);
+    // A machine that cannot solve inside a frame gets one solve a frame and
+    // the water runs slow, rather than three solves and a frozen picture: a
+    // phone's Mali-G77 took 47 ms a solve and drew 7 frames a second this way.
+    owed = Math.min(owed + elapsed * params.solvesPerSecond, lag > 20 ? 1 : 3);
     const solves = Math.floor(owed);
     // the pointer's travel since the last solve, shared between this frame's solves
     const target = stroking && toCell(pointer);
@@ -14989,9 +15003,16 @@ const _s44 = function* _mainLoop(tray,$0,$1,fluids,sequence,absorbance,contourPa
             strength: pointer.tool === "stylus" ? 1 : 0.6
           };
       }
+      // A GPU that cannot solve inside a frame gets a cheaper solve: one
+      // V-cycle and fewer flux steps. On a Mali-G77 phone a solve was 47 ms,
+      // 13 of them a V-cycle and 5.4 each transport step; touching, 110 ms.
+      // Past the finish rule's floor the lines are the cost, not the solve.
+      const economy = lag > 24 && vertices <= 200000;
+      const steps = busy > 0 ? params.touchTransportSteps : params.transportSteps;
       tray.step({
         ...params,
-        transportSteps: busy > 0 ? params.touchTransportSteps : params.transportSteps,
+        cycles: economy ? Math.min(params.cycles, 1) : params.cycles,
+        transportSteps: economy ? Math.min(steps, busy > 0 ? 4 : 2) : steps,
         stroke
       });
       contourPainter.advect(contours, tray, params.dt);
@@ -15229,6 +15250,10 @@ fans of 8                              28
 
 Every triangle of a fan reaches from its pivot to a segment, so one pivot per curve redraws the whole tray for every few thousand vertices. Short fans about their own first vertex stay local; too short, and the fan over the fans' first vertices becomes the long one.
 
+The fans are 31 vertices now, not 32. The fan over the fans' first vertices was drawn from an index buffer, and on an Android phone (OPPO CPH2399, Mali-G77, Chrome 153, 2026-09-18) that fan drew from stale indices: every disc came out as crescents between its curve and the polygon of its chunk starts, though \`getBufferSubData\` returned the right indices and writing them again just before the draw fixed the picture. The fan now reads the chunk starts straight from the vertex buffer through a second vertex array whose stride is one chunk, and WebGL caps a stride at 255 bytes. Same fill to the pixel on the phone (513,266 against 513,266 with the indices rewritten).
+
+The same phone also showed two more things a Mac hides. \`int\` in a fragment shader is \`mediump\` unless declared, which on Mali is 16 bits, so \`uSize.x * uSize.y\` wrapped at 32,768 cells: the mean film came out wrong at 200×200, the pressure grew to 2×10⁹ in one V-cycle, and at 256×256 the product wrapped to zero and everything was NaN. Every shader now declares \`precision highp int\`. And a solve there took 47 ms (13 per V-cycle, 5.4 per transport step, on a 208×380 tray) against about 4 on the Mac, so a frame that ran long now takes one solve rather than three, and while it runs long the solve is cheaper too, one V-cycle and 2 transport steps (4 touching). The phone went from 11 frames a second idle and 4 touching to 19 to 21 idle and 13.5 to 14 touching, with the water slower and the rings a little less crisp; not compared side by side.
+
 Nothing thins the lines out, and a spiral that winds for five seconds is that long. The first answer was a vertex budget that widened the spacing when it was hit. At 400,000 it widened the spacing to 8.9 cells, still held 361,397 vertices because a curved line needs vertices as the square root of the tolerance, and drew every curve in facets and zigzags. Tom: "the pictures are beautiful, it ok if it only survives a single stir, maybe we jsut pause the simulation when it get laggy, thats the end of the picture, next click empties it". That is what it does: past 200,000 vertices, once the smoothed work in a frame takes longer than *finish at* (28 ms), the water stops. A touch in the first two seconds after that does nothing. A scripted stir finished mid stroke, and the stroke that followed emptied the tray before the picture had been seen.
 
 The rule first timed the gap between frames. Tom, 2026-09-17, on a laptop running from its battery: "it was doing 3M vertices but now much less". His note read *0.2 million vertices, 33 ms a frame*. 33 ms is a page held to 30 frames a second, which is over *finish at* before a line is drawn, so the picture finished at the 200,000 floor. Holding \`requestAnimationFrame\` to one frame every 33 ms in the probe gave the same note on the same scripted stir:
@@ -15271,6 +15296,7 @@ md`## Tests`
 const _s51 = function _confinementShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uVelocity;
 uniform ivec2 uSize;
@@ -15302,6 +15328,7 @@ void main () {
 const _s52 = function _reduceShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uSource;
 uniform sampler2D uSourceB;
@@ -15324,6 +15351,7 @@ void main () {
 const _s53 = function _divergenceShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uVelocity;
 uniform sampler2D uFilm;
@@ -15344,7 +15372,7 @@ void main () {
   float divergence = vel(c + ivec2(1, 0)).x - w.x + vel(c + ivec2(0, 1)).y - w.y;
   // a cell holding more film than the tray average has to expand
   float film = dot(texelFetch(uFilm, c, 0) + texelFetch(uFilmB, c, 0), vec4(1.0));
-  float mean = texelFetch(uTotal, ivec2(0), 0).x / float(uSize.x * uSize.y);
+  float mean = texelFetch(uTotal, ivec2(0), 0).x / (float(uSize.x) * float(uSize.y));
   // bounded, so one solve never asks a cell to shed more than it holds
   float wanted = uStiffness * (film - mean) / max(max(film, mean), 1e-6);
   outColor = vec4(divergence - wanted, 0.0, 0.0, 1.0);
@@ -15353,6 +15381,7 @@ void main () {
 const _s71 = function _shiftShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uSource;
 uniform sampler2D uTotal;
@@ -15363,13 +15392,14 @@ void main () {
   // a constant and the equation only has a solution if its right hand side
   // sums to zero. Left in, the constant grows every solve until float32 has
   // no digits left for the part that matters.
-  float mean = texelFetch(uTotal, ivec2(0), 0).x / float(uSize.x * uSize.y);
+  float mean = texelFetch(uTotal, ivec2(0), 0).x / (float(uSize.x) * float(uSize.y));
   outColor = vec4(texelFetch(uSource, ivec2(gl_FragCoord.xy), 0).x - mean, 0.0, 0.0, 1.0);
 }`
 )};
 const _s54 = function _pressureShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uPressure;
 uniform sampler2D uRhs;
@@ -15391,6 +15421,7 @@ void main () {
 const _s65 = function _restrictShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uPressure;
 uniform sampler2D uRhs;
@@ -15419,6 +15450,7 @@ void main () {
 const _s66 = function _prolongShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uPressure;
 uniform sampler2D uCoarse;
@@ -15441,6 +15473,7 @@ void main () {
 const _s55 = function _projectShader(){return(
 `#version 300 es
 precision highp float;
+precision highp int; // mediump int is 16 bits on Mali: 208 * 380 cells overflows it
 precision highp sampler2D;
 uniform sampler2D uVelocity;
 uniform sampler2D uPressure;
