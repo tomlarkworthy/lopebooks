@@ -6785,7 +6785,7 @@ const _4zsqot = function _actionHandler(Inputs,getSourceModule,notebook_name,_ru
     }
   };
 };
-const _lhn762 = function _exportToHTML(_runtime,cssForTheme,css,location,keepalive,exporter_module,$0){return(
+const _lhn762 = function _exportToHTML(_runtime,cssForTheme,css,location,keepalive,exporter_module,$0,additionalMainUrl){return(
 async function exportToHTML({mains = new Map(), runtime = _runtime, options = {}} = {}) {
         let conf = { headless: false };
         try {
@@ -6794,6 +6794,27 @@ async function exportToHTML({mains = new Map(), runtime = _runtime, options = {}
         }
         if (runtime.module_names) {
             runtime.mains.forEach((name, module) => mains.set(name, module));
+        }
+        // Extra mains the caller wants in the export; what they are is none of our business.
+        // Instantiating is not enough: buildModuleNames keys on "module X" variables with a
+        // resolved _value, and runtime.module() applies the observer only on FIRST
+        // instantiation — so one already pulled in as someone else's dependency comes back
+        // unobserved and gets no name. Re-observe in place, as the bootloader does, without
+        // adding synthetic variables the exporter would then serialize.
+        for (const spec of options.additionalMains ?? []) {
+            const { default: define } = await import(additionalMainUrl(spec));
+            const observer = () => ({});
+            const mod = runtime.module(define, observer);
+            let reobserved = false;
+            for (const v of runtime._variables) {
+                if (v._module === mod && typeof v._observer === 'symbol') {
+                    v._observer = observer(v._name);
+                    runtime._dirty.add(v);
+                    reobserved = true;
+                }
+            }
+            if (reobserved) runtime._compute();
+            mains.set(spec, mod);
         }
         if (!options.bootloader) {
             options.bootloader = '@tomlarkworthy/bootloader';
@@ -6883,6 +6904,43 @@ async function exportToHTML({mains = new Map(), runtime = _runtime, options = {}
         return response;
     }
 )};
+const _amurl1 = function _additionalMainUrl(){return(
+function additionalMainUrl(spec) {
+  // Callers name a main `@ns/slug`; choosing the URL is ours. This is the form Notebook Kit
+  // compiles an Observable import to, which is what makes it the canonical external 1.0
+  // spelling rather than one of several. It is public and serves
+  // `access-control-allow-origin: *`, so it works cross-origin from new.observablehq.com —
+  // unlike /api/import/@ns/slug, which is internal and answers 403.
+  //
+  // No `resolutions` pin: the served document already pins its own closure (lopepage-2 and the
+  // editor-5 it pulls both carried resolutions=f2dac8191520a531@4033), so a pin adds nothing
+  // and a DIFFERENT pin would split module identity against a copy the page already holds.
+  if (/^(https?:)?\/\//.test(spec) || spec.startsWith("/")) return spec;
+  return `https://api.observablehq.com/${spec}.js?v=4`;
+}
+)};
+const _amurl2 = function _test_additionalMainUrl_expands_a_slug(expect,additionalMainUrl)
+{
+  expect(additionalMainUrl("@tomlarkworthy/lopepage-2")).toBe(
+    "https://api.observablehq.com/@tomlarkworthy/lopepage-2.js?v=4"
+  );
+  return "ok";
+};
+const _amurl3 = function _test_additionalMainUrl_passes_a_url_through(expect,additionalMainUrl)
+{
+  // The escape hatch for a module that is not on Observable at all — canonical.json records
+  // several as `upstream: null`, and those can only ever be named by URL.
+  const u = "https://example.com/mod.js";
+  expect(additionalMainUrl(u)).toBe(u);
+  expect(additionalMainUrl("/@tomlarkworthy/lopepage-2.js?v=4")).toBe("/@tomlarkworthy/lopepage-2.js?v=4");
+  return "ok";
+};
+const _amurl4 = function _test_additionalMainUrl_leaves_no_resolutions_pin(expect,additionalMainUrl)
+{
+  // Pinning is the thing that splits one slug into several module instances; assert we emit none.
+  expect(additionalMainUrl("@tomlarkworthy/runtime-sdk").includes("resolutions")).toBe(false);
+  return "ok";
+};
 const _43zr7 = function _getSourceModule(notebook_name,main,_runtime)
 {
   return async state => {
@@ -9002,7 +9060,11 @@ export default function define(runtime, observer) {
   $def("_1u2ju69", "forkAnchor", ["exportAnchor"], _1u2ju69);  
   $def("_1a8n42w", "downloadAnchor", ["exportAnchor"], _1a8n42w);  
   $def("_4zsqot", "actionHandler", ["Inputs","getSourceModule","notebook_name","_runtime","exportToHTML","htmlToConsoleSnippet","copyTextToClipboard","view","linkTo","location","getCompactISODate"], _4zsqot);  
-  $def("_lhn762", "exportToHTML", ["_runtime","cssForTheme","css","location","keepalive","exporter_module","viewof task"], _lhn762);  
+  $def("_lhn762", "exportToHTML", ["_runtime","cssForTheme","css","location","keepalive","exporter_module","viewof task","additionalMainUrl"], _lhn762);
+  $def("_amurl1", "additionalMainUrl", [], _amurl1);
+  $def("_amurl2", "test_additionalMainUrl_expands_a_slug", ["expect","additionalMainUrl"], _amurl2);
+  $def("_amurl3", "test_additionalMainUrl_passes_a_url_through", ["expect","additionalMainUrl"], _amurl3);
+  $def("_amurl4", "test_additionalMainUrl_leaves_no_resolutions_pin", ["expect","additionalMainUrl"], _amurl4);  
   $def("_43zr7", "getSourceModule", ["notebook_name","main","_runtime"], _43zr7);  
   $def("_tpv4tl", "createShowable", ["variable","view"], _tpv4tl);  
   $def("_rnq9mt", "reportValidity", [], _rnq9mt);  
@@ -10245,16 +10307,13 @@ async (attachment) => {
   return response.blob();
 }
 )};
-const _1u9tn3v = async function _Inspector(src,require)
+const _1u9tn3v = async function _Inspector(src)
 {
-  const objectURL = URL.createObjectURL(
-    new Blob([src], { type: "application/javascript" })
-  );
-  try {
-    return (await require(objectURL)).Inspector;
-  } finally {
-    URL.revokeObjectURL(objectURL); // Ensure URL is revoked after import
-  }
+  // The bundle is UMD, so evaluate it as CommonJS. Not the `require` builtin:
+  // notebook-kit's stdlib (new.observablehq.com) does not have one.
+  const cjs = { exports: {} };
+  new Function("exports", "module", await src.text())(cjs.exports, cjs);
+  return cjs.exports.Inspector;
 };
 const _b5ui8y = function _isnode(Element,Text){return(
 (value) => {
@@ -10282,7 +10341,7 @@ export default function define(runtime, observer) {
   $def("_1q5hkak", "inspect", ["Inspector"], _1q5hkak);  
   $def("_rod2q7", "src", ["unzip","FileAttachment"], _rod2q7);  
   $def("_g5fwfs", "unzip", ["Response","DecompressionStream"], _g5fwfs);  
-  $def("_1u9tn3v", "Inspector", ["src","require"], _1u9tn3v);  
+  $def("_1u9tn3v", "Inspector", ["src"], _1u9tn3v);  
   $def("_b5ui8y", "isnode", ["Element","Text"], _b5ui8y);
   return main;
 }</script><!--/-->
@@ -10899,7 +10958,7 @@ Inputs.radio(
 )
 )};
 const _4jpb27 = (G, _) => G.input(_);
-const _17ce9dw = async function* _test_tests_example(example_type)
+const _17ce9dw = async function* _test_tests_example(example_type,invalidation)
 {
   switch (example_type) {
     case "error":
@@ -10907,14 +10966,14 @@ const _17ce9dw = async function* _test_tests_example(example_type)
     case "success":
       yield "Ok";
     case "pending":
-      yield new Promise(() => {});
+      yield invalidation;
     case "changing":
       while (true) {
         yield Math.random();
         await new Promise((r) => setTimeout(r, 1000));
       }
   }
-  yield new Promise(() => {});
+  yield invalidation;
 };
 const _178t107 = function _7(md){return(
 md`## Testing variables
@@ -11115,7 +11174,7 @@ export default function define(runtime, observer) {
   $def("_1sr7w7b", null, ["md"], _1sr7w7b);  
   $def("_8dmusz", "viewof example_type", ["Inputs"], _8dmusz);  
   $def("_4jpb27", "example_type", ["Generators","viewof example_type"], _4jpb27);  
-  $def("_17ce9dw", "test_tests_example", ["example_type"], _17ce9dw);  
+  $def("_17ce9dw", "test_tests_example", ["example_type","invalidation"], _17ce9dw);  
   $def("_178t107", null, ["md"], _178t107);  
   $def("_kdc1xp", "modules", ["moduleMap","runtime"], _kdc1xp);  
   $def("_pvmmyu", "viewof testing_variables", ["scan","viewof runtime_variables","modules","_","invalidation"], _pvmmyu);  
