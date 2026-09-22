@@ -2799,10 +2799,19 @@ function defineCell(main, definition, { variables = [] } = {}) {
   const oldShadows = [...v._shadow.values()];
   v._shadow.clear();
   const vid = output ?? (outputs.length ? `cell ${id}` : null);
-  if (
-    defineDisplay &&
-    (inputs.includes("display") || inputs.includes("view"))
-  ) {
+  // DELIBERATE DIVERGENCE from notebook-kit's src/runtime/define.ts, which tests
+  // `inputs.includes("view")` alone. There `view`/`display` are BUILTINS, so the test is sound.
+  // Here they can be ordinary imports -- @tomlarkworthy/view exports a `view` tagged template that
+  // many notebooks use -- and a cell that merely CALLS view`...` was then given a viewof companion,
+  // whose `input(display(value))` fed Generators.input the cell's value. Measured 2026-09-22 on an
+  // exporter-3 exported from observablehq.com: the `exporter` cell's value is the template strings
+  // Array, so the companion threw `TypeError: e.addEventListener is not a function` and the UI never
+  // rendered. A name a variable in module scope provides is not the builtin.
+  const kitBuiltin = (n) =>
+    inputs.includes(n) && !(v._module && v._module._scope && v._module._scope.has(n));
+  const kitDisplay = kitBuiltin("display");
+  const kitView = kitBuiltin("view");
+  if (defineDisplay && (kitDisplay || kitView)) {
     let displayVersion = -1;
     const vd = new v.constructor(2, v._module);
     vd.define(
@@ -2820,7 +2829,7 @@ function defineCell(main, definition, { variables = [] } = {}) {
       }
     );
     v._shadow.set("display", vd);
-    if (inputs.includes("view")) {
+    if (kitView) {
       const vv = new v.constructor(2, v._module, null, { shadow: {} });
       vv._shadow.set("display", vd);
       vv.define(["display"], (display) => (value) => input(display(value)));
@@ -2887,6 +2896,28 @@ thisModule()
 )};
 const _jtmodg = (G, _) => G.input(_);
 
+const _jttv = function _test_defineCell_view_shadow_only_for_the_builtin(defineCell,runtime) {
+    // notebook-kit tests `inputs.includes("view")`; here `view` can be an ordinary import
+    // (@tomlarkworthy/view's tagged template), and a cell that merely calls view`...` must NOT get a
+    // viewof companion -- its value is not a DOM node, so Generators.input would throw
+    // "e.addEventListener is not a function" and take the notebook's UI with it.
+    const nkDef = (inputs) => ({ id: 1, inputs, body: () => 1, output: null, outputs: [] });
+
+    // a module whose scope PROVIDES view: the name is an import, not the builtin
+    const shadowed = runtime.module();
+    shadowed.variable(true).define("view", [], () => (s) => s);
+    const sv = defineCell(shadowed, nkDef(["view"]));
+    if (sv[0]._shadow.has("view"))
+        throw new Error("a shadowed `view` must not install a view shadow");
+
+    // nothing shadows view: the genuine kit builtin, companion still expected
+    const plain = runtime.module();
+    const pv = defineCell(plain, nkDef(["view"]));
+    if (!pv[0]._shadow.has("view"))
+        throw new Error("an unshadowed `view` must still install a view shadow");
+
+    return "ok: view shadow installed only when view is the builtin";
+};
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -2907,6 +2938,7 @@ export default function define(runtime, observer) {
   main.define("acorn_walk", ["module @tomlarkworthy/acorn-8-11-3", "@variable"], (_, v) => v.import("acorn_walk", _));  
   main.define("keepalive", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("keepalive", _));  
   main.define("thisModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("thisModule", _));  
+  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));  
   $def("_jtocmp", null, ["md"], _jtocmp);  
   $def("_jtodcm", null, ["md"], _jtodcm);  
   $def("_jtoprr", null, ["md"], _jtoprr);  
@@ -2939,6 +2971,7 @@ export default function define(runtime, observer) {
   $def("_jtdefc", "defineCell", ["nkRuntime","nkDisplayStates"], _jtdefc);  
   $def("_jtdsof", "displayStateOf", ["nkDisplayStates"], _jtdsof);  
   $def("_jtattd", "attachDisplay", ["nkDisplayStates"], _jtattd);  
+  $def("_jttv", "test_defineCell_view_shadow_only_for_the_builtin", ["defineCell","runtime"], _jttv);  
   $def("_jtmod", "viewof jsToolchainModule", ["thisModule"], _jtmod);  
   $def("_jtmodg", "jsToolchainModule", ["Generators","viewof jsToolchainModule"], _jtmodg);
   return main;
@@ -8563,16 +8596,13 @@ async (attachment) => {
   return response.blob();
 }
 )};
-const _1u9tn3v = async function _Inspector(src,require)
+const _1u9tn3v = async function _Inspector(src)
 {
-  const objectURL = URL.createObjectURL(
-    new Blob([src], { type: "application/javascript" })
-  );
-  try {
-    return (await require(objectURL)).Inspector;
-  } finally {
-    URL.revokeObjectURL(objectURL); // Ensure URL is revoked after import
-  }
+  // The bundle is UMD, so evaluate it as CommonJS. Not the `require` builtin:
+  // notebook-kit's stdlib (new.observablehq.com) does not have one.
+  const cjs = { exports: {} };
+  new Function("exports", "module", await src.text())(cjs.exports, cjs);
+  return cjs.exports.Inspector;
 };
 const _b5ui8y = function _isnode(Element,Text){return(
 (value) => {
@@ -8600,7 +8630,7 @@ export default function define(runtime, observer) {
   $def("_1q5hkak", "inspect", ["Inspector"], _1q5hkak);  
   $def("_rod2q7", "src", ["unzip","FileAttachment"], _rod2q7);  
   $def("_g5fwfs", "unzip", ["Response","DecompressionStream"], _g5fwfs);  
-  $def("_1u9tn3v", "Inspector", ["src","require"], _1u9tn3v);  
+  $def("_1u9tn3v", "Inspector", ["src"], _1u9tn3v);  
   $def("_b5ui8y", "isnode", ["Element","Text"], _b5ui8y);
   return main;
 }</script><!--/-->
@@ -9217,7 +9247,7 @@ Inputs.radio(
 )
 )};
 const _4jpb27 = (G, _) => G.input(_);
-const _17ce9dw = async function* _test_tests_example(example_type)
+const _17ce9dw = async function* _test_tests_example(example_type,invalidation)
 {
   switch (example_type) {
     case "error":
@@ -9225,14 +9255,14 @@ const _17ce9dw = async function* _test_tests_example(example_type)
     case "success":
       yield "Ok";
     case "pending":
-      yield new Promise(() => {});
+      yield invalidation;
     case "changing":
       while (true) {
         yield Math.random();
         await new Promise((r) => setTimeout(r, 1000));
       }
   }
-  yield new Promise(() => {});
+  yield invalidation;
 };
 const _178t107 = function _7(md){return(
 md`## Testing variables
@@ -9433,7 +9463,7 @@ export default function define(runtime, observer) {
   $def("_1sr7w7b", null, ["md"], _1sr7w7b);  
   $def("_8dmusz", "viewof example_type", ["Inputs"], _8dmusz);  
   $def("_4jpb27", "example_type", ["Generators","viewof example_type"], _4jpb27);  
-  $def("_17ce9dw", "test_tests_example", ["example_type"], _17ce9dw);  
+  $def("_17ce9dw", "test_tests_example", ["example_type","invalidation"], _17ce9dw);  
   $def("_178t107", null, ["md"], _178t107);  
   $def("_kdc1xp", "modules", ["moduleMap","runtime"], _kdc1xp);  
   $def("_pvmmyu", "viewof testing_variables", ["scan","viewof runtime_variables","modules","_","invalidation"], _pvmmyu);  
