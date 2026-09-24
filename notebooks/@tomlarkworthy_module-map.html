@@ -1357,7 +1357,58 @@ queue.runtime.mains || new Map()
 const _ox2g3b = function _bootloader(queue){return(
 queue.runtime.bootloader
 )};
-const _1turw8j = function _resolve_modules(modules,module_definition_variables,findModuleName,module_definition_cache)
+const _pmd001 = function _pickModuleDefinition(){return(
+// Several variables map to one module: the LOADERS that built it, which carry its URL, and the
+// ALIASES that merely import a name from it, which carry nothing. `.find()` took whichever came
+// first. Measured 2026-09-24 on old.observablehq.com: 6 candidates for observablejs-toolchain and
+// the alias `findModuleName` won, whose 172-entry scope holds no variable whose _value is the
+// module -- so findModuleName fell through to its fixpoint and minted `<unknown ${Math.random()}>`,
+// while `module 3` and `module 4` both carried /@tomlarkworthy/observablejs-toolchain.js and both
+// resolve correctly. The export then shipped 184 cells under "<unknown 0.503951547926479>" and an
+// EMPTY block under the slug, so every importer got undefined with no error badge.
+// Order-dependent, which is why the winner changed between page loads.
+(candidates, module, nameOf) => {
+  const ranked = [...candidates].sort((a, b) => Number(b._value === module) - Number(a._value === module));
+  let first = null;
+  for (const variable of ranked) {
+    const name = nameOf(variable);
+    if (first === null) first = { variable, name };
+    // A placeholder is not an answer; keep looking. Falling back to `first` leaves the old
+    // behaviour intact when no candidate can be named.
+    if (name && !/^<unknown/.test(name)) return { variable, name };
+  }
+  return first;
+}
+)};
+const _pmd002 = function _test_pickModuleDefinition_prefers_the_loader_over_an_alias(expect,pickModuleDefinition)
+{
+  // the shape measured on old.observablehq.com: an alias listed before the loader that holds it
+  const module = {};
+  const alias = { _name: "findModuleName" };
+  const loader = { _name: "module 3", _value: module };
+  const nameOf = (v) => v === loader ? "@tomlarkworthy/observablejs-toolchain" : "<unknown 0.5039>";
+  expect(pickModuleDefinition([alias, loader], module, nameOf).name).toBe("@tomlarkworthy/observablejs-toolchain");
+  expect(pickModuleDefinition([alias, loader], module, nameOf).variable).toBe(loader);
+  return "ok";
+};
+const _pmd003 = function _test_pickModuleDefinition_skips_a_placeholder(expect,pickModuleDefinition)
+{
+  // neither candidate holds the module, so ranking cannot help -- scanning past the placeholder does
+  const module = {};
+  const a = { _name: "parser" }, b = { _name: "decompress_url" };
+  const nameOf = (v) => v === b ? "@tomlarkworthy/view" : "<unknown 0.1>";
+  expect(pickModuleDefinition([a, b], module, nameOf).name).toBe("@tomlarkworthy/view");
+  return "ok";
+};
+const _pmd004 = function _test_pickModuleDefinition_falls_back_to_the_first(expect,pickModuleDefinition)
+{
+  // nothing resolves: keep the old behaviour rather than dropping the module into `unresolved`
+  const module = {};
+  const a = { _name: "alpha" }, b = { _name: "beta" };
+  expect(pickModuleDefinition([a, b], module, () => "<unknown 0.7>")).toEqual({ variable: a, name: "<unknown 0.7>" });
+  return "ok";
+};
+const _1turw8j = function _resolve_modules(modules,module_definition_variables,findModuleName,module_definition_cache,pickModuleDefinition)
 {
   console.log("resolve_modules");
   const module_definitions = new Map();
@@ -1365,20 +1416,24 @@ const _1turw8j = function _resolve_modules(modules,module_definition_variables,f
   // Shared across this pass so findModuleName's fixpoint is computed once, not per module.
   const nameCache = new Map();
   modules.forEach((m) => {
-    const md = module_definition_variables.find(
+    const candidates = module_definition_variables.filter(
       (md) => md._value == m || module_definition_cache.get(md) === m
     );
-    if (md) {
+    const picked = candidates.length
+      ? pickModuleDefinition(candidates, m, (md) =>
+          findModuleName(md._module._scope, m, {
+            moduleOf: module_definition_cache,
+            // A module imported by another module has a relative specifier; the fixpoint over every
+            // variable in the runtime is what resolves it.
+            variables: md._module._runtime && md._module._runtime._variables,
+            nameCache
+          }))
+      : null;
+    if (picked) {
       module_definitions.set(m, {
         type: "module variable",
-        name: findModuleName(md._module._scope, m, {
-          moduleOf: module_definition_cache,
-          // A module imported by another module has a relative specifier; the fixpoint over every
-          // variable in the runtime is what resolves it.
-          variables: md._module._runtime && md._module._runtime._variables,
-          nameCache
-        }),
-        variable: md
+        name: picked.name,
+        variable: picked.variable
       });
     } else {
       unresolved.push(m);
@@ -1716,6 +1771,7 @@ export default function define(runtime, observer) {
   main.define("importedModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("importedModule", _));  
   main.define("module @tomlarkworthy/invoke-variable", async () => runtime.module((await import("/@tomlarkworthy/invoke-variable.js?v=4")).default));
   main.define("module @tomlarkworthy/spectral-layout", async () => runtime.module((await import("/@tomlarkworthy/spectral-layout.js?v=4")).default));
+  main.define("module @tomlarkworthy/jest-expect-standalone", async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
   $def("_1w9yf3l", null, ["md"], _1w9yf3l);  
   $def("_b6n8js", null, ["visualizeModules"], _b6n8js);  
   $def("_1sznqfl", null, ["md"], _1sznqfl);  
@@ -1745,7 +1801,11 @@ export default function define(runtime, observer) {
   $def("_ir3ob0", "main_modules", ["queue","modules","builtin"], _ir3ob0);  
   $def("_yflsv5", "bootloaded_mains", ["queue"], _yflsv5);  
   $def("_ox2g3b", "bootloader", ["queue"], _ox2g3b);  
-  $def("_1turw8j", "resolve_modules", ["modules","module_definition_variables","findModuleName","module_definition_cache"], _1turw8j);  
+  $def("_pmd001", "pickModuleDefinition", [], _pmd001);
+  $def("_1turw8j", "resolve_modules", ["modules","module_definition_variables","findModuleName","module_definition_cache","pickModuleDefinition"], _1turw8j);
+  $def("_pmd002", "test_pickModuleDefinition_prefers_the_loader_over_an_alias", ["expect","pickModuleDefinition"], _pmd002);
+  $def("_pmd003", "test_pickModuleDefinition_skips_a_placeholder", ["expect","pickModuleDefinition"], _pmd003);
+  $def("_pmd004", "test_pickModuleDefinition_falls_back_to_the_first", ["expect","pickModuleDefinition"], _pmd004);  
   $def("_9fbvam", null, ["md"], _9fbvam);  
   $def("_1h0lryb", "notebookImports", ["main","parser","queue"], _1h0lryb);
   $def("_7t198q", "notebookImportVariables", ["runtime","notebookImports"], _7t198q);  
@@ -1772,6 +1832,7 @@ export default function define(runtime, observer) {
   main.define("spectralCircleOrder", ["module @tomlarkworthy/spectral-layout", "@variable"], (_, v) => v.import("spectralCircleOrder", _));  
   main.define("improveOrderSifting", ["module @tomlarkworthy/spectral-layout", "@variable"], (_, v) => v.import("improveOrderSifting", _));  
   main.define("bestOfRandomOrders", ["module @tomlarkworthy/spectral-layout", "@variable"], (_, v) => v.import("bestOfRandomOrders", _));
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone", "@variable"], (_, v) => v.import("expect", _));
   return main;
 }</script>
 
