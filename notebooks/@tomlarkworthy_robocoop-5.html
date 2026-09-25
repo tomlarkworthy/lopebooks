@@ -4393,8 +4393,11 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelView,promptView,contextToggle,reasoningToggle,session,toolLabel,md,summarizeTurn)
+const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelView,promptView,contextToggle,reasoningToggle,rc5_controller,toolLabel,md,summarizeTurn,invalidation,PROFILES)
 {
+  // The chat is a facade over the controller's sessions; `entry`/`session` are whichever one is shown.
+  let entry = rc5_controller.active;
+  let session = entry.session;
   hostSetup;
   contextSetup;  // boots the situational-context providers wherever the chat renders (same pattern as hostSetup)
   const C = {
@@ -4427,6 +4430,26 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
   cfgBody.append(keyView, modelView, promptView, contextToggle, reasoningToggle);
   cfg.append(cfgBody);
   root.append(cfg);
+  // ── sessions ─────────────────────────────────────────────────────────────
+  const picker = html`<select title="Switch session" style="flex:1;min-width:0;background:#010409;color:${ C.fg };border:1px solid ${ C.border };border-radius:6px;font:inherit;padding:2px 4px"></select>`;
+  const saveBox = html`<input type="checkbox" title="Saved sessions are mains: they go into the notebook on the next save">`;
+  const saveLabel = html`<label style="display:flex;gap:4px;align-items:center;color:${ C.muted };cursor:pointer">${ saveBox } save</label>`;
+  const sessBar = html`<div style="display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid ${ C.border };font-size:12px"><span style="color:${ C.muted }">session</span></div>`;
+  const profilePick = html`<select title="Guardrail profile for the next new session (⟲)" style="background:#010409;color:${ C.fg };border:1px solid ${ C.border };border-radius:6px;font:inherit;padding:2px 4px">${ Object.values(PROFILES).map(p => html`<option value=${ p.id }>${ p.label }</option>`) }</select>`;
+  const profileEl = html`<span style="color:${ C.muted }"></span>`;
+  sessBar.append(picker, profileEl, saveLabel, profilePick);
+  root.append(sessBar);
+  const renderBar = () => {
+    picker.replaceChildren(...rc5_controller.entries.map((e, i) => {
+      const o = document.createElement('option');
+      o.value = String(i);
+      o.textContent = (e.saved ? '\u25CF ' : '\u25CB ') + e.title + (e.busy ? '  \u2026' : '');
+      o.selected = e === entry;
+      return o;
+    }));
+    saveBox.checked = !!entry.saved;
+    profileEl.textContent = entry.profile && entry.profile !== 'default' ? '[' + entry.profile + ']' : '';
+  };
   // ── transcript ───────────────────────────────────────────────────────────
   // flex:1 + min-height:0 scrolls when the pane bounds us; max-height is a fallback so the log
   // scrolls (and the input bar stays reachable) even when lopepage gives the cell an unbounded height.
@@ -4462,7 +4485,8 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
     }
     return frag;
   };
-  let busy = false;
+  // hostSetup rebuilds this cell (every module write does); a turn running in the controller survives it.
+  let busy = !!entry.busy;
   const errors = [];
   // surfaced agent failures (e.g. OpenRouter 402); part of render state so they persist
   let lastOutcome = null;
@@ -4664,7 +4688,7 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
   const attach = html`<button title="Attach image" style="background:${ C.tool };color:${ C.fg };border:1px solid ${ C.border };border-radius:8px;padding:0 12px;cursor:pointer">📎</button>`;
   const send = html`<button style="background:${ C.user };color:#fff;border:0;border-radius:8px;padding:0 14px;cursor:pointer">Send</button>`;
   const stop = html`<button title="Stop the agent (end this turn)" style="display:none;background:${ C.err };color:#fff;border:0;border-radius:8px;padding:0 14px;cursor:pointer">Stop</button>`;
-  const newchat = html`<button title="New chat — clear the conversation history (your built modules stay)" style="background:${ C.tool };color:${ C.fg };border:1px solid ${ C.border };border-radius:8px;padding:0 10px;cursor:pointer">⟲</button>`;
+  const newchat = html`<button title="New session (the current one stays in the session list; your built modules are untouched)" style="background:${ C.tool };color:${ C.fg };border:1px solid ${ C.border };border-radius:8px;padding:0 10px;cursor:pointer">⟲</button>`;
   const bar = html`<div style="display:flex;gap:8px;padding:10px;border-top:1px solid ${ C.border }"></div>`;
   bar.append(newchat, attach, ta, send, stop, fileInput);
   // Active-model line: makes a mid-conversation model switch visibly take effect.
@@ -4685,6 +4709,11 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
     }
   });
   root.append(thumbs, statusEl, modelEl, bar);
+  if (busy) {
+    send.textContent = 'Steer';
+    stop.style.display = '';
+    setStatus('\u25CF working\u2026');
+  }
   attach.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', async () => {
     for (const f of fileInput.files)
@@ -4749,46 +4778,52 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
     stepN = 0;
     renderThumbs();
     setStatus('\u25CF thinking\u2026');
+    const mine = entry;
+    // Callbacks from a turn whose session is no longer shown must not touch the visible transcript.
+    const shown = f => (...a) => { if (entry === mine) return f(...a); };
     try {
       // send() pushes the user message synchronously before its first await, so kicking it off and rendering
       // immediately shows the user's bubble right away. Tool calls land in the transcript as activity lines
-      // (render on each tool call), and the cheap statusEl carries the live signal.
-      const p = session.send(input, {
-        onStep: i => {
+      // (render on each tool call), and the cheap statusEl carries the live signal. The controller commits
+      // the finished turn to the session log.
+      const p = rc5_controller.send(mine, input, {
+        onStep: shown(i => {
           stepN = (i | 0) + 1;
           thinkReset();  // each step thinks afresh; the previous step's deliberation is spent
           setStatus('\u25CF thinking\u2026 \xB7 step ' + stepN);
-        },
+        }),
         // Streamed reasoning — the only thing arriving during the long silence before the first visible token.
-        onReasoningToken: thinkAppend,
-        onToolCall: (callId, name, args) => {
+        onReasoningToken: shown(thinkAppend),
+        onToolCall: shown((callId, name, args) => {
           thinkSettle();
           setStatus('\u2699 ' + toolLabel(name, args) + ' \xB7 step ' + stepN);
           render();
-        },
-        onToolResult: () => setStatus('\u25CF thinking\u2026 \xB7 step ' + stepN),
-        onSteer: render,
+        }),
+        onToolResult: shown(() => setStatus('\u25CF thinking\u2026 \xB7 step ' + stepN)),
+        onSteer: shown(render),
         // a steered user message was injected into the running turn → show its bubble
-        onInterrupt: () => {
+        onInterrupt: shown(() => {
           thinkReset();  // the interrupted call's partial reasoning dies with the call
           setStatus('\u21AA redirecting\u2026 \xB7 step ' + stepN);
           render();
-        },
-        onText: () => {
+        }),
+        onText: shown(() => {
           thinkSettle();
           render();
-        },
-        onFinish: render
+        }),
+        onFinish: shown(render)
       });
       render();
       const result = await p;
+      if (entry !== mine) return;
       // If the turn produced no closing assistant text, show why it ended so the user is never left guessing.
       const last = session.messages[session.messages.length - 1];
       if (!(last && last.role === 'assistant' && last.content))
         lastOutcome = summarizeTurn(result);
     } catch (err) {
-      errors.push(err && err.message ? err.message : String(err));
+      if (entry === mine) errors.push(err && err.message ? err.message : String(err));
     } finally {
+      if (entry !== mine) return;
       busy = false;
       send.textContent = 'Send';
       stop.style.display = 'none';
@@ -4806,20 +4841,42 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
       setStatus('\u23F9 stopping\u2026');
     }
   });
-  // New chat: abort any running turn, then wipe the LLM conversation history. The agent's built modules
-  // are separate and are NOT touched — only the chat context is reset.
-  newchat.addEventListener('click', () => {
-    if (busy)
-      session.abort?.();
-    session.reset?.();
+  // Show another session. A turn still running in the old one carries on and commits when it settles.
+  const switchTo = e => {
+    entry = e;
+    session = e.session;
+    busy = !!e.busy;
+    send.textContent = busy ? 'Steer' : 'Send';
+    stop.style.display = busy ? '' : 'none';
     thinkReset();
     errors.length = 0;
     lastOutcome = null;
     stepN = 0;
-    setStatus('');
+    setStatus(busy ? '\u25CF working in the background\u2026' : '');
+    renderBar();
     render();
     ta.focus();
+  };
+  // New chat = a new session; the old one stays in the picker (and in the notebook if saved).
+  newchat.addEventListener('click', () => switchTo(rc5_controller.create({ profile: profilePick.value })));
+  picker.addEventListener('change', async () => {
+    const e = rc5_controller.entries[Number(picker.value)];
+    if (e && e !== entry) switchTo(await rc5_controller.open(e));
   });
+  saveBox.addEventListener('change', () => rc5_controller.setSaved(entry, saveBox.checked));
+  // A UI rebuilt mid-turn gets none of that turn's callbacks; catch up when the controller says it settled.
+  invalidation.then(rc5_controller.onChange(() => {
+    renderBar();
+    if (busy && !entry.busy) {
+      busy = false;
+      send.textContent = 'Send';
+      stop.style.display = 'none';
+      setStatus('');
+      render();
+    }
+  }));
+  renderBar();
+  rc5_controller.refresh();
   ta.addEventListener('keydown', ev => {
     if (ev.key === 'Enter' && !ev.shiftKey) {
       ev.preventDefault();
@@ -4828,6 +4885,9 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
   });
   return root;
 };
+const _rc5ctl = function _rc5_controller(createSessionController,runtime,makeSession,session){return(
+createSessionController({ runtime, makeSession, initial: session })
+)};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -4838,9 +4898,16 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/robocoop-5-engine", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-engine.js?v=4")).default));  
   main.define("module @tomlarkworthy/robocoop-5-core", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-core.js?v=4")).default));  
   main.define("module @tomlarkworthy/robocoop-5-srctools", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-srctools.js?v=4")).default));
+  main.define("module @tomlarkworthy/robocoop-5-sessions", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-sessions.js?v=4")).default));
+  main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
   main.define("module @tomlarkworthy/robocoop-5-context", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-context.js?v=4")).default));
-  $def("_ka663b", "robocoop_5", ["hostSetup","contextSetup","html","keyView","modelView","promptView","contextToggle","reasoningToggle","session","toolLabel","md","summarizeTurn"], _ka663b);
+  $def("_ka663b", "robocoop_5", ["hostSetup","contextSetup","html","keyView","modelView","promptView","contextToggle","reasoningToggle","rc5_controller","toolLabel","md","summarizeTurn","invalidation","PROFILES"], _ka663b);
+  $def("_rc5ctl", "rc5_controller", ["createSessionController","runtime","makeSession","session"], _rc5ctl);
   main.define("session", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("session", _));
+  main.define("makeSession", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("makeSession", _));
+  main.define("createSessionController", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("createSessionController", _));
+  main.define("PROFILES", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("PROFILES", _));
+  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
   main.define("contextToggle", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("contextToggle", _));
   main.define("keyView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("keyView", _));  
   main.define("modelView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("modelView", _));  
@@ -5297,8 +5364,11 @@ Inputs.toggle({
   value: true
 })
 )};
-const _zqho0j = function _session(client,createAgentSession,reasoningToggle,toolsView,modelView,promptView,rc5_watchBus,rc5_monitorBus,monitorsView,contextToggle,composeContext,contextView,specGateCheck,rc5_specGate,zeroToolCallGate)
+const _rc5makeSession = function _makeSession(client,createAgentSession,reasoningToggle,toolsView,modelView,promptView,rc5_watchBus,rc5_monitorBus,monitorsView,contextToggle,composeContext,contextView,specGateCheck,rc5_specGate,zeroToolCallGate)
 {
+  // One agent per call. `session` below is the default one; robocoop-5-sessions builds the others.
+  // model / toolsTransform / completeGuard are per-agent overrides (plan/robocoop-5-multi-session.md §2.4-2.5).
+  return ({ model = null, toolsTransform = null, completeGuard: extraGuard = null } = {}) => {
   if (!client) {
     return {
       messages: [],
@@ -5338,9 +5408,9 @@ const _zqho0j = function _session(client,createAgentSession,reasoningToggle,tool
       const t = Array.isArray(toolsView.value) ? toolsView.value : [];
       if (t.length)
         lastTools = t;
-      return lastTools;
+      return toolsTransform ? toolsTransform(lastTools) : lastTools;
     },
-    modelProvider: () => modelView.value,
+    modelProvider: () => model ?? modelView.value,
     systemPromptProvider: () => promptView.value,
     runCommand: () => ({
       stdout: '',
@@ -5377,13 +5447,17 @@ const _zqho0j = function _session(client,createAgentSession,reasoningToggle,tool
     // a task with no spec module holds a null scorecard, so the guard degenerates to the zero-tool-call check.
     // The verdict is refreshed by the per-step monitor, so it is at most one step old — never the stale
     // last-successful-write verdict the write-path-only version left behind.
-    completeGuard: info => specGateCheck(rc5_specGate.scorecard, info.summary) ?? zeroToolCallGate(info),
+    completeGuard: info => (extraGuard && extraGuard(info)) ?? specGateCheck(rc5_specGate.scorecard, info.summary) ?? zeroToolCallGate(info),
     stallNudgeLimit: 2,
     maxStepsPerTurn: 40,
     // Reasoning models spend completion budget on reasoning; give headroom for reasoning + a full write_file.
     maxTokens: 32000
   });
+  };
 };
+const _zqho0j = function _session(makeSession){return(
+makeSession()
+)};
 
 const _rc5specLockOn = function _specLockOn()
 {
@@ -5490,7 +5564,8 @@ export default function define(runtime, observer) {
   $def("_gdleyk", "promptView", ["viewof rc5_systemPrompt"], _gdleyk);  
   $def("_5agv7a", "client", ["OPENROUTER_API_KEY","createOpenRouterClient","gatewayBase"], _5agv7a);
   $def("_ctxtog", "contextToggle", ["Inputs"], _ctxtog);
-  $def("_zqho0j", "session", ["client","createAgentSession","reasoningToggle","toolsView","modelView","promptView","rc5_watchBus","rc5_monitorBus","monitorsView","contextToggle","composeContext","contextView","specGateCheck","rc5_specGate","zeroToolCallGate"], _zqho0j);
+  $def("_rc5makeSession", "makeSession", ["client","createAgentSession","reasoningToggle","toolsView","modelView","promptView","rc5_watchBus","rc5_monitorBus","monitorsView","contextToggle","composeContext","contextView","specGateCheck","rc5_specGate","zeroToolCallGate"], _rc5makeSession);
+  $def("_zqho0j", "session", ["makeSession"], _zqho0j);
   $def("_rc5specLockOn", "specLockOn", [], _rc5specLockOn);
   $def("_rc5specLockPrompt", "specLockPrompt", [], _rc5specLockPrompt);
   $def("_rc5reasoningToggle", "reasoningToggle", ["Inputs"], _rc5reasoningToggle);
@@ -40356,6 +40431,30 @@ const _rs_readValues = function _readValues(){return(
     .define(names, (...xs) => xs);
 })
 )};
+const _rs_peek = function _peekValues(readValues){return(
+// Read literal cells WITHOUT defining a variable. Adding or deleting any variable recomputes module-map's
+// currentModules, which rebuilds the chat UI through hostSetup; a UI that re-lists sessions on build then
+// loops (measured 2026-09-25: 1661 rebuilds in 70s with readValues here). A computed cell gives its _value;
+// an uncomputed one is parsed from its source, which is the JSON literal defineLiteral wrote.
+async (runtime, module, names) => {
+  const vars = new Map();
+  for (const v of runtime._variables)
+    if (v._module === module && v._type === 1 && names.includes(v._name)) vars.set(v._name, v);
+  const out = [], missing = [];
+  names.forEach((n, i) => {
+    const v = vars.get(n);
+    if (v && v._value !== undefined) return (out[i] = v._value);
+    const m = v && /^function\s*_?[\w$]*\s*\(\)\s*\{\s*return\s*\(([\s\S]*)\)\s*;?\s*\}\s*$/.exec(String(v._definition));
+    try { if (m) return (out[i] = JSON.parse(m[1])); } catch (e) {}
+    missing.push(i);
+  });
+  if (missing.length) {
+    const got = await readValues(module, missing.map(i => names[i]));
+    missing.forEach((i, k) => (out[i] = got[k]));
+  }
+  return out;
+}
+)};
 const _rs_defineLiteral = function _defineLiteral(realize,encodeLiteral){return(
 async (runtime, module, name, value) => {
   const [fn] = await realize([`function _${name}(){return(\n${encodeLiteral(value)}\n)}`], runtime);
@@ -40369,9 +40468,9 @@ const _rs_turnNumbers = function _turnNumbers(){return(
   .map(v => Number(v._name.slice(5)))
   .sort((a, b) => a - b)
 )};
-const _rs_open = function _openSessionLog(readValues,turnNumbers,SESSION_KIND){return(
+const _rs_open = function _openSessionLog(peekValues,turnNumbers,SESSION_KIND){return(
 async (runtime, module) => {
-  const [meta] = await readValues(module, ["session_meta"]);
+  const [meta] = await peekValues(runtime, module, ["session_meta"]);
   if (meta?.kind !== SESSION_KIND) throw new Error("not a robocoop-5 session module");
   const nums = turnNumbers(runtime, module);
   return { runtime, module, meta, nextTurn: (nums.at(-1) ?? 0) + 1 };
@@ -40431,16 +40530,16 @@ async (log, { messages, status = "complete", error = null, at = new Date().toISO
   return name;
 }
 )};
-const _rs_readTurns = function _readTurns(turnNumbers,turnName,readValues){return(
+const _rs_readTurns = function _readTurns(turnNumbers,turnName,peekValues){return(
 async log => {
   const names = turnNumbers(log.runtime, log.module).map(turnName);
-  return names.length ? readValues(log.module, names) : [];
+  return names.length ? peekValues(log.runtime, log.module, names) : [];
 }
 )};
 const _rs_readMessages = function _readMessages(readTurns,rehydrateImages){return(
 async log => rehydrateImages(log, (await readTurns(log)).flatMap(t => t.messages))
 )};
-const _rs_list = function _listSessions(readValues,SESSION_KIND,sessionName){return(
+const _rs_list = function _listSessions(peekValues,SESSION_KIND,sessionName){return(
 // Reflection, no index: every module holding a session_meta cell of this kind is a session; it is
 // saved iff it is a main.
 async runtime => {
@@ -40451,7 +40550,7 @@ async runtime => {
   const out = [];
   for (const module of modules) {
     let meta;
-    try { [meta] = await readValues(module, ["session_meta"]); } catch (e) { continue; }
+    try { [meta] = await peekValues(runtime, module, ["session_meta"]); } catch (e) { continue; }
     if (meta?.kind !== SESSION_KIND) continue;
     out.push({ id: meta.id, meta, module, saved: mainName.has(module), name: mainName.get(module) ?? sessionName(meta.id) });
   }
@@ -40526,6 +40625,208 @@ const _rs_test_storable = function _test_storableMessages(storableMessages,expec
   return "drops prompt, earlier turns and environment blocks; keeps notices";
 };
 
+const _rs_controller = function _createSessionController(listSessions,openSessionLog,createSessionLog,appendTurn,readMessages,saveSession,unsaveSession,storableMessages,applyProfile,PROFILES){return(
+// The facade's state: every session known to this page, which one is shown, and the one path that
+// commits a turn. Turns stream into session.messages as before; the log is written once, when send()
+// settles, so a background turn still commits after the user has switched away.
+({ runtime, makeSession, initial = null, profiles = PROFILES }) => {
+  const entries = [];
+  const build = id => makeSession({ toolsTransform: ts => applyProfile(ts, profiles[id] ?? profiles.default) });
+  const listeners = new Set();
+  const emit = () => { for (const f of listeners) try { f(ctl); } catch (e) { console.error(e); } };
+  const titleOf = input => {
+    const t = typeof input === "string" ? input : input?.text || "";
+    return t.trim().replace(/\s+/g, " ").slice(0, 60) || "untitled";
+  };
+  const ensureLog = async entry => {
+    entry.log ??= await createSessionLog(runtime, { id: entry.id ?? undefined, title: entry.title, profile: entry.profile });
+    return entry.log;
+  };
+  const ctl = {
+    entries,
+    active: null,
+    onChange(f) { listeners.add(f); return () => listeners.delete(f); },
+    async refresh() {
+      for (const s of await listSessions(runtime)) {
+        let e = entries.find(x => x.log?.module === s.module);
+        if (!e) {
+          e = { id: s.id, title: s.meta.title || s.id, created: s.meta.created, profile: s.meta.profile || "default", session: null, log: await openSessionLog(runtime, s.module), saved: s.saved, busy: false };
+          entries.push(e);
+        }
+        e.saved = s.saved;
+      }
+      entries.sort((a, b) => String(b.created).localeCompare(String(a.created)));
+      emit();
+      return entries;
+    },
+    create({ profile = "default", session = build(profile), activate = true } = {}) {
+      const created = new Date().toISOString();
+      const e = { id: null, title: "new session", created, profile, session, log: null, saved: false, busy: false };
+      entries.unshift(e);
+      if (activate) ctl.active = e;
+      emit();
+      return e;
+    },
+    async open(e) {
+      if (!e.session) {
+        e.session = build(e.profile);
+        e.session.messages.push(...await readMessages(e.log));
+      }
+      ctl.active = e;
+      emit();
+      return e;
+    },
+    async setSaved(e, on) {
+      await ensureLog(e);
+      on ? saveSession(e.log) : unsaveSession(e.log);
+      e.saved = !!on;
+      emit();
+    },
+    async send(e, input, callbacks) {
+      const before = new Set(e.session.messages);
+      if (!e.log && e.title === "new session") e.title = titleOf(input);
+      e.busy = true;
+      emit();
+      let status = "complete", error = null;
+      try {
+        return await e.session.send(input, callbacks);
+      } catch (err) {
+        status = "aborted";
+        error = err?.message ?? String(err);
+        throw err;
+      } finally {
+        const messages = storableMessages(e.session.messages, before);
+        if (messages.length) await appendTurn(await ensureLog(e), { messages, status, error });
+        e.id = e.log?.meta.id ?? e.id;
+        e.busy = false;
+        emit();
+      }
+    }
+  };
+  if (initial) ctl.create({ session: initial });
+  return ctl;
+}
+)};
+const _rs_test_peek = async function _test_peekValues(peekValues,defineLiteral,realize,runtime,expect){
+  const m = runtime.module();
+  try {
+    await defineLiteral(runtime, m, "lit_a", { x: "<" + "/script>", n: 1 });
+    const [fn] = await realize(["function _lit_b(){return(\n" + JSON.stringify({ y: [1, 2] }) + "\n)}"], runtime);
+    m.variable().define("lit_b", [], fn);  // no observer: never computed, so peek must parse the source
+    const count = () => [...runtime._variables].filter(v => v._module === m).length;
+    const n = count();
+    expect(await peekValues(runtime, m, ["lit_a", "lit_b"])).toEqual([{ x: "<" + "/script>", n: 1 }, { y: [1, 2] }]);
+    expect(count()).toBe(n);
+    return "reads computed and uncomputed literals, defines no variable";
+  } finally {
+    for (const v of [...runtime._variables]) if (v._module === m) v.delete();
+  }
+};
+const _rs_test_controller = async function _test_session_controller(createSessionController,disposeSession,runtime,expect){
+  const fake = () => {
+    const messages = [];
+    return { messages, async send(input) {
+      if (input === "boom") throw new Error("boom");
+      messages.push({ role: "user", content: input }, { role: "assistant", content: "re: " + input });
+    } };
+  };
+  const a = createSessionController({ runtime, makeSession: fake });
+  const e = a.create();
+  let logs = [];
+  try {
+    await a.send(e, "hello there");
+    await expect(a.send(e, "boom")).rejects.toThrow("boom");
+    expect(e.title).toBe("hello there");
+    expect(e.log).toBeTruthy();
+    logs.push(e.log);
+    await a.setSaved(e, true);
+    // a fresh controller stands in for a reload: it finds the session by reflection and resumes it
+    const b = createSessionController({ runtime, makeSession: fake });
+    await b.refresh();
+    const found = b.entries.find(x => x.log.module === e.log.module);
+    expect(found.saved).toBe(true);
+    expect(found.session).toBe(null);
+    await b.open(found);
+    expect(found.session.messages).toEqual([
+      { role: "user", content: "hello there" }, { role: "assistant", content: "re: hello there" }
+    ]);
+    // the failed send committed nothing (it pushed no messages) and did not break the next one
+    await b.send(found, "second");
+    expect(found.session.messages.length).toBe(4);
+    return "create, commit on settle, save, rediscover, resume, continue";
+  } finally {
+    for (const l of logs) disposeSession(l);
+  }
+};
+
+const _rs_protected = function _PROTECTED_MODULES(SESSION_NAMESPACE){return(
+[SESSION_NAMESPACE, "@tomlarkworthy/robocoop-5"]
+)};
+const _rs_applyProfile = function _applyProfile(PROTECTED_MODULES){return(
+// A profile fences one agent: `deny` drops tools from what it is offered, `beforeTool` may refuse a call
+// with a reason the model reads as the tool result, `afterTool` may rewrite a result. Every profile refuses
+// writes into session logs and into robocoop-5 itself. This constrains the model, not the page: a tool
+// that runs code (eval_js, run_python) can reach round any wrapper, which is why `reviewer` denies them.
+(() => {
+  const cache = new WeakMap();
+  const WRITES = new Set(["write_file", "edit_file", "attach_file"]);
+  const targetOf = args => String(args?.file_path ?? args?.module ?? "");
+  const guard = (name, args) =>
+    WRITES.has(name) && PROTECTED_MODULES.some(p => targetOf(args).includes(p))
+      ? `writes to ${targetOf(args)} are not allowed (session logs and robocoop-5 are protected)`
+      : null;
+  const wrap = (tool, profile) => ({
+    ...tool,
+    execute: async (args, ctx) => {
+      const why = guard(tool.id, args) ?? (profile.hooks?.beforeTool?.({ name: tool.id, args }) || null);
+      if (why) return { title: tool.id + " refused", output: "Refused by guardrail: " + why, metadata: { refused: true, profile: profile.id ?? null } };
+      const result = await tool.execute(args, ctx);
+      return profile.hooks?.afterTool ? await profile.hooks.afterTool({ name: tool.id, args, result }) ?? result : result;
+    }
+  });
+  return (tools, profile = {}) => {
+    let byTool = cache.get(profile);
+    if (!byTool) cache.set(profile, byTool = new WeakMap());
+    const deny = new Set(profile.deny || []);
+    return tools.filter(t => !deny.has(t.id)).map(t => {
+      if (!byTool.has(t)) byTool.set(t, wrap(t, profile));
+      return byTool.get(t);
+    });
+  };
+})()
+)};
+const _rs_profiles = function _PROFILES(){return(
+{
+  default: { id: "default", label: "default" },
+  reviewer: {
+    id: "reviewer",
+    label: "reviewer (read-only)",
+    deny: ["write_file", "edit_file", "attach_file", "eval_js", "run_python"]
+  }
+}
+)};
+const _rs_test_profile = async function _test_applyProfile(applyProfile,PROFILES,expect){
+  const tool = id => ({ id, description: id, parameters: {}, execute: async args => ({ title: id, output: "ran " + id + " " + JSON.stringify(args), metadata: {} }) });
+  const tools = [tool("read_file"), tool("write_file"), tool("eval_js")];
+  expect(applyProfile(tools, PROFILES.reviewer).map(t => t.id)).toEqual(["read_file"]);
+  const [, write] = applyProfile(tools, PROFILES.default);
+  const refused = await write.execute({ file_path: "/src/@rc5-sessions/2026-09-25-x.js", content: "" });
+  expect(refused.metadata.refused).toBe(true);
+  expect(refused.output).toContain("Refused by guardrail");
+  expect((await write.execute({ file_path: "/src/@tomlarkworthy/robocoop-5-engine.js" })).metadata.refused).toBe(true);
+  expect((await write.execute({ file_path: "/src/@user/app.js" })).output).toContain("ran write_file");
+  const custom = { id: "t", hooks: {
+    beforeTool: ({ name, args }) => name === "read_file" && args.file_path.includes("secret") ? "no secrets" : null,
+    afterTool: ({ result }) => ({ ...result, output: result.output.toUpperCase() })
+  } };
+  const [read] = applyProfile(tools, custom);
+  expect((await read.execute({ file_path: "/secret.txt" })).output).toBe("Refused by guardrail: no secrets");
+  expect((await read.execute({ file_path: "/a.txt" })).output).toContain("RAN READ_FILE");
+  // wrapping is stable per (profile, tool), so the loop sees the same objects step to step
+  expect(applyProfile(tools, custom)[0]).toBe(read);
+  return "deny, protected writes, beforeTool refusal, afterTool rewrite, stable wrappers";
+};
+
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -40545,18 +40846,26 @@ export default function define(runtime, observer) {
   $def("_rs_readValues", "readValues", [], _rs_readValues);
   $def("_rs_defineLiteral", "defineLiteral", ["realize","encodeLiteral"], _rs_defineLiteral);
   $def("_rs_turnNumbers", "turnNumbers", [], _rs_turnNumbers);
-  $def("_rs_open", "openSessionLog", ["readValues","turnNumbers","SESSION_KIND"], _rs_open);
+  $def("_rs_peek", "peekValues", ["readValues"], _rs_peek);
+  $def("_rs_open", "openSessionLog", ["peekValues","turnNumbers","SESSION_KIND"], _rs_open);
   $def("_rs_create", "createSessionLog", ["newSessionId","defineLiteral","SESSION_KIND","openSessionLog"], _rs_create);
   $def("_rs_extImages", "externaliseImages", ["createFileAttachment","setFileAttachment"], _rs_extImages);
   $def("_rs_rehydrate", "rehydrateImages", ["readValues"], _rs_rehydrate);
   $def("_rs_append", "appendTurn", ["turnName","externaliseImages","defineLiteral"], _rs_append);
-  $def("_rs_readTurns", "readTurns", ["turnNumbers","turnName","readValues"], _rs_readTurns);
+  $def("_rs_readTurns", "readTurns", ["turnNumbers","turnName","peekValues"], _rs_readTurns);
   $def("_rs_readMessages", "readMessages", ["readTurns","rehydrateImages"], _rs_readMessages);
-  $def("_rs_list", "listSessions", ["readValues","SESSION_KIND","sessionName"], _rs_list);
+  $def("_rs_list", "listSessions", ["peekValues","SESSION_KIND","sessionName"], _rs_list);
   $def("_rs_save", "saveSession", ["sessionName"], _rs_save);
   $def("_rs_unsave", "unsaveSession", [], _rs_unsave);
   $def("_rs_dispose", "disposeSession", ["unsaveSession"], _rs_dispose);
   $def("_rs_storable", "storableMessages", [], _rs_storable);
+  $def("_rs_controller", "createSessionController", ["listSessions","openSessionLog","createSessionLog","appendTurn","readMessages","saveSession","unsaveSession","storableMessages","applyProfile","PROFILES"], _rs_controller);
+  $def("_rs_test_peek", "test_peekValues", ["peekValues","defineLiteral","realize","runtime","expect"], _rs_test_peek);
+  $def("_rs_test_controller", "test_session_controller", ["createSessionController","disposeSession","runtime","expect"], _rs_test_controller);
+  $def("_rs_protected", "PROTECTED_MODULES", ["SESSION_NAMESPACE"], _rs_protected);
+  $def("_rs_applyProfile", "applyProfile", ["PROTECTED_MODULES"], _rs_applyProfile);
+  $def("_rs_profiles", "PROFILES", [], _rs_profiles);
+  $def("_rs_test_profile", "test_applyProfile", ["applyProfile","PROFILES","expect"], _rs_test_profile);
   $def("_rs_test_roundtrip", "test_session_roundtrip", ["createSessionLog","appendTurn","readMessages","readTurns","listSessions","saveSession","unsaveSession","disposeSession","sessionName","runtime","expect"], _rs_test_roundtrip);
   $def("_rs_test_storable", "test_storableMessages", ["storableMessages","expect"], _rs_test_storable);
   main.define("realize", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("realize", _));
