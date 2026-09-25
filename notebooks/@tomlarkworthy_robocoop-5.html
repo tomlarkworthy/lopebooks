@@ -40313,6 +40313,489 @@ export default function define(runtime, observer) {
   return main;
 }</script>
 
+<script id="@tomlarkworthy/robocoop-5-sessions" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _rs_doc = function _doc(md){return(
+md`# robocoop-5 sessions
+
+A session log is a module with a <code>session_meta</code> cell and one <code>turn_NNNN</code> cell per finished turn. It is saved when it is in <code>runtime.mains</code>, and nowhere else. Images in messages are stored as file attachments of the session module. Design and evidence: <code>plan/robocoop-5-multi-session.md</code>.`
+)};
+const _rs_kind = function _SESSION_KIND(){return(
+"robocoop-5/session"
+)};
+const _rs_ns = function _SESSION_NAMESPACE(){return(
+"@rc5-sessions/"
+)};
+const _rs_sessionName = function _sessionName(SESSION_NAMESPACE){return(
+id => SESSION_NAMESPACE + id
+)};
+const _rs_turnName = function _turnName(){return(
+n => "turn_" + String(n).padStart(4, "0")
+)};
+const _rs_encode = function _encodeLiteral(){return(
+// Cell source is compiled via a <script type="module-shim"> and exported inside a <script> block, so a
+// transcript containing a closing script tag must not appear literally. In JSON output "<" only occurs inside
+// strings, where < is equivalent.
+value => JSON.stringify(value).replace(/</g, "\\u003c")
+)};
+const _rs_newId = function _newSessionId(){return(
+(date = new Date()) => {
+  const p = n => String(n).padStart(2, "0");
+  const stamp = `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}-${p(date.getHours())}${p(date.getMinutes())}`;
+  return stamp + "-" + Math.random().toString(36).slice(2, 6);
+}
+)};
+const _rs_readValues = function _readValues(){return(
+// Resolve cells of a module by name, without leaving an observer behind.
+(module, names) => new Promise((resolve, reject) => {
+  let v = null;
+  const once = f => x => { f(x); window.queueMicrotask(() => { if (v) { v.delete(); v = null; } }); };
+  v = module.variable({ pending() {}, fulfilled: once(resolve), rejected: once(reject) })
+    .define(names, (...xs) => xs);
+})
+)};
+const _rs_defineLiteral = function _defineLiteral(realize,encodeLiteral){return(
+async (runtime, module, name, value) => {
+  const [fn] = await realize([`function _${name}(){return(\n${encodeLiteral(value)}\n)}`], runtime);
+  const existing = [...runtime._variables].find(v => v._module === module && v._name === name && v._type === 1);
+  (existing ?? module.variable({ pending() {}, fulfilled() {}, rejected() {} })).define(name, [], fn);
+}
+)};
+const _rs_turnNumbers = function _turnNumbers(){return(
+(runtime, module) => [...runtime._variables]
+  .filter(v => v._module === module && v._type === 1 && /^turn_\d+$/.test(v._name))
+  .map(v => Number(v._name.slice(5)))
+  .sort((a, b) => a - b)
+)};
+const _rs_open = function _openSessionLog(readValues,turnNumbers,SESSION_KIND){return(
+async (runtime, module) => {
+  const [meta] = await readValues(module, ["session_meta"]);
+  if (meta?.kind !== SESSION_KIND) throw new Error("not a robocoop-5 session module");
+  const nums = turnNumbers(runtime, module);
+  return { runtime, module, meta, nextTurn: (nums.at(-1) ?? 0) + 1 };
+}
+)};
+const _rs_create = function _createSessionLog(newSessionId,defineLiteral,SESSION_KIND,openSessionLog){return(
+async (runtime, { id = newSessionId(), title = "", model = null, profile = "default" } = {}) => {
+  const module = runtime.module();
+  const meta = { kind: SESSION_KIND, version: 1, id, created: new Date().toISOString(), title, model, profile };
+  await defineLiteral(runtime, module, "session_meta", meta);
+  return openSessionLog(runtime, module);
+}
+)};
+const _rs_extImages = function _externaliseImages(createFileAttachment,setFileAttachment){return(
+// data: image parts become attachments of the session module; the message keeps only the name.
+async (log, turn, messages) => {
+  let k = 0;
+  const part = async p => {
+    const url = p?.type === "image_url" && p.image_url?.url;
+    if (typeof url !== "string" || !url.startsWith("data:")) return p;
+    const blob = await (await window.fetch(url)).blob();
+    const ext = (blob.type.split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "");
+    const name = `${turn}_${k++}.${ext}`;
+    await setFileAttachment(createFileAttachment(window.URL.createObjectURL(blob), name, blob.type), log.module);
+    return { type: "image_attachment", name, mimeType: blob.type };
+  };
+  const out = [];
+  for (const m of messages)
+    out.push(Array.isArray(m.content) ? { ...m, content: await Promise.all(m.content.map(part)) } : m);
+  return out;
+}
+)};
+const _rs_rehydrate = function _rehydrateImages(readValues){return(
+async (log, messages) => {
+  if (!messages.some(m => Array.isArray(m.content) && m.content.some(p => p?.type === "image_attachment"))) return messages;
+  const [FA] = await readValues(log.module, ["FileAttachment"]);
+  const dataUrl = blob => new Promise((resolve, reject) => {
+    const r = new window.FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+  const part = async p => p?.type === "image_attachment"
+    ? { type: "image_url", image_url: { url: await dataUrl(await FA(p.name).blob()) } }
+    : p;
+  return Promise.all(messages.map(async m =>
+    Array.isArray(m.content) ? { ...m, content: await Promise.all(m.content.map(part)) } : m));
+}
+)};
+const _rs_append = function _appendTurn(turnName,externaliseImages,defineLiteral){return(
+// One new cell per turn; earlier turn cells are never redefined. The number is reserved before the
+// first await so concurrent appends keep their order.
+async (log, { messages, status = "complete", error = null, at = new Date().toISOString() }) => {
+  const name = turnName(log.nextTurn++);
+  const stored = await externaliseImages(log, name, messages);
+  await defineLiteral(log.runtime, log.module, name, { at, status, error, messages: stored });
+  return name;
+}
+)};
+const _rs_readTurns = function _readTurns(turnNumbers,turnName,readValues){return(
+async log => {
+  const names = turnNumbers(log.runtime, log.module).map(turnName);
+  return names.length ? readValues(log.module, names) : [];
+}
+)};
+const _rs_readMessages = function _readMessages(readTurns,rehydrateImages){return(
+async log => rehydrateImages(log, (await readTurns(log)).flatMap(t => t.messages))
+)};
+const _rs_list = function _listSessions(readValues,SESSION_KIND,sessionName){return(
+// Reflection, no index: every module holding a session_meta cell of this kind is a session; it is
+// saved iff it is a main.
+async runtime => {
+  const modules = new Set();
+  for (const v of runtime._variables)
+    if (v._name === "session_meta" && v._type === 1) modules.add(v._module);
+  const mainName = new Map([...runtime.mains].map(([n, m]) => [m, n]));
+  const out = [];
+  for (const module of modules) {
+    let meta;
+    try { [meta] = await readValues(module, ["session_meta"]); } catch (e) { continue; }
+    if (meta?.kind !== SESSION_KIND) continue;
+    out.push({ id: meta.id, meta, module, saved: mainName.has(module), name: mainName.get(module) ?? sessionName(meta.id) });
+  }
+  return out.sort((a, b) => String(b.meta.created).localeCompare(String(a.meta.created)));
+}
+)};
+const _rs_save = function _saveSession(sessionName){return(
+log => { log.runtime.mains.set(sessionName(log.meta.id), log.module); return log; }
+)};
+const _rs_unsave = function _unsaveSession(){return(
+log => {
+  for (const [n, m] of [...log.runtime.mains]) if (m === log.module) log.runtime.mains.delete(n);
+  return log;
+}
+)};
+const _rs_dispose = function _disposeSession(unsaveSession){return(
+log => {
+  unsaveSession(log);
+  for (const v of [...log.runtime._variables]) if (v._module === log.module && v._type === 1) v.delete();
+}
+)};
+const _rs_storable = function _storableMessages(){return(
+// The part of a turn worth keeping: messages added since `before` (a Set of message objects taken before
+// send), minus the system prompt (send() re-adds it) and <environment> context blocks (regenerated
+// every turn, and they carry the page URL).
+(messages, before) => messages.filter((m, i) =>
+  !before.has(m) &&
+  !(i === 0 && m.role === "system") &&
+  !(m.role === "system" && typeof m.content === "string" && m.content.startsWith("<environment")))
+)};
+const _rs_test_roundtrip = async function _test_session_roundtrip(createSessionLog,appendTurn,readMessages,readTurns,listSessions,saveSession,unsaveSession,disposeSession,sessionName,runtime,expect){
+  const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+  const log = await createSessionLog(runtime, { title: "test" });
+  try {
+    const t1 = [
+      { role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: png } }] },
+      { role: "assistant", content: "it has <" + "/script> in it" }
+    ];
+    const t2 = [{ role: "user", content: "again" }, { role: "assistant", content: "ok" }];
+    expect(await appendTurn(log, { messages: t1 })).toBe("turn_0001");
+    const first = [...runtime._variables].find(v => v._module === log.module && v._name === "turn_0001")._definition;
+    expect(await appendTurn(log, { messages: t2, status: "aborted", error: "stopped" })).toBe("turn_0002");
+    // append-only: the earlier turn's definition is untouched
+    expect([...runtime._variables].find(v => v._module === log.module && v._name === "turn_0001")._definition).toBe(first);
+    expect(String(first)).not.toContain("<" + "/script>");
+    // PutGet: reading back gives exactly what was appended, image rehydrated
+    expect(await readMessages(log)).toEqual([...t1, ...t2]);
+    const turns = await readTurns(log);
+    expect(turns.map(t => t.status)).toEqual(["complete", "aborted"]);
+    expect(turns[0].messages[0].content[1]).toEqual({ type: "image_attachment", name: "turn_0001_0.png", mimeType: "image/png" });
+    // saved iff main
+    const find = async () => (await listSessions(runtime)).find(s => s.module === log.module);
+    expect((await find()).saved).toBe(false);
+    saveSession(log);
+    expect(runtime.mains.get(sessionName(log.meta.id))).toBe(log.module);
+    expect((await find()).saved).toBe(true);
+    unsaveSession(log);
+    expect((await find()).saved).toBe(false);
+    return "round trip, append-only, image attachment, save/unsave";
+  } finally {
+    disposeSession(log);
+  }
+};
+const _rs_test_storable = function _test_storableMessages(storableMessages,expect){
+  const sys = { role: "system", content: "prompt" };
+  const old = { role: "user", content: "earlier" };
+  const env = { role: "system", content: "<environment scope=\"turn\">x</environment>" };
+  const watch = { role: "system", content: "Watch updates: spec 3/3" };
+  const u = { role: "user", content: "now" };
+  const a = { role: "assistant", content: "done" };
+  expect(storableMessages([sys, old, env, u, watch, a], new Set([old]))).toEqual([u, watch, a]);
+  return "drops prompt, earlier turns and environment blocks; keeps notices";
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+
+  main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
+  main.define("module @tomlarkworthy/fileattachments", async () => runtime.module((await import("/@tomlarkworthy/fileattachments.js?v=4")).default));
+  main.define("module @tomlarkworthy/jest-expect-standalone", async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
+  $def("_rs_doc", null, ["md"], _rs_doc);
+  $def("_rs_kind", "SESSION_KIND", [], _rs_kind);
+  $def("_rs_ns", "SESSION_NAMESPACE", [], _rs_ns);
+  $def("_rs_sessionName", "sessionName", ["SESSION_NAMESPACE"], _rs_sessionName);
+  $def("_rs_turnName", "turnName", [], _rs_turnName);
+  $def("_rs_encode", "encodeLiteral", [], _rs_encode);
+  $def("_rs_newId", "newSessionId", [], _rs_newId);
+  $def("_rs_readValues", "readValues", [], _rs_readValues);
+  $def("_rs_defineLiteral", "defineLiteral", ["realize","encodeLiteral"], _rs_defineLiteral);
+  $def("_rs_turnNumbers", "turnNumbers", [], _rs_turnNumbers);
+  $def("_rs_open", "openSessionLog", ["readValues","turnNumbers","SESSION_KIND"], _rs_open);
+  $def("_rs_create", "createSessionLog", ["newSessionId","defineLiteral","SESSION_KIND","openSessionLog"], _rs_create);
+  $def("_rs_extImages", "externaliseImages", ["createFileAttachment","setFileAttachment"], _rs_extImages);
+  $def("_rs_rehydrate", "rehydrateImages", ["readValues"], _rs_rehydrate);
+  $def("_rs_append", "appendTurn", ["turnName","externaliseImages","defineLiteral"], _rs_append);
+  $def("_rs_readTurns", "readTurns", ["turnNumbers","turnName","readValues"], _rs_readTurns);
+  $def("_rs_readMessages", "readMessages", ["readTurns","rehydrateImages"], _rs_readMessages);
+  $def("_rs_list", "listSessions", ["readValues","SESSION_KIND","sessionName"], _rs_list);
+  $def("_rs_save", "saveSession", ["sessionName"], _rs_save);
+  $def("_rs_unsave", "unsaveSession", [], _rs_unsave);
+  $def("_rs_dispose", "disposeSession", ["unsaveSession"], _rs_dispose);
+  $def("_rs_storable", "storableMessages", [], _rs_storable);
+  $def("_rs_test_roundtrip", "test_session_roundtrip", ["createSessionLog","appendTurn","readMessages","readTurns","listSessions","saveSession","unsaveSession","disposeSession","sessionName","runtime","expect"], _rs_test_roundtrip);
+  $def("_rs_test_storable", "test_storableMessages", ["storableMessages","expect"], _rs_test_storable);
+  main.define("realize", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("realize", _));
+  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
+  main.define("createFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("createFileAttachment", _));
+  main.define("setFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("setFileAttachment", _));
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone", "@variable"], (_, v) => v.import("expect", _));
+  return main;
+}</script>" must not appear literally. In JSON output "<" only occurs inside
+// strings, where < is equivalent.
+value => JSON.stringify(value).replace(/</g, "\\u003c")
+)};
+const _rs_newId = function _newSessionId(){return(
+(date = new Date()) => {
+  const p = n => String(n).padStart(2, "0");
+  const stamp = `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}-${p(date.getHours())}${p(date.getMinutes())}`;
+  return stamp + "-" + Math.random().toString(36).slice(2, 6);
+}
+)};
+const _rs_readValues = function _readValues(){return(
+// Resolve cells of a module by name, without leaving an observer behind.
+(module, names) => new Promise((resolve, reject) => {
+  let v = null;
+  const once = f => x => { f(x); window.queueMicrotask(() => { if (v) { v.delete(); v = null; } }); };
+  v = module.variable({ pending() {}, fulfilled: once(resolve), rejected: once(reject) })
+    .define(names, (...xs) => xs);
+})
+)};
+const _rs_defineLiteral = function _defineLiteral(realize,encodeLiteral){return(
+async (runtime, module, name, value) => {
+  const [fn] = await realize([`function _${name}(){return(\n${encodeLiteral(value)}\n)}`], runtime);
+  const existing = [...runtime._variables].find(v => v._module === module && v._name === name && v._type === 1);
+  (existing ?? module.variable({ pending() {}, fulfilled() {}, rejected() {} })).define(name, [], fn);
+}
+)};
+const _rs_turnNumbers = function _turnNumbers(){return(
+(runtime, module) => [...runtime._variables]
+  .filter(v => v._module === module && v._type === 1 && /^turn_\d+$/.test(v._name))
+  .map(v => Number(v._name.slice(5)))
+  .sort((a, b) => a - b)
+)};
+const _rs_open = function _openSessionLog(readValues,turnNumbers,SESSION_KIND){return(
+async (runtime, module) => {
+  const [meta] = await readValues(module, ["session_meta"]);
+  if (meta?.kind !== SESSION_KIND) throw new Error("not a robocoop-5 session module");
+  const nums = turnNumbers(runtime, module);
+  return { runtime, module, meta, nextTurn: (nums.at(-1) ?? 0) + 1 };
+}
+)};
+const _rs_create = function _createSessionLog(newSessionId,defineLiteral,SESSION_KIND,openSessionLog){return(
+async (runtime, { id = newSessionId(), title = "", model = null, profile = "default" } = {}) => {
+  const module = runtime.module();
+  const meta = { kind: SESSION_KIND, version: 1, id, created: new Date().toISOString(), title, model, profile };
+  await defineLiteral(runtime, module, "session_meta", meta);
+  return openSessionLog(runtime, module);
+}
+)};
+const _rs_extImages = function _externaliseImages(createFileAttachment,setFileAttachment){return(
+// data: image parts become attachments of the session module; the message keeps only the name.
+async (log, turn, messages) => {
+  let k = 0;
+  const part = async p => {
+    const url = p?.type === "image_url" && p.image_url?.url;
+    if (typeof url !== "string" || !url.startsWith("data:")) return p;
+    const blob = await (await window.fetch(url)).blob();
+    const ext = (blob.type.split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "");
+    const name = `${turn}_${k++}.${ext}`;
+    await setFileAttachment(createFileAttachment(window.URL.createObjectURL(blob), name, blob.type), log.module);
+    return { type: "image_attachment", name, mimeType: blob.type };
+  };
+  const out = [];
+  for (const m of messages)
+    out.push(Array.isArray(m.content) ? { ...m, content: await Promise.all(m.content.map(part)) } : m);
+  return out;
+}
+)};
+const _rs_rehydrate = function _rehydrateImages(readValues){return(
+async (log, messages) => {
+  if (!messages.some(m => Array.isArray(m.content) && m.content.some(p => p?.type === "image_attachment"))) return messages;
+  const [FA] = await readValues(log.module, ["FileAttachment"]);
+  const dataUrl = blob => new Promise((resolve, reject) => {
+    const r = new window.FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+  const part = async p => p?.type === "image_attachment"
+    ? { type: "image_url", image_url: { url: await dataUrl(await FA(p.name).blob()) } }
+    : p;
+  return Promise.all(messages.map(async m =>
+    Array.isArray(m.content) ? { ...m, content: await Promise.all(m.content.map(part)) } : m));
+}
+)};
+const _rs_append = function _appendTurn(turnName,externaliseImages,defineLiteral){return(
+// One new cell per turn; earlier turn cells are never redefined. The number is reserved before the
+// first await so concurrent appends keep their order.
+async (log, { messages, status = "complete", error = null, at = new Date().toISOString() }) => {
+  const name = turnName(log.nextTurn++);
+  const stored = await externaliseImages(log, name, messages);
+  await defineLiteral(log.runtime, log.module, name, { at, status, error, messages: stored });
+  return name;
+}
+)};
+const _rs_readTurns = function _readTurns(turnNumbers,turnName,readValues){return(
+async log => {
+  const names = turnNumbers(log.runtime, log.module).map(turnName);
+  return names.length ? readValues(log.module, names) : [];
+}
+)};
+const _rs_readMessages = function _readMessages(readTurns,rehydrateImages){return(
+async log => rehydrateImages(log, (await readTurns(log)).flatMap(t => t.messages))
+)};
+const _rs_list = function _listSessions(readValues,SESSION_KIND,sessionName){return(
+// Reflection, no index: every module holding a session_meta cell of this kind is a session; it is
+// saved iff it is a main.
+async runtime => {
+  const modules = new Set();
+  for (const v of runtime._variables)
+    if (v._name === "session_meta" && v._type === 1) modules.add(v._module);
+  const mainName = new Map([...runtime.mains].map(([n, m]) => [m, n]));
+  const out = [];
+  for (const module of modules) {
+    let meta;
+    try { [meta] = await readValues(module, ["session_meta"]); } catch (e) { continue; }
+    if (meta?.kind !== SESSION_KIND) continue;
+    out.push({ id: meta.id, meta, module, saved: mainName.has(module), name: mainName.get(module) ?? sessionName(meta.id) });
+  }
+  return out.sort((a, b) => String(b.meta.created).localeCompare(String(a.meta.created)));
+}
+)};
+const _rs_save = function _saveSession(sessionName){return(
+log => { log.runtime.mains.set(sessionName(log.meta.id), log.module); return log; }
+)};
+const _rs_unsave = function _unsaveSession(){return(
+log => {
+  for (const [n, m] of [...log.runtime.mains]) if (m === log.module) log.runtime.mains.delete(n);
+  return log;
+}
+)};
+const _rs_dispose = function _disposeSession(unsaveSession){return(
+log => {
+  unsaveSession(log);
+  for (const v of [...log.runtime._variables]) if (v._module === log.module && v._type === 1) v.delete();
+}
+)};
+const _rs_storable = function _storableMessages(){return(
+// The part of a turn worth keeping: messages added since `before` (a Set of message objects taken before
+// send), minus the system prompt (send() re-adds it) and <environment> context blocks (regenerated
+// every turn, and they carry the page URL).
+(messages, before) => messages.filter((m, i) =>
+  !before.has(m) &&
+  !(i === 0 && m.role === "system") &&
+  !(m.role === "system" && typeof m.content === "string" && m.content.startsWith("<environment")))
+)};
+const _rs_test_roundtrip = async function _test_session_roundtrip(createSessionLog,appendTurn,readMessages,readTurns,listSessions,saveSession,unsaveSession,disposeSession,sessionName,runtime,expect){
+  const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+  const log = await createSessionLog(runtime, { title: "test" });
+  try {
+    const t1 = [
+      { role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: png } }] },
+      { role: "assistant", content: "it has </script> in it" }
+    ];
+    const t2 = [{ role: "user", content: "again" }, { role: "assistant", content: "ok" }];
+    expect(await appendTurn(log, { messages: t1 })).toBe("turn_0001");
+    const first = [...runtime._variables].find(v => v._module === log.module && v._name === "turn_0001")._definition;
+    expect(await appendTurn(log, { messages: t2, status: "aborted", error: "stopped" })).toBe("turn_0002");
+    // append-only: the earlier turn's definition is untouched
+    expect([...runtime._variables].find(v => v._module === log.module && v._name === "turn_0001")._definition).toBe(first);
+    expect(String(first)).not.toContain("</script>");
+    // PutGet: reading back gives exactly what was appended, image rehydrated
+    expect(await readMessages(log)).toEqual([...t1, ...t2]);
+    const turns = await readTurns(log);
+    expect(turns.map(t => t.status)).toEqual(["complete", "aborted"]);
+    expect(turns[0].messages[0].content[1]).toEqual({ type: "image_attachment", name: "turn_0001_0.png", mimeType: "image/png" });
+    // saved iff main
+    const find = async () => (await listSessions(runtime)).find(s => s.module === log.module);
+    expect((await find()).saved).toBe(false);
+    saveSession(log);
+    expect(runtime.mains.get(sessionName(log.meta.id))).toBe(log.module);
+    expect((await find()).saved).toBe(true);
+    unsaveSession(log);
+    expect((await find()).saved).toBe(false);
+    return "round trip, append-only, image attachment, save/unsave";
+  } finally {
+    disposeSession(log);
+  }
+};
+const _rs_test_storable = function _test_storableMessages(storableMessages,expect){
+  const sys = { role: "system", content: "prompt" };
+  const old = { role: "user", content: "earlier" };
+  const env = { role: "system", content: "<environment scope=\"turn\">x</environment>" };
+  const watch = { role: "system", content: "Watch updates: spec 3/3" };
+  const u = { role: "user", content: "now" };
+  const a = { role: "assistant", content: "done" };
+  expect(storableMessages([sys, old, env, u, watch, a], new Set([old]))).toEqual([u, watch, a]);
+  return "drops prompt, earlier turns and environment blocks; keeps notices";
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+
+  main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
+  main.define("module @tomlarkworthy/fileattachments", async () => runtime.module((await import("/@tomlarkworthy/fileattachments.js?v=4")).default));
+  main.define("module @tomlarkworthy/jest-expect-standalone", async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
+  $def("_rs_doc", null, ["md"], _rs_doc);
+  $def("_rs_kind", "SESSION_KIND", [], _rs_kind);
+  $def("_rs_ns", "SESSION_NAMESPACE", [], _rs_ns);
+  $def("_rs_sessionName", "sessionName", ["SESSION_NAMESPACE"], _rs_sessionName);
+  $def("_rs_turnName", "turnName", [], _rs_turnName);
+  $def("_rs_encode", "encodeLiteral", [], _rs_encode);
+  $def("_rs_newId", "newSessionId", [], _rs_newId);
+  $def("_rs_readValues", "readValues", [], _rs_readValues);
+  $def("_rs_defineLiteral", "defineLiteral", ["realize","encodeLiteral"], _rs_defineLiteral);
+  $def("_rs_turnNumbers", "turnNumbers", [], _rs_turnNumbers);
+  $def("_rs_open", "openSessionLog", ["readValues","turnNumbers","SESSION_KIND"], _rs_open);
+  $def("_rs_create", "createSessionLog", ["newSessionId","defineLiteral","SESSION_KIND","openSessionLog"], _rs_create);
+  $def("_rs_extImages", "externaliseImages", ["createFileAttachment","setFileAttachment"], _rs_extImages);
+  $def("_rs_rehydrate", "rehydrateImages", ["readValues"], _rs_rehydrate);
+  $def("_rs_append", "appendTurn", ["turnName","externaliseImages","defineLiteral"], _rs_append);
+  $def("_rs_readTurns", "readTurns", ["turnNumbers","turnName","readValues"], _rs_readTurns);
+  $def("_rs_readMessages", "readMessages", ["readTurns","rehydrateImages"], _rs_readMessages);
+  $def("_rs_list", "listSessions", ["readValues","SESSION_KIND","sessionName"], _rs_list);
+  $def("_rs_save", "saveSession", ["sessionName"], _rs_save);
+  $def("_rs_unsave", "unsaveSession", [], _rs_unsave);
+  $def("_rs_dispose", "disposeSession", ["unsaveSession"], _rs_dispose);
+  $def("_rs_storable", "storableMessages", [], _rs_storable);
+  $def("_rs_test_roundtrip", "test_session_roundtrip", ["createSessionLog","appendTurn","readMessages","readTurns","listSessions","saveSession","unsaveSession","disposeSession","sessionName","runtime","expect"], _rs_test_roundtrip);
+  $def("_rs_test_storable", "test_storableMessages", ["storableMessages","expect"], _rs_test_storable);
+  main.define("realize", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("realize", _));
+  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
+  main.define("createFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("createFileAttachment", _));
+  main.define("setFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("setFileAttachment", _));
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone", "@variable"], (_, v) => v.import("expect", _));
+  return main;
+}</script>
+
 <!-- Bootloader -->
 <script id="bootconf.json"
         type="text/plain"
