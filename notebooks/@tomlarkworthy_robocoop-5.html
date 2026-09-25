@@ -4727,7 +4727,54 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
     }).join('  \xB7  ');
     return d;
   };
-  const cacheKey = m => String(m.content ?? '') + '|' + (Array.isArray(m.tool_calls) ? m.tool_calls.length : 0);
+  const cacheKey = m => m.role === 'user'
+    ? 'u|' + rc5_controller.nodeOf(m) + '|' + rc5_controller.siblings(entry, rc5_controller.nodeOf(m)).join(',')
+    : String(m.content ?? '') + '|' + (Array.isArray(m.tool_calls) ? m.tool_calls.length : 0);
+  // Turns form a tree: a committed user message can be edited (a new sibling branch) or its siblings shown.
+  const afterCheckout = () => {
+    thinkReset();
+    errors.length = 0;
+    lastOutcome = null;
+    renderBar();
+    render();
+  };
+  const branchControls = m => {
+    const id = rc5_controller.nodeOf(m);
+    if (!id) return null;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;justify-content:flex-end;gap:6px;align-items:center;color:' + C.muted + ';font-size:11px;padding:0 4px';
+    const btn = (label, title, f) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.title = title;
+      b.style.cssText = 'background:none;border:0;color:inherit;cursor:pointer;font:inherit;padding:0 2px';
+      b.addEventListener('click', async () => {
+        if (busy) return;
+        await f();
+        afterCheckout();
+      });
+      return b;
+    };
+    const sibs = rc5_controller.siblings(entry, id);
+    if (sibs.length > 1) {
+      const k = sibs.indexOf(id);
+      const pos = document.createElement('span');
+      pos.textContent = (k + 1) + '/' + sibs.length;
+      row.append(
+        btn('\u2039', 'Previous branch', () => k > 0 && rc5_controller.showBranch(entry, sibs[k - 1])),
+        pos,
+        btn('\u203A', 'Next branch', () => k < sibs.length - 1 && rc5_controller.showBranch(entry, sibs[k + 1])));
+    }
+    row.append(btn('\u270E edit', 'Edit and resend: a new branch from here, the original stays in the session', async () => {
+      await rc5_controller.forkBefore(entry, m);
+      const parts = Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content ?? '') }];
+      ta.value = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
+      pendingImages.push(...parts.filter(p => p?.type === 'image_url').map(p => p.image_url.url));
+      renderThumbs();
+      ta.focus();
+    }));
+    return row;
+  };
   const renderMsg = m => {
     // Injected situational context: shown as a muted collapsible line so the human can audit exactly
     // what the agent was told. Other system messages (nudges, watch updates) stay hidden.
@@ -4744,8 +4791,15 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
       det.append(sum, pre);
       return det;
     }
-    if (m.role === 'user')
-      return bubble('right', C.user, renderContent(m.content));
+    if (m.role === 'user') {
+      const b = bubble('right', C.user, renderContent(m.content));
+      const row = branchControls(m);
+      if (!row) return b;
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex;flex-direction:column;gap:2px';
+      wrap.append(b, row);
+      return wrap;
+    }
     if (m.role === 'assistant') {
       const parts = [];
       if (m.content) {
@@ -4777,7 +4831,7 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
         desired.push(thinkEl);
       const c = msgCache.get(m);
       let wrap;
-      if (c && (m.role === 'user' || c.key === cacheKey(m)))
+      if (c && c.key === cacheKey(m))
         wrap = c.wrap;  // unchanged → reuse
       else {
         wrap = renderMsg(m);
@@ -43701,7 +43755,7 @@ export default function define(runtime, observer) {
 const _rs_doc = function _doc(md){return(
 md`# robocoop-5 sessions
 
-A session log is a module with a <code>session_meta</code> cell and one <code>turn_NNNN</code> cell per finished turn. It is saved when it is in <code>runtime.mains</code>, and nowhere else. Images in messages are stored as file attachments of the session module. Design and evidence: <code>plan/robocoop-5-multi-session.md</code>.`
+A session log is a module with a <code>session_meta</code> cell and one <code>turn_…</code> cell per finished turn. A turn cell names its <code>parent</code> turn, so the turns form a tree: sending from an earlier point starts a branch and leaves the old one in place. Cell names are unique ids, not a sequence. On load the turn with the latest <code>created</code> time is the head and its ancestors are the transcript. A log is saved when it is in <code>runtime.mains</code>, and nowhere else. Images in messages are stored as file attachments of the session module. Design and evidence: <code>plan/robocoop-5-multi-session.md</code>.`
 )};
 const _rs_kind = function _SESSION_KIND(){return(
 "robocoop-5/session"
@@ -43712,8 +43766,9 @@ const _rs_ns = function _SESSION_NAMESPACE(){return(
 const _rs_sessionName = function _sessionName(SESSION_NAMESPACE){return(
 id => SESSION_NAMESPACE + id
 )};
-const _rs_turnName = function _turnName(){return(
-n => "turn_" + String(n).padStart(4, "0")
+const _rs_turnName = function _newTurnName(){return(
+// Unique, not sequential: two writers (or two branches) never need to agree on a next number.
+() => "turn_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 6)
 )};
 const _rs_encode = function _encodeLiteral(){return(
 // Cell source is compiled via a <script type="module-shim"> and exported inside a <script> block, so a
@@ -43768,24 +43823,22 @@ async (runtime, module, name, value) => {
   (existing ?? module.variable({ pending() {}, fulfilled() {}, rejected() {} })).define(name, [], fn);
 }
 )};
-const _rs_turnNumbers = function _turnNumbers(){return(
+const _rs_turnNumbers = function _turnNames(){return(
 (runtime, module) => [...runtime._variables]
-  .filter(v => v._module === module && v._type === 1 && /^turn_\d+$/.test(v._name))
-  .map(v => Number(v._name.slice(5)))
-  .sort((a, b) => a - b)
+  .filter(v => v._module === module && v._type === 1 && /^turn_[a-z0-9_]+$/.test(v._name))
+  .map(v => v._name)
 )};
-const _rs_open = function _openSessionLog(peekValues,turnNumbers,SESSION_KIND){return(
+const _rs_open = function _openSessionLog(peekValues,SESSION_KIND){return(
 async (runtime, module) => {
   const [meta] = await peekValues(runtime, module, ["session_meta"]);
   if (meta?.kind !== SESSION_KIND) throw new Error("not a robocoop-5 session module");
-  const nums = turnNumbers(runtime, module);
-  return { runtime, module, meta, nextTurn: (nums.at(-1) ?? 0) + 1 };
+  return { runtime, module, meta };
 }
 )};
 const _rs_create = function _createSessionLog(newSessionId,defineLiteral,SESSION_KIND,openSessionLog){return(
 async (runtime, { id = newSessionId(), title = "", model = null, profile = "default" } = {}) => {
   const module = runtime.module();
-  const meta = { kind: SESSION_KIND, version: 1, id, created: new Date().toISOString(), title, model, profile };
+  const meta = { kind: SESSION_KIND, version: 2, id, created: new Date().toISOString(), title, model, profile };
   await defineLiteral(runtime, module, "session_meta", meta);
   return openSessionLog(runtime, module);
 }
@@ -43826,24 +43879,53 @@ async (log, messages) => {
     Array.isArray(m.content) ? { ...m, content: await Promise.all(m.content.map(part)) } : m));
 }
 )};
-const _rs_append = function _appendTurn(turnName,externaliseImages,defineLiteral){return(
-// One new cell per turn; earlier turn cells are never redefined. The number is reserved before the
-// first await so concurrent appends keep their order.
-async (log, { messages, status = "complete", error = null, at = new Date().toISOString() }) => {
-  const name = turnName(log.nextTurn++);
-  const stored = await externaliseImages(log, name, messages);
-  await defineLiteral(log.runtime, log.module, name, { at, status, error, messages: stored });
-  return name;
+const _rs_append = function _appendTurn(newTurnName,externaliseImages,defineLiteral){return(
+// One new cell per turn, never redefined. `parent` is the turn this one was sent after (null at the root).
+async (log, { parent = null, messages, status = "complete", error = null, created = new Date().toISOString() }) => {
+  const id = newTurnName();
+  const stored = await externaliseImages(log, id, messages);
+  await defineLiteral(log.runtime, log.module, id, { id, parent, created, completed: new Date().toISOString(), status, error, messages: stored });
+  return id;
 }
 )};
-const _rs_readTurns = function _readTurns(turnNumbers,turnName,peekValues){return(
+const _rs_readTurns = function _readTurns(turnNames,peekValues){return(
+// Every turn of the log, as a Map id -> turn. Unordered: order comes from parent links and timestamps.
 async log => {
-  const names = turnNumbers(log.runtime, log.module).map(turnName);
-  return names.length ? peekValues(log.runtime, log.module, names) : [];
+  const names = turnNames(log.runtime, log.module);
+  const turns = names.length ? await peekValues(log.runtime, log.module, names) : [];
+  return new Map(turns.map((t, i) => [names[i], { ...t, id: names[i] }]));
 }
 )};
-const _rs_readMessages = function _readMessages(readTurns,rehydrateImages){return(
-async log => rehydrateImages(log, (await readTurns(log)).flatMap(t => t.messages))
+const _rs_latest = function _latestTurn(){return(
+// The default head: the most recently sent turn, optionally within the subtree under `under`.
+(turns, under = undefined) => {
+  let best = null;
+  for (const t of turns.values()) {
+    if (under !== undefined) {
+      let a = t, seen = new Set();
+      while (a && a.id !== under && !seen.has(a.id)) { seen.add(a.id); a = turns.get(a.parent); }
+      if (!a) continue;
+    }
+    if (!best || String(t.created) > String(best.created) || (t.created === best.created && t.id > best.id)) best = t;
+  }
+  return best?.id ?? null;
+}
+)};
+const _rs_chain = function _turnChain(){return(
+// Root .. head. A missing parent ends the chain (the log was cut), a repeated id stops a cycle.
+(turns, head) => {
+  const out = [], seen = new Set();
+  for (let t = turns.get(head); t && !seen.has(t.id); t = turns.get(t.parent)) { seen.add(t.id); out.push(t); }
+  return out.reverse();
+}
+)};
+const _rs_readMessages = function _readMessages(readTurns,latestTurn,turnChain,rehydrateImages){return(
+// The transcript ending at `head` (default: the latest turn), with images rehydrated.
+async (log, head = undefined) => {
+  const turns = await readTurns(log);
+  const chain = turnChain(turns, head === undefined ? latestTurn(turns) : head);
+  return rehydrateImages(log, chain.flatMap(t => t.messages));
+}
 )};
 const _rs_list = function _listSessions(peekValues,SESSION_KIND,sessionName){return(
 // Reflection, no index: every module holding a session_meta cell of this kind is a session; it is
@@ -43896,17 +43978,25 @@ const _rs_test_roundtrip = async function _test_session_roundtrip(createSessionL
       { role: "assistant", content: "it has <" + "/script> in it" }
     ];
     const t2 = [{ role: "user", content: "again" }, { role: "assistant", content: "ok" }];
-    expect(await appendTurn(log, { messages: t1 })).toBe("turn_0001");
-    const first = [...runtime._variables].find(v => v._module === log.module && v._name === "turn_0001")._definition;
-    expect(await appendTurn(log, { messages: t2, status: "aborted", error: "stopped" })).toBe("turn_0002");
+    const t3 = [{ role: "user", content: "instead" }, { role: "assistant", content: "branch" }];
+    const def = id => [...runtime._variables].find(v => v._module === log.module && v._name === id)._definition;
+    const id1 = await appendTurn(log, { messages: t1, created: "2026-09-25T10:00:00.000Z" });
+    expect(id1).toMatch(/^turn_[a-z0-9]+_[a-z0-9]+$/);
+    const first = def(id1);
+    const id2 = await appendTurn(log, { parent: id1, messages: t2, status: "aborted", error: "stopped", created: "2026-09-25T10:01:00.000Z" });
     // append-only: the earlier turn's definition is untouched
-    expect([...runtime._variables].find(v => v._module === log.module && v._name === "turn_0001")._definition).toBe(first);
+    expect(def(id1)).toBe(first);
     expect(String(first)).not.toContain("<" + "/script>");
     // PutGet: reading back gives exactly what was appended, image rehydrated
     expect(await readMessages(log)).toEqual([...t1, ...t2]);
+    // a second child of id1 is a branch; the latest turn is the default head, the other stays addressable
+    const id3 = await appendTurn(log, { parent: id1, messages: t3, created: "2026-09-25T10:02:00.000Z" });
+    expect(await readMessages(log)).toEqual([...t1, ...t3]);
+    expect(await readMessages(log, id2)).toEqual([...t1, ...t2]);
+    expect(await readMessages(log, null)).toEqual([]);
     const turns = await readTurns(log);
-    expect(turns.map(t => t.status)).toEqual(["complete", "aborted"]);
-    expect(turns[0].messages[0].content[1]).toEqual({ type: "image_attachment", name: "turn_0001_0.png", mimeType: "image/png" });
+    expect([...turns.values()].map(t => [t.id, t.parent, t.status]).sort()).toEqual([[id1, null, "complete"], [id2, id1, "aborted"], [id3, id1, "complete"]].sort());
+    expect(turns.get(id1).messages[0].content[1]).toEqual({ type: "image_attachment", name: id1 + "_0.png", mimeType: "image/png" });
     // saved iff main
     const find = async () => (await listSessions(runtime)).find(s => s.module === log.module);
     expect((await find()).saved).toBe(false);
@@ -43915,7 +44005,7 @@ const _rs_test_roundtrip = async function _test_session_roundtrip(createSessionL
     expect((await find()).saved).toBe(true);
     unsaveSession(log);
     expect((await find()).saved).toBe(false);
-    return "round trip, append-only, image attachment, save/unsave";
+    return "round trip, append-only, branch + latest head, image attachment, save/unsave";
   } finally {
     disposeSession(log);
   }
@@ -43931,14 +44021,16 @@ const _rs_test_storable = function _test_storableMessages(storableMessages,expec
   return "drops prompt, earlier turns and environment blocks; keeps notices";
 };
 
-const _rs_controller = function _createSessionController(listSessions,openSessionLog,createSessionLog,appendTurn,readMessages,saveSession,unsaveSession,storableMessages,applyProfile,PROFILES){return(
+const _rs_controller = function _createSessionController(listSessions,openSessionLog,createSessionLog,appendTurn,readTurns,latestTurn,turnChain,rehydrateImages,saveSession,unsaveSession,storableMessages,applyProfile,PROFILES){return(
 // The facade's state: every session known to this page, which one is shown, and the one path that
 // commits a turn. Turns stream into session.messages as before; the log is written once, when send()
-// settles, so a background turn still commits after the user has switched away.
+// settles, so a background turn still commits after the user has switched away. An entry's `head` is the
+// turn its transcript ends at; the next turn is committed as its child.
 ({ runtime, makeSession, initial = null, profiles = PROFILES }) => {
   const entries = [];
   const build = id => makeSession({ toolsTransform: ts => applyProfile(ts, profiles[id] ?? profiles.default) });
   const listeners = new Set();
+  const nodeOf = new WeakMap();  // stored message object -> id of the turn it belongs to
   const emit = () => { for (const f of listeners) try { f(ctl); } catch (e) { console.error(e); } };
   const titleOf = input => {
     const t = typeof input === "string" ? input : input?.text || "";
@@ -43948,15 +44040,48 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
     entry.log ??= await createSessionLog(runtime, { id: entry.id ?? undefined, title: entry.title, profile: entry.profile });
     return entry.log;
   };
+  // Point the entry's session at `head` (undefined = the latest turn): its messages become that chain.
+  const load = async (e, head) => {
+    e.turns = e.log ? await readTurns(e.log) : new Map();
+    if (head === undefined) head = latestTurn(e.turns);
+    const chain = turnChain(e.turns, head);
+    const msgs = await rehydrateImages(e.log, chain.flatMap(t => t.messages));
+    let k = 0;
+    for (const t of chain) for (const _ of t.messages) nodeOf.set(msgs[k++], t.id);
+    e.session.messages.length = 0;
+    e.session.messages.push(...msgs);
+    e.head = head;
+  };
   const ctl = {
     entries,
     active: null,
+    nodeOf: m => nodeOf.get(m) ?? null,
+    // Turns sharing `id`'s parent, oldest first: the branches a user message could show.
+    siblings(e, id) {
+      const t = e.turns?.get(id);
+      if (!t) return [];
+      return [...e.turns.values()].filter(x => x.parent === t.parent)
+        .sort((a, b) => String(a.created).localeCompare(String(b.created))).map(x => x.id);
+    },
+    async checkout(e, head) {
+      if (e.busy) throw new Error("session is busy");
+      await load(e, head);
+      emit();
+      return e;
+    },
+    // Back up to just before the turn holding message `m`; the next send starts a sibling branch.
+    forkBefore(e, m) {
+      const id = nodeOf.get(m);
+      return ctl.checkout(e, id ? (e.turns.get(id)?.parent ?? null) : e.head);
+    },
+    // Show the branch rooted at turn `id`, at its most recent turn.
+    showBranch(e, id) { return ctl.checkout(e, latestTurn(e.turns, id)); },
     onChange(f) { listeners.add(f); return () => listeners.delete(f); },
     async refresh() {
       for (const s of await listSessions(runtime)) {
         let e = entries.find(x => x.log?.module === s.module);
         if (!e) {
-          e = { id: s.id, title: s.meta.title || s.id, created: s.meta.created, profile: s.meta.profile || "default", session: null, log: await openSessionLog(runtime, s.module), saved: s.saved, busy: false };
+          e = { id: s.id, title: s.meta.title || s.id, created: s.meta.created, profile: s.meta.profile || "default", session: null, log: await openSessionLog(runtime, s.module), saved: s.saved, busy: false, head: null, turns: new Map() };
           entries.push(e);
         }
         e.saved = s.saved;
@@ -43967,7 +44092,7 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
     },
     create({ profile = "default", session = build(profile), activate = true } = {}) {
       const created = new Date().toISOString();
-      const e = { id: null, title: "new session", created, profile, session, log: null, saved: false, busy: false };
+      const e = { id: null, title: "new session", created, profile, session, log: null, saved: false, busy: false, head: null, turns: new Map() };
       entries.unshift(e);
       if (activate) ctl.active = e;
       emit();
@@ -43976,7 +44101,7 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
     async open(e) {
       if (!e.session) {
         e.session = build(e.profile);
-        e.session.messages.push(...await readMessages(e.log));
+        await load(e, undefined);
       }
       ctl.active = e;
       emit();
@@ -43990,6 +44115,7 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
     },
     async send(e, input, callbacks) {
       const before = new Set(e.session.messages);
+      const parent = e.head, created = new Date().toISOString();
       if (!e.log && e.title === "new session") e.title = titleOf(input);
       e.busy = true;
       emit();
@@ -44002,7 +44128,12 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
         throw err;
       } finally {
         const messages = storableMessages(e.session.messages, before);
-        if (messages.length) await appendTurn(await ensureLog(e), { messages, status, error });
+        if (messages.length) {
+          const id = await appendTurn(await ensureLog(e), { parent, messages, status, error, created });
+          for (const m of messages) nodeOf.set(m, id);
+          e.turns.set(id, { id, parent, created });
+          e.head = id;
+        }
         e.id = e.log?.meta.id ?? e.id;
         e.busy = false;
         emit();
@@ -44059,7 +44190,24 @@ const _rs_test_controller = async function _test_session_controller(createSessio
     // the failed send committed nothing (it pushed no messages) and did not break the next one
     await b.send(found, "second");
     expect(found.session.messages.length).toBe(4);
-    return "create, commit on settle, save, rediscover, resume, continue";
+    // edit-and-resend: back up to before "second", send something else -> a sibling branch
+    const second = found.session.messages[2];
+    const secondId = b.nodeOf(second);
+    await b.forkBefore(found, second);
+    expect(found.session.messages.map(m => m.content)).toEqual(["hello there", "re: hello there"]);
+    await new Promise(r => window.setTimeout(r, 5));
+    await b.send(found, "third");
+    const thirdId = found.head;
+    expect(b.siblings(found, thirdId)).toEqual([secondId, thirdId]);
+    // a reload opens the latest branch; the older one is still one step away
+    const c = createSessionController({ runtime, makeSession: fake });
+    await c.refresh();
+    const again = c.entries.find(x => x.log.module === e.log.module);
+    await c.open(again);
+    expect(again.session.messages.map(m => m.content)).toEqual(["hello there", "re: hello there", "third", "re: third"]);
+    await c.showBranch(again, secondId);
+    expect(again.session.messages.map(m => m.content)).toEqual(["hello there", "re: hello there", "second", "re: second"]);
+    return "create, commit on settle, save, rediscover, resume, continue, fork, reopen at latest, switch branch";
   } finally {
     for (const l of logs) disposeSession(l);
   }
@@ -44146,26 +44294,28 @@ export default function define(runtime, observer) {
   $def("_rs_kind", "SESSION_KIND", [], _rs_kind);
   $def("_rs_ns", "SESSION_NAMESPACE", [], _rs_ns);
   $def("_rs_sessionName", "sessionName", ["SESSION_NAMESPACE"], _rs_sessionName);
-  $def("_rs_turnName", "turnName", [], _rs_turnName);
+  $def("_rs_turnName", "newTurnName", [], _rs_turnName);
   $def("_rs_encode", "encodeLiteral", [], _rs_encode);
   $def("_rs_newId", "newSessionId", [], _rs_newId);
   $def("_rs_readValues", "readValues", [], _rs_readValues);
   $def("_rs_defineLiteral", "defineLiteral", ["realize","encodeLiteral"], _rs_defineLiteral);
-  $def("_rs_turnNumbers", "turnNumbers", [], _rs_turnNumbers);
+  $def("_rs_turnNumbers", "turnNames", [], _rs_turnNumbers);
   $def("_rs_peek", "peekValues", ["readValues"], _rs_peek);
-  $def("_rs_open", "openSessionLog", ["peekValues","turnNumbers","SESSION_KIND"], _rs_open);
+  $def("_rs_open", "openSessionLog", ["peekValues","SESSION_KIND"], _rs_open);
   $def("_rs_create", "createSessionLog", ["newSessionId","defineLiteral","SESSION_KIND","openSessionLog"], _rs_create);
   $def("_rs_extImages", "externaliseImages", ["createFileAttachment","setFileAttachment"], _rs_extImages);
   $def("_rs_rehydrate", "rehydrateImages", ["readValues"], _rs_rehydrate);
-  $def("_rs_append", "appendTurn", ["turnName","externaliseImages","defineLiteral"], _rs_append);
-  $def("_rs_readTurns", "readTurns", ["turnNumbers","turnName","peekValues"], _rs_readTurns);
-  $def("_rs_readMessages", "readMessages", ["readTurns","rehydrateImages"], _rs_readMessages);
+  $def("_rs_append", "appendTurn", ["newTurnName","externaliseImages","defineLiteral"], _rs_append);
+  $def("_rs_readTurns", "readTurns", ["turnNames","peekValues"], _rs_readTurns);
+  $def("_rs_latest", "latestTurn", [], _rs_latest);
+  $def("_rs_chain", "turnChain", [], _rs_chain);
+  $def("_rs_readMessages", "readMessages", ["readTurns","latestTurn","turnChain","rehydrateImages"], _rs_readMessages);
   $def("_rs_list", "listSessions", ["peekValues","SESSION_KIND","sessionName"], _rs_list);
   $def("_rs_save", "saveSession", ["sessionName"], _rs_save);
   $def("_rs_unsave", "unsaveSession", [], _rs_unsave);
   $def("_rs_dispose", "disposeSession", ["unsaveSession"], _rs_dispose);
   $def("_rs_storable", "storableMessages", [], _rs_storable);
-  $def("_rs_controller", "createSessionController", ["listSessions","openSessionLog","createSessionLog","appendTurn","readMessages","saveSession","unsaveSession","storableMessages","applyProfile","PROFILES"], _rs_controller);
+  $def("_rs_controller", "createSessionController", ["listSessions","openSessionLog","createSessionLog","appendTurn","readTurns","latestTurn","turnChain","rehydrateImages","saveSession","unsaveSession","storableMessages","applyProfile","PROFILES"], _rs_controller);
   $def("_rs_test_peek", "test_peekValues", ["peekValues","defineLiteral","realize","runtime","expect"], _rs_test_peek);
   $def("_rs_test_controller", "test_session_controller", ["createSessionController","disposeSession","runtime","expect"], _rs_test_controller);
   $def("_rs_protected", "PROTECTED_MODULES", ["SESSION_NAMESPACE"], _rs_protected);
