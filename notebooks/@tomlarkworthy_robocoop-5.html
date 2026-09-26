@@ -4534,7 +4534,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelView,promptView,contextToggle,reasoningToggle,rc5_controller,toolLabel,md,summarizeTurn,invalidation,PROFILES)
+const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelView,promptView,contextToggle,reasoningToggle,rc5_controller,toolLabel,md,summarizeTurn,invalidation,PROFILES,runtime,linkTo)
 {
   // The chat is a facade over the controller's sessions; `entry`/`session` are whichever one is shown.
   let entry = rc5_controller.active;
@@ -4599,7 +4599,11 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
   const sessBar = html`<div style="display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid ${ C.border };font-size:12px"><span style="color:${ C.muted }">session</span></div>`;
   const profilePick = html`<select title="Guardrail profile for the next new session (⟲)" style="background:#010409;color:${ C.fg };border:1px solid ${ C.border };border-radius:6px;font:inherit;padding:2px 4px">${ Object.values(PROFILES).map(p => html`<option value=${ p.id }>${ p.label }</option>`) }</select>`;
   const profileEl = html`<span style="color:${ C.muted }"></span>`;
-  sessBar.append(unsnapshotted(picker, 'flex:1;min-width:0;display:flex'), profileEl, saveLabel, profilePick);
+  // A saved session is a main, so it has a name lopepage can open.
+  const sessionLink = html`<a title="Open the session module" style="color:${ C.muted };text-decoration:none;display:none">open ↗</a>`;
+  const savedName = () => entry.log && [...runtime.mains].find(([, m]) => m === entry.log.module)?.[0];
+  sessionLink.addEventListener('click', () => { const n = savedName(); if (n) sessionLink.href = linkTo(n); });
+  sessBar.append(unsnapshotted(picker, 'flex:1;min-width:0;display:flex'), profileEl, sessionLink, saveLabel, profilePick);
   root.append(sessBar);
   const renderBar = () => {
     picker.replaceChildren(...rc5_controller.entries.map((e, i) => {
@@ -4610,6 +4614,9 @@ const _ka663b = function _robocoop_5(hostSetup,contextSetup,html,keyView,modelVi
       return o;
     }));
     saveBox.checked = !!entry.saved;
+    const n = entry.saved && savedName();
+    sessionLink.style.display = n ? '' : 'none';
+    if (n) sessionLink.href = linkTo(n);
     profileEl.textContent = entry.profile && entry.profile !== 'default' ? '[' + entry.profile + ']' : '';
   };
   // ── transcript ───────────────────────────────────────────────────────────
@@ -5120,13 +5127,15 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/robocoop-5-srctools", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-srctools.js?v=4")).default));
   main.define("module @tomlarkworthy/robocoop-5-sessions", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-sessions.js?v=4")).default));
   main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
+  main.define("module @tomlarkworthy/lopepage-urls", async () => runtime.module((await import("/@tomlarkworthy/lopepage-urls.js?v=4")).default));
   main.define("module @tomlarkworthy/robocoop-5-context", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-context.js?v=4")).default));
-  $def("_ka663b", "robocoop_5", ["hostSetup","contextSetup","html","keyView","modelView","promptView","contextToggle","reasoningToggle","rc5_controller","toolLabel","md","summarizeTurn","invalidation","PROFILES"], _ka663b);
+  $def("_ka663b", "robocoop_5", ["hostSetup","contextSetup","html","keyView","modelView","promptView","contextToggle","reasoningToggle","rc5_controller","toolLabel","md","summarizeTurn","invalidation","PROFILES","runtime","linkTo"], _ka663b);
   $def("_rc5ctl", "rc5_controller", ["createSessionController","runtime","makeSession"], _rc5ctl);
   main.define("makeSession", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("makeSession", _));
   main.define("createSessionController", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("createSessionController", _));
   main.define("PROFILES", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("PROFILES", _));
   main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
+  main.define("linkTo", ["module @tomlarkworthy/lopepage-urls", "@variable"], (_, v) => v.import("linkTo", _));
   main.define("contextToggle", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("contextToggle", _));
   main.define("keyView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("keyView", _));  
   main.define("modelView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("modelView", _));  
@@ -43945,18 +43954,48 @@ async runtime => {
   return out.sort((a, b) => String(b.meta.created).localeCompare(String(a.meta.created)));
 }
 )};
-const _rs_save = function _saveSession(sessionName){return(
-log => { log.runtime.mains.set(sessionName(log.meta.id), log.module); return log; }
-)};
-const _rs_unsave = function _unsaveSession(){return(
-log => {
-  for (const [n, m] of [...log.runtime.mains]) if (m === log.module) log.runtime.mains.delete(n);
+const _rs_rehome = function _rehomeSession(peekValues,readValues,turnNames,defineLiteral,createFileAttachment,setFileAttachment){return(
+// Move a log into `target`: session_meta, every turn and the image attachments, then empty the old module.
+// Module-map and @tomlarkworthy/modules name a module when they first see it and do not rename it when it
+// later joins runtime.mains, so saving an existing module left it called "main" (CMD+K, lopepage panes).
+// A new module that is already a main is named correctly on its first scan.
+async (log, target) => {
+  const { runtime, module: from } = log;
+  const names = ["session_meta", ...turnNames(runtime, from)];
+  const values = await peekValues(runtime, from, names);
+  const images = values.flatMap(t => (t?.messages ?? []).flatMap(m =>
+    Array.isArray(m.content) ? m.content.filter(p => p?.type === "image_attachment") : []));
+  if (images.length) {
+    const [FA] = await readValues(from, ["FileAttachment"]);
+    for (const p of images) {
+      const blob = await FA(p.name).blob();
+      await setFileAttachment(createFileAttachment(window.URL.createObjectURL(blob), p.name, p.mimeType || blob.type), target);
+    }
+  }
+  for (let i = 0; i < names.length; i++) await defineLiteral(runtime, target, names[i], values[i]);
+  for (const v of [...runtime._variables]) if (v._module === from && v._type === 1) v.delete();
+  log.module = target;
   return log;
 }
 )};
-const _rs_dispose = function _disposeSession(unsaveSession){return(
+const _rs_save = function _saveSession(sessionName,createModule,rehomeSession){return(
+async log => {
+  const name = sessionName(log.meta.id);
+  if (log.runtime.mains.get(name) === log.module) return log;
+  return rehomeSession(log, createModule(name, log.runtime));
+}
+)};
+const _rs_unsave = function _unsaveSession(rehomeSession){return(
+async log => {
+  const names = [...log.runtime.mains].filter(([, m]) => m === log.module).map(([n]) => n);
+  if (!names.length) return log;
+  for (const n of names) log.runtime.mains.delete(n);
+  return rehomeSession(log, log.runtime.module());
+}
+)};
+const _rs_dispose = function _disposeSession(){return(
 log => {
-  unsaveSession(log);
+  for (const [n, m] of [...log.runtime.mains]) if (m === log.module) log.runtime.mains.delete(n);
   for (const v of [...log.runtime._variables]) if (v._module === log.module && v._type === 1) v.delete();
 }
 )};
@@ -44000,10 +44039,15 @@ const _rs_test_roundtrip = async function _test_session_roundtrip(createSessionL
     // saved iff main
     const find = async () => (await listSessions(runtime)).find(s => s.module === log.module);
     expect((await find()).saved).toBe(false);
-    saveSession(log);
+    const before = log.module;
+    await saveSession(log);
+    // saving moves the log into a module that was a main from its first variable; the old one is emptied
+    expect(log.module).not.toBe(before);
+    expect([...runtime._variables].some(v => v._module === before && v._type === 1)).toBe(false);
+    expect(await readMessages(log)).toEqual([...t1, ...t3]);
     expect(runtime.mains.get(sessionName(log.meta.id))).toBe(log.module);
     expect((await find()).saved).toBe(true);
-    unsaveSession(log);
+    await unsaveSession(log);
     expect((await find()).saved).toBe(false);
     return "round trip, append-only, branch + latest head, image attachment, save/unsave";
   } finally {
@@ -44109,7 +44153,7 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
     },
     async setSaved(e, on) {
       await ensureLog(e);
-      on ? saveSession(e.log) : unsaveSession(e.log);
+      on ? await saveSession(e.log) : await unsaveSession(e.log);
       e.saved = !!on;
       emit();
     },
@@ -44311,9 +44355,10 @@ export default function define(runtime, observer) {
   $def("_rs_chain", "turnChain", [], _rs_chain);
   $def("_rs_readMessages", "readMessages", ["readTurns","latestTurn","turnChain","rehydrateImages"], _rs_readMessages);
   $def("_rs_list", "listSessions", ["peekValues","SESSION_KIND","sessionName"], _rs_list);
-  $def("_rs_save", "saveSession", ["sessionName"], _rs_save);
-  $def("_rs_unsave", "unsaveSession", [], _rs_unsave);
-  $def("_rs_dispose", "disposeSession", ["unsaveSession"], _rs_dispose);
+  $def("_rs_rehome", "rehomeSession", ["peekValues","readValues","turnNames","defineLiteral","createFileAttachment","setFileAttachment"], _rs_rehome);
+  $def("_rs_save", "saveSession", ["sessionName","createModule","rehomeSession"], _rs_save);
+  $def("_rs_unsave", "unsaveSession", ["rehomeSession"], _rs_unsave);
+  $def("_rs_dispose", "disposeSession", [], _rs_dispose);
   $def("_rs_storable", "storableMessages", [], _rs_storable);
   $def("_rs_controller", "createSessionController", ["listSessions","openSessionLog","createSessionLog","appendTurn","readTurns","latestTurn","turnChain","rehydrateImages","saveSession","unsaveSession","storableMessages","applyProfile","PROFILES"], _rs_controller);
   $def("_rs_test_peek", "test_peekValues", ["peekValues","defineLiteral","realize","runtime","expect"], _rs_test_peek);
@@ -44326,6 +44371,7 @@ export default function define(runtime, observer) {
   $def("_rs_test_storable", "test_storableMessages", ["storableMessages","expect"], _rs_test_storable);
   main.define("realize", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("realize", _));
   main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
+  main.define("createModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("createModule", _));
   main.define("createFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("createFileAttachment", _));
   main.define("setFileAttachment", ["module @tomlarkworthy/fileattachments", "@variable"], (_, v) => v.import("setFileAttachment", _));
   main.define("expect", ["module @tomlarkworthy/jest-expect-standalone", "@variable"], (_, v) => v.import("expect", _));
