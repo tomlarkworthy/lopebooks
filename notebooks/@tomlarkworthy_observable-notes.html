@@ -13482,16 +13482,13 @@ async (attachment) => {
   return response.blob();
 }
 )};
-const _1u9tn3v = async function _Inspector(src,require)
+const _1u9tn3v = async function _Inspector(src)
 {
-  const objectURL = URL.createObjectURL(
-    new Blob([src], { type: "application/javascript" })
-  );
-  try {
-    return (await require(objectURL)).Inspector;
-  } finally {
-    URL.revokeObjectURL(objectURL); // Ensure URL is revoked after import
-  }
+  // The bundle is UMD, so evaluate it as CommonJS. Not the `require` builtin:
+  // notebook-kit's stdlib (new.observablehq.com) does not have one.
+  const cjs = { exports: {} };
+  new Function("exports", "module", await src.text())(cjs.exports, cjs);
+  return cjs.exports.Inspector;
 };
 const _b5ui8y = function _isnode(Element,Text){return(
 (value) => {
@@ -13519,7 +13516,7 @@ export default function define(runtime, observer) {
   $def("_1q5hkak", "inspect", ["Inspector"], _1q5hkak);  
   $def("_rod2q7", "src", ["unzip","FileAttachment"], _rod2q7);  
   $def("_g5fwfs", "unzip", ["Response","DecompressionStream"], _g5fwfs);  
-  $def("_1u9tn3v", "Inspector", ["src","require"], _1u9tn3v);  
+  $def("_1u9tn3v", "Inspector", ["src"], _1u9tn3v);  
   $def("_b5ui8y", "isnode", ["Element","Text"], _b5ui8y);
   return main;
 }</script>
@@ -18439,6 +18436,283 @@ Observablehq.com extensively uses native web features like links.
 Its worth keeping in mind several links might resolve to the same notebook. If the URL is changed the old name continues to resolve, and every notebook has an id which means the id based URL form always works as well.
 `
 )};
+const _421ewb2 = function _127(md){return(
+md`## The \`api.observablehq.com\` endpoints
+
+Observable has no public write API, but the endpoints the site itself uses are reachable and the
+whole read side answers **unauthenticated**. Measured 2026-09-26 against
+\`@tomlarkworthy/module-map\`; none of it is contractual, so check rather than trust.
+
+| endpoint | returns |
+|---|---|
+| \`/@user/slug.js?v=4\` | the notebook compiled to an ES module — \`export default function define(runtime, observer)\` |
+| \`/d/{documentId}.js?v=4\` | the same module, addressed by document id |
+| \`/document/@user/slug\` | the document as JSON — \`nodes\`, \`version\`, \`id\`, \`files\`, \`resolutions\` |
+| \`/api/import/@user/slug\` | \`401\`. Internal, not for you |
+
+Both open endpoints answer \`cache-control: public, max-age=30, stale-while-revalidate=30\`, so a
+push takes about half a minute to become visible — long enough to make you think the push failed.
+Only the \`.js\` endpoints carry \`access-control-allow-origin: *\`; \`/document/…\` does not, so you
+can import a notebook from anywhere in the browser but you cannot read its pin list there.`
+)};
+const _7nvfe8q = function _128(md){return(
+md`### \`v\` selects a compiler, it is not a cache buster
+
+\`v\` chooses the **output format**, and the three that work are three different artifacts. Same
+notebook, same minute (2026-09-26, \`@tomlarkworthy/module-map\`):
+
+| \`v\` | exports | dependencies | bytes |
+|---|---|---|---|
+| absent | \`notebook = {id, modules:[…]}\` — the notebook as **data** | every imported module **inlined** | 95527 |
+| \`3\` | \`function define(runtime, observer)\` | **static** \`import define1 from "/@user/dep.js?v=3&resolutions=…"\` | 42332 |
+| \`4\` | the same \`define\` | **dynamic** \`import(…)\`, inline in the import cell | 43623 |
+| \`5\` | \`{"errors":[]}\` | HTTP \`400\` | 13 |
+
+\`v=4\` is the one to run. Observable's runtime is lazy — a cell nobody observes never runs — and
+only the dynamic form lets an unobserved *import* stay unloaded too.
+
+The unversioned form is the one to **read**, and it is not a commented version of the others. It is
+a description rather than a program: a provenance header, then each module as a literal, each
+variable as \`{name, inputs, value}\` with \`value\` a real function.
+
+\`\`\`js
+// URL: https://observablehq.com/@tomlarkworthy/module-map
+// Title: Module map
+// Version: 1424
+// Runtime version: 1
+const m0 = { id: "db42ae70222a8b08@1424", variables: [
+  { inputs: ["md"], value: (function(md){return( md\`# Module map\` )}) },
+\`\`\`
+
+Nothing is imported because everything is already there — \`modules\` held all 10 for module-map:
+the host, then \`@tomlarkworthy/lopepage-urls\`, \`@tomlarkworthy/flow-queue\`,
+\`@tomlarkworthy/observablejs-toolchain\` and six more, each with its cells. That makes it the right
+endpoint for analysing a notebook and the wrong one for loading it: it is over twice the size, and
+an inlined module is identified by bare slug (\`@tomlarkworthy/flow-queue\`) where the host carries
+\`docId@version\`, so the dependency pins are gone.`
+)};
+const _3jycsac = function _129(md){return(
+md`### \`resolutions\` re-resolves the whole closure, from the importer's point of view
+
+A notebook pins its imports per document, and the pin list is readable without auth:
+
+\`\`\`sh
+curl -s https://api.observablehq.com/document/@tomlarkworthy/module-map | jq '.resolutions'
+# [{specifier: "@mootari/access-runtime", value: "e1c39d41e8e944b0@939"}, …]
+\`\`\`
+
+A value with \`@version\` is a hard pin; without one it tracks latest. Appending
+\`&resolutions=<docId>@<version>\` to a \`.js\` request asks for **that document's** view of the graph,
+which rewrites the import URLs inside the module you get back — and, because the rewritten URLs
+carry the same parameter, on down the whole closure. Measured 2026-09-26: all 7 of module-map's
+import cells, asked for as itself and then as \`@tomlarkworthy/exporter-3\`
+(\`c5bd58fe29172a81@17355\`):
+
+\`\`\`
+import("/@tomlarkworthy/flow-queue.js?v=4&resolutions=db42ae70222a8b08@1424")    as itself
+import("/@tomlarkworthy/flow-queue.js?v=4&resolutions=c5bd58fe29172a81@17355")   as exporter-3
+\`\`\`
+
+So **resolution context belongs to the importer, not to the root**. Fixing a pin in the notebook
+you are looking at does nothing for the notebooks it imports, and one stale pin anywhere on the
+path re-breaks everything below it. On new.observablehq.com the viewed notebook has no resolution
+context at all, so only the imported notebooks' maps are ever consulted.
+
+If you re-emit one of these URLs yourself, emit the pin **verbatim**:
+[es-module-shims](https://github.com/guybedford/es-module-shims) keys its registry on the URL
+string, so a percent-encoded \`%40\` is a different module and you get two copies of it.`
+)};
+const _7xkmgfl = function _130(md){return(
+md`### There is no write API, but there is a WebSocket
+
+Observable has had [an open feature request for a write API since
+2021](https://talk.observablehq.com/t/api-for-notebooks/1584). The editor itself uses a persistent
+socket, and it works from Node:
+
+\`\`\`
+wss://ws.observablehq.com/document/{documentId}/edit
+  Origin: https://observablehq.com
+  Cookie: I={jwt}; T={token}
+  -> {"type":"hello","token":"{T}","version":{currentVersion},"next":true}
+\`\`\`
+
+\`version\` must be the document's **current** version from the REST API — \`0\` answers 404. Then
+\`save\` events carry \`modify_node\`, \`insert_node\` or \`remove_node\`, and \`node_id\` for an insert
+**must equal the event version** or the server answers 400.
+
+Two limits found the hard way. The save endpoint 404s after about three back-to-back writes, so
+pace them and retry — a timed-out save is not applied, which is what makes resend safe rather than
+a duplicate-insert risk. And the socket goes quiet after ~57 saves whatever the pacing: measured
+2026-08-14 pushing 165 cells, two runs died at 57 and 58 operations, the second on a cell the first
+had already written. Retire the socket every 40 saves.
+
+\`insert_node\` with \`new_node_mode: "md"\` answers 400. A prose cell has to go up as mode \`js\` whose
+value is \`\` md\`…\` \`\`.`
+)};
+const _fvk744v = function _137(md){return(
+md`### \`/api/import\` — the third compiled format
+
+\`observablehq.com/api/import/@user/slug\` is where the new site gets the notebooks it **imports**, and
+it is neither of the \`api.observablehq.com\` forms. Measured 2026-09-26 on a cold load of
+\`@tomlarkworthy/module-map\`: **147 requests, 18 of them to \`/api/import/\`, and zero module fetches
+from \`api.observablehq.com\`.** So the rule that imported notebooks get the legacy \`?v=4\` compile is
+no longer true — it was, and it is worth re-checking rather than believing either version.
+
+The format is a hybrid. It exports \`define(runtime)\` with **no observer parameter** and uses only
+\`main.define(…)\`, so nothing in it is displayable. Variable names are the legacy spaced ones while
+the function names carry the kit \`$\` spelling — one cell, both spellings live at once:
+
+\`\`\`js
+main.define("initial main_mutable", …)
+main.define("mutator main_mutable", …)      // legacy emits "mutable main_mutable" here
+function mutable$main_mutable(){…}
+function viewof$cellMapModule(Inputs){…}
+\`\`\`
+
+Anonymous cells are named \`cell <node id>\` — the **document** node id, so unlike an index it is
+stable across edits. Its own imports are emitted as bare relative specifiers, \`import("./flow-queue")\`,
+carrying no version: \`resolutions\` is **inert** here, and passing one returns a byte-identical file.`
+)};
+const _0rmzg15 = function _131(md){return(
+md`## Notebook Kit, and why a notebook has two behaviours
+
+[\`new.observablehq.com\`](https://new.observablehq.com) runs
+[notebook-kit](https://github.com/observablehq/notebook-kit); \`observablehq.com\` still runs the
+legacy runtime. The difference that matters most is not which site you are on — it is that on the
+new site **the same notebook behaves differently depending on whether it is being viewed or
+imported**:
+
+| | viewed on new.observablehq.com | imported by another notebook |
+|---|---|---|
+| served as | server-rendered into the worker frame | \`observablehq.com/api/import/@user/slug\` |
+| compiler | notebook-kit | the hybrid form below |
+| cell names | \`viewof$x\` | \`viewof x\` |
+| \`FileAttachment\` | one runtime-level builtin | one per module |
+
+So \`@tomlarkworthy/editor-5\` open as a page and \`editor-5\` imported by \`svg-lens\` are two
+materially different environments in the same browser tab. Any bug report about the new platform
+has to say which one it is in.
+
+Two things that look like they should tell them apart, and do not. \`isOnObservableCom()\` matches
+\`observableusercontent.com\`, and *both* sites render the notebook inside an iframe on that host. And
+the viewed notebook's source is never fetched over the network at all — it arrives server-rendered
+in the page payload — so there is no request to intercept when the bug is in the notebook you are
+looking at.`
+)};
+const _bzoubq6 = function _132(md){return(
+md`### Names gained a \`$\`
+
+The new compiler emits \`viewof$x\` and \`mutable$x\` where the legacy one emits \`viewof x\` and
+\`mutable x\`. Anything that looks a cell up by name has to handle both:
+
+\`\`\`js
+const canonName    = n => typeof n === 'string' ? n.replace(/^(viewof|mutable)\\$/, '$1 ') : n;
+const platformName = n => String(n).replace(/^(viewof|mutable) /, '$1$');
+const scopeHas     = (m, n) => m._scope.has(n) || m._scope.has(platformName(n));
+\`\`\`
+
+Treat the space form as canonical and the \`$\` form as a platform detail that must not escape the
+boundary. A self-editing view that writes a runtime name back into *source* — a layout literal, an
+editable markdown hole — will otherwise bake \`viewof$freq\` into source that is then broken
+everywhere else.
+
+The subtler failure is \`_scope.has('viewof ' + name)\`, which is the usual way to filter a derived
+viewof value out of a cell picker. It misses on the new site, so \`amp\` and \`viewof$amp\` both show
+up as separate candidates.`
+)};
+const _z9p9abc = function _133(md){return(
+md`### An import cell no longer looks like an import
+
+| | legacy | notebook-kit |
+|---|---|---|
+| name | \`module 1\`, \`module 2\`, … | \`cell 227\`, \`cell 17246\`, … |
+| definition | \`async t => t.import(name, alias, await mod)\` | \`async (__variable) => { … __variable._module._runtime.module(_.default) … }\` |
+
+Both carry exactly one input, \`@variable\`, and both stringify to something containing \`import(\`,
+which is the only stable way to recognise one:
+
+\`\`\`js
+const isImportVar = v => typeof v?._name === 'string' &&
+  (v._name.startsWith('module ') ||
+   v._inputs?.length === 1 && v._inputs[0]?._name === '@variable' &&
+   String(v._definition).includes('import('));
+\`\`\`
+
+A \`"module "\` prefix test fails twice over: it stops recognising real imports, and it leaks every
+\`cell N\` into whatever list it was guarding.`
+)};
+const _5n2z3te = function _134(md){return(
+md`### \`Mutable\` is the generator now, not a box around it
+
+Legacy \`Mutable(v)\` returns \`{generator, value}\`. The notebook-kit stdlib returns the **generator
+itself**, with \`value\` as an accessor. A legacy-compiled \`mutable x\` is
+
+\`\`\`js
+main.define("mutable x", ["Mutable", "initial x"], (M, _) => new M(_))
+\`\`\`
+
+so under notebook-kit that variable *is* a generator, the runtime unwraps it, and \`mutable x\`
+settles to the yielded value instead of the box. Writes (\`mutableX.value = …\`) throw — you are
+assigning a property to a primitive — and reads of \`.generator\` come back \`undefined\`.
+
+A per-notebook remedy is a module-local cell named \`Mutable\` returning the legacy box: module
+scope shadows the builtin for every cell in that notebook.`
+)};
+const _hjr268m = function _135(md){return(
+md`### \`FileAttachment\` moved up to the runtime
+
+For the **viewed** notebook, \`FileAttachment\` is a single runtime-level builtin rather than one per
+module, so \`module._builtins\` holds only \`@variable, invalidation, visibility\` and
+\`module._builtins.get("FileAttachment")\` is \`undefined\`. The registry is keyed by **resolved
+href**, not by the plain name you passed.
+
+[mootari's](https://observablehq.com/@mootari) capture trick still works — patch
+\`Map.prototype.get\`/\`has\`, call \`FileAttachment("")\`, keep \`this\` — with one addition: notebook-kit
+**memoises unknown names**, so the probe must also no-op \`Map.prototype.set\`, or it registers
+\`document.baseURI\` as a real attachment on the way past.`
+)};
+const _67z3edx = function _136(md){return(
+md`### \`require\` is gone, and you cannot put it back from a cell
+
+\`require\` is a builtin in the legacy stdlib — classic Observable *and* the lopecode bootloader —
+and is absent from notebook-kit's. A cell compiled with \`["require"]\` in its dependency array
+raises \`RuntimeError: require is not defined\` on the new site and nowhere else. Measured
+2026-09-08 across our corpus: 32 modules depend on it, and it is the only legacy-only builtin any
+of them actually use (\`resolve\`, \`SQLite\`, \`SQLiteDatabaseClient\` and \`flare\` are all unreferenced).
+
+Setting \`window.require\` from a cell does not fix it, and the reason is worth knowing generally.
+The runtime's \`module_resolve\` does fall back to \`globalThis[name]\` — that is how \`Element\`,
+\`Response\` and \`DecompressionStream\` resolve without being builtins — but it runs at
+**module-define time**, and when the name is missing it caches a placeholder \`Variable\` in \`_scope\`
+that is never resolved again. Any global you set from a cell body is already too late.
+
+The remedy has to be at the cell: shadow the name with a module-local cell, or drop the
+dependency. These builtins exist on **both** platforms, so a \`require\` of any of them can simply be
+deleted: \`_ aq Arrow d3 dot DuckDBClient htl html Inputs L md mermaid Plot svg tex topojson vl
+width\`.`
+)};
+const _pn6j4bt = function _138(md){return(
+md`### A viewed notebook is not lazy any more
+
+Everything above about laziness — a cell nobody observes never runs — still holds for the runtime,
+but it stops describing what you see on the new site. \`define()\` builds each cell's output root,
+its \`display\`/\`view\` shadows **and its observer** in one constructor call, and a variable with an
+observer is reachable from birth. So every cell in a viewed notebook computes whether or not it is
+on screen.
+
+Measured 2026-09-26 on \`@tomlarkworthy/module-map\`, whose document is 57 nodes, reading the live
+runtime before touching the page:
+
+\`\`\`
+kitHeads 57   headsWithObserver 57   headsReachable 57   headsComputed 55
+  …after scrolling to the bottom: kitHeads 57, headsReachable 57   (unchanged)
+\`\`\`
+
+One head per authored cell, all 57 already reachable. Note the tell used to count them:
+\`v._shadow instanceof Map\` picks out exactly one variable per authored cell, which no name test
+does. Rendering is still lazy even though computation is not, so a headless probe that never
+scrolls sees fewer *cells* than a human while the values are all there regardless.`
+)};
 const _1mkb7aa = function _125(md){return(
 md`---`
 )};
@@ -18607,6 +18881,18 @@ export default function define(runtime, observer) {
   $def("_10q3rj2", null, ["md"], _10q3rj2);  
   $def("_1syiuna", null, ["md"], _1syiuna);  
   $def("_1kayzom", null, ["md"], _1kayzom);  
+  $def("_421ewb2", null, ["md"], _421ewb2);  
+  $def("_7nvfe8q", null, ["md"], _7nvfe8q);  
+  $def("_3jycsac", null, ["md"], _3jycsac);  
+  $def("_7xkmgfl", null, ["md"], _7xkmgfl);  
+  $def("_fvk744v", null, ["md"], _fvk744v);  
+  $def("_0rmzg15", null, ["md"], _0rmzg15);  
+  $def("_bzoubq6", null, ["md"], _bzoubq6);  
+  $def("_z9p9abc", null, ["md"], _z9p9abc);  
+  $def("_5n2z3te", null, ["md"], _5n2z3te);  
+  $def("_hjr268m", null, ["md"], _hjr268m);  
+  $def("_67z3edx", null, ["md"], _67z3edx);  
+  $def("_pn6j4bt", null, ["md"], _pn6j4bt);  
   $def("_1mkb7aa", null, ["md"], _1mkb7aa);  
   $def("_1mdc01x", null, ["exporter"], _1mdc01x);  
   $def("_g1z7uq", "toMap", [], _g1z7uq);  
@@ -25538,7 +25824,7 @@ Inputs.radio(
 )
 )};
 const _4jpb27 = (G, _) => G.input(_);
-const _17ce9dw = async function* _test_tests_example(example_type)
+const _17ce9dw = async function* _test_tests_example(example_type,invalidation)
 {
   switch (example_type) {
     case "error":
@@ -25546,14 +25832,14 @@ const _17ce9dw = async function* _test_tests_example(example_type)
     case "success":
       yield "Ok";
     case "pending":
-      yield new Promise(() => {});
+      yield invalidation;
     case "changing":
       while (true) {
         yield Math.random();
         await new Promise((r) => setTimeout(r, 1000));
       }
   }
-  yield new Promise(() => {});
+  yield invalidation;
 };
 const _178t107 = function _7(md){return(
 md`## Testing variables
@@ -25754,7 +26040,7 @@ export default function define(runtime, observer) {
   $def("_1sr7w7b", null, ["md"], _1sr7w7b);  
   $def("_8dmusz", "viewof example_type", ["Inputs"], _8dmusz);  
   $def("_4jpb27", "example_type", ["Generators","viewof example_type"], _4jpb27);  
-  $def("_17ce9dw", "test_tests_example", ["example_type"], _17ce9dw);  
+  $def("_17ce9dw", "test_tests_example", ["example_type","invalidation"], _17ce9dw);  
   $def("_178t107", null, ["md"], _178t107);  
   $def("_kdc1xp", "modules", ["moduleMap","runtime"], _kdc1xp);  
   $def("_pvmmyu", "viewof testing_variables", ["scan","viewof runtime_variables","modules","_","invalidation"], _pvmmyu);  
@@ -30155,34 +30441,22 @@ const _1y1ubko = function _lp2_page(apply_theme,lp2_host,commandPaletteStyles,co
   root.appendChild(commandPaletteOverlay);
   return root;
 };
-const _12gz9ep = function _lp2_background_jobs(commandPaletteKeybinding,cc_chat,change_listener,commit_history,replay_git,auto_attach,lp2_watchModules,lp2_menu_sync,lp2_menu_defaults,lp2_menu_clear_history,lp2_import_sync,lp2_import_drop)
-{
+const _12gz9ep = function _lp2_background_jobs(commandPaletteKeybinding,cc_chat,change_listener,commit_history,replay_git,auto_attach,lp2_watchModules,lp2_menu_sync,lp2_menu_defaults,lp2_menu_clear_history,lp2_import_sync,lp2_import_drop,lp2_reading_mode) {
   // hold references so these orthogonal features' main-loop cells instantiate
-  commandPaletteKeybinding;
-  // installs the ⌘K keydown listener
-  cc_chat;
-  // instantiates the pairing connection
-  change_listener;
-  // records cell edits into local-change-history
-  commit_history;
-  // commits runtime edit history
-  replay_git;
-  // replays git commits on load
-  auto_attach;
-  // attaches editor-5 CodeMirror editors to rendered cells
-  lp2_watchModules;
-  // keeps the layout-relevant module watcher running
-  lp2_menu_sync;
-  // keeps the burger menu populated from the plugin registry
-  lp2_menu_defaults;
-  // registers the built-in menu items (download, fork)
-  lp2_menu_clear_history;
-  // registers the per-notebook history wipe menu item
-  lp2_import_sync;
-  // keeps the import dialog's probe set current from the plugin registry
-  lp2_import_drop;
-  // captures OS file drops for the import wizards
-  return 'background jobs: command-palette, claude-code-pairing, local-change-history, editor-5, module-watcher, burger-menu, import-wizards';
+  commandPaletteKeybinding; // installs the ⌘K keydown listener
+  cc_chat; // instantiates the pairing connection
+  change_listener; // records cell edits into local-change-history
+  commit_history; // commits runtime edit history
+  replay_git; // replays git commits on load
+  auto_attach; // attaches editor-5 CodeMirror editors to rendered cells
+  lp2_watchModules; // keeps the layout-relevant module watcher running
+  lp2_menu_sync; // keeps the burger menu populated from the plugin registry
+  lp2_menu_defaults; // registers the built-in menu items (download, fork)
+  lp2_menu_clear_history; // registers the per-notebook history wipe menu item
+  lp2_import_sync; // keeps the import dialog's probe set current from the plugin registry
+  lp2_import_drop; // captures OS file drops for the import wizards
+  lp2_reading_mode; // hides inspector chrome while edit mode is off
+  return 'background jobs: command-palette, claude-code-pairing, local-change-history, editor-5, module-watcher, burger-menu, import-wizards, reading-mode';
 };
 const _1yumqn = function _lp2_append_to_body(lp2_view,lp2_syncFromUrl,lp2_syncToUrl,lp2_page)
 {
@@ -30640,7 +30914,9 @@ A hamburger button docked at the left of the top-left tab bar opens a menu of pl
 
 Plugins (this module's defaults, or any other notebook) register through \`lp2_registerMenuItem(item)\` — an id-keyed wrapper over \`plugins.add("lp2-menu", item)\` that replaces by \`id\` and returns a disposer (call it from \`invalidation\` so a re-run replaces rather than duplicates). Any notebook can equally \`plugins.add("lp2-menu", item)\` directly without importing lopepage-2. Only \`lp2_menu_sync\` consumes \`lp2MenuItems\`, so adding an item repopulates the popover in place — the layout, panes, and scroll state are untouched.
 
-The button and popover are built once by \`lp2_burger\` (immortal, like panes) and reparented into the current top-left tab bar on each layout render. \`lp2_menu_defaults\` registers the built-ins: **Download** and **Fork** via [\`exporter-3\`](https://observablehq.com/@tomlarkworthy/exporter-3)'s \`downloadAnchor\`/\`forkAnchor\`, which serialise every booted main. \`lp2_menu_clear_history\` registers **Clear local history…**: it deletes only the current file's branch in the shared [\`local-change-history\`](https://observablehq.com/@tomlarkworthy/local-change-history) repo (other notebooks' branches are untouched) and reloads, so the notebook reboots from the file on disk.`
+The button and popover are built once by \`lp2_burger\` (immortal, like panes) and reparented into the current top-left tab bar on each layout render. \`lp2_menu_defaults\` registers the built-ins: **Download** and **Fork** via [\`exporter-3\`](https://observablehq.com/@tomlarkworthy/exporter-3)'s \`downloadAnchor\`/\`forkAnchor\`, which serialise every booted main. \`lp2_menu_clear_history\` registers **Clear local history…**: it deletes only the current file's branch in the shared [\`local-change-history\`](https://observablehq.com/@tomlarkworthy/local-change-history) repo (other notebooks' branches are untouched) and reloads, so the notebook reboots from the file on disk.
+
+**Edit mode** is the third built-in, a full-HTML item (the \`element\` contract) wired to [\`editor-5\`](https://observablehq.com/@tomlarkworthy/editor-5)'s \`viewof attachContextManu\`. Off is the reading view: editor-5 detaches every inline editor, and \`lp2_reading_mode\` puts \`lp2-reading\` on \`<html>\`, which hides the [\`visualizer\`](https://observablehq.com/@tomlarkworthy/visualizer)'s inspector chrome — value dumps (\`.observablehq--inspect\`), import headers, and empty (detached) slots — leaving the cells' own DOM. The slots stay in the document with their \`cell=\` attribute, so annotations, deep links and UI tests still resolve; cells in error stay visible.`
 )};
 const _1uvdt3f = function _lp2MenuItems(plugins){return(
 plugins.get('lp2-menu')
@@ -31309,6 +31585,24 @@ const _1c4imop = function _lp2_import_drop(lp2_page,lp2_import_host,invalidation
   });
   return 'import drop capture installed';
 };
+const _fobdz7 = function _lp2_reading_mode(attachContextManu) {
+  // Edit mode off = reading view. Hide the inspector chrome — value dumps, import
+  // headers, detached/empty placeholders — but leave every cell slot in the DOM so
+  // `cell=` addressing, annotations and automation still resolve. Errors stay visible.
+  const ID = 'lp2-reading-mode-style';
+  if (!document.getElementById(ID)) {
+    const style = document.createElement('style');
+    style.id = ID;
+    style.textContent = [
+      '.lp2-reading .lope-viz .observablehq:not(.observablehq--error):has(> .observablehq--inspect){display:none;}',
+      '.lp2-reading .lope-viz .observablehq.lope-viz-import{display:none;}',
+      '.lp2-reading .lope-viz .observablehq:empty{display:none;}'
+    ].join('\n');
+    document.head.appendChild(style);
+  }
+  document.documentElement.classList.toggle('lp2-reading', !attachContextManu);
+  return `reading mode: ${!attachContextManu}`;
+};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -31354,7 +31648,7 @@ export default function define(runtime, observer) {
   $def("_1rf2mk0", "lp2_syncToUrl", ["lp2Model","lp2_serializeDSL","lp2_parseDSL","location","lp2_setHash"], _1rf2mk0);  
   $def("_6e8yep", "lp2_doc_mount", ["md"], _6e8yep);  
   $def("_1y1ubko", "lp2_page", ["apply_theme","lp2_host","commandPaletteStyles","commandPaletteOverlay"], _1y1ubko);  
-  $def("_12gz9ep", "lp2_background_jobs", ["commandPaletteKeybinding","cc_chat","change_listener","commit_history","replay_git","auto_attach","lp2_watchModules","lp2_menu_sync","lp2_menu_defaults","lp2_menu_clear_history","lp2_import_sync","lp2_import_drop"], _12gz9ep);  
+  $def("_12gz9ep", "lp2_background_jobs", ["commandPaletteKeybinding","cc_chat","change_listener","commit_history","replay_git","auto_attach","lp2_watchModules","lp2_menu_sync","lp2_menu_defaults","lp2_menu_clear_history","lp2_import_sync","lp2_import_drop","lp2_reading_mode"], _12gz9ep);  
   $def("_1yumqn", "lp2_append_to_body", ["lp2_view","lp2_syncFromUrl","lp2_syncToUrl","lp2_page"], _1yumqn);  
   $def("_z83rug", null, ["currentModules"], _z83rug);  
   $def("_pve6pg", "lp2_renderTab", ["navigate","location"], _pve6pg);  
@@ -31407,7 +31701,8 @@ export default function define(runtime, observer) {
   $def("_b6wzxf", "lp2_importWizards", ["plugins"], _b6wzxf);  
   $def("_1c3xppz", "lp2_import_host", ["invalidation"], _1c3xppz);  
   $def("_pi4ntk", "lp2_import_sync", ["lp2_import_host","lp2_importWizards"], _pi4ntk);  
-  $def("_1c4imop", "lp2_import_drop", ["lp2_page","lp2_import_host","invalidation"], _1c4imop);
+  $def("_1c4imop", "lp2_import_drop", ["lp2_page","lp2_import_host","invalidation"], _1c4imop);  
+  $def("_fobdz7", "lp2_reading_mode", ["attachContextManu"], _fobdz7);
   return main;
 }</script>
 
