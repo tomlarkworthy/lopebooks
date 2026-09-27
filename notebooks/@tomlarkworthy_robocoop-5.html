@@ -6068,13 +6068,53 @@ const _76otvk = function _cellHelpers(currentModules,runtime)
   const label = v => (v.pid ? v.pid : '(derived)') + (v._name ? ' ' + v._name : ' (anonymous)');
   const oneLine = s => String(s).replace(/\s+/g, ' ').trim();
   const watchKey = (module, pid, name) => module + ':' + (pid || name);
+  // A canvas summarises to its surrounding text only ("" alone); a text-only model then reads that as
+  // "rendering" (rc5-train w5 2026-09-27). Say what the pixels hold.
+  const canvasNote = val => {
+    if (typeof Element === 'undefined' || !(val instanceof Element))
+      return '';
+    const cs = (val.tagName === 'CANVAS' ? [val] : [...val.querySelectorAll('canvas')]).slice(0, 3);
+    return cs.map(c => {
+      const w = c.width, h = c.height, dims = 'canvas ' + w + '\u00D7' + h;
+      if (!w || !h)
+        return ' [' + dims + ': empty]';
+      try {
+        let ctx = c.getContext('2d');
+        if (!ctx) {
+          const t = document.createElement('canvas');
+          t.width = w;
+          t.height = h;
+          ctx = t.getContext('2d');
+          ctx.drawImage(c, 0, 0);
+        }
+        const d = ctx.getImageData(0, 0, w, h).data, hist = new Map();
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4 * 3, n++) {
+          const k = d[i + 3] === 0 ? -1 : d[i] << 16 | d[i + 1] << 8 | d[i + 2];
+          hist.set(k, (hist.get(k) || 0) + 1);
+        }
+        let top = -1, cnt = 0;
+        for (const [k, v] of hist)
+          if (v > cnt) {
+            top = k;
+            cnt = v;
+          }
+        const hex = top < 0 ? 'transparent' : '#' + top.toString(16).padStart(6, '0');
+        const pct = Math.round(100 * cnt / n);
+        return ' [' + dims + ': ' + hist.size + ' colour' + (hist.size === 1 ? '' : 's') + ', commonest ' + hex + ' ' + pct + '%' + (hist.size <= 2 ? ' \u2014 nothing drawn, or every pixel took one branch' : '') + ']';
+      } catch (e) {
+        return ' [' + dims + ': pixels unreadable (' + (e && e.name || 'error') + ')]';
+      }
+    }).join('');
+  };
   return {
     resolveModule,
     varsOf,
     isStructural,
     label,
     oneLine,
-    watchKey
+    watchKey,
+    canvasNote
   };
 };
 const _19x8b93 = function _rc5_store(){return(
@@ -6418,12 +6458,12 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         probeDefine,
         createModule
     });
-    const {resolveModule, varsOf, isStructural, oneLine, watchKey} = cellHelpers;
+    const {resolveModule, varsOf, isStructural, oneLine, watchKey, canvasNote} = cellHelpers;
     const summ = val => {
         if (typeof val === 'string')
             return oneLine(val.length > 200 ? val.slice(0, 200) + ' \u2026(+' + (val.length - 200) + ' chars)' : val);
         try {
-            return oneLine(summarizeJS(val, { max_size: 200 }));
+            return oneLine(summarizeJS(val, { max_size: 200 }) + canvasNote(val));
         } catch (e) {
             return oneLine(String(val));
         }
@@ -6713,7 +6753,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
 };
 const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus,srcContext,localDisk,py)
 {
-  const {resolveModule, varsOf, isStructural, label, oneLine, watchKey} = cellHelpers;
+  const {resolveModule, varsOf, isStructural, label, oneLine, watchKey, canvasNote} = cellHelpers;
   const nudge = mod => {
     const s = varsOf(mod).find(x => x._name && !isStructural(x));
     if (s) {
@@ -6777,7 +6817,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       return value.length > lim ? value.slice(0, lim) + ' \u2026(+' + (value.length - lim) + ' chars)' : value;
     }
     try {
-      return summarizeJS(value, { max_size: max });
+      return summarizeJS(value, { max_size: max }) + canvasNote(value);
     } catch (e) {
       return String(value);
     }
@@ -6858,14 +6898,23 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     ];
     // One expression (any number of lines) is returned; the parser decides, not a regex for ";"/"\n",
     // which returned a bare undefined for a multi-line IIFE, a chained call or `await x` (s18 probe).
-    let fn, asExpr = null;
+    let fn, asExpr = null, rerun = false;
     try {
       asExpr = t ? new AsyncFunction(...params, 'return (\n' + t + '\n);') : null;
     } catch (e) {
     }
     try {
       const inner = asExpr || new AsyncFunction(...params, code);
-      fn = (...depVals) => inner(...depVals, ...extraNames.map(n => EXTRAS[n]));
+      // Run once. A snippet that changes a cell it reads (a click that re-runs the canvas it then samples)
+      // would otherwise be re-run by the runtime, act again, and loop until the timeout (w5 after-run, 2026-09-27).
+      let first = null;
+      fn = (...depVals) => {
+        if (first) {
+          rerun = true;
+          return first;
+        }
+        return first = inner(...depVals, ...extraNames.map(n => EXTRAS[n]));
+      };
     } catch (e) {
       return resolve({ error: 'syntax error: ' + (e && e.message || e) });
     }
@@ -6882,7 +6931,11 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     };
     try {
       v = mod.variable({
-        fulfilled: val => finish({ value: val, statements: !asExpr }),
+        fulfilled: val => finish({
+          value: val,
+          statements: !asExpr,
+          stale: rerun ? inputs.concat(usedViews.map(x => x.alias)) : null
+        }),
         rejected: err => finish({
           error: err && err.message || String(err),
           errObj: err
@@ -7068,7 +7121,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       const noReturn = r.value === undefined && r.statements && !/\breturn\b/.test(code);
       return {
         title: 'eval_js ' + module,
-        output: noReturn ? 'undefined \u2014 the code has several statements and no `return`, so nothing was returned. Add `return <value>`.' : summary(r.value, 6000)
+        output: (noReturn ? 'undefined \u2014 the code has several statements and no `return`, so nothing was returned. Add `return <value>`.' : summary(r.value, 6000)) + (r.stale ? '\n\u26A0 a cell this snippet reads (' + r.stale.join(', ') + ') changed while it ran; the snippet ran once and saw the values from when it started. Read them again in a new eval_js; an element the cell re-created is a new node (look it up again).' : '')
       };
     }
   });
