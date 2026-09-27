@@ -6495,6 +6495,32 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         }
         setTimeout(() => finish(v._value !== undefined ? { value: v._value } : { pending: true }), 4000);
     });
+    // Markup that computes but does not render (rc5-train 20260928-0040-w9, SVG clocks):
+    //   text   a string interpolated into htl.html/htl.svg is inserted as a text node (`<line x1=…>` as text)
+    //   ns     an htl.html`<line …>` fragment inside <svg> is an HTML element, which SVG does not draw
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const markupDefect = val => {
+        try {
+            if (!val || typeof val !== 'object' || typeof val.nodeType !== 'number' || !val.ownerDocument)
+                return null;
+            const walker = val.ownerDocument.createTreeWalker(val, 1 | 4);
+            for (let n = walker.nextNode() || null, first = true; n; n = walker.nextNode()) {
+                if (n.nodeType === 3) {
+                    if (n.parentElement && n.parentElement.closest('code,pre,textarea,script,style,kbd,samp,[contenteditable],.cm-editor'))
+                        continue;
+                    const m = /<\/?[a-zA-Z][\w:-]*(\s+[\w:-]+\s*=\s*["'][^"'<>]*["'])+\s*\/?>/.exec(n.data);
+                    if (m)
+                        return { kind: 'text', what: m[0].replace(/\s+/g, ' ').slice(0, 60) };
+                } else if (n.namespaceURI !== SVG_NS && n.parentElement && n.parentElement.namespaceURI === SVG_NS && n.parentElement.localName !== 'foreignObject') {
+                    return { kind: 'ns', what: '<' + n.localName + '>' };
+                }
+            }
+            if (val.nodeType === 1 && val.namespaceURI !== SVG_NS && /^(line|circle|path|rect|polygon|polyline|ellipse|g|text)$/.test(val.localName))
+                return { kind: 'ns', what: '<' + val.localName + '>' };
+        } catch (e) {
+        }
+        return null;
+    };
     const probeAndWatch = async (id, bus = rc5_watchBus) => {
         const mod = resolveModule(id);
         if (!mod)
@@ -6526,7 +6552,8 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                 variable: v,
                 error: base.error,
                 errObj: base.errObj,
-                value: base.error ? undefined : baseText
+                value: base.error ? undefined : baseText,
+                markup: base.error ? null : markupDefect(base.value)
             };
         }));
     };
@@ -6563,6 +6590,12 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             return ' \xB7 \u26A0 ' + errored.length + ' cell' + (errored.length === 1 ? '' : 's') + ' ERRORING at runtime \u2014 ' + detail + ' \u2014 FIX before task_complete (a compile-clean cell can still error when observed)' + sources;
         }
         const vals = probe.filter(r => r.value !== undefined).slice(0, 8).map(r => r.name + '=' + r.value).join(', ');
+        const broken = probe.filter(r => r.markup);
+        if (broken.length) {
+            const b = broken[0].markup;
+            const why = b.kind === 'text' ? ' render' + (broken.length === 1 ? 's' : '') + ' markup as literal TEXT (' + b.what + ' is a text node, not an element): a string interpolated into htl.html`\u2026` or htl.svg`\u2026` is inserted as text, never parsed' : ' put' + (broken.length === 1 ? 's' : '') + ' an HTML ' + b.what + ' inside <svg>, which the browser does not draw: it was built with htl.html`\u2026`; SVG child elements need htl.svg`\u2026`';
+            return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + why + '. Build each SVG part with htl.svg`<line \u2026/>` (HTML parts with htl.html`\u2026`) and interpolate those elements (an array of them works) \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
+        }
         return ' \xB7 \u2713 all ' + okCount + ' cell' + (okCount === 1 ? '' : 's') + ' compute with no runtime error (auto-watched; changes stream to you)' + (vals ? ' \xB7 values: ' + vals + (probe.length > 8 ? ' \u2026(+' + (probe.length - 8) + ' more)' : '') : '');
     };
     const downstreamStatus = async id => {
