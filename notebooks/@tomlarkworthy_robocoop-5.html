@@ -6507,6 +6507,17 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                     d = srcContext.diffOf(e.errObj);
                 } catch (x) {
                 }
+                // Inputs reach the function BY POSITION: adding a name to only one of the two lists is the
+                // usual cause (rc5-train w2: 11 edits, each fixing params then the $def list separately).
+                try {
+                    const fn = e.variable && e.variable._definition, ins = e.variable && e.variable._inputs;
+                    const undef = /^(\S+) is not defined$/.exec(e.error || '');
+                    if (typeof fn === 'function' && ins && fn.length !== ins.length)
+                        d += ' [its function takes ' + fn.length + ' parameter(s) but $def lists ' + ins.length + ' input(s); they pair up by position, so every name must be in BOTH lists]';
+                    else if (undef)
+                        d += ' [declare ' + undef[1] + ' in BOTH places: the function\'s parameters and the $def inputs list, same position]';
+                } catch (x) {
+                }
                 return e.name + ': ' + e.error + d;
             }).join('; ');
             return ' \xB7 \u26A0 ' + errored.length + ' cell' + (errored.length === 1 ? '' : 's') + ' ERRORING at runtime \u2014 ' + detail + ' \u2014 FIX before task_complete (a compile-clean cell can still error when observed)' + sources;
@@ -6728,12 +6739,14 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       }
       resolve(res);
     };
-    if (v._error != null)
+    // A cached value is current only while something observes the cell: an unobserved one keeps the value
+    // from its last read after its inputs change (inspect_value said ocean-floor 4x after a theme switch).
+    if (v._reachable && v._error != null)
       return finish({
         error: v._error && v._error.message || String(v._error),
         errObj: v._error
       });
-    if (v._value !== undefined)
+    if (v._reachable && v._value !== undefined)
       return finish({ value: v._value });
     if (v._name) {
       Promise.resolve().then(() => mod.value(v._name)).then(value => finish({ value }), error => finish({
@@ -6833,7 +6846,6 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const inputs = [...names].filter(refs);
     const usedViews = aliases.filter(x => !names.has(x.alias) && refs(x.alias));
     const t = code.trim();
-    const isExpr = t && !/[;\n]/.test(t) && !/^\s*(return|const|let|var|throw|if|for|while|async|function|\{|await)\b/.test(t);
     const extraNames = Object.keys(EXTRAS).filter(n => !names.has(n) && refs(n));
     const params = [
       ...inputs,
@@ -6844,9 +6856,15 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       ...inputs,
       ...usedViews.map(x => x.dep)
     ];
-    let fn;
+    // One expression (any number of lines) is returned; the parser decides, not a regex for ";"/"\n",
+    // which returned a bare undefined for a multi-line IIFE, a chained call or `await x` (s18 probe).
+    let fn, asExpr = null;
     try {
-      const inner = new AsyncFunction(...params, isExpr ? 'return (' + t + ');' : code);
+      asExpr = t ? new AsyncFunction(...params, 'return (\n' + t + '\n);') : null;
+    } catch (e) {
+    }
+    try {
+      const inner = asExpr || new AsyncFunction(...params, code);
       fn = (...depVals) => inner(...depVals, ...extraNames.map(n => EXTRAS[n]));
     } catch (e) {
       return resolve({ error: 'syntax error: ' + (e && e.message || e) });
@@ -6864,7 +6882,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     };
     try {
       v = mod.variable({
-        fulfilled: val => finish({ value: val }),
+        fulfilled: val => finish({ value: val, statements: !asExpr }),
         rejected: err => finish({
           error: err && err.message || String(err),
           errObj: err
@@ -7047,7 +7065,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
         };
       }
       // multi-statement code without `return` evaluates to undefined; say so rather than report a bare undefined
-      const noReturn = r.value === undefined && /;\s*\S/.test(code.trim().replace(/;\s*$/, '')) && !/\breturn\b/.test(code);
+      const noReturn = r.value === undefined && r.statements && !/\breturn\b/.test(code);
       return {
         title: 'eval_js ' + module,
         output: noReturn ? 'undefined \u2014 the code has several statements and no `return`, so nothing was returned. Add `return <value>`.' : summary(r.value, 6000)
