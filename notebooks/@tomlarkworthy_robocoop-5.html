@@ -4971,7 +4971,44 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     grip.addEventListener('pointerup', up);
     grip.addEventListener('pointercancel', up);
   });
-  root.append(thumbs, statusEl, modelEl, bar, grip);
+  // request_files: a tool's question to the human, answered here with files or a URL (or skipped).
+  const askEl = document.createElement('div');
+  askEl.style.cssText = 'display:none;margin:6px 10px;padding:10px;border:1px solid ' + C.accent + ';border-radius:8px;background:' + C.tool;
+  let askBus = null, askOff = null;
+  const isUrls = t => t && t.split(/\s+/).every(w => /^https?:\/\/\S+$/.test(w));
+  const renderAsk = () => {
+    const req = askBus?.pending;
+    askEl.replaceChildren();
+    askEl.style.display = req ? 'block' : 'none';
+    if (!req) return;
+    const pick = html`<input type="file" style="display:none">`;
+    if (req.accept) pick.accept = req.accept;
+    pick.multiple = !!req.multiple;
+    pick.addEventListener('change', () => { if (pick.files.length) askBus.respond([...pick.files]); });
+    const url = html`<input type="url" placeholder="…or paste a URL" style="flex:1;min-width:0;background:#010409;color:${ C.fg };border:1px solid ${ C.border };border-radius:6px;padding:4px 8px;font:inherit">`;
+    const btn = (label, bg) => html`<button style="background:${ bg };color:#fff;border:0;border-radius:6px;padding:4px 12px;cursor:pointer">${ label }</button>`;
+    const choose = btn(req.multiple ? 'Choose files' : 'Choose file', C.user), fetchB = btn('Use URL', C.user), skip = btn('Skip', C.muted);
+    choose.addEventListener('click', () => pick.click());
+    const useUrl = () => { const t = url.value.trim(); if (isUrls(t)) askBus.respond(t.split(/\s+/)); };
+    fetchB.addEventListener('click', useUrl);
+    url.addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); useUrl(); } });
+    skip.addEventListener('click', () => askBus.skip());
+    const row = html`<div style="display:flex;gap:6px;align-items:center"></div>`;
+    row.append(choose, url, fetchB, skip, pick);
+    askEl.append(
+      html`<div style="color:${ C.fg };margin-bottom:8px">📎 <b>The agent is asking for ${ req.multiple ? 'files' : 'a file' }</b>${ req.accept ? ' (' + req.accept + ')' : '' }: ${ req.prompt }<div style="color:${ C.muted };font-size:11px">drop it on this panel, choose it, or paste a URL · it is attached to ${ req.module }</div></div>`,
+      row);
+    setStatus('\u23F8 waiting for your file' + (req.multiple ? 's' : '') + ' \xB7 step ' + stepN);
+  };
+  const bindAsk = () => {
+    const bus = entry.session?.askBus ?? null;
+    if (bus === askBus) return renderAsk();
+    askOff?.();
+    askBus = bus;
+    askOff = bus?.onChange(renderAsk) ?? null;
+    renderAsk();
+  };
+  root.append(thumbs, askEl, statusEl, modelEl, bar, grip);
   if (busy) {
     send.textContent = 'Steer';
     stop.style.display = '';
@@ -5009,6 +5046,8 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
   root.addEventListener('drop', async ev => {
     ev.preventDefault();
     root.style.outline = '';
+    if (askBus?.pending && ev.dataTransfer?.files?.length)
+      return askBus.respond([...ev.dataTransfer.files]);
     for (const f of ev.dataTransfer?.files || [])
       await addImageFile(f);
   });
@@ -5024,6 +5063,11 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     } : text;
     // STEERING: if a turn is already running, inject this as a redirect into the live conversation (aborts the
     // in-flight model call so the agent reads it on the next step) rather than blocking.
+    if (busy && askBus?.pending && !images.length) {
+      ta.value = '';
+      if (isUrls(text)) { askBus.respond(text.split(/\s+/)); ta.focus(); return; }
+      askBus.skip();
+    }
     if (busy) {
       session.steer?.(input);
       ta.value = '';
@@ -5037,6 +5081,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     ta.value = '';
     try { await ready(entry); } finally { starting = false; }
     session = entry.session;
+    bindAsk();
     send.textContent = 'Steer';
     stop.style.display = '';
     errors.length = 0;
@@ -5123,6 +5168,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     stepN = 0;
     setStatus(busy ? '\u25CF working in the background\u2026' : '');
     renderBar();
+    bindAsk();
     render();
     ta.focus();
   };
@@ -5136,6 +5182,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
   // A UI rebuilt mid-turn gets none of that turn's callbacks; catch up when the controller says it settled.
   const off = rc5_controller.onChange(() => {
     session = entry.session;
+    bindAsk();
     renderBar();
     if (busy && !starting && !entry.busy) {
       busy = false;
@@ -5147,12 +5194,13 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
   });
   invalidation?.then(() => {
     off();
+    askOff?.();
     modelView.removeEventListener('input', onModelInput);
   });
   renderBar();
   rc5_controller.refresh();
   // A saved or earlier session opens at its latest turn.
-  ready(entry).then(() => { session = entry.session; render(); });
+  ready(entry).then(() => { session = entry.session; bindAsk(); render(); });
   ta.addEventListener('keydown', ev => {
     if (ev.key === 'Enter' && !ev.shiftKey) {
       ev.preventDefault();
@@ -5751,7 +5799,7 @@ Inputs.toggle({
   value: true
 })
 )};
-const _rc5makeSession = function _makeSession(client,createAgentSession,reasoningToggle,toolsView,modelView,promptView,createWatchBus,rc5_monitorBus,monitorsView,contextToggle,composeContext,contextView,specGateCheck,rc5_specGate,zeroToolCallGate)
+const _rc5makeSession = function _makeSession(client,createAgentSession,reasoningToggle,toolsView,modelView,promptView,createWatchBus,createAskBus,rc5_monitorBus,monitorsView,contextToggle,composeContext,contextView,specGateCheck,rc5_specGate,zeroToolCallGate)
 {
   // One agent per call. `session` below is the default one; robocoop-5-sessions builds the others.
   // Per-agent overrides: `model` and `system` are a value or a function read every step (null = the settings
@@ -5759,6 +5807,7 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
   // `watches` ([{label, read}]) are polled every step and arrive as deltas, the first time in full; they and
   // any watch_variable the agent sets go on this session's own bus (`watchBus`, fresh by default).
   return ({ model = null, system = null, toolsTransform = null, completeGuard: extraGuard = null, watches = [], watchBus = createWatchBus() } = {}) => {
+    const askBus = createAskBus();
   const read = v => typeof v === 'function' ? v() : v;
   if (!client) {
     return {
@@ -5782,7 +5831,7 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
   const bound = new WeakMap();
   const bind = t => {
     let b = bound.get(t);
-    if (!b) bound.set(t, b = { ...t, execute: (args, ctx) => t.execute(args, { ...ctx, watchBus, sessionState }) });
+    if (!b) bound.set(t, b = { ...t, execute: (args, ctx) => t.execute(args, { ...ctx, watchBus, sessionState, askBus }) });
     return b;
   };
   // `robocoop5_temperature` is a float read from localStorage, the same persistence the model picker uses
@@ -5854,8 +5903,9 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
     maxTokens: 32000
   });
   agent.watchBus = watchBus;
+  agent.askBus = askBus;
   agent.sessionState = sessionState;
-  agent.dispose = () => watchBus.dispose();
+  agent.dispose = () => { watchBus.dispose(); askBus.dispose(); };
   return agent;
   };
 };
@@ -5968,7 +6018,7 @@ export default function define(runtime, observer) {
   $def("_gdleyk", "promptView", ["viewof rc5_systemPrompt"], _gdleyk);  
   $def("_5agv7a", "client", ["OPENROUTER_API_KEY","createOpenRouterClient","gatewayBase"], _5agv7a);
   $def("_ctxtog", "contextToggle", ["Inputs"], _ctxtog);
-  $def("_rc5makeSession", "makeSession", ["client","createAgentSession","reasoningToggle","toolsView","modelView","promptView","createWatchBus","rc5_monitorBus","monitorsView","contextToggle","composeContext","contextView","specGateCheck","rc5_specGate","zeroToolCallGate"], _rc5makeSession);
+  $def("_rc5makeSession", "makeSession", ["client","createAgentSession","reasoningToggle","toolsView","modelView","promptView","createWatchBus","createAskBus","rc5_monitorBus","monitorsView","contextToggle","composeContext","contextView","specGateCheck","rc5_specGate","zeroToolCallGate"], _rc5makeSession);
   $def("_zqho0j", "session", ["makeSession","rc5_watchBus"], _zqho0j);
   $def("_rc5specLockOn", "specLockOn", [], _rc5specLockOn);
   $def("_rc5specLockPrompt", "specLockPrompt", [], _rc5specLockPrompt);
@@ -5978,6 +6028,7 @@ export default function define(runtime, observer) {
   main.define("contextView", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("contextView", _));
   main.define("rc5_watchBus", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("rc5_watchBus", _));
   main.define("createWatchBus", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("createWatchBus", _));
+  main.define("createAskBus", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("createAskBus", _));
   main.define("createAgentSession", ["module @tomlarkworthy/robocoop-5-core", "@variable"], (_, v) => v.import("createAgentSession", _));
   main.define("composeContext", ["module @tomlarkworthy/robocoop-5-core", "@variable"], (_, v) => v.import("composeContext", _));
   main.define("createOpenRouterClient", ["module @tomlarkworthy/robocoop-5-core", "@variable"], (_, v) => v.import("createOpenRouterClient", _));  
@@ -7546,6 +7597,72 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
       return { output: 'Attached ' + name + ' (' + file.size + ' bytes, ' + file.type + ') to ' + moduleId + '. Cells read it with FileAttachment(' + JSON.stringify(name) + ').' };
     }
   });
+  const request_files = defineTool({
+    id: 'request_files',
+    description: 'Ask the human to give you files (a dataset, an image, a document) through a picker in the chat \u2014 they may ' + 'also answer with a URL, which is fetched \u2014 and attach what they choose to a module as FileAttachments. Use it when a task needs the user\'s own data ' + 'instead of inventing sample data. The turn waits until they choose or skip. Ask before writing code when the data decides the design. Its cells ' + 'read each file with FileAttachment(name) (.csv({typed: true}) / .json() / .text() / .blob() / .url()). ' + 'The result names each attached file and shows the first lines of text files.',
+    parameters: {
+      type: 'object',
+      required: ['module', 'prompt'],
+      properties: {
+        module: { type: 'string', description: 'Module id that will own the files, e.g. @user/mymod. Created empty if it does not exist yet.' },
+        prompt: { type: 'string', description: 'What to ask the user for, shown above the picker, e.g. "a CSV of your monthly sales".' },
+        accept: { type: 'string', description: 'Optional file filter for the picker, e.g. ".csv,.tsv" or "image/*".' },
+        multiple: { type: 'boolean', description: 'Allow several files (default false).' }
+      }
+    },
+    execute: async ({module: moduleId, prompt, accept, multiple}, ctx) => {
+      if (!ctx?.askBus)
+        return { output: 'ERROR: no chat UI to ask the user in (this session has no ask channel)' };
+      const got = await ctx.askBus.request({ kind: 'files', prompt: String(prompt || ''), accept: accept || '', multiple: !!multiple, module: moduleId }, ctx.abort);
+      if (ctx.abort?.aborted)
+        return { output: 'Aborted before the user chose files.' };
+      const files = [], lines = [];
+      for (const x of got || []) {
+        if (typeof x !== 'string') { files.push(x); continue; }
+        try {
+          const res = await fetch(x);
+          if (!res.ok) { lines.push('ERROR: fetch ' + x + ' \u2192 HTTP ' + res.status); continue; }
+          const blob = await res.blob();
+          const base = decodeURIComponent(new URL(x, location.href).pathname.split('/').filter(Boolean).pop() || 'download');
+          files.push(new File([blob], base, { type: blob.type || 'application/octet-stream' }));
+        } catch (e) {
+          lines.push('ERROR: fetch ' + x + ' failed: ' + (e && e.message || e) + ' (the user can download it and pick the file instead)');
+        }
+      }
+      if (!files.length && lines.length)
+        return { output: lines.join('\n') };
+      // Asking before any code exists is the natural order (the data decides the design): create the module empty.
+      let created = false, mod = cellHelpers.resolveModule(moduleId);
+      if (files.length && !mod && /^@[\w.-]+\/[\w.-]+$/.test(moduleId)) {
+        const made = await write_file.execute({ file_path: '/src/' + moduleId + '.js', content: 'export default function define(runtime, observer) {\n  const main = runtime.module();\n  return main;\n}\n' }, ctx);
+        mod = cellHelpers.resolveModule(moduleId);
+        created = !!mod;
+        if (!mod) return { output: 'ERROR: could not create ' + moduleId + ' to hold the files: ' + String(made?.output ?? made).slice(0, 300) };
+      }
+      if (files.length && !mod)
+        return { output: 'ERROR: ' + moduleId + ' is not a module id (use @user/name)' };
+      if (created) lines.push('Created ' + moduleId + ' (empty) to hold the files; write its cells to /src/' + moduleId + '.js.');
+      if (!files.length)
+        return { output: 'The user skipped the request: no files were attached. Continue without them, or ask in your reply what they would like to do.' };
+      for (const f of files) {
+        try {
+          await setFileAttachment(f, mod);
+        } catch (e) {
+          lines.push('ERROR attaching ' + f.name + ': ' + (e && e.message || e));
+          continue;
+        }
+        let head = '';
+        if (/^text\/|json|csv|xml|yaml|javascript/.test(f.type || '') || /\.(csv|tsv|txt|json|md|xml|ya?ml|js)$/i.test(f.name)) {
+          try {
+            const t = await f.slice(0, 4000).text();
+            head = '\n  first lines:\n    ' + t.split('\n').slice(0, 5).map(l => l.slice(0, 200)).join('\n    ');
+          } catch (e) {}
+        }
+        lines.push('Attached ' + f.name + ' (' + f.size + ' bytes, ' + (f.type || 'unknown type') + ') to ' + moduleId + ' \u2014 cells read it with FileAttachment(' + JSON.stringify(f.name) + ')' + head);
+      }
+      return { output: lines.join('\n') };
+    }
+  });
   return [
     read_file,
     write_file,
@@ -7553,7 +7670,8 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
     globTool,
     grepTool,
     view_image,
-    attach_file
+    attach_file,
+    request_files
   ];
 };
 const _pytl01 = function _pythonTools(defineTool,py)
@@ -7674,13 +7792,16 @@ const _qc0bl = function _rc5_host(rc5_store,applyLib,pathLib,exportModuleJS,moun
 };
 const _1nb19yl = function _hostSetup(valueTools,fileTools,pythonTools,registerTool,invalidation,unregisterTool)
 {
+  // fresh objects per run: a later run's registration must never be mistaken for this run's
   const tools = [
     ...valueTools,
     ...fileTools,
     ...pythonTools
-  ];
+  ].map(t => ({ ...t }));
   tools.forEach(t => registerTool(t));
-  invalidation.then(() => tools.forEach(t => unregisterTool(t.id)));
+  // Every write recomputes fileTools; removing eagerly left steps a partial tool list ("unknown tool
+  // edit_file", e9 2026-09-27). The next run replaces by id; only tools nobody re-registered go.
+  invalidation.then(() => setTimeout(() => tools.forEach(t => unregisterTool(t.id, t)), 1000));
   return tools.map(t => t.id);
 };
 const _55ati1 = function _watchTable(html,rc5_watchBus,invalidation)
@@ -36517,15 +36638,16 @@ const _17jpbf2 = function _rc5_toolMgr(plugins)
         throw new Error('registerTool: tool needs an id');
       const prev = handles.get(tool.id);
       if (prev)
-        prev();
+        prev.remove();
       // replace-by-id
-      handles.set(tool.id, plugins.add('rc5-tools', tool));
+      handles.set(tool.id, { tool, remove: plugins.add('rc5-tools', tool) });
       return tool;
     },
-    unregister(id) {
-      const remove = handles.get(id);
-      if (remove) {
-        remove();
+    // With `tool`, only removes it if that exact object is still the registered one (a re-registration wins).
+    unregister(id, tool) {
+      const h = handles.get(id);
+      if (h && (!tool || h.tool === tool)) {
+        h.remove();
         handles.delete(id);
       }
     }
@@ -36535,7 +36657,7 @@ const _2b4tt9 = function _registerTool(rc5_toolMgr){return(
 tool => rc5_toolMgr.register(tool)
 )};
 const _15um81e = function _unregisterTool(rc5_toolMgr){return(
-id => rc5_toolMgr.unregister(id)
+(id, tool) => rc5_toolMgr.unregister(id, tool)
 )};
 const _1dzamy5 = function _rc5_tools(plugins){return(
 plugins.get('rc5-tools')
@@ -36731,6 +36853,41 @@ const _rc5wbf = function _createWatchBus(){return(
     }
   };
   return bus;
+}
+)};
+const _rc5askb = function _createAskBus(){return(
+// One pending question from a tool to the human, per session. request() resolves with the answer
+// (or null when skipped, or when the turn's abort signal fires); the chat UI renders `pending`.
+() => {
+  let pending = null;
+  const subs = new Set();
+  const notify = () => { for (const f of subs) { try { f(pending); } catch (e) {} } };
+  const settle = value => {
+    const p = pending;
+    if (!p) return false;
+    pending = null;
+    p.signal?.removeEventListener?.('abort', p.onAbort);
+    notify();
+    p.resolve(value);
+    return true;
+  };
+  return {
+    get pending() { return pending; },
+    request(req, signal) {
+      if (pending) settle(null);
+      return new Promise(resolve => {
+        const onAbort = () => settle(null);
+        pending = { ...req, resolve, signal, onAbort, at: Date.now() };
+        if (signal?.aborted) return settle(null);
+        signal?.addEventListener?.('abort', onAbort, { once: true });
+        notify();
+      });
+    },
+    respond: value => settle(value),
+    skip: () => settle(null),
+    onChange(f) { subs.add(f); return () => subs.delete(f); },
+    dispose() { settle(null); subs.clear(); }
+  };
 }
 )};
 const _16sx9jh = function _rc5_watchBus(createWatchBus){return(
@@ -36971,6 +37128,7 @@ export default function define(runtime, observer) {
   $def("_ctxmgr4", "contextView", ["plugins","invalidation"], _ctxmgr4);
   $def("_rc5wbf", "createWatchBus", [], _rc5wbf);
   $def("_16sx9jh", "rc5_watchBus", ["createWatchBus"], _16sx9jh);
+  $def("_rc5askb", "createAskBus", [], _rc5askb);
   $def("_1yx9hra", null, ["html","rc5_tools"], _1yx9hra);  
   $def("_rc5rc5monitorMgr", "rc5_monitorMgr", ["plugins"], _rc5rc5monitorMgr);
   $def("_rc5registerMonitor", "registerMonitor", ["rc5_monitorMgr"], _rc5registerMonitor);
