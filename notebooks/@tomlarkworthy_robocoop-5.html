@@ -4812,6 +4812,19 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     }
     if (m.role === 'assistant') {
       const parts = [];
+      // The step's reasoning, kept on the message (non-enumerable, so never re-sent) and in the turn cell.
+      if (typeof m.reasoning === 'string' && m.reasoning) {
+        const det = document.createElement('details');
+        det.style.cssText = 'color:' + C.muted + ';font-size:11.5px;padding:0 4px;opacity:.85';
+        const sum = document.createElement('summary');
+        sum.style.cssText = 'cursor:pointer;list-style-position:inside;font-style:italic';
+        sum.textContent = '\u{1F4AD} thought ' + m.reasoning.length + ' chars';
+        const pre = document.createElement('pre');
+        pre.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0 0;max-height:18em;overflow-y:auto;color:' + C.muted + ';font-size:11px';
+        pre.textContent = m.reasoning;
+        det.append(sum, pre);
+        parts.push(det);
+      }
       if (m.content) {
         let node;
         try {
@@ -4834,11 +4847,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
   };
   const render = () => {
     const desired = [];
-    let mi = 0;
     for (const m of session?.messages ?? []) {
-      // The reasoning block goes where it started — before the assistant message it produced, not after it.
-      if (mi++ === thinkAnchor && thinkChars)
-        desired.push(thinkEl);
       const c = msgCache.get(m);
       let wrap;
       if (c && c.key === cacheKey(m))
@@ -4853,7 +4862,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
       if (wrap)
         desired.push(wrap);
     }
-    // In flight: the reply it is thinking about has not been pushed yet, so the block trails the transcript.
+    // In flight only: once the step's message lands it carries its own reasoning block.
     if (thinkChars && thinkAnchor >= (session?.messages.length ?? 0))
       desired.push(thinkEl);
     for (const er of errors) {
@@ -44027,11 +44036,29 @@ async (log, messages) => {
     Array.isArray(m.content) ? { ...m, content: await Promise.all(m.content.map(part)) } : m));
 }
 )};
-const _rs_append = function _appendTurn(newTurnName,externaliseImages,defineLiteral){return(
+const _rs_keepReasoning = function _withStoredReasoning(){return(
+// The engine hangs each step's reasoning on its assistant message as a NON-enumerable property, so it is
+// never re-sent to the provider. A turn cell keeps it for display, capped to the last `cap` characters.
+(messages, cap = 20000) => messages.map(m => {
+  const r = m.reasoning;
+  if (typeof r !== "string" || !r) return m;
+  return { ...m, reasoning: r.length > cap ? "\u2026[" + (r.length - cap) + " chars cut]\n" + r.slice(-cap) : r };
+})
+)};
+const _rs_restore = function _restoreMessages(rehydrateImages){return(
+// Stored messages back into live ones: images rehydrated, reasoning hidden from the wire again.
+async (log, messages) => (await rehydrateImages(log, messages)).map(m => {
+  if (!Object.prototype.propertyIsEnumerable.call(m, "reasoning")) return m;
+  const { reasoning, ...rest } = m;
+  Object.defineProperty(rest, "reasoning", { value: reasoning, enumerable: false, configurable: true, writable: true });
+  return rest;
+})
+)};
+const _rs_append = function _appendTurn(newTurnName,externaliseImages,defineLiteral,withStoredReasoning){return(
 // One new cell per turn, never redefined. `parent` is the turn this one was sent after (null at the root).
 async (log, { parent = null, messages, status = "complete", error = null, created = new Date().toISOString() }) => {
   const id = newTurnName();
-  const stored = await externaliseImages(log, id, messages);
+  const stored = await externaliseImages(log, id, withStoredReasoning(messages));
   await defineLiteral(log.runtime, log.module, id, { id, parent, created, completed: new Date().toISOString(), status, error, messages: stored });
   return id;
 }
@@ -44067,12 +44094,12 @@ const _rs_chain = function _turnChain(){return(
   return out.reverse();
 }
 )};
-const _rs_readMessages = function _readMessages(readTurns,latestTurn,turnChain,rehydrateImages){return(
+const _rs_readMessages = function _readMessages(readTurns,latestTurn,turnChain,restoreMessages){return(
 // The transcript ending at `head` (default: the latest turn), with images rehydrated.
 async (log, head = undefined) => {
   const turns = await readTurns(log);
   const chain = turnChain(turns, head === undefined ? latestTurn(turns) : head);
-  return rehydrateImages(log, chain.flatMap(t => t.messages));
+  return restoreMessages(log, chain.flatMap(t => t.messages));
 }
 )};
 const _rs_list = function _listSessions(peekValues,SESSION_KIND,sessionName,DEFAULT_GROUP){return(
@@ -44156,6 +44183,8 @@ const _rs_test_roundtrip = async function _test_session_roundtrip(createSessionL
       { role: "assistant", content: "it has <" + "/script> in it" }
     ];
     const t2 = [{ role: "user", content: "again" }, { role: "assistant", content: "ok" }];
+    const thought = "x".repeat(24990) + "END";
+    Object.defineProperty(t2[1], "reasoning", { value: thought, enumerable: false });
     const t3 = [{ role: "user", content: "instead" }, { role: "assistant", content: "branch" }];
     const def = id => [...runtime._variables].find(v => v._module === log.module && v._name === id)._definition;
     const id1 = await appendTurn(log, { messages: t1, created: "2026-09-25T10:00:00.000Z" });
@@ -44174,6 +44203,14 @@ const _rs_test_roundtrip = async function _test_session_roundtrip(createSessionL
     expect(await readMessages(log, null)).toEqual([]);
     const turns = await readTurns(log);
     expect([...turns.values()].map(t => [t.id, t.parent, t.status]).sort()).toEqual([[id1, null, "complete"], [id2, id1, "aborted"], [id3, id1, "complete"]].sort());
+    // reasoning: stored capped to its tail, read back readable but off the wire
+    const storedR = turns.get(id2).messages[1].reasoning;
+    expect(storedR.startsWith("\u2026[4993 chars cut]\n")).toBe(true);
+    expect(storedR.endsWith("END")).toBe(true);
+    const back = (await readMessages(log, id2))[3];
+    expect(back.reasoning).toBe(storedR);
+    expect(Object.keys(back)).not.toContain("reasoning");
+    expect(JSON.stringify(back)).not.toContain("END");
     expect(turns.get(id1).messages[0].content[1]).toEqual({ type: "image_attachment", name: id1 + "_0.png", mimeType: "image/png" });
     // saved iff main
     const find = async () => (await listSessions(runtime)).find(s => s.module === log.module);
@@ -44188,7 +44225,7 @@ const _rs_test_roundtrip = async function _test_session_roundtrip(createSessionL
     expect((await find()).saved).toBe(true);
     await unsaveSession(log);
     expect((await find()).saved).toBe(false);
-    return "round trip, append-only, branch + latest head, image attachment, save/unsave";
+    return "round trip, append-only, branch + latest head, image attachment, reasoning cap, save/unsave";
   } finally {
     disposeSession(log);
   }
@@ -44204,7 +44241,7 @@ const _rs_test_storable = function _test_storableMessages(storableMessages,expec
   return "drops prompt, earlier turns and environment blocks; keeps notices";
 };
 
-const _rs_controller = function _createSessionController(listSessions,openSessionLog,createSessionLog,appendTurn,readTurns,latestTurn,turnChain,rehydrateImages,saveSession,unsaveSession,storableMessages,DEFAULT_GROUP){return(
+const _rs_controller = function _createSessionController(listSessions,openSessionLog,createSessionLog,appendTurn,readTurns,latestTurn,turnChain,restoreMessages,saveSession,unsaveSession,storableMessages,DEFAULT_GROUP){return(
 // Every session known to this page, and the one path that commits a turn. One controller serves every chat
 // on the page; which session a chat shows is the chat's business. Turns stream into session.messages; the log
 // is written once, when send() settles, so a background turn still commits after its chat switched away.
@@ -44230,7 +44267,7 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
     e.turns = e.log ? await readTurns(e.log) : new Map();
     if (head === undefined) head = latestTurn(e.turns);
     const chain = turnChain(e.turns, head);
-    const msgs = await rehydrateImages(e.log, chain.flatMap(t => t.messages));
+    const msgs = await restoreMessages(e.log, chain.flatMap(t => t.messages));
     let k = 0;
     for (const t of chain) for (const _ of t.messages) nodeOf.set(msgs[k++], t.id);
     e.session.messages.length = 0;
@@ -44499,18 +44536,20 @@ export default function define(runtime, observer) {
   $def("_rs_create", "createSessionLog", ["newSessionId","defineLiteral","SESSION_KIND","openSessionLog","DEFAULT_GROUP"], _rs_create);
   $def("_rs_extImages", "externaliseImages", ["createFileAttachment","setFileAttachment"], _rs_extImages);
   $def("_rs_rehydrate", "rehydrateImages", ["readValues"], _rs_rehydrate);
-  $def("_rs_append", "appendTurn", ["newTurnName","externaliseImages","defineLiteral"], _rs_append);
+  $def("_rs_keepReasoning", "withStoredReasoning", [], _rs_keepReasoning);
+  $def("_rs_restore", "restoreMessages", ["rehydrateImages"], _rs_restore);
+  $def("_rs_append", "appendTurn", ["newTurnName","externaliseImages","defineLiteral","withStoredReasoning"], _rs_append);
   $def("_rs_readTurns", "readTurns", ["turnNames","peekValues"], _rs_readTurns);
   $def("_rs_latest", "latestTurn", [], _rs_latest);
   $def("_rs_chain", "turnChain", [], _rs_chain);
-  $def("_rs_readMessages", "readMessages", ["readTurns","latestTurn","turnChain","rehydrateImages"], _rs_readMessages);
+  $def("_rs_readMessages", "readMessages", ["readTurns","latestTurn","turnChain","restoreMessages"], _rs_readMessages);
   $def("_rs_list", "listSessions", ["peekValues","SESSION_KIND","sessionName","DEFAULT_GROUP"], _rs_list);
   $def("_rs_rehome", "rehomeSession", ["peekValues","readValues","turnNames","defineLiteral","createFileAttachment","setFileAttachment"], _rs_rehome);
   $def("_rs_save", "saveSession", ["sessionName","createModule","rehomeSession","DEFAULT_GROUP"], _rs_save);
   $def("_rs_unsave", "unsaveSession", ["rehomeSession"], _rs_unsave);
   $def("_rs_dispose", "disposeSession", [], _rs_dispose);
   $def("_rs_storable", "storableMessages", [], _rs_storable);
-  $def("_rs_controller", "createSessionController", ["listSessions","openSessionLog","createSessionLog","appendTurn","readTurns","latestTurn","turnChain","rehydrateImages","saveSession","unsaveSession","storableMessages","DEFAULT_GROUP"], _rs_controller);
+  $def("_rs_controller", "createSessionController", ["listSessions","openSessionLog","createSessionLog","appendTurn","readTurns","latestTurn","turnChain","restoreMessages","saveSession","unsaveSession","storableMessages","DEFAULT_GROUP"], _rs_controller);
   $def("_rs_test_peek", "test_peekValues", ["peekValues","defineLiteral","realize","runtime","expect"], _rs_test_peek);
   $def("_rs_test_controller", "test_session_controller", ["createSessionController","disposeSession","runtime","expect"], _rs_test_controller);
   $def("_rs_guardTools", "guardTools", ["runtime","SESSION_KIND"], _rs_guardTools);
