@@ -1648,10 +1648,141 @@ const _197sgjt = async function _titles(modules,moduleTitle)
   );
   return map;
 };
-const _11z3pt0 = function _summary(main_modules,titles,bootloader,builtin,queue,notebookImportMatches,bootloaded_mains,resolve_modules,module_definition_variables)
+const _lme001 = function _lookupModuleEntry(){return(
+// The summary entry for the module a module-definition variable imports.
+//
+// `resolve_modules` already resolves a variable to its module BOTH ways -- `md._value == m ||
+// module_definition_cache.get(md) === m` -- but summary's cross-link pass trusted `v._value`
+// alone, and that asymmetry is a bug on notebook-kit. Measured 2026-09-25 on
+// new.observablehq.com/@tomlarkworthy/module-map: of 41 module-definition variables (named
+// `cell 1409`, `cell 1348`, … by the new compiler rather than `module 1`), `v._value` was
+// `undefined` for 30 and a bare namespace Object for 11 -- a Module for NONE. So every one of the
+// 41 lookups missed, every `dependsOn`/`dependedBy` stayed empty, and the resulting
+// `error building module dependancy map` was 41/41 rather than the cosmetic noise it was taken for.
+// Going through the cache resolves all 41 (cacheHits 41, stillMissing 0).
+//
+// The map is consulted first and the cache only as a fallback, because `v._value` is the Module
+// itself on classic and a WRONG object (not undefined) on notebook-kit -- so `v._value ?? cache`
+// would silently pick the wrong thing for those 11 rather than fall through.
+(modules, cache, v) => modules.get(v._value) ?? modules.get(cache?.get(v))
+)};
+const _lme002 = function _test_lookupModuleEntry_prefers_the_variables_own_value(expect,lookupModuleEntry)
+{
+  // the classic shape: the variable's value IS the module
+  const mod = {}, entry = { name: "@tomlarkworthy/themes" };
+  const v = { _value: mod };
+  expect(lookupModuleEntry(new Map([[mod, entry]]), new Map(), v)).toBe(entry);
+  return "ok";
+};
+const _lme003 = function _test_lookupModuleEntry_falls_back_to_the_cache(expect,lookupModuleEntry)
+{
+  // the notebook-kit shape: _value is undefined, the cache holds the module
+  const mod = {}, entry = { name: "@tomlarkworthy/themes" };
+  const v = { _value: undefined };
+  expect(lookupModuleEntry(new Map([[mod, entry]]), new Map([[v, mod]]), v)).toBe(entry);
+  return "ok";
+};
+const _lme004 = function _test_lookupModuleEntry_ignores_a_value_that_is_not_a_module(expect,lookupModuleEntry)
+{
+  // the other notebook-kit shape: _value is a bare namespace object, NOT undefined, so a
+  // `v._value ?? cache.get(v)` would wrongly stop at it -- 11 of 41 measured on the new site
+  const mod = {}, entry = { name: "@tomlarkworthy/themes" };
+  const v = { _value: { default: () => {} } };
+  expect(lookupModuleEntry(new Map([[mod, entry]]), new Map([[v, mod]]), v)).toBe(entry);
+  return "ok";
+};
+const _lme005 = function _test_lookupModuleEntry_gives_up_when_neither_resolves(expect,lookupModuleEntry)
+{
+  // nothing to link: the caller must still see undefined rather than a bogus entry
+  const v = { _value: undefined };
+  expect(lookupModuleEntry(new Map(), new Map(), v)).toBe(undefined);
+  expect(lookupModuleEntry(new Map(), undefined, v)).toBe(undefined);
+  return "ok";
+};
+const _mme001 = function _mergeModuleEntries(){return(
+// `new Map(entries)` lets the LAST entry for a module win, which silently discards a name an
+// earlier source already recovered. `summary` feeds it the DOM sniff (notebookImportMatches)
+// BEFORE resolve_modules, and resolve_modules contributes `<unknown ${Math.random()}>` whenever
+// findModuleName cannot recover a slug -- so the placeholder overwrote the real name.
+//
+// Only observablehq.com can reach this: there a notebook's OWN `import {x} from "@a/b"` cell
+// creates a module with NO module-definition variable, so findModuleName has nothing to read and
+// the DOM sniff is the only source of that name. A lopecode notebook embeds every module as a
+// block and never takes this path, so no amount of local testing can surface it -- which is why
+// it survived. Measured 2026-09-24 on old.observablehq.com/@tomlarkworthy/exporter-3: themes,
+// reversible-attachment and local-storage-view, exactly the three `main` imports, were each
+// sniffed correctly and then renamed `<unknown …>`. That exported 9 bridges onto a module no
+// loader can resolve, so the second-generation fork booted blank with `css is not defined`.
+(entries) => {
+  const isPlaceholder = (name) => typeof name === "string" && /^<unknown/.test(name);
+  const merged = new Map();
+  for (const [module, info] of entries) {
+    const held = merged.get(module);
+    // A later source still contributes its other fields (title, variable); only the NAME is held.
+    merged.set(
+      module,
+      held && !isPlaceholder(held.name) && isPlaceholder(info?.name)
+        ? { ...held, ...info, name: held.name }
+        : info
+    );
+  }
+  return merged;
+}
+)};
+const _mme002 = function _test_mergeModuleEntries_keeps_a_recovered_name_over_a_placeholder(expect,mergeModuleEntries)
+{
+  // the measured shape: the DOM sniff names `main`'s own import, resolve_modules then can't
+  const themes = {};
+  const merged = mergeModuleEntries([
+    [themes, { name: "@tomlarkworthy/themes", type: "notebook import" }],
+    [themes, { name: "<unknown 0.7346051590142268>", type: "module variable" }]
+  ]);
+  expect(merged.get(themes).name).toBe("@tomlarkworthy/themes");
+  expect(merged.size).toBe(1);
+  return "ok";
+};
+const _mme003 = function _test_mergeModuleEntries_takes_the_later_fields_but_not_its_name(expect,mergeModuleEntries)
+{
+  // holding the name must not cost the title and variable the later source carries
+  const m = {}, variable = { _name: "module 3" };
+  const merged = mergeModuleEntries([
+    [m, { name: "@tomlarkworthy/themes", dom: "<sniffed>" }],
+    [m, { name: "<unknown 0.5>", title: "Themes", variable }]
+  ]);
+  expect(merged.get(m)).toEqual({
+    name: "@tomlarkworthy/themes",
+    dom: "<sniffed>",
+    title: "Themes",
+    variable
+  });
+  return "ok";
+};
+const _mme004 = function _test_mergeModuleEntries_still_lets_a_real_name_win(expect,mergeModuleEntries)
+{
+  // last-wins is the normal rule and must survive: only a placeholder is held back
+  const m = {};
+  const merged = mergeModuleEntries([
+    [m, { name: "@tomlarkworthy/themes" }],
+    [m, { name: "main" }]
+  ]);
+  expect(merged.get(m).name).toBe("main");
+  return "ok";
+};
+const _mme005 = function _test_mergeModuleEntries_accepts_a_placeholder_when_nothing_better(expect,mergeModuleEntries)
+{
+  // a placeholder is still better than dropping the module out of the map entirely
+  const m = {};
+  const merged = mergeModuleEntries([
+    [m, { name: "<unknown 0.1>" }],
+    [m, { name: "<unknown 0.2>" }]
+  ]);
+  expect(merged.get(m).name).toBe("<unknown 0.2>");
+  return "ok";
+};
+const _11z3pt0 = function _summary(main_modules,titles,bootloader,builtin,queue,notebookImportMatches,bootloaded_mains,resolve_modules,module_definition_variables,mergeModuleEntries,lookupModuleEntry,module_definition_cache)
 {
   console.log("generate summary");
-  const modules = new Map([
+  const entries = [
     ...main_modules.map((main_module) => [
       main_module,
       {
@@ -1709,7 +1840,9 @@ const _11z3pt0 = function _summary(main_modules,titles,bootloader,builtin,queue,
         dependedBy: []
       }
     ])
-  ]);
+  ];
+  // NOT `new Map(entries)` -- see mergeModuleEntries for why the last entry must not always win.
+  const modules = mergeModuleEntries(entries);
   // add cross links
   // notebookImportVariables[0].variable._module == main
   [...notebookImportMatches.keys()].forEach((m) => {
@@ -1729,7 +1862,7 @@ const _11z3pt0 = function _summary(main_modules,titles,bootloader,builtin,queue,
 
   module_definition_variables.forEach((v) => {
     const hostModule = modules.get(v._module);
-    const importedModule = modules.get(v._value);
+    const importedModule = lookupModuleEntry(modules, module_definition_cache, v);
     if (!hostModule?.dependsOn || !importedModule?.dependedBy) {
       console.error(
         "error building module dependancy map",
@@ -1813,7 +1946,17 @@ export default function define(runtime, observer) {
   $def("_1akt4kz", "notebookImportMatches", ["pageImportMatch","notebookImportVariables","modules"], _1akt4kz);  
   $def("_1ang0sg", "moduleTitle", ["observeVariable","isImportCell"], _1ang0sg);
   $def("_197sgjt", "titles", ["modules","moduleTitle"], _197sgjt);  
-  $def("_11z3pt0", "summary", ["main_modules","titles","bootloader","builtin","queue","notebookImportMatches","bootloaded_mains","resolve_modules","module_definition_variables"], _11z3pt0);  
+  $def("_mme001", "mergeModuleEntries", [], _mme001);
+  $def("_mme002", "test_mergeModuleEntries_keeps_a_recovered_name_over_a_placeholder", ["expect","mergeModuleEntries"], _mme002);
+  $def("_mme003", "test_mergeModuleEntries_takes_the_later_fields_but_not_its_name", ["expect","mergeModuleEntries"], _mme003);
+  $def("_mme004", "test_mergeModuleEntries_still_lets_a_real_name_win", ["expect","mergeModuleEntries"], _mme004);
+  $def("_mme005", "test_mergeModuleEntries_accepts_a_placeholder_when_nothing_better", ["expect","mergeModuleEntries"], _mme005);
+  $def("_lme001", "lookupModuleEntry", [], _lme001);
+  $def("_lme002", "test_lookupModuleEntry_prefers_the_variables_own_value", ["expect","lookupModuleEntry"], _lme002);
+  $def("_lme003", "test_lookupModuleEntry_falls_back_to_the_cache", ["expect","lookupModuleEntry"], _lme003);
+  $def("_lme004", "test_lookupModuleEntry_ignores_a_value_that_is_not_a_module", ["expect","lookupModuleEntry"], _lme004);
+  $def("_lme005", "test_lookupModuleEntry_gives_up_when_neither_resolves", ["expect","lookupModuleEntry"], _lme005);
+  $def("_11z3pt0", "summary", ["main_modules","titles","bootloader","builtin","queue","notebookImportMatches","bootloaded_mains","resolve_modules","module_definition_variables","mergeModuleEntries","lookupModuleEntry","module_definition_cache"], _11z3pt0);  
   $def("_1pou2g6", "submit_summary", ["resolve_modules","queue","notebookImports","viewof queue","summary"], _1pou2g6);  
   main.define("linkTo", ["module @tomlarkworthy/lopepage-urls", "@variable"], (_, v) => v.import("linkTo", _));  
   main.define("flowQueue", ["module @tomlarkworthy/flow-queue", "@variable"], (_, v) => v.import("flowQueue", _));  
