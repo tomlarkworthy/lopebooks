@@ -2051,11 +2051,15 @@ const _qq3v7b = function _jbApply(importShim)
   const genPid = () => '_jb' + (pidSeq++).toString(36) + Math.floor(Math.random() * 1000000).toString(36);
   const hasVarInput = inputs => (inputs || []).some(iv => (typeof iv === 'string' ? iv : iv && iv._name) === '@variable');
   const importPath = defn => {
-    const m = (defn ? defn.toString() : '').match(/import\(\s*["'`]([^"'`]+)["'`]/);
+    // es-module-shims rewrites a dynamic import( in shimmed source to importShim(
+    const m = (defn ? defn.toString() : '').match(/import(?:Shim)?\(\s*["'`]([^"'`]+)["'`]/);
     return m ? m[1] : null;
   };
   return function makeApply({currentModules, runtime, probeDefine, createModule, obj_observer} = {}) {
-    const resolveModule = moduleId => {
+    // create: only the module being applied may be created. A module it IMPORTS must be found or loaded,
+    // never created — an empty stub named like a notebook shadows the real one (observed 2026-09-27: an
+    // import of @tomlarkworthy/slides bound to an empty stub, so every imported name was undefined).
+    const resolveModule = (moduleId, { create = false } = {}) => {
       if (currentModules)
         for (const [, info] of currentModules)
           if (info.name === moduleId)
@@ -2063,7 +2067,7 @@ const _qq3v7b = function _jbApply(importShim)
       const r = runtime;
       if (r.mains && r.mains.has(moduleId))
         return r.mains.get(moduleId);
-      if (typeof createModule === 'function') {
+      if (create && typeof createModule === 'function') {
         try {
           return createModule(moduleId, r);
         } catch (e) {
@@ -2086,7 +2090,7 @@ const _qq3v7b = function _jbApply(importShim)
       }
     })();
     return function applyModule(moduleId, defineFn) {
-      const mod = resolveModule(moduleId);
+      const mod = resolveModule(moduleId, { create: true });
       if (!mod)
         return {
           applied: false,
@@ -2164,15 +2168,16 @@ const _qq3v7b = function _jbApply(importShim)
         // explicit module.variable().import(remote, alias, from) form
         if (cell.type === 'import') {
           const spec = cell.from;
-          const child = spec && resolveModule(spec);
-          if (!child)
+          if (!spec)
             continue;
+          const child = resolveModule(spec);
           const loaderName = 'module ' + spec;
           seenNames.add(loaderName);
           if (!existingByName.has(loaderName)) {
             const lv = mod.variable(null);
-            lv.define(loaderName, [], () => child);
-            lv._jbKey = 'live:' + spec;
+            const path = '/' + spec + '.js?v=4';
+            lv.define(loaderName, [], child ? () => child : async () => runtime.module((await import(path)).default));
+            lv._jbKey = child ? 'live:' + spec : 'path:' + path;
             existingByName.set(loaderName, lv);
             changes++;
           }
