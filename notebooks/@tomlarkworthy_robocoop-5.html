@@ -5777,11 +5777,12 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
   // cannot work. Same defensive shape as the loop's lastModel: remember the last non-empty tool set.
   let lastTools = [];
   for (const w of watches ?? []) watchBus.poll(w.label, w.read, w);
+  const sessionState = {};  // tools keep per-session facts here (e.g. which wiki docs were read)
   // Tools reach this session's bus through ctx, so a watch it sets reports to it and to no other agent.
   const bound = new WeakMap();
   const bind = t => {
     let b = bound.get(t);
-    if (!b) bound.set(t, b = { ...t, execute: (args, ctx) => t.execute(args, { ...ctx, watchBus }) });
+    if (!b) bound.set(t, b = { ...t, execute: (args, ctx) => t.execute(args, { ...ctx, watchBus, sessionState }) });
     return b;
   };
   // `robocoop5_temperature` is a float read from localStorage, the same persistence the model picker uses
@@ -5853,6 +5854,7 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
     maxTokens: 32000
   });
   agent.watchBus = watchBus;
+  agent.sessionState = sessionState;
   agent.dispose = () => watchBus.dispose();
   return agent;
   };
@@ -7119,11 +7121,24 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     unwatch_variable
   ];
 };
-const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_module_files,cellHelpers,setFileAttachment,localDisk)
+const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_module_files,cellHelpers,setFileAttachment,localDisk,wiki_triggers)
 {
   const {listPathsAsync, readPath, globToRe, isDisk} = pathLib;
   const {applyModuleSrc} = applyLib;
   const MODULE_PATH = /^\/(?:notebook|src)\/(.+)\.js$/;
+  // A wiki doc's write-triggers name constructs it documents; a module write using one is refused until
+  // the session has read that doc. The state is per session (ctx.sessionState); without it, no gate.
+  const WIKI = '/content/@tomlarkworthy/markdown-wiki/';
+  const wikiGate = (text, ctx) => {
+    const st = ctx?.sessionState;
+    if (!st) return null;
+    const read = st.wikiRead ??= new Set();
+    const due = (wiki_triggers || []).filter(d => !read.has(d.path) && d.patterns.some(p => p.test(text)));
+    if (!due.length) return null;
+    (st.wikiRefusals ??= []).push(...due.map(d => d.path));
+    return 'REFUSED, nothing was written: this source uses constructs documented in ' + due.map(d => d.path).join(', ') +
+      ', which you have not read in this session. read_file it, then retry the same write.';
+  };
   const read_file = defineTool({
     id: 'read_file',
     description: 'Read a file from the virtual notebook filesystem, returned with line numbers (cat -n style). ' + 'Use offset/limit for large files. Mirrors Claude Code\'s Read. /src/<id>.js is your byte-stable editable ' + 'copy; /notebook/<id>.js is the canonical live form; /content/<id> are the raw blocks/attachments; ' + '/local-disk/** is the mounted folder on the user\'s machine (real files, read where they are).',
@@ -7145,7 +7160,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         }
       }
     },
-    execute: async ({file_path, offset, limit}) => {
+    execute: async ({file_path, offset, limit}, ctx) => {
       let text;
       try {
         text = await readPath(file_path);
@@ -7158,6 +7173,8 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
       const start = Math.max(0, offset ? offset - 1 : 0);
       const end = Math.min(lines.length, start + (limit || 2000));
       const body = lines.slice(start, end).map((l, i) => String(start + i + 1).padStart(6) + '\t' + (l.length > 2000 ? l.slice(0, 2000) + '\u2026 [line truncated]' : l)).join('\n');
+      if (file_path.startsWith(WIKI) && ctx?.sessionState)
+        (ctx.sessionState.wikiRead ??= new Set()).add(file_path);
       return { output: body || '(empty file)' };
     }
   });
@@ -7195,6 +7212,9 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         rc5_store.scratch.set(file_path, String(content ?? ''));
         return { output: 'Wrote ' + file_path };
       }
+      const refused = wikiGate(String(content ?? ''), ctx);
+      if (refused)
+        return { output: refused };
       const applied = await applyModuleSrc(m[1], String(content ?? ''), { watchBus: ctx?.watchBus });
       return { output: 'Wrote ' + file_path + ' \u2014 ' + applied.msg };
     }
@@ -7239,6 +7259,9 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         return { output: 'ERROR: cannot read ' + file_path + ': not found' };
       if (old_string === new_string)
         return { output: 'ERROR: old_string and new_string are identical.' };
+      const refused = MODULE_PATH.test(file_path) && wikiGate(String(new_string ?? ''), ctx);
+      if (refused)
+        return { output: refused };
       const parts = text.split(old_string);
       const count = parts.length - 1;
       if (count === 0)
@@ -8004,6 +8027,7 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/summarizejs", async () => runtime.module((await import("/@tomlarkworthy/summarizejs.js?v=4")).default));  
   main.define("module @tomlarkworthy/fileattachments", async () => runtime.module((await import("/@tomlarkworthy/fileattachments.js?v=4")).default));  
   main.define("module @tomlarkworthy/local-disk", async () => runtime.module((await import("/@tomlarkworthy/local-disk.js?v=4")).default));
+  main.define("module @tomlarkworthy/markdown-wiki", async () => runtime.module((await import("/@tomlarkworthy/markdown-wiki.js?v=4")).default));
   main.define("module @tomlarkworthy/pyodide", async () => runtime.module((await import("/@tomlarkworthy/pyodide.js?v=4")).default));  
   $def("_yyrxg4", null, ["md"], _yyrxg4);  
   $def("_76otvk", "cellHelpers", ["currentModules","runtime"], _76otvk);  
@@ -8012,7 +8036,7 @@ export default function define(runtime, observer) {
   $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
   $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib"], _190yjiu);
   $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py"], _ual70b);
-  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment","localDisk"], _6aumvx);  
+  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment","localDisk","wiki_triggers"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS","mountLocalDisk"], _qc0bl);  
   $def("_pytl01", "pythonTools", ["defineTool","py"], _pytl01);
   $def("_1nb19yl", "hostSetup", ["valueTools","fileTools","pythonTools","registerTool","invalidation","unregisterTool"], _1nb19yl);  
@@ -8045,6 +8069,7 @@ export default function define(runtime, observer) {
   main.define("rc5_specGate", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("rc5_specGate", _));
   main.define("registerMonitor", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("registerMonitor", _));
   main.define("unregisterMonitor", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("unregisterMonitor", _));
+  main.define("wiki_triggers", ["module @tomlarkworthy/markdown-wiki", "@variable"], (_, v) => v.import("wiki_triggers", _));
   return main;
 }</script>
 
@@ -29345,6 +29370,70 @@ rather than decorative. Re-run it if a fixture changes.
   `@tomlarkworthy/assembly-script`) attach `.wasm.gz` next to the JS and hand the bytes to the
   library explicitly. Not covered above; read those modules.
 </script>
+<script id="@tomlarkworthy/markdown-wiki/writing-cells-in-module-source.md" 
+  type="text/plain"
+  data-mime="text/markdown"
+>
+---
+write-triggers:
+  - "viewof[ _]"
+  - "mutable[ _]"
+  - "main\\.define\\(\"module "
+---
+
+# Writing viewof, mutable and import cells in module source
+
+A module file under `/src` is the compiled `define()` form, not Observable source. Three Observable
+constructs expand into more than one variable there, and each must be written out in full. The
+robocoop-5 agent got every one of these wrong at least once on 2026-09-27; the failures are quoted
+under each.
+
+## viewof — two variables
+
+```js
+$def("_k1", "viewof knob", ["Inputs"], (Inputs) => Inputs.range([0, 100], {value: 10}));
+$def("_k2", "knob", ["Generators", "viewof knob"], (G, v) => G.input(v));
+```
+
+`knob` is the value; other cells list `"knob"` as an input and recompute when the slider moves.
+`Generators.input` is what connects the two: it yields the element's `value` on every `input`
+event.
+
+Observed (e6, game-theory prompt): the value cell was written as `(viewof_marketSize) =>
+viewof_marketSize`, so `marketSize` was the element, and every payoff came out `NaN`. The fix the
+agent chose, `+viewof_marketSize.value`, reads the slider once when the cell first runs and never
+again: the model stopped responding to its own inputs. Both compile and both report "computes
+with no runtime error", so the apply result does not catch either.
+
+## mutable — three variables
+
+```js
+$def("_m1", "initial count", [], () => 0);
+$def("_m2", "mutable count", ["Mutable", "initial count"], (M, _) => new M(_));
+$def("_m3", "count", ["mutable count"], _ => _.generator);
+```
+
+Read `count` to react to it. Assign through `"mutable count"` (`m.value = 5`). Copied from the
+`item` cell of `@spond/revised-sars-cov-2-analytics-page` in lopebooks.
+
+## import — a loader and a binding per name
+
+```js
+main.define("module @user/other", async () => runtime.module((await import("/@user/other.js?v=4")).default));
+main.define("x", ["module @user/other", "@variable"], (_, v) => v.import("x", _));
+```
+
+Both lines go inside `define()`, after the `$def` lines. The same two lines load a notebook
+published on observablehq.com that this page does not embed; after the write applies, its source
+is readable at `/src/@user/other.js`. To read a published notebook's API before importing it, fetch
+`https://api.observablehq.com/@user/other.js?v=4`. `?v=3`, `/d/…` and the observablehq.com page URL
+were all tried in runs on 2026-09-27 and none returned the module.
+
+Observed: before lopebooks `dd9a6f7f` the apply bound an import of a notebook not in the page to an
+empty module of the same name, so every imported name was "not defined" although the file was
+correct. If an import still reports a name as not defined, check the loader line's path before
+rewriting the binding.
+</script>
 <script id="@tomlarkworthy/markdown-wiki" 
   type="text/plain"
   data-mime="application/javascript"
@@ -29361,13 +29450,13 @@ Inputs.select(wiki_files, {
 })
 )};
 const _1ie98l = (G, _) => G.input(_);
-const _wbv2ns = function _wiki_view(wiki_register,wiki_selection,wikiRead,html,md)
+const _wbv2ns = function _wiki_view(wiki_register,wiki_selection,wikiRead,wikiFrontmatter,html,md)
 {
     wiki_register;
     // side-effect: register docs as FileAttachments for export durability
     const content = !wiki_selection
       ? '_(no documents — inject them with tools/sync-wiki.ts)_'
-      : (wikiRead(wiki_selection) ?? '_(document not found)_');
+      : (wikiFrontmatter(wikiRead(wiki_selection)).body || '_(document not found)_');
     return html`<div style="max-height:70vh;overflow:auto;padding:0 1rem;line-height:1.5">${ md([content]) }</div>`;
 };
 const _1trbfb3 = function _wikiRead(){return(
@@ -29392,7 +29481,7 @@ const _103elop = function _wiki_files()
   const prefix = '@tomlarkworthy/markdown-wiki/';
   return Array.from(document.querySelectorAll(`script[type="text/plain"][id^="${ prefix }"]`)).map(el => el.id.slice(prefix.length)).sort();
 };
-const _1q8134j = function _wiki_summaries(wiki_files,wikiRead)
+const _1q8134j = function _wiki_summaries(wiki_files,wikiRead,wikiFrontmatter)
 {
   const firstLine = t => {
     for (const raw of String(t || '').split('\n')) {
@@ -29404,7 +29493,7 @@ const _1q8134j = function _wiki_summaries(wiki_files,wikiRead)
   };
   return wiki_files.map(name => ({
     name,
-    summary: firstLine(wikiRead(name))
+    summary: firstLine(wikiFrontmatter(wikiRead(name)).body)
   }));
 };
 const _1xyi3gi = function _wiki_index(wiki_register,wiki_summaries)
@@ -29415,6 +29504,27 @@ const _1xyi3gi = function _wiki_index(wiki_register,wiki_summaries)
     const lines = wiki_summaries.map(({name, summary}) => `- ${ base }${ name } — ${ summary }`);
     return 'KNOWLEDGE WIKI — a curated, authoritative set of docs about THIS project (lopecode / lopebooks / ' + 'robocoop / the notebook runtime and its tooling). When a task or question touches any of these topics, ' + 'read the relevant doc with read_file FIRST — before investigating the live notebook, fetching anything, ' + 'or answering from memory. These docs are current and take precedence over your priors; do not fabricate ' + 'an answer a doc already gives. Available docs:\n' + lines.join('\n');
 };
+const _wikifm = function _wikiFrontmatter(){return(
+// A doc may open with `---\nwrite-triggers:\n  - "<regex>"\n---`: regexes over module source an agent
+// writes. robocoop-5 refuses such a write until the doc has been read (tools/sync-wiki.ts ships the key).
+text => {
+  const t = String(text ?? '').replace(/^\s*\n(?=---\n)/, '');  // a content block opens with a newline
+  const m = /^---\n([\s\S]*?)\n---\n+/.exec(t);
+  if (!m) return { body: t, writeTriggers: [] };
+  const block = /^write-triggers:\n((?:[ \t]+-.*(?:\n|$))+)/m.exec(m[1] + '\n');
+  const writeTriggers = [];
+  for (const line of block ? block[1].split('\n') : []) {
+    const q = /^[ \t]+-[ \t]*(.+?)[ \t]*$/.exec(line);
+    if (!q) continue;
+    try { writeTriggers.push(new RegExp(q[1].startsWith('"') ? JSON.parse(q[1]) : q[1])); } catch (e) {}
+  }
+  return { body: t.slice(m[0].length), writeTriggers };
+}
+)};
+const _wikitrig = function _wiki_triggers(wiki_files,wikiRead,wikiFrontmatter){return(
+wiki_files.map(name => ({ name, path: '/content/@tomlarkworthy/markdown-wiki/' + name, patterns: wikiFrontmatter(wikiRead(name)).writeTriggers }))
+  .filter(d => d.patterns.length)
+)};
 const _ae4w5v = function _wikiModule(thisModule){return(
 thisModule()
 )};
@@ -29459,10 +29569,12 @@ export default function define(runtime, observer) {
   $def("_okuukn", "intro", ["md"], _okuukn);  
   $def("_xnpk0l", "viewof wiki_selection", ["Inputs","wiki_files"], _xnpk0l);  
   $def("_1ie98l", "wiki_selection", ["Generators","viewof wiki_selection"], _1ie98l);  
-  $def("_wbv2ns", "wiki_view", ["wiki_register","wiki_selection","wikiRead","html","md"], _wbv2ns);  
+  $def("_wbv2ns", "wiki_view", ["wiki_register","wiki_selection","wikiRead","wikiFrontmatter","html","md"], _wbv2ns);  
   $def("_1trbfb3", "wikiRead", [], _1trbfb3);  
   $def("_103elop", "wiki_files", [], _103elop);  
-  $def("_1q8134j", "wiki_summaries", ["wiki_files","wikiRead"], _1q8134j);  
+  $def("_1q8134j", "wiki_summaries", ["wiki_files","wikiRead","wikiFrontmatter"], _1q8134j);
+  $def("_wikifm", "wikiFrontmatter", [], _wikifm);
+  $def("_wikitrig", "wiki_triggers", ["wiki_files","wikiRead","wikiFrontmatter"], _wikitrig);  
   $def("_1xyi3gi", "wiki_index", ["wiki_register","wiki_summaries"], _1xyi3gi);  
   $def("_ae4w5v", "viewof wikiModule", ["thisModule"], _ae4w5v);  
   $def("_1q7cpig", "wikiModule", ["Generators","viewof wikiModule"], _1q7cpig);  
