@@ -32618,6 +32618,54 @@ chart. In order of preference:
 Do not delete the axis (`axis: null`, `tickFormat: null`) or shrink the font below 9px: the labels
 stop overlapping and can no longer be read.
 </script>
+<script id="@tomlarkworthy/markdown-wiki/what-a-saved-notebook-opens.md" 
+  type="text/plain"
+  data-mime="text/markdown"
+>
+---
+write-triggers:
+  - "[mM]ains\\.(set|delete)\\("
+  - "headless\\s*:\\s*(false|true)"
+---
+
+# What a saved notebook opens with (mains and the layout)
+
+A saved file opens two things from its `bootconf.json` block (read it at `/content/bootconf.json`):
+
+- `mains` — the modules the bootloader boots. A module block the file carries but that is not in
+  `mains` and that no booted module imports never runs.
+- `hash` — the lopepage layout, `#view=R100(S70(@a/doc),S30(@a/other))`. Only modules named in it
+  get a pane. In a stack `S(a,b)` the reopened page shows the FIRST tab; which tab was active is not
+  saved.
+
+Saving (the save button, `@tomlarkworthy/save-in-place`) writes `runtime.mains` of the live page as
+`mains` and the live `location.hash` (minus `open=`, `cc=` and other one-shot params) as `hash`. The
+exporter serializes only modules the runtime has booted, so an unbooted block is dropped by the next
+save.
+
+When the user's work "is not there" after reopening, the save code is not the fault. The work is
+either not booted or not in the layout. Fix the page, then the next save carries it:
+
+1. Not booted (the environment lists it as saved but NOT booted; its text is at `/content/<id>`):
+   `read_file /content/<id>` and `write_file /src/<id>.js` with that text unchanged. The write boots
+   it and adds it to `runtime.mains`; a module with `md`, `html` or `viewof` cells is opened as a tab.
+2. Not visible: give it its own stack in the layout, keeping the other panes, with `eval_js`:
+   ```js
+   location.hash = "#view=R100(S50(@user/mine),S35(@tomlarkworthy/robocoop-5),S15(@tomlarkworthy/robocoop-5-srctools))";
+   ```
+   lopepage-2 applies a `view=` hash on `hashchange` and keeps it in the URL; the next save stores it.
+3. Check what a save would write, without saving:
+   ```js
+   const r = await exportToHTML({ mains: new Map(runtime.mains), runtime, options: { hash: location.hash } });
+   const conf = JSON.parse(new DOMParser().parseFromString(r.source ?? r, "text/html").getElementById("bootconf.json").textContent);
+   return conf;   // mains must list the module; hash must name it outside another module's stack
+   ```
+   (`eval_js` in module `@tomlarkworthy/save-in-place`, which has both names.) Then tell the user to save.
+
+Do not edit `@tomlarkworthy/exporter-3` or `save-in-place` for this, and do not change `headless`:
+`"headless": true` is what a lopepage notebook needs; with `false` every cell also renders
+underneath the layout.
+</script>
 <script id="@tomlarkworthy/markdown-wiki" 
   type="text/plain"
   data-mime="application/javascript"
@@ -46604,11 +46652,24 @@ const _ctx_notebook = function _ctx_notebook(runtime){return(
       if (!mains.length && !mods.length) return null;
       // bootconf is the file as loaded; modules created or seeded since are only in the live mains
       try { mains = [...new Set([...mains, ...runtime.mains.keys()])]; } catch (e) {}
+      // a module block the file carries that nothing boots or imports: saved once, never in mains, so it does not open.
+      // Attachment owners are skipped: 180 corpus files carry an unused golden-layout-2-6-0 library block.
+      let orphans = [];
+      try {
+        const loaded = new Set(mains);
+        for (const v of runtime._variables) if (typeof v._name === 'string' && v._name.startsWith('module ') && v._value) loaded.add(v._name.slice(7));
+        const blocks = [...document.querySelectorAll('script[type="text/plain"][id]')];
+        orphans = mods.filter((id) => /^@[^/]+\/[^/]+$/.test(id) && !loaded.has(id) && id !== '@tomlarkworthy/bootloader' &&
+          !blocks.some((b) => b.id !== id && (b.id.startsWith(id + '/') || (b.textContent || '').includes(id))));
+      } catch (e) {}
       const lines = [];
       // the host's own mains: the chat (robocoop-5*) and its page chrome. The rest is the user's work.
       const host = (m) => /^@tomlarkworthy\/(robocoop-5|lopepage|save-in-place$|inputs-reference$)/.test(m);
       if (mains.length) {
-        lines.push("the user's modules (\"my notebook\" means these): " + (mains.filter((m) => !host(m)).join(', ') || 'none yet'));
+        const own = mains.filter((m) => !host(m));
+        lines.push("the user's modules (\"my notebook\" means these): " + (own.join(', ') || (orphans.length ? 'none booted' : 'none yet')));
+        if (orphans.length) lines.push("also the user's, saved in this file but NOT booted — absent from bootconf.json mains and imported by nothing, so the page opens without them: " +
+          orphans.map((id) => id + ' (source: /content/' + id + ')').join(', '));
         lines.push("the chat you run in (not the user's notebook): " + mains.filter(host).join(', '));
       }
       if (mods.length) lines.push(mods.length + ' modules bundled (glob /src/**/*.js to list; read one as a template)');
@@ -46635,7 +46696,8 @@ const _ctx_layout = function _ctx_layout(){return(
       let view = '';
       try { view = new URLSearchParams(location.hash.slice(1)).get('view') || ''; } catch (e) {}
       const names = panes.map((p) => p.dataset.module + (p.dataset.module === focused ? ' (focused)' : ''));
-      return 'open panes: ' + names.join(', ') + (view ? '\nlayout: ' + view : '');
+      return 'open panes: ' + names.join(', ') + (view ? '\nlayout: ' + view +
+        '\na save writes this layout and runtime.mains into the file; reopened, each S(...) stack shows only its FIRST tab. Change it with eval_js: location.hash = "#view=…"' : '');
     }
   }
 )};
