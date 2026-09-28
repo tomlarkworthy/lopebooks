@@ -6454,7 +6454,89 @@ const _1e7rc5x = function _srcContext(rc5_store, cellHelpers) {
         elide
     };
 };
-const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,createModule,cellHelpers,summarizeJS,rc5_watchBus,observe,srcContext,descendants,location,navigate,rc5_store,specLib)
+const _rc5uncaught = function _uncaughtLog(invalidation)
+{
+    // Exceptions the runtime never sees: thrown in a timer, an event handler or an unawaited promise
+    // (rc5-train 20260928-0205-w14: a floating `for await` rejected 8x/s while write_file said "all cells compute").
+    // Each write is imported from its own blob: URL, and that URL is in the stack, so an error is charged to
+    // the module whose code threw it; errors with no tracked URL (the notebook's own code) are ignored.
+    const urls = new Map();
+    const current = new Map();  // module id -> the url of its latest write; code from a replaced write is not charged
+    const seen = new Map();
+    const subs = new Map();
+    const cellAt = (src, line) => {
+        const lines = String(src || '').split('\n');
+        for (let i = Math.min(line, lines.length) - 1; i >= 0; i--) {
+            const m = /^const\s+[\w$]+\s*=\s*(?:async\s+)?function\s*\*?\s*([\w$]+)/.exec(lines[i]);
+            if (m)
+                return m[1];
+            if (/^export\s+default/.test(lines[i]))
+                return null;
+        }
+        return null;
+    };
+    const note = (err, fallback) => {
+        const stack = String(err && err.stack || '');
+        for (const [url, rec] of urls) {
+            const at = stack.indexOf(url) >= 0 ? stack : String(fallback || '').indexOf(url) >= 0 ? url + ':' + (fallback.split(url + ':')[1] || '') : '';
+            if (!at)
+                continue;
+            if (current.get(rec.id) !== url)
+                return;
+            const lm = new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':(\\d+)').exec(at);
+            const cell = lm ? cellAt(rec.src, +lm[1]) : null;
+            const msg = (err && (err.name ? err.name + ': ' : '') + (err.message || '')) || String(err);
+            const shown = (cell ? cell + ': ' : '') + msg.slice(0, 200);
+            const key = shown.replace(/\d+/g, '#');
+            const m = seen.get(rec.id) || new Map();
+            seen.set(rec.id, m);
+            const e = m.get(key) || { shown, n: 0 };
+            e.n++;
+            m.set(key, e);
+            for (const f of subs.get(rec.id) || [])
+                try {
+                    f();
+                } catch (e) {
+                }
+            return;
+        }
+    };
+    const onError = e => note(e.error || { message: e.message }, e.filename ? e.filename + ':' + e.lineno : '');
+    const onRejection = e => note(e.reason);
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onRejection);
+    invalidation.then(() => {
+        window.removeEventListener('error', onError);
+        window.removeEventListener('unhandledrejection', onRejection);
+    });
+    // counted: the write result, read once. Not counted: the watch stream, so a repeating error streams once
+    // (and once more as "repeating"), not on every step
+    const text = (id, counted = true) => {
+        const m = seen.get(id);
+        if (!m || !m.size)
+            return '';
+        const parts = [...m.values()].slice(0, 3).map(({shown, n}) => shown + (n > 1 ? counted ? ' (\xD7' + n + ')' : ' (repeating)' : ''));
+        return '⚠ uncaught, outside any cell\'s value (a timer, event handler or unawaited promise; the runtime does not see it): ' + parts.join('; ') + (m.size > 3 ? '; +' + (m.size - 3) + ' more' : '');
+    };
+    return {
+        // a new write of `id`: its code runs from `url`; earlier counts belong to the replaced code
+        track(url, id, src) {
+            urls.set(url, { id, src });
+            current.set(id, url);
+            seen.delete(id);
+            if (urls.size > 200)
+                urls.delete(urls.keys().next().value);
+        },
+        text,
+        subscribe(id, f) {
+            const s = subs.get(id) || new Set();
+            subs.set(id, s);
+            s.add(f);
+            return () => s.delete(f);
+        }
+    };
+};
+const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,createModule,cellHelpers,summarizeJS,rc5_watchBus,observe,srcContext,descendants,location,navigate,rc5_store,specLib,uncaughtLog)
 {
     const apply = jbApply({
         currentModules,
@@ -6517,6 +6599,14 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                         return { kind: 'text', what: m[0].replace(/\s+/g, ' ').slice(0, 60) };
                 } else if (n.namespaceURI !== SVG_NS && n.parentElement && n.parentElement.namespaceURI === SVG_NS && n.parentElement.localName !== 'foreignObject') {
                     return { kind: 'ns', what: '<' + n.localName + '>' };
+                } else if (n.namespaceURI === SVG_NS) {
+                    // an invalid attribute is only a browser console message ("<path> attribute d: Expected …"),
+                    // which page code cannot read, so validate the values here (rc5-train 20260928-0235-w17)
+                    for (const a of n.attributes) {
+                        const bad = a.name === 'd' ? typeof CSS !== 'undefined' && CSS.supports && CSS.supports('d', 'path("' + a.value.replace(/["\\]/g, '').replace(/\s+/g, ' ') + '")') === false && CSS.supports('d', 'path("M0,0")') : /[^/]\/$/.test(a.value) && !/href$|^src$|^data-/.test(a.name);
+                        if (bad)
+                            return { kind: 'attr', what: '<' + n.localName + ' ' + a.name + '="' + (a.value.length > 24 ? '…' + a.value.slice(-24) : a.value) + '">' };
+                    }
                 }
             }
             if (val.nodeType === 1 && val.namespaceURI !== SVG_NS && /^(line|circle|path|rect|polygon|polyline|ellipse|g|text)$/.test(val.localName))
@@ -6530,6 +6620,9 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         if (!mod)
             return null;
         const cells = varsOf(mod).filter(v => v._name && v.pid && !isStructural(v)).slice(0, 24);
+        const uwid = watchKey(id, '(uncaught)');
+        // re-registered on every write, so the same error from the rewritten code streams again
+        bus.register(uwid, id + ' (uncaught)', uncaughtLog.subscribe(id, () => bus.record(uwid, uncaughtLog.text(id, false))), '');
         return Promise.all(cells.map(async v => {
             const base = await readVar(mod, v);
             const baseText = base.error ? '\u26A0 ' + base.error : summ(base.value);
@@ -6562,6 +6655,13 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         }));
     };
     const probeStatus = (probe, id) => {
+        const uncaught = id ? uncaughtLog.text(id) : '';
+        const st = probeStatus1(probe, id);
+        if (!uncaught)
+            return st;
+        return st.replace(' \xB7 \u2713 all ', ' \xB7 all ').replace(' compute with no runtime error', ' return a value') + ' \xB7 ' + uncaught + ' \u2014 FIX before task_complete';
+    };
+    const probeStatus1 = (probe, id) => {
         if (!probe || !probe.length)
             return '';
         const errored = probe.filter(r => r.error);
@@ -6599,6 +6699,8 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         const broken = probe.filter(r => r.markup);
         if (broken.length) {
             const b = broken[0].markup;
+            if (b.kind === 'attr')
+                return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + ' render' + (broken.length === 1 ? 's' : '') + ' an SVG attribute the browser rejects: ' + b.what + ' (it logs "attribute \u2026: Expected \u2026" to the console, which you cannot see, and draws it wrong or not at all).' + (/\/"?>$/.test(b.what) ? ' A trailing "/" comes from an unquoted hole before a self-closing tag: in htl, <path d=${p}/> reads the "/" into the value; quote it: d="${p}" />.' : '') + ' \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
             const why = b.kind === 'text' ? ' render' + (broken.length === 1 ? 's' : '') + ' markup as literal TEXT (' + b.what + ' is a text node, not an element): a string interpolated into htl.html`\u2026` or htl.svg`\u2026` is inserted as text, never parsed' : ' put' + (broken.length === 1 ? 's' : '') + ' an HTML ' + b.what + ' inside <svg>, which the browser does not draw: it was built with htl.html`\u2026`; SVG child elements need htl.svg`\u2026`';
             return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + why + '. Build each SVG part with htl.svg`<line \u2026/>` (HTML parts with htl.html`\u2026`) and interpolate those elements (an array of them works) \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
         }
@@ -6715,6 +6817,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         }
         const wasNew = !moduleExists(id);
         const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        uncaughtLog.track(url, id, src);
         try {
             const mod = await import(url);
             if (typeof mod.default !== 'function') {
@@ -6738,7 +6841,10 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             const surfaced = wasNew && /\bviewof\s|\bmd`|\bhtml`/.test(src) && surfaceInView(id);
             let status = '';
             try {
-                status = probeStatus(await probeAndWatch(id, watchBus), id);
+                const probe = await probeAndWatch(id, watchBus);
+                // a rejection nobody awaits is reported a task after it happens; give the first compute's a moment
+                await new Promise(r => setTimeout(r, 50));
+                status = probeStatus(probe, id);
             } catch (e) {
             }
             let downstream = '';
@@ -8285,7 +8391,8 @@ export default function define(runtime, observer) {
   $def("_19x8b93", "rc5_store", [], _19x8b93);  
   $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim","localDisk"], _o37ix1);  
   $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
-  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib"], _190yjiu);
+  $def("_rc5uncaught", "uncaughtLog", ["invalidation"], _rc5uncaught);
+  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib","uncaughtLog"], _190yjiu);
   $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py"], _ual70b);
   $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment","localDisk","wiki_triggers"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS","mountLocalDisk"], _qc0bl);  
