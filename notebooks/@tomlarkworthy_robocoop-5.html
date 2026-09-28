@@ -7009,7 +7009,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         moduleExists
     };
 };
-const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus,srcContext,localDisk,py)
+const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus,srcContext,localDisk,py,ui_set,ui_settle)
 {
   const {resolveModule, varsOf, isStructural, label, oneLine, watchKey, canvasNote} = cellHelpers;
   const nudge = mod => {
@@ -7315,7 +7315,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   });
   const eval_js = defineTool({
     id: 'eval_js',
-    description: 'Run a snippet of native JavaScript in the browser, scoped to a module. The module\'s builtins ' + '(md, html, Inputs, Plot, d3, Generators, and crucially FileAttachment) and its named cells are in ' + 'scope by name, and so are `localDisk` (the mounted /local-disk folder: readText/readBytes/read/write) and `py` (Python via run_python) without any import; 60 s budget per call;  \u2014 a `viewof x` cell\'s live element is in scope as `viewof_x`, so you can DRIVE a ' + 'control without editing it: `viewof_x.value = 30; viewof_x.dispatchEvent(new Event("input"))`. ' + 'Page globals (window, document, DecompressionStream, \u2026) are available too. A bare ' + 'expression is returned automatically; multi-statement code needs an explicit `return`; top-level await ' + 'works. Use this for computed transforms \u2014 above all, to DECODE a bundled file attachment: ' + 'scope to the module that owns it and do `new Response((await FileAttachment("name.gz").stream())' + '.pipeThrough(new DecompressionStream("gzip"))).text()`. An attachment at /content/@user/mod/name belongs ' + 'to module "@user/mod" with FileAttachment name "name". Also good for computing over live cell values.',
+    description: 'Run a snippet of native JavaScript in the browser, scoped to a module. The module\'s builtins ' + '(md, html, Inputs, Plot, d3, Generators, and crucially FileAttachment) and its named cells are in ' + 'scope by name, and so are `localDisk` (the mounted /local-disk folder: readText/readBytes/read/write) and `py` (Python via run_python) without any import; 60 s budget per call;  \u2014 a `viewof x` cell\'s live element is in scope as `viewof_x`, so you can DRIVE a ' + 'control without editing it: `viewof_x.value = 30; viewof_x.dispatchEvent(new Event("input"))` (cells downstream still hold their OLD values inside the same snippet; to check what a control changes, use try_control). ' + 'Page globals (window, document, DecompressionStream, \u2026) are available too. A bare ' + 'expression is returned automatically; multi-statement code needs an explicit `return`; top-level await ' + 'works. Use this for computed transforms \u2014 above all, to DECODE a bundled file attachment: ' + 'scope to the module that owns it and do `new Response((await FileAttachment("name.gz").stream())' + '.pipeThrough(new DecompressionStream("gzip"))).text()`. An attachment at /content/@user/mod/name belongs ' + 'to module "@user/mod" with FileAttachment name "name". Also good for computing over live cell values.',
     parameters: {
       type: 'object',
       properties: {
@@ -7493,10 +7493,138 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       };
     }
   });
+  // try_control: use a control the way a user does and report what that changed. Observed 2026-09-28
+  // (rc5-train m4): driving sliders from eval_js and reading the result in the same snippet gave the
+  // OLD values, so the agent checked each slider's own value and reported "all 9 controls update the
+  // graphic" while the horizon slider moved nothing.
+  const fingerprint = el => {
+    const out = new Map();
+    const walk = (n, path) => {
+      if (out.size > 3000) return;
+      const id = n.getAttribute?.('id'), fill = n.getAttribute?.('fill'), cls = n.getAttribute?.('class');
+      const tag = '<' + n.tagName.toLowerCase() + (id ? ' id="' + id + '"' : fill ? ' fill="' + fill + '"' : cls ? ' class="' + String(cls).slice(0, 40) + '"' : '') + '>';
+      const own = [...n.childNodes].filter(c => c.nodeType === 3).map(c => c.textContent).join('').trim();
+      if (own) out.set(path + ' text', { tag, key: 'text', v: own.slice(0, 120) });
+      for (const a of n.attributes || []) out.set(path + ' @' + a.name, { tag, key: a.name, v: String(a.value).replace(/\s+/g, ' ').slice(0, 120) });
+      if ('value' in n && /^(INPUT|SELECT|TEXTAREA)$/.test(n.tagName)) out.set(path + ' .value', { tag, key: 'value', v: String(n.value).slice(0, 120) });
+      [...n.children].forEach((c, i) => walk(c, path + '/' + i));
+    };
+    walk(el, '');
+    return out;
+  };
+  const snapshotOf = mod => {
+    const snap = new Map();
+    for (const v of varsOf(mod)) {
+      if (isStructural(v) || (!v._name && !v.pid)) continue;
+      const key = v._name || v.pid;
+      const val = v._value;
+      snap.set(key, v._error != null ? { err: String(v._error?.message ?? v._error) }
+        : val instanceof Element ? { el: fingerprint(val), node: val }
+        : { s: summary(val, 300) });
+    }
+    return snap;
+  };
+  const BAD = /NaN|undefined|\[object \w+\]/;
+  const diffOf = (a, b) => {
+    if (a.err || b.err) return a.err === b.err ? null : ['error: ' + (a.err || 'none') + ' → ' + (b.err || 'none')];
+    if (a.s !== undefined || b.s !== undefined) return a.s === b.s ? null : [oneLine(a.s ?? '(element)').slice(0, 120) + ' → ' + oneLine(b.s ?? '(element)').slice(0, 120)];
+    const lines = [];
+    for (const [k, x] of b.el) { const y = a.el.get(k); if (!y) lines.push('+ ' + x.tag + ' ' + x.key + '=' + x.v); else if (y.v !== x.v) lines.push(x.tag + ' ' + x.key + ': ' + y.v.slice(0, 60) + ' → ' + x.v.slice(0, 60)); }
+    for (const [k, y] of a.el) if (!b.el.has(k)) lines.push('- ' + y.tag + ' ' + y.key);
+    return lines.length ? lines : null;
+  };
+  const controlsOf = mod => varsOf(mod).filter(v => /^viewof /.test(v._name || '') && v._value instanceof Element).map(v => ({
+    v, name: v._name, label: oneLine(v._value.querySelector?.('label')?.textContent || v._value.getAttribute?.('aria-label') || '')
+  }));
+  const tryOne = async (mod, c, value) => {
+    const el = c.v._value;
+    const valueName = c.name.slice(7);
+    const button = value === undefined ? (el.matches('button') ? el : el.querySelector('button')) : null;
+    if (value === undefined && !button) return { out: c.name + ' is not a button; pass `value`. Current value: ' + summary(el.value, 200), dead: false };
+    const before = snapshotOf(mod);
+    const raw = el.value;
+    const was = summary(raw, 200);
+    await ui_settle();
+    if (button) await ui_set(button); else await ui_set(el, value);
+    await ui_settle();
+    await new Promise(r => setTimeout(r, 50));
+    await ui_settle();
+    const after = snapshotOf(mod);
+    const changed = [], bad = [];
+    for (const [k, b] of after) {
+      if (k === c.name) continue;
+      const a = before.get(k);
+      if (!a) { changed.push(k + ': (new)'); continue; }
+      const d = diffOf(a, b);
+      if (!d) continue;
+      changed.push(k + (b.node ? ' (rendered ' + b.node.tagName.toLowerCase() + ')' : '') + ':\n    ' + d.slice(0, 12).join('\n    ') + (d.length > 12 ? '\n    …(+' + (d.length - 12) + ' more)' : ''));
+      if (d.some(l => BAD.test(l.split('→').pop()))) bad.push(k);
+    }
+    const dead = !changed.some(l => !l.startsWith(valueName + ':'));
+    let out = 'Set ' + c.name + (c.label ? ' ("' + c.label + '")' : '') + (button ? ' by clicking' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
+    out += changed.length ? 'Changed:\n  ' + changed.join('\n  ') : 'Nothing changed, not even ' + valueName + '.';
+    if (dead) out += '\n⚠ NO VISIBLE EFFECT: no cell other than ' + valueName + ' changed, so a user using this control sees nothing happen. Look for where ' + valueName + ' should be used: a cell that lists "viewof ' + valueName + '" (the element) where it needs "' + valueName + '", or an output that interpolates a different cell.';
+    if (bad.length) out += '\n⚠ NaN/undefined/[object …] appeared in: ' + bad.join(', ') + '.';
+    return { out, dead, was: raw };
+  };
+  // A value a user might pick that differs from the current one; undefined means "click it".
+  const probeValue = el => {
+    const input = el.matches('input, select, textarea') ? el : el.querySelector('input, select, textarea');
+    if (!input) return el.querySelector?.('button') || el.matches?.('button') ? undefined : null;
+    if (input.type === 'range' || input.type === 'number') {
+      const lo = +(input.min || 0), hi = +(input.max || 100), cur = +el.value;
+      const step = +(input.step) || 0;
+      let x = cur < (lo + hi) / 2 ? lo + (hi - lo) * 0.75 : lo + (hi - lo) * 0.25;
+      if (step) x = lo + Math.round((x - lo) / step) * step;
+      return x;
+    }
+    if (input.type === 'checkbox') return Array.isArray(el.value) ? (el.value.length ? [] : null) : !el.value;
+    if (input.tagName === 'SELECT') { const o = [...input.options].find(o => !o.selected); return o ? (el.value !== undefined && typeof el.value !== 'string' ? null : o.value) : null; }
+    if (typeof el.value === 'string') return el.value + ' test';
+    return null;
+  };
+  const try_control = defineTool({
+    id: 'try_control',
+    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards): do this ' + 'first when asked whether a notebook works. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button; that control keeps the new value.',
+    parameters: {
+      type: 'object',
+      required: ['module'],
+      properties: {
+        module: { type: 'string', description: 'Module id, e.g. "@user/stats".' },
+        control: { type: 'string', description: 'The viewof cell ("viewof rate" or "rate") or the text of its label ("Rate"). Omit to try every control.' },
+        value: { description: 'The new value (number, string, boolean, array for a multi-select). Omit to click a button.' }
+      },
+      additionalProperties: false
+    },
+    execute: async ({ module, control, value }) => {
+      const mod = resolveModule(module);
+      if (!mod) return { title: 'try_control', output: 'Module not found: ' + module };
+      const all = controlsOf(mod);
+      const list = () => all.map(x => x.name + (x.label ? ' ("' + x.label + '")' : '')).join(', ') || '(none)';
+      if (control == null || control === '') {
+        if (!all.length) return { title: 'try_control', output: module + ' has no viewof controls.' };
+        const parts = [], dead = [];
+        for (const c of all) {
+          const v = probeValue(c.v._value);
+          if (v === null) { parts.push(c.name + ': skipped (no value to pick automatically; call with control and value)'); continue; }
+          const r = await tryOne(mod, c, v);
+          parts.push(r.out.length > 1500 ? r.out.slice(0, 1500) + ' …' : r.out);
+          if (r.dead) dead.push(c.label || c.name);
+          if (v !== undefined) { try { await ui_set(c.v._value, r.was); await ui_settle(); } catch (e) {} }
+        }
+        return { title: 'try_control ' + module, output: 'Tried ' + all.length + ' controls (each put back afterwards).' + (dead.length ? ' ⚠ NO VISIBLE EFFECT: ' + dead.join(', ') + '.' : '') + '\n\n' + parts.join('\n\n') };
+      }
+      const want = String(control).trim().replace(/^viewof\s+/, '');
+      const c = all.find(x => x.name === 'viewof ' + want) || all.find(x => x.label && x.label.toLowerCase() === want.toLowerCase()) || all.find(x => x.label && x.label.toLowerCase().includes(want.toLowerCase()));
+      if (!c) return { title: 'try_control', output: 'No control "' + control + '" in ' + module + '. Controls: ' + list() };
+      return { title: 'try_control ' + module, output: (await tryOne(mod, c, value)).out };
+    }
+  });
   return [
     inspect_value,
     list_values,
     eval_js,
+    try_control,
     watch_variable,
     unwatch_variable
   ];
@@ -8554,7 +8682,10 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/fileattachments", async () => runtime.module((await import("/@tomlarkworthy/fileattachments.js?v=4")).default));  
   main.define("module @tomlarkworthy/local-disk", async () => runtime.module((await import("/@tomlarkworthy/local-disk.js?v=4")).default));
   main.define("module @tomlarkworthy/markdown-wiki", async () => runtime.module((await import("/@tomlarkworthy/markdown-wiki.js?v=4")).default));
-  main.define("module @tomlarkworthy/pyodide", async () => runtime.module((await import("/@tomlarkworthy/pyodide.js?v=4")).default));  
+  main.define("module @tomlarkworthy/pyodide", async () => runtime.module((await import("/@tomlarkworthy/pyodide.js?v=4")).default));
+  main.define("module @tomlarkworthy/ui-testing", async () => runtime.module((await import("/@tomlarkworthy/ui-testing.js?v=4")).default));
+  main.define("ui_set", ["module @tomlarkworthy/ui-testing", "@variable"], (_, v) => v.import("set", "ui_set", _));
+  main.define("ui_settle", ["module @tomlarkworthy/ui-testing", "@variable"], (_, v) => v.import("settle", "ui_settle", _));  
   $def("_yyrxg4", null, ["md"], _yyrxg4);  
   $def("_76otvk", "cellHelpers", ["currentModules","runtime"], _76otvk);  
   $def("_19x8b93", "rc5_store", [], _19x8b93);  
@@ -8562,7 +8693,7 @@ export default function define(runtime, observer) {
   $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
   $def("_rc5uncaught", "uncaughtLog", ["invalidation"], _rc5uncaught);
   $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib","uncaughtLog","acorn"], _190yjiu);
-  $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py"], _ual70b);
+  $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py","ui_set","ui_settle"], _ual70b);
   $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment","localDisk","wiki_triggers"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS","mountLocalDisk"], _qc0bl);  
   $def("_pytl01", "pythonTools", ["defineTool","py"], _pytl01);
