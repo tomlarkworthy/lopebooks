@@ -6830,8 +6830,9 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         } catch (e) {
             return [];
         }
-        const ids = ast.body.filter(n => n.type === 'VariableDeclaration').flatMap(n => n.declarations).filter(d => d.id && d.id.type === 'Identifier' && d.init && /FunctionExpression$/.test(d.init.type)).map(d => d.id.name);
-        return ids.filter(n => (src.match(new RegExp('(^|[^\\w$])' + n.replace(/\$/g, '\\$') + '(?![\\w$])', 'g')) || []).length < 2);
+        const decls = ast.body.filter(n => n.type === 'VariableDeclaration').flatMap(n => n.declarations).filter(d => d.id && d.id.type === 'Identifier' && d.init && /FunctionExpression$/.test(d.init.type));
+        // `const _x = function _x(…)` names _x twice in its own declaration
+        return decls.filter(d => (src.match(new RegExp('(^|[^\\w$])' + d.id.name.replace(/\$/g, '\\$') + '(?![\\w$])', 'g')) || []).length < 2 + (d.init.id && d.init.id.name === d.id.name ? 1 : 0)).map(d => d.id.name);
     };
     const probeStatus = (probe, id, src) => {
         const uncaught = id ? uncaughtLog.text(id) : '';
@@ -7166,6 +7167,46 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         }).join('; ');
         return ' \xB7 ⚠ this write CHANGED what ' + changed.length + ' of ' + kept.length + ' kept cells (matched by pid)' + renames + ' show at the current control settings: ' + detail + (changed.length > 4 ? '; …' : '') + '. If you meant to change them (a new feature, a fix), this is expected: tell the user what changed. If the task was a refactor, cleanup or documentation, which must not change what cells show, FIX before task_complete';
     };
+    // A cell is its `const _x = function…` AND its $def line; removing one of the two in an edit throws
+    // "_x is not defined" at define time and names only the first (rc5-train m20: 5-9 failed edits a run, 2 read_files to find the lines).
+    const defHolderGap = (src, missing) => {
+        let ast;
+        try {
+            ast = acorn.parse(src, { ecmaVersion: 'latest', sourceType: 'module', locations: true });
+        } catch (e) {
+            return '';
+        }
+        const declared = new Set(), refs = [];
+        const walk = n => {
+            if (!n || typeof n.type !== 'string')
+                return;
+            if (n.type === 'VariableDeclarator' && n.id && n.id.type === 'Identifier')
+                declared.add(n.id.name);
+            if ((n.type === 'FunctionDeclaration' || n.type === 'ClassDeclaration') && n.id)
+                declared.add(n.id.name);
+            if (/^Import(Default|Namespace)?Specifier$/.test(n.type) && n.local)
+                declared.add(n.local.name);
+            if (n.type === 'CallExpression' && n.callee.type === 'Identifier' && n.callee.name === '$def') {
+                const last = n.arguments[n.arguments.length - 1];
+                if (last && last.type === 'Identifier')
+                    refs.push({ name: last.name, line: n.loc.start.line });
+            }
+            for (const k in n)
+                if (k !== 'loc') {
+                    const c = n[k];
+                    if (Array.isArray(c))
+                        c.forEach(walk);
+                    else if (c && typeof c.type === 'string')
+                        walk(c);
+                }
+        };
+        walk(ast);
+        const gaps = refs.filter(r => !declared.has(r.name));
+        if (!gaps.some(r => r.name === missing))
+            return '';
+        const lines = src.split('\n');
+        return ' \xB7 ⚠ ' + gaps.length + ' $def line' + (gaps.length === 1 ? ' names a cell function' : 's name cell functions') + ' that no `const _x = function…` declares: ' + gaps.slice(0, 8).map(r => 'line ' + r.line + ' `' + lines[r.line - 1].trim().slice(0, 120) + '`').join(', ') + (gaps.length > 8 ? ', …' : '') + '. A cell is its declaration AND its $def line: to remove a cell delete both, to add one write both. Delete ' + (gaps.length === 1 ? 'this $def line, or write its declaration' : 'these $def lines, or write their declarations') + '; this draft is kept, so your next edit_file applies on top of it';
+    };
     const applyModuleSrc = async (id, src, { watchBus } = {}) => {
         const keepDraft = () => {
             const prev = rc5_store.srcFns.get(id);
@@ -7260,9 +7301,15 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                 if (pe && pe.loc)
                     where = ' at line ' + pe.loc.line + ':' + (pe.loc.column + 1) + ' (' + String(pe.message).replace(/\s*\(\d+:\d+\)$/, '') + '): `' + src.split('\n')[pe.loc.line - 1].trim().slice(0, 160) + '`';
             }
+            let gap = '';
+            try {
+                const undef = !where && /^(\S+) is not defined$/.exec(String(e && e.message || ''));
+                gap = undef ? defHolderGap(src, undef[1]) : '';
+            } catch (x) {
+            }
             return {
                 ok: false,
-                msg: 'written, but FAILED TO COMPILE: ' + (e && e.message || e) + where + ' \u2014 live runtime unchanged; fix and re-edit'
+                msg: 'written, but FAILED TO COMPILE: ' + (e && e.message || e) + where + ' \u2014 live runtime unchanged; fix and re-edit' + gap
             };
         } finally {
             URL.revokeObjectURL(url);
