@@ -6141,6 +6141,17 @@ const _19x8b93 = function _rc5_store(){return(
 )};
 const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module_files, exportModuleJS, importShim, localDisk) {
     const isStyle = id => /^https?:\/\//.test(id) || /\.css$/.test(id);
+    // all_module_files names a module only through a `module <id>` loader; one created on the page has none and comes back "main"
+    const files = all_module_files.map(f => {
+        try {
+            if (f.module === 'main' && runtime.mains)
+                for (const [k, m] of runtime.mains)
+                    if (m === f._module)
+                        return { ...f, module: k };
+        } catch (e) {
+        }
+        return f;
+    });
     const isAttachment = id => /^@?[^/]+\/[^/]+\/.+/.test(id) || /^file:/.test(id);
     const moduleIds = () => {
         const ids = new Set();
@@ -6179,7 +6190,7 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         }
         for (const id of blockIds())
             out.push('/content/' + id);
-        for (const f of all_module_files)
+        for (const f of files)
             out.push('/content/' + f.module + '/' + f.name);
         return out.sort();
     };
@@ -6245,7 +6256,7 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         m = /^\/content\/(.+)$/.exec(path);
         if (m) {
             const rest = m[1];
-            const att = all_module_files.find(f => f.module + '/' + f.name === rest);
+            const att = files.find(f => f.module + '/' + f.name === rest);
             if (att) {
                 try {
                     return new TextDecoder().decode(new Uint8Array(await (await fetch(att.url)).arrayBuffer()));
@@ -6282,7 +6293,8 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         isDisk,
         readPath,
         seedSrc,
-        globToRe
+        globToRe,
+        files
     };
 };
 const _1e7rc5x = function _srcContext(rc5_store, cellHelpers) {
@@ -6862,6 +6874,9 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         const errored = probe.filter(r => r.error);
         const okCount = probe.length - errored.length;
         if (errored.length) {
+            // a renamed column breaks cells two ways at once: one throws, a chart over it draws nothing (rc5-train 20260928-0847-m30)
+            const empty = probe.filter(r => r.markup && (r.markup.kind === 'plot' || r.markup.kind === 'svg'));
+            const emptyNote = empty.length ? ' \xB7 \u26A0 ' + empty.map(who).join(', ') + ' compute' + (empty.length === 1 ? 's' : '') + ' but draw' + (empty.length === 1 ? 's' : '') + ' NO DATA (' + (empty[0].markup.kind === 'plot' ? 'the Plot drew ' : 'an empty ') + empty[0].markup.what + '): Plot skips every datum whose channel names a missing or non-numeric field, so a renamed or misspelled column draws nothing and throws nothing \u2014 FIX before task_complete' : '';
             let sources = '';
             try {
                 sources = id ? srcContext.sourcesFor(id, errored) : '';
@@ -6894,10 +6909,10 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             const failedTests = errored.filter(isFailedTest);
             const testNote = failedTests.length ? ' \xB7 \u26A0 ' + failedTests.length + ' test_* cell' + (failedTests.length === 1 ? '' : 's') + ' FAILING \u2014 ' + failedTests.map(e => e.name + ': ' + e.error).join('; ') + '. A failing test_* cell is a test result, not a broken cell. Check its expected value against what the function is documented to do: if the expectation is wrong, fix the test; if it is right, the function under test has a bug. Tell the user which function fails, on which input, expected and actual value. If you wrote that function in this session, fix it. If it was already in the user\'s notebook, change it only if the user asked for a fix; if they asked for tests or a review, leave it as it is and report it. A test failing on a bug in the user\'s existing code does not block task_complete' : '';
             if (failedTests.length === errored.length)
-                return testNote + sources;
+                return testNote + emptyNote + sources;
             const broken = errored.filter(e => !isFailedTest(e));
             const brokenDetail = details.filter((d, i) => !isFailedTest(errored[i])).join('; ');
-            return ' \xB7 \u26A0 ' + broken.length + ' cell' + (broken.length === 1 ? '' : 's') + ' ERRORING at runtime \u2014 ' + brokenDetail + ' \u2014 FIX before task_complete (a compile-clean cell can still error when observed)' + testNote + sources;
+            return ' \xB7 \u26A0 ' + broken.length + ' cell' + (broken.length === 1 ? '' : 's') + ' ERRORING at runtime \u2014 ' + brokenDetail + ' \u2014 FIX before task_complete (a compile-clean cell can still error when observed)' + testNote + emptyNote + sources;
         }
         const named = probe.filter(r => !r.anon);
         const vals = named.filter(r => r.value !== undefined).slice(0, 8).map(r => r.name + '=' + r.value).join(', ');
@@ -7126,7 +7141,9 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
     const removedStatus = (before, after) => {
         if (!before || !after)
             return '';
-        const removed = [...before.keys()].filter(k => !after.has(k)).map(k => before.get(k));
+        // gone by pid AND by name: a redefined builtin (FileAttachment after an attach) or a cell given a new pid is not removed
+        const namesAfter = new Set([...after.values()].filter(c => !c.anon).map(c => c.label));
+        const removed = [...before.keys()].filter(k => !after.has(k)).map(k => before.get(k)).filter(c => c.anon || !namesAfter.has(c.label));
         if (!removed.length)
             return '';
         const isNode = x => typeof Node !== 'undefined' && x instanceof Node;
@@ -8007,7 +8024,7 @@ const _rc5punct = function _punctuationMatch(){return(
   return { at, diffs };
 }
 )};
-const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_module_files,cellHelpers,setFileAttachment,localDisk,wiki_triggers,newTriggerMatch,punctuationMatch)
+const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHelpers,setFileAttachment,localDisk,wiki_triggers,newTriggerMatch,punctuationMatch)
 {
   const {listPathsAsync, readPath, globToRe, isDisk} = pathLib;
   const {applyModuleSrc} = applyLib;
@@ -8386,7 +8403,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
           output: 'Image viewing is unavailable in this context.'
         };
       const m = /^\/content\/(.+)$/.exec(file_path);
-      const att = m && all_module_files.find(f => f.module + '/' + f.name === m[1]);
+      const att = m && pathLib.files.find(f => f.module + '/' + f.name === m[1]);
       if (!att)
         return {
           title: 'view_image',
@@ -9104,7 +9121,7 @@ export default function define(runtime, observer) {
   $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py","ui_set","ui_settle"], _ual70b);
   $def("_rc5newTrigger", "newTriggerMatch", [], _rc5newTrigger);
   $def("_rc5punct", "punctuationMatch", [], _rc5punct);
-  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment","localDisk","wiki_triggers","newTriggerMatch","punctuationMatch"], _6aumvx);  
+  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","cellHelpers","setFileAttachment","localDisk","wiki_triggers","newTriggerMatch","punctuationMatch"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS","mountLocalDisk"], _qc0bl);  
   $def("_pytl01", "pythonTools", ["defineTool","py"], _pytl01);
   $def("_1nb19yl", "hostSetup", ["valueTools","fileTools","pythonTools","registerTool","invalidation","unregisterTool"], _1nb19yl);  
