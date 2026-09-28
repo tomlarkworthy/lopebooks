@@ -6478,7 +6478,7 @@ const _1e7rc5x = function _srcContext(rc5_store, cellHelpers) {
         elide
     };
 };
-const _rc5uncaught = function _uncaughtLog(invalidation)
+const _rc5uncaught = function _uncaughtLog(invalidation,runtime)
 {
     // What a module's code sends to the browser console that no cell value shows: exceptions thrown in a timer,
     // an event handler or an unawaited promise (rc5-train 20260928-0205-w14), console.warn/console.error calls
@@ -6487,7 +6487,37 @@ const _rc5uncaught = function _uncaughtLog(invalidation)
     // stack, so an entry is charged to the module whose code made it; entries with no tracked URL (the notebook's
     // own code) are ignored. A write redefines only the cells it changed, so the others keep running code from
     // an earlier write's URL: every URL a module was written from is charged to it.
+    // A module booted from the notebook file runs from the bootloader's file://<id> URL (rc5-train
+    // 20260928-0847-m36): charged when <id> is one of the user's mains (ctx_notebook's notion).
     const urls = new Map();
+    const host = m => /^@tomlarkworthy\/(robocoop-5|lopepage|save-in-place$|inputs-reference$)/.test(m);
+    const userMain = id => {
+        try {
+            return !host(id) && runtime.mains.has(id);
+        } catch (e) {
+            return false;
+        }
+    };
+    const hasUserMain = () => {
+        try {
+            for (const id of runtime.mains.keys())
+                if (!host(id))
+                    return true;
+        } catch (e) {
+        }
+        return false;
+    };
+    const bootSrc = new Map();
+    const bootSource = id => {
+        if (!bootSrc.has(id))
+            try {
+                const r = window.lopecode.contentSync(id);
+                bootSrc.set(id, r.status === 200 ? new TextDecoder().decode(r.bytes) : '');
+            } catch (e) {
+                bootSrc.set(id, '');
+            }
+        return bootSrc.get(id);
+    };
     const seen = new Map();
     const subs = new Map();
     const cellAt = (src, line) => {
@@ -6501,28 +6531,35 @@ const _rc5uncaught = function _uncaughtLog(invalidation)
         }
         return null;
     };
-    const note = (kind, msg, stack) => {
-        stack = String(stack || '');
+    const charge = stack => {
         for (const [url, rec] of urls) {
             if (stack.indexOf(url) < 0)
                 continue;
             const lm = new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':(\\d+)').exec(stack);
-            const cell = lm ? cellAt(rec.src, +lm[1]) : null;
-            const shown = (cell ? cell + ': ' : '') + String(msg).replace(/\s+/g, ' ').slice(0, 200);
-            const key = kind + '|' + shown.replace(/\d+/g, '#');
-            const m = seen.get(rec.id) || new Map();
-            seen.set(rec.id, m);
-            const e = m.get(key) || { kind, shown, n: 0 };
-            e.n++;
-            e.at = performance.now();
-            m.set(key, e);
-            for (const f of subs.get(rec.id) || [])
-                try {
-                    f();
-                } catch (e) {
-                }
-            return;
+            return { id: rec.id, cell: lm ? cellAt(rec.src, +lm[1]) : null };
         }
+        for (const [, id, line] of stack.matchAll(/file:\/\/([^\s():]+):(\d+):\d+/g))
+            if (userMain(id))
+                return { id, cell: cellAt(bootSource(id), +line) };
+        return null;
+    };
+    const note = (kind, msg, stack) => {
+        const rec = charge(String(stack || ''));
+        if (!rec)
+            return;
+        const shown = (rec.cell ? rec.cell + ': ' : '') + String(msg).replace(/\s+/g, ' ').slice(0, 200);
+        const key = kind + '|' + shown.replace(/\d+/g, '#');
+        const m = seen.get(rec.id) || new Map();
+        seen.set(rec.id, m);
+        const e = m.get(key) || { kind, shown, n: 0 };
+        e.n++;
+        e.at = performance.now();
+        m.set(key, e);
+        for (const f of subs.get(rec.id) || [])
+            try {
+                f();
+            } catch (e) {
+            }
     };
     const errText = err => (err && (err.name ? err.name + ': ' : '') + (err.message || '')) || String(err);
     const onError = e => {
@@ -6547,7 +6584,7 @@ const _rc5uncaught = function _uncaughtLog(invalidation)
     for (const k of ['warn', 'error']) {
         wrapped[k] = function (...a) {
             try {
-                if (urls.size)
+                if (urls.size || hasUserMain())
                     note('console', 'console.' + k + ': ' + a.map(str).join(' '), new Error().stack);
             } catch (e) {
             }
@@ -6558,7 +6595,7 @@ const _rc5uncaught = function _uncaughtLog(invalidation)
     if (typeof orig.fetch === 'function') {
         wrapped.fetch = function (input) {
             const p = orig.fetch.apply(this, arguments);
-            if (urls.size) {
+            if (urls.size || hasUserMain()) {
                 const stack = new Error().stack, url = String(input && input.url || input).slice(0, 120);
                 p.then(r => {
                     if (!r.ok)
@@ -9243,7 +9280,7 @@ export default function define(runtime, observer) {
   $def("_19x8b93", "rc5_store", [], _19x8b93);  
   $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim","localDisk"], _o37ix1);  
   $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
-  $def("_rc5uncaught", "uncaughtLog", ["invalidation"], _rc5uncaught);
+  $def("_rc5uncaught", "uncaughtLog", ["invalidation","runtime"], _rc5uncaught);
   $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib","uncaughtLog","acorn"], _190yjiu);
   $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py","ui_set","ui_settle","uncaughtLog"], _ual70b);
   $def("_rc5newTrigger", "newTriggerMatch", [], _rc5newTrigger);
