@@ -6905,6 +6905,60 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             return false;
         }
     };
+    // A write to an existing module reports which cells kept by name now show something different
+    // (rc5-train 20260928-0847-m2: a refactor turned 60 SVG paths into ",<path" and the result said only "all compute").
+    const fingerprint = val => {
+        if (val === undefined || typeof val === 'function' || val && typeof val.then === 'function')
+            return null;
+        try {
+            if (typeof Node !== 'undefined' && val instanceof Node) {
+                const s = (val.outerHTML != null ? val.outerHTML : new XMLSerializer().serializeToString(val)).replace(/\b(id|for|name)="([^"]*?)-\d+"/g, '$1="$2"').replace(/>\s+</g, '><').replace(/\s*,\s*/g, ',').replace(/\s+/g, ' ');
+                const ins = val.querySelectorAll ? [...val.querySelectorAll('input,select,textarea')].map(i => i.value).join('|') : '';
+                return s + (ins ? ' [inputs: ' + ins + ']' : '');
+            }
+            const j = JSON.stringify(val);
+            return j === undefined ? String(val) : j;
+        } catch (e) {
+            return summ(val);
+        }
+    };
+    const snapshotValues = async id => {
+        const mod = resolveModule(id);
+        if (!mod)
+            return null;
+        const m = new Map();
+        // a cell that reads the clock or Math.random differs on every run; skip it rather than cry wolf
+        const unstable = v => /Math\.random|Date\.now|new Date\(|performance\.now/.test(String(v._definition)) || (v._inputs || []).some(i => i && i._name === 'now');
+        await Promise.all(varsOf(mod).filter(v => v._name && !isStructural(v) && !unstable(v)).map(async v => {
+            const r = v._value !== undefined && v._error == null ? { value: v._value } : await Promise.race([
+                readVar(mod, v),
+                new Promise(res => setTimeout(() => res({ pending: true }), 500))
+            ]);
+            const f = r.error || r.pending ? null : fingerprint(r.value);
+            if (f != null)
+                m.set(v._name, f);
+        }));
+        return m;
+    };
+    const valueDiffStatus = (before, after) => {
+        if (!before || !after)
+            return '';
+        const kept = [...before.keys()].filter(k => after.has(k));
+        if (!kept.length)
+            return '';
+        const changed = kept.filter(k => before.get(k) !== after.get(k));
+        if (!changed.length)
+            return ' \xB7 ✓ values unchanged: the ' + kept.length + ' cell' + (kept.length === 1 ? '' : 's') + ' kept by name show the same value as before this write';
+        const detail = changed.slice(0, 4).map(k => {
+            const a = before.get(k), b = after.get(k);
+            let i = 0;
+            while (i < a.length && a[i] === b[i])
+                i++;
+            const s = Math.max(0, i - 40);
+            return k + ' (' + a.length + '→' + b.length + ' chars, first difference at ' + i + ': was …' + oneLine(a.slice(s, i + 40)) + '… now …' + oneLine(b.slice(s, i + 40)) + '…)';
+        }).join('; ');
+        return ' \xB7 ⚠ this write CHANGED what ' + changed.length + ' of ' + kept.length + ' cells kept by name show: ' + detail + (changed.length > 4 ? '; …' : '') + '. If you meant to change them (a new feature, a fix), this is expected: tell the user what changed. If the task was a refactor, cleanup or documentation, which must not change what cells show, FIX before task_complete';
+    };
     const applyModuleSrc = async (id, src, { watchBus } = {}) => {
         const keepDraft = () => {
             const prev = rc5_store.srcFns.get(id);
@@ -6931,6 +6985,11 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                     ok: false,
                     msg: 'written, but no default export define() \u2014 not applied'
                 };
+            }
+            let before = null;
+            try {
+                before = await snapshotValues(id);
+            } catch (e) {
             }
             const r = apply(id, mod.default);
             if (!r.applied) {
@@ -6967,9 +7026,14 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                 spec = await specLib.specStatus();
             } catch (e) {
             }
+            let valueDiff = '';
+            try {
+                valueDiff = valueDiffStatus(before, await snapshotValues(id));
+            } catch (e) {
+            }
             return {
                 ok: true,
-                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + status + downstream + structure + spec
+                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + status + valueDiff + downstream + structure + spec
             };
         } catch (e) {
             keepDraft();
