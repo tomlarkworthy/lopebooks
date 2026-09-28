@@ -7859,6 +7859,13 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     for (const [k, y] of a.el) if (!b.el.has(k)) lines.push('- ' + y.tag + ' ' + y.key);
     return lines.length ? lines : null;
   };
+  // The one box a user types into: the view itself, or its single text/number field (Inputs.range's number box).
+  const typingBoxOf = el => {
+    const ok = n => n.tagName === 'TEXTAREA' || (n.tagName === 'INPUT' && /^(text|number|search|email|tel|url|)$/.test(n.getAttribute('type') || ''));
+    if (ok(el)) return el;
+    const all = [...(el.querySelectorAll?.('input, textarea') || [])].filter(ok);
+    return all.length === 1 ? all[0] : null;
+  };
   const controlsOf = mod => varsOf(mod).filter(v => /^viewof /.test(v._name || '') && v._value instanceof Element).map(v => ({
     v, name: v._name, label: oneLine(v._value.querySelector?.('label')?.textContent || v._value.getAttribute?.('aria-label') || '')
   }));
@@ -7871,7 +7878,12 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const raw = el.value;
     const was = summary(raw, 200);
     await ui_settle();
-    if (button) await ui_set(button); else await ui_set(el, value);
+    // rc5-train 20260928-0847-m26: a typed value goes into the box, not the view's .value setter. The setter
+    // coerces ("" -> 0 in Inputs.number), so the tool reported "empty -> 0" where a user sees the old result.
+    const box = !button && (typeof value === 'string' || typeof value === 'number') ? typingBoxOf(el) : null;
+    if (button) await ui_set(button);
+    else if (box) { box.value = String(value); box.dispatchEvent(new Event('input', { bubbles: true })); box.dispatchEvent(new Event('change', { bubbles: true })); }
+    else await ui_set(el, value);
     await ui_settle();
     await new Promise(r => setTimeout(r, 50));
     await ui_settle();
@@ -7886,8 +7898,12 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       changed.push(k + (b.node ? ' (rendered ' + b.node.tagName.toLowerCase() + ')' : '') + ':\n    ' + d.slice(0, 12).join('\n    ') + (d.length > 12 ? '\n    …(+' + (d.length - 12) + ' more)' : ''));
       if (d.some(l => BAD.test(l.split('→').pop()))) bad.push(k);
     }
-    const dead = !changed.some(l => !l.startsWith(valueName + ':'));
-    let out = 'Set ' + c.name + (c.label ? ' ("' + c.label + '")' : '') + (button ? ' by clicking' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
+    const shown = box ? box.value : null;
+    const refused = box && String(value) !== String(raw) && summary(el.value, 200) === was;
+    const dead = !refused && !changed.some(l => !l.startsWith(valueName + ':'));
+    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (button ? ' by clicking' : box ? '' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
+    if (box && shown !== String(value)) out += 'The box shows ' + JSON.stringify(shown) + ' (a ' + (box.type || 'text') + ' box cannot hold ' + JSON.stringify(String(value)) + ').\n';
+    if (refused) out += '⚠ NOT ACCEPTED: the box shows ' + JSON.stringify(shown) + ' but ' + valueName + ' stayed ' + was + ', so every output still shows the previous result and nothing tells the user their input was rejected. If this input is invalid, show a message that names the problem; if it is valid, the control is refusing it (e.g. outside its [min, max] extent).\n';
     out += changed.length ? 'Changed:\n  ' + changed.join('\n  ') : 'Nothing changed, not even ' + valueName + '.';
     if (dead) out += '\n⚠ NO VISIBLE EFFECT: no cell other than ' + valueName + ' changed, so a user using this control sees nothing happen. Look for where ' + valueName + ' should be used: a cell that lists "viewof ' + valueName + '" (the element) where it needs "' + valueName + '", or an output that interpolates a different cell.';
     if (bad.length) out += '\n⚠ NaN/undefined/[object …] appeared in: ' + bad.join(', ') + '.';
@@ -7911,7 +7927,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   };
   const try_control = defineTool({
     id: 'try_control',
-    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards): do this ' + 'first when asked whether a notebook works. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
+    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards): do this ' + 'first when asked whether a notebook works. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
     parameters: {
       type: 'object',
       required: ['module'],
