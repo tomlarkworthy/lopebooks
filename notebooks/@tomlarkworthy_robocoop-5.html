@@ -29355,11 +29355,75 @@ Before adding a notebook to lopebooks:
   type="text/plain"
   data-mime="text/markdown"
 >
+---
+write-triggers:
+  - "(\\$def|\\.define)\\([^\\n]*\\[[^\\]\\n]*\"(topojson|vl|SQLite|mermaid|Arrow|aq)\""
+---
+
 # Vendoring an npm dependency into a notebook
 
 Vendoring = the package's bytes live inside the HTML file, so the notebook runs with the network
 unplugged. A cell that does `import("https://esm.sh/…")` reads almost identically and is not the same
 thing: it works until the reader is offline, or esm.sh is down, or the page is opened from a USB stick.
+
+## 0. What has to be vendored
+
+Everything a cell loads from a URL whose content does not change: libraries, and also static data
+files published on npm or GitHub (TopoJSON or GeoJSON geometry, a CSV or JSON dataset). Being data
+rather than code is not an exemption. In run `20260928-0235-w17-before` (*"Show a world map with the
+ten most populous countries highlighted"*) the agent read this page, decided the world-atlas
+TopoJSON "is a data file rather than a library", and wrote
+
+```js
+const _world = async function world(d3){return(
+  await d3.json("https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json")
+)};
+```
+
+The map was correct online. Reopened with the network blocked, `world` and `topojson` never resolved
+and the map was blank. Only a feed whose value changes (weather, prices, a user's own API) stays a
+`fetch`.
+
+A static data file is one `attach_file` and one literal `FileAttachment` call, as in
+`@tomlarkworthy/womens-suffrage._iso3166` (`lopebooks/notebooks/@tomlarkworthy_womens-suffrage.html`),
+which also carries its world geometry as the attachment `world-110m.v1.json`:
+
+```
+attach_file({ module: "@user/world-map", name: "countries-110m.json",
+              url: "https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json" })
+```
+```js
+const _133p2z6 = function _iso3166(FileAttachment){return(
+FileAttachment("3166.json").json()
+)};
+```
+
+### Builtins that are fetched, not bundled
+
+Probed 2026-09-28 in the robocoop-5 notebook with every non-`file:` request aborted, one variable per
+stdlib builtin. `d3`, `Plot`, `htl`, `Inputs`, `md`, `html`, `svg`, `DOM`, `Generators`, `Mutable`,
+`FileAttachment`, `width`, `now` and `_` resolved. These did not:
+
+```
+topojson vl SQLite mermaid L Arrow aq tex dot      → unable to load module   (cdn.jsdelivr.net)
+aapl alphabet cars citywages diamonds flare
+industries miserables olympians penguins pizza weather → Failed to fetch  (static.observableusercontent.com)
+```
+
+A cell input named `topojson` is therefore a network load, and so is `require("topojson-client@3")`:
+the stdlib `require` resolves bare names on cdn.jsdelivr.net. Vendor the library (§ 1, § 2) and
+define a cell with the builtin's name in your module, so the cells that use it do not change. A
+module's own cell shadows the builtin. topojson-client's `dist/topojson-client.min.js` is UMD; the
+CommonJS wrapper of § 2.2 returns its exports:
+
+```js
+const _topojson = async function topojson(FileAttachment){
+  const src = await FileAttachment("topojson-client.min.js").text();
+  const mod = { exports: {} };
+  new Function("module", "exports", "define", src)(mod, mod.exports, undefined);
+  return mod.exports;
+};
+```
 
 Two separate problems, and they fail differently:
 
