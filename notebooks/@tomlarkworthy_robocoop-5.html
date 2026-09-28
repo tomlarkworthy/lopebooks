@@ -30037,7 +30037,7 @@ write-triggers:
   - "Inputs\\.button\\("
 ---
 
-# Event handlers and buttons in cells: htl.html, not html; a button that acts on another cell's input; two inputs that update each other
+# Event handlers and buttons in cells: htl.html, not html; a button that acts on another cell's input; a download button; two inputs that update each other
 
 A cell that builds a clickable element and passes it a function (`onclick=${() => …}`) must build it
 with `htl.html`. The bare `html` built-in in a Lopecode notebook is the legacy stdlib template: it
@@ -30129,8 +30129,40 @@ were written by robocoop-5 for "a text box and a button that summarises it" (202
   in a cell that also lists `model`). Each run adds one more listener and none is removed, so after the
   model changed one click sent two requests, one with the old model.
 
+- **A click count that gates an action cell** (`viewof save = Inputs.button("Save")`, then a cell that
+  lists `save` and the form's value cells, `save > 0 && (() => { …; a.click(); })()`). After the
+  first click the count stays above 0, so the cell runs again whenever any listed value changes.
+  Observed (robocoop-5, a form with a download button, 20260928-0847-w10): after one click, editing
+  one text field twice offered two more downloads with no click.
+
 `Inputs.button` is the other working form when the button only needs to count clicks or emit a
 value; it is a `viewof` and follows the viewof page (`writing-cells-in-module-source.md`).
+
+## A button that downloads a file
+
+The cell's value is the button. The file is built and saved inside its click handler, so nothing is
+saved until it is clicked. The cell may list the values the file is made from; when they change the
+cell returns a new button and saves nothing. `@tomlarkworthy/suminagashi` `_download`
+(lopebooks/notebooks/@tomlarkworthy_suminagashi.html) saves a PNG this way. The same shape for a CSV:
+
+```js
+const _saveCsv = function saveCsv(htl, d3, rows){return(
+  htl.html`<button onclick=${() => {
+    const blob = new Blob([d3.csvFormat(rows)], {type: "text/csv"});
+    const link = htl.html`<a download="rows.csv" href=${URL.createObjectURL(blob)}>`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }}>Download CSV</button>`
+)};
+// in define():
+$def("_saveCsv", "saveCsv", ["htl", "d3", "rows"], _saveCsv);
+```
+
+An async builder (a zip, a PDF) goes inside the handler: `onclick=${async () => { const blob = await build(rows); … }}`.
+The stdlib `DOM.download(blob, name, label)` returns a ready control too
+(`@tomlarkworthy/fileattachments` `_download_selected`, lopecode/notebooks/@tomlarkworthy_atlas.html);
+its first click builds the file and relabels the button "Download"; a second click saves it
+(`download.js` in the stdlib awaits the value before it sets `href`).
 
 ## Listening on an Inputs view; two inputs that update each other
 
@@ -30984,6 +31016,7 @@ and the date in the CSV or export if there is one.
 write-triggers:
   - "Inputs\\.table\\([^;]*?\\bedit(able)?\\s*:"
   - "jspdf|jsPDF|html2pdf|pdfmake"
+  - "application/msword|wordprocessingml|\\.docx?[\"'`]"
 ---
 
 # Asked for a spreadsheet or editable table, a document the reader edits in place, a slide deck, drawing, diagram, saved setting, PDF or other file download? Import the published module
@@ -31007,7 +31040,7 @@ cells all computed, and the saved file was reopened with the network blocked
 | drawing / editable SVG | `@tomlarkworthy/svg-lens` | svg-lens |
 | drag a drawing to change its parameters | `@tomlarkworthy/parametric-svg` | parametric-svg |
 | flowchart, sequence diagram, org chart, tree | stdlib `mermaid` | Diagrams |
-| download CSV / JSON / PDF / Word / Excel | `DOM.download`, `pdfLib`, CDN libraries | Files |
+| download CSV / JSON / PDF / Word (.docx) / Excel | `DOM.download`, `pdfLib`, `JSZip` | Files |
 | make or render a PDF | `pdfLib` / `pdfjs` from `@tomlarkworthy/sign-a-pdf` | sign-a-pdf |
 | button that saves the whole notebook | `downloadAnchor` from `@tomlarkworthy/exporter-3` | exporter-3 |
 | dashboard of cells on a grid | `@tomlarkworthy/grid-container` | grid-container |
@@ -31291,6 +31324,38 @@ htl.html`<button onclick=${() => canvas.toBlob(blob => {
   link.click();
 }, "image/png")}>Download PNG</button>`
 ``` For a PDF that works offline, use `pdfLib` (next section).
+
+A Word `.docx` (or Excel `.xlsx`) file is a zip of XML parts. `JSZip` from
+`@tomlarkworthy/jszip-3-10-1` is embedded in robocoop-5, so a save keeps it; the corpus zips files with
+it in `@tomlarkworthy/local-change-history` `_exportFsToZip` (lopecode/notebooks/@tomlarkworthy_exporter-3.html:
+`new JSZip()`, `zip.file(path, data)`, `zip.generateAsync({type: "blob"})`). Three parts make a
+document with one paragraph per string:
+
+```js
+$def("_docxBlob", "docxBlob", ["JSZip"], (JSZip) => async (paragraphs) => {
+  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
+  zip.file("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>');
+  const body = paragraphs.map(p => '<w:p><w:r><w:t xml:space="preserve">' + esc(p) + '</w:t></w:r></w:p>').join("");
+  zip.file("word/document.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' + body + '</w:body></w:document>');
+  return zip.generateAsync({type: "blob", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"});
+});
+$def("_saveDocx", "saveDocx", ["htl", "docxBlob", "notes"], (htl, docxBlob, notes) =>
+  htl.html`<button onclick=${async () => {
+    const link = htl.html`<a download="notes.docx" href=${URL.createObjectURL(await docxBlob(notes.split("\n")))}>`;
+    link.click();
+  }}>Download Word document</button>`);
+main.define("module @tomlarkworthy/jszip-3-10-1", async () => runtime.module((await import("/@tomlarkworthy/jszip-3-10-1.js?v=4")).default));
+main.define("JSZip", ["module @tomlarkworthy/jszip-3-10-1", "@variable"], (_, v) => v.import("JSZip", _));
+```
+
+Applied with `write_file` on 2026-09-28 (`notes` a textarea); after a save and an offline reopen the
+cells still computed, and the file parsed with python-docx. The file is built when the button is
+clicked (`event-handlers-in-cells.md`, "A button that downloads a file"). An HTML page saved with a
+`.doc` name is not a Word document: it is not a zip. On 2026-09-28 the agent, told only that the CDN
+`docx` library fails offline, downloaded one of those instead; in another run it spent a 10-minute
+turn trying to vendor the `docx` library and wrote nothing.
 
 The following worked live but fail offline, because a save does not embed CDN imports (`Unable to
 fetch …`). Pin the version:
