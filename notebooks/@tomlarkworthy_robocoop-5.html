@@ -7958,7 +7958,40 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     unwatch_variable
   ];
 };
-const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_module_files,cellHelpers,setFileAttachment,localDisk,wiki_triggers)
+const _rc5newTrigger = function _newTriggerMatch(){return(
+(re, before, after) => {
+  // The lines of the first match of re in `after` that `before` does not already hold (lines compared
+  // trimmed), or null. A match whose construct `before` lacks entirely always counts (rc5-train m28).
+  const one = new RegExp(re.source, re.flags.replace('g', ''));
+  if (!one.test(after)) return null;
+  const norm = s => '\n' + s.split('\n').map(l => l.trim()).join('\n') + '\n';
+  const had = before == null || !one.test(before) ? null : norm(before);
+  const g = new RegExp(re.source, re.flags.replace('g', '') + 'g');
+  for (let m; (m = g.exec(after)); ) {
+    if (m[0] === '') g.lastIndex++;
+    const s = after.lastIndexOf('\n', m.index - 1) + 1;
+    let e = after.indexOf('\n', m.index + m[0].length);
+    if (e < 0) e = after.length;
+    const span = after.slice(s, Math.max(e, s));
+    if (had == null || !had.includes(norm(span))) return span;
+  }
+  return null;
+}
+)};
+const _rc5punct = function _punctuationMatch(){return(
+(text, needle) => {
+  // Where needle occurs in text when curly quotes, dashes and no-break spaces read as their ASCII forms.
+  // Each fold is one char to one char, so an index in the folded text is an index in the original.
+  const fold = s => s.replace(/[‘’‚‛′]/g, "'").replace(/[“”„‟″]/g, '"')
+    .replace(/[‐-―−]/g, '-').replace(/[   ]/g, ' ');
+  const t = fold(text), n = fold(needle), at = [];
+  if (n) for (let i = t.indexOf(n); i >= 0; i = t.indexOf(n, i + 1)) at.push(i);
+  const name = c => JSON.stringify(c) + ' (U+' + c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0') + ')';
+  const diffs = at.length ? [...new Set([...needle].map((c, k) => text[at[0] + k] !== c ? 'the file has ' + name(text[at[0] + k]) + ' where you wrote ' + name(c) : null).filter(Boolean))] : [];
+  return { at, diffs };
+}
+)};
+const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_module_files,cellHelpers,setFileAttachment,localDisk,wiki_triggers,newTriggerMatch,punctuationMatch)
 {
   const {listPathsAsync, readPath, globToRe, isDisk} = pathLib;
   const {applyModuleSrc} = applyLib;
@@ -7966,18 +7999,29 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
   // A wiki doc's write-triggers name constructs it documents; a module write using one is refused until
   // the session has read that doc. The state is per session (ctx.sessionState); without it, no gate.
   const WIKI = '/content/@tomlarkworthy/markdown-wiki/';
-  const wikiGate = (text, ctx) => {
+  // `before` is text already in the modules: only text the write adds is tested, so rewriting or moving code
+  // that was already there (a translation, a reorder, a cell moved to another module) is not refused (rc5-train m28).
+  const wikiGate = (text, ctx, before = null) => {
     const st = ctx?.sessionState;
     if (!st) return null;
     const read = st.wikiRead ??= new Set();
-    const due = (wiki_triggers || []).filter(d => !read.has(d.path) && d.patterns.some(p => p.test(text)));
+    const due = [];
+    for (const d of wiki_triggers || []) {
+      if (read.has(d.path)) continue;
+      for (const p of d.patterns) {
+        const hit = newTriggerMatch(p, before, text);
+        if (hit != null) { due.push([d.path, hit.trim()]); break; }
+      }
+    }
     if (!due.length) return null;
-    (st.wikiRefusals ??= []).push(...due.map(d => d.path));
-    return 'REFUSED, nothing was written: this source uses constructs documented in ' + due.map(d => d.path).join(', ') +
+    (st.wikiRefusals ??= []).push(...due.map(d => d[0]));
+    return 'REFUSED, nothing was written: this source uses constructs documented in ' + due.map(([p, hit]) => p + ' (`' + (hit.length > 100 ? hit.slice(0, 100) + '\u2026' : hit) + '`)').join(', ') +
       ', which you have not read in this session. read_file it, then write again, changed to follow what it says.';
   };
   // A module write that did not land (refused, not applied, failed to compile) stays listed until a later
   // write to the same path lands; the engine's completion guard reads the list (run 20260928-0847-w9).
+  // other modules count only when they are the user's: a line copied from a library module read as a template still gates
+  const heldText = (id, current) => [current ?? '', ...[...rc5_store.srcFns].filter(([k, f]) => k !== id && !/^@tomlarkworthy\//.test(k) && typeof f?.src === 'string').map(([, f]) => f.src)].join('\n');
   const noteWrite = (ctx, path, output) => {
     const st = ctx?.sessionState;
     if (!st) return output;
@@ -8059,7 +8103,9 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         rc5_store.scratch.set(file_path, String(content ?? ''));
         return { output: 'Wrote ' + file_path };
       }
-      const refused = wikiGate(String(content ?? ''), ctx);
+      let before = null;
+      if (pathLib.moduleIds().includes(m[1])) try { before = await readPath(file_path); } catch (e) {}
+      const refused = wikiGate(String(content ?? ''), ctx, heldText(m[1], before));
       if (refused)
         return { output: noteWrite(ctx, file_path, refused) };
       const applied = await applyModuleSrc(m[1], String(content ?? ''), { watchBus: ctx?.watchBus });
@@ -8106,21 +8152,38 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         return { output: 'ERROR: cannot read ' + file_path + ': not found' };
       if (old_string === new_string)
         return { output: 'ERROR: old_string and new_string are identical.' };
-      const refused = MODULE_PATH.test(file_path) && wikiGate(String(new_string ?? ''), ctx);
-      if (refused)
-        return { output: refused };
+      old_string = String(old_string ?? ''); new_string = String(new_string ?? '');
       const parts = text.split(old_string);
       const count = parts.length - 1;
-      if (count === 0)
-        return { output: 'ERROR: old_string not found in ' + file_path + '.' };
-      if (count > 1 && !replace_all)
+      let updated, note = '';
+      if (count === 0) {
+        // rc5-train 20260928-0847-m28: prose holds I\u2019m (U+2019), the model sends I'm
+        const pm = punctuationMatch(text, old_string);
+        if (!pm.at.length)
+          return { output: 'ERROR: old_string not found in ' + file_path + '.' };
+        if (pm.at.length > 1)
+          return { output: 'ERROR: old_string not found in ' + file_path + ' as written. Read as plain ASCII punctuation it matches ' + pm.at.length +
+            ' places (' + pm.diffs.join('; ') + '). Nothing was changed: add surrounding context so it matches one place, or copy the file\'s characters into old_string.' };
+        const at = pm.at[0], span = text.slice(at, at + old_string.length);
+        // the unchanged ends of the span keep the file's characters; only the part new_string changes is taken from it
+        let p = 0, q = 0;
+        while (p < old_string.length && p < new_string.length && old_string[p] === new_string[p]) p++;
+        while (q < old_string.length - p && q < new_string.length - p && old_string[old_string.length - 1 - q] === new_string[new_string.length - 1 - q]) q++;
+        updated = text.slice(0, at) + span.slice(0, p) + new_string.slice(p, new_string.length - q) + span.slice(span.length - q) + text.slice(at + old_string.length);
+        note = ' Matched by reading typographic punctuation as ASCII: ' + pm.diffs.join('; ') +
+          '. The file\'s characters were kept outside the text you changed; the changed text is as you wrote it.';
+      } else if (count > 1 && !replace_all)
         return { output: 'ERROR: old_string is not unique (' + count + ' matches). Add more surrounding context, or set replace_all:true.' };
-      const updated = replace_all ? parts.join(new_string) : parts[0] + new_string + parts.slice(1).join(old_string);
-      const n = replace_all ? count : 1;
+      else updated = replace_all ? parts.join(new_string) : parts[0] + new_string + parts.slice(1).join(old_string);
+      const n = replace_all ? Math.max(count, 1) : 1;
+      const mp = MODULE_PATH.exec(file_path);
+      const refused = mp && wikiGate(updated, ctx, heldText(mp[1], text));
+      if (refused)
+        return { output: refused };
       if (isDisk(file_path)) {
         try {
           await localDisk.write(file_path, updated);
-          return { output: 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ', on disk)' };
+          return { output: 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ', on disk)' + note };
         } catch (e) {
           return { output: 'ERROR: cannot write ' + file_path + ': ' + (e && e.message || e) };
         }
@@ -8128,10 +8191,10 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
       const m = MODULE_PATH.exec(file_path);
       if (!m) {
         rc5_store.scratch.set(file_path, updated);
-        return { output: 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ')' };
+        return { output: 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ')' + note };
       }
       const applied = await applyModuleSrc(m[1], updated, { watchBus: ctx?.watchBus });
-      return { output: noteWrite(ctx, file_path, 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ') \u2014 ' + applied.msg) };
+      return { output: noteWrite(ctx, file_path, 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ') \u2014 ' + applied.msg + note) };
     }
   });
   // an empty search of /src or /content for a name: a published notebook is not there until imported
@@ -9023,7 +9086,9 @@ export default function define(runtime, observer) {
   $def("_rc5uncaught", "uncaughtLog", ["invalidation"], _rc5uncaught);
   $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib","uncaughtLog","acorn"], _190yjiu);
   $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py","ui_set","ui_settle"], _ual70b);
-  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment","localDisk","wiki_triggers"], _6aumvx);  
+  $def("_rc5newTrigger", "newTriggerMatch", [], _rc5newTrigger);
+  $def("_rc5punct", "punctuationMatch", [], _rc5punct);
+  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","all_module_files","cellHelpers","setFileAttachment","localDisk","wiki_triggers","newTriggerMatch","punctuationMatch"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS","mountLocalDisk"], _qc0bl);  
   $def("_pytl01", "pythonTools", ["defineTool","py"], _pytl01);
   $def("_1nb19yl", "hostSetup", ["valueTools","fileTools","pythonTools","registerTool","invalidation","unregisterTool"], _1nb19yl);  
