@@ -8030,7 +8030,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       const val = v._value;
       snap.set(key, v._error != null ? { err: String(v._error?.message ?? v._error) }
         : val instanceof Element ? { el: fingerprint(val), node: val }
-        : { s: summary(val, 300) });
+        : { s: summary(val, 300), v });
     }
     return snap;
   };
@@ -8073,7 +8073,12 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     await new Promise(r => setTimeout(r, 50));
     await ui_settle();
     const after = snapshotOf(mod);
-    const changed = [], bad = [];
+    // rc5-train 20260928-0847-m40: a cell that threw after the change showed as "→ undefined"; read its promise
+    for (const b of after.values()) if (b.v && b.v._value === undefined) {
+      const e = await Promise.race([Promise.resolve(b.v._promise).then(() => null, e => e ?? 'rejected'), new Promise(r => setTimeout(() => r(null), 50))]);
+      if (e) { b.err = e instanceof Error ? e.name + ': ' + e.message : String(e); delete b.s; }
+    }
+    const changed = [], bad = [], failed = [];
     for (const [k, b] of after) {
       if (k === c.name) continue;
       const a = before.get(k);
@@ -8082,6 +8087,8 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       if (!d) continue;
       changed.push(k + (b.node ? ' (rendered ' + b.node.tagName.toLowerCase() + ')' : '') + ':\n    ' + d.slice(0, 12).join('\n    ') + (d.length > 12 ? '\n    …(+' + (d.length - 12) + ' more)' : ''));
       if (d.some(l => BAD.test(l.split('→').pop()))) bad.push(k);
+      if (b.err && !a.err) failed.push(k + ' throws ' + b.err.slice(0, 120));
+      else if (!b.err && d.some(l => BAD.test(l.split('→').pop()))) failed.push(k + ' shows ' + (oneLine(b.s ?? '').match(BAD)?.[0] || 'NaN/undefined'));
     }
     const shown = box ? box.value : null;
     const refused = box && String(value) !== String(raw) && summary(el.value, 200) === was;
@@ -8094,7 +8101,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     if (bad.length) out += '\n⚠ NaN/undefined/[object …] appeared in: ' + bad.join(', ') + '.';
     const logged = id ? uncaughtLog.since(id, t0) : '';
     if (logged) out += '\n' + logged + '.';
-    return { out, dead, was: raw };
+    return { out, dead, was: raw, failed };
   };
   // A value a user might pick that differs from the current one; undefined means "click it".
   const probeValue = el => {
@@ -8108,13 +8115,25 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       return x;
     }
     if (input.type === 'checkbox') return Array.isArray(el.value) ? (el.value.length ? [] : null) : !el.value;
-    if (input.tagName === 'SELECT') { const o = [...input.options].find(o => !o.selected); return o ? (el.value !== undefined && typeof el.value !== 'string' ? null : o.value) : null; }
+    if (input.tagName === 'SELECT') { const o = [...input.options].find(o => !o.selected); return o ? (el.value !== undefined && typeof el.value !== 'string' ? null : o.textContent) : null; }
     if (typeof el.value === 'string') return el.value + ' test';
     return null;
   };
+  // rc5-train 20260928-0847-m40: a cell that throws only at a slider's max (an empty filter) or at one select
+  // option computed at every value the sweep tried (25%/75%, one option); the sweep now also tries these.
+  const edgeValues = (el, tried) => {
+    const input = el.matches('input, select, textarea') ? el : el.querySelector('input, select, textarea');
+    if (!input) return [];
+    let xs = [];
+    if (input.type === 'range' || input.type === 'number') {
+      if (input.min === '' || input.max === '') return [];
+      xs = [+input.min, +input.max];
+    } else if (input.tagName === 'SELECT' && !input.multiple && typeof el.value === 'string') xs = [...input.options].map(o => o.textContent).slice(0, 8);
+    return xs.filter(x => Number.isFinite(x) || typeof x === 'string').filter(x => x !== tried && String(x) !== String(el.value));
+  };
   const try_control = defineTool({
     id: 'try_control',
-    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards): do this ' + 'first when asked whether a notebook works. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
+    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards), plus each slider\'s min and max and each select option, flagging a cell that throws or shows NaN at any of them: do this ' + 'first when asked whether a notebook works or what is wrong with it. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
     parameters: {
       type: 'object',
       required: ['module'],
@@ -8137,9 +8156,19 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
           const v = probeValue(c.v._value);
           if (v === null) { parts.push(c.name + ': skipped (no value to pick automatically; call with control and value)'); continue; }
           const r = await tryOne(mod, c, v, module);
-          parts.push(r.out.length > 1500 ? r.out.slice(0, 1500) + ' …' : r.out);
+          let part = r.out.length > 1500 ? r.out.slice(0, 1500) + ' …' : r.out;
           if (r.dead) dead.push(c.label || c.name);
           if (v !== undefined) { try { await ui_set(c.v._value, r.was); await ui_settle(); } catch (e) {} }
+          if (v !== undefined) {
+            const edges = edgeValues(c.v._value, v), broke = [];
+            for (const x of edges) {
+              const e = await tryOne(mod, c, x, module);
+              try { await ui_set(c.v._value, e.was); await ui_settle(); } catch (err) {}
+              if (e.failed.length) broke.push('at ' + JSON.stringify(x) + ': ' + e.failed.join('; '));
+            }
+            if (edges.length) part += broke.length ? '\n⚠ FAILS AT SOME SETTINGS (' + c.name + '):\n  ' + broke.join('\n  ') : '\nAlso tried ' + edges.map(x => JSON.stringify(x)).join(', ') + ': nothing threw or showed NaN.';
+          }
+          parts.push(part);
         }
         return { title: 'try_control ' + module, output: 'Tried ' + all.length + ' controls (each put back afterwards).' + (dead.length ? ' ⚠ NO VISIBLE EFFECT: ' + dead.join(', ') + '.' : '') + '\n\n' + parts.join('\n\n') };
       }
@@ -32422,11 +32451,16 @@ was found in modules that computed cleanly.
    `innerHTML`, `.value`, `.sort()`, repeated numbers) and decide for each hit.
 3. Report each problem as: the cell name, what the code does, and what the user sees because of it.
    Order by what the user sees: wrong or runaway behaviour first, then wrong values, then upkeep.
-4. Check a few displayed values by hand against what their cells say they compute (eval_js, or
-   try_control to move an input). The classes below are not the whole list: in run 20260928-0847-m5
+4. Run `try_control` with only `module`. It moves every control, including each slider's min and
+   max and each select option, puts each back, and flags a cell that throws or shows NaN at any of
+   them (`⚠ FAILS AT SOME SETTINGS`). A cell that fails only at some settings computes at the
+   defaults, so reading the source and `list_values` do not show it: in run 20260928-0847-m40
+   `topTweet` threw only with the slider at its max, where a filter returned no rows, and the review
+   that read the source and ran `list_values` did not report it.
+5. Check a few displayed values by hand against what their cells say they compute (eval_js). The classes below are not the whole list: in run 20260928-0847-m5
    the run that used this page found every seeded problem but missed that the module's starting
    values (PM2.5 50, AQI 250) contradict its own formula (137), which a run without the page caught.
-5. Leave out advice that names no cell ("add comments", "split long cells"), and check a claim
+6. Leave out advice that names no cell ("add comments", "split long cells"), and check a claim
    against the class's exceptions before reporting it.
 
 ## Serious: behaviour that grows or silently stops working
@@ -32452,6 +32486,11 @@ const _invalidation_example = function _invalidation_example(htl,invalidation)
 On 2026-09-28, `invalidation.then(() => clearInterval(…))` appeared in 247 notebook files.
 Not a leak: a listener on an element the cell itself creates and returns. The element is replaced
 when the cell re-runs and the listener goes with it.
+
+**A cell that throws or shows NaN at some control settings.** A filter a slider can empty followed by
+`[0]`, `d3.greatest(…)[…]` or `.toFixed`; a select that offers a column whose values are text to a
+cell that does arithmetic. Report the control, the setting and the cell (from `try_control`'s
+`FAILS AT SOME SETTINGS` lines), not only the code.
 
 **A cell that reads `viewof x.value` instead of listing `x`.** It reads the value once, when the cell
 runs, and does not re-run when the input changes. Observed (20260928-0525-w28): `passCount` listed
