@@ -2250,7 +2250,13 @@ const _qq3v7b = function _jbApply(importShim)
       }
       // F4: prune anything the file no longer contains — reload-proof, no cross-call state.
       //   user cells   → pid-bearing vars not seen this apply
-      //   import plumbing → "module @x" loaders / "@variable"-wired bindings whose name not seen
+      //   import plumbing → "module @x" loaders / import bindings whose name not seen
+      // A binding that has run is no longer "@variable"-wired: v.import() redefines it with the remote variable as its
+      // only input, so it is also recognised by an input from another module (rc5-train 20260928-0847-m35: a dropped
+      // import stayed live, erroring "summarise is not defined"). Readers go first, then bindings, then loaders: a
+      // variable deleted while another still reads it leaves an implicit "X is not defined" variable in its place.
+      const fromElsewhere = v => (v._inputs || []).some(iv => iv && typeof iv === 'object' && iv._module && iv._module !== mod && iv._module !== runtime._builtin);
+      const doomed = [];
       for (const v of [...runtime._variables]) {
         if (v._module !== mod)
           continue;
@@ -2260,19 +2266,17 @@ const _qq3v7b = function _jbApply(importShim)
         if (name && seenNames.has(name))
           continue;
         // present in file (user cell or import binding/loader) → keep, even if it acquired a pid via persistentId
-        // removed import plumbing ("module @x" loader, or a "@variable"-wired binding)
-        if (name && name.startsWith('module ') || hasVarInput(v._inputs)) {
-          if (name) {
-            v.delete();
-            changes++;
-          }
-          continue;
-        }
-        if (!v.pid || seenPids.has(v.pid))
-          continue;
-        // keep pid-less and still-present user cells
+        if (name && name.startsWith('module '))
+          doomed.push([2, v]);
+        else if (hasVarInput(v._inputs) || fromElsewhere(v)) {
+          if (name)
+            doomed.push([1, v]);
+        } else if (v.pid && !seenPids.has(v.pid))
+          doomed.push([0, v]);
+        // orphaned user cell (removed / renamed); pid-less and still-present user cells are kept
+      }
+      for (const [, v] of doomed.sort((a, b) => a[0] - b[0])) {
         v.delete();
-        // orphaned user cell (removed / renamed)
         changes++;
       }
       // A cell added mid-file is created at the END of runtime._variables; the pane and the exporter read that

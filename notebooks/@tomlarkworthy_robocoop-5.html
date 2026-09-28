@@ -6750,6 +6750,54 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         }
         return null;
     };
+    // Displayed text that shows NaN/undefined/Infinity (rc5-train 20260928-0847-m35: after a library changed its return
+    // shape, md prose showed "(NaN× the mean)" under "✓ all cells compute"). A token the cell's own string or template
+    // literals contain is prose (a notebook explaining JavaScript), not a defect.
+    const placeholderDefect = (val, def) => {
+        try {
+            if (!val || typeof val !== 'object' || typeof val.nodeType !== 'number' || !val.ownerDocument)
+                return null;
+            const walker = val.ownerDocument.createTreeWalker(val, 4);
+            const parts = [];
+            for (let n = walker.nextNode(); n; n = walker.nextNode())
+                // an Inspector's rendering of a value (a page or pane holding other cells) prints undefined as a value
+                if (!(n.parentElement && n.parentElement.closest('code,pre,textarea,script,style,kbd,samp,[contenteditable],.cm-editor,[class*="observablehq--"]')))
+                    parts.push(n.data);
+            const text = parts.join(' ').replace(/\s+/g, ' ');
+            const re = /(?:^|[^\w$.'"`])(-?Infinity|NaN|undefined)(?![\w$'"`])/g;
+            let lits = null;
+            for (let m; m = re.exec(text);) {
+                if (lits == null) {
+                    lits = '';
+                    const walk = x => {
+                        if (!x || typeof x !== 'object')
+                            return;
+                        if (Array.isArray(x))
+                            return x.forEach(walk);
+                        if (x.type === 'Literal' && typeof x.value === 'string')
+                            lits += x.value + '\n';
+                        else if (x.type === 'TemplateElement')
+                            lits += (x.value.cooked ?? x.value.raw) + '\n';
+                        for (const k in x)
+                            if (k !== 'type' && x[k] && typeof x[k] === 'object')
+                                walk(x[k]);
+                    };
+                    try {
+                        walk(acorn.parse('(' + String(def) + ')', { ecmaVersion: 'latest' }));
+                    } catch (e) {
+                        lits = String(def);
+                    }
+                }
+                const tok = m[1].replace(/^-/, '');
+                if (new RegExp('(^|[^\\w$])' + tok + '([^\\w$]|$)').test(lits))
+                    continue;
+                const at = m.index + m[0].indexOf(m[1]);
+                return { kind: 'placeholder', what: (at > 40 ? '…' : '') + text.slice(Math.max(0, at - 40), at + m[1].length + 30).trim() + (at + m[1].length + 30 < text.length ? '…' : '') };
+            }
+        } catch (e) {
+        }
+        return null;
+    };
     // A chart that computes but draws no data (rc5-train 20260928-0610-w31: Plot.barY given y as an array of
     // functions drew 0 bars; the agent told the user it showed coloured segments). Plot omits a mark whose every
     // datum has a missing or non-numeric channel, leaving only axes; a d3 join over [] leaves an empty <svg>.
@@ -6851,7 +6899,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         // after every cell has run: a chart filled by a later cell is not empty
         for (const r of rows)
             if (!r.markup && r.el)
-                r.markup = chartDefect(r.el);
+                r.markup = chartDefect(r.el) || placeholderDefect(r.el, r.variable && r.variable._definition);
         return rows;
     };
     // an anonymous cell is found in the source by its pid; the start of its body tells it apart from its neighbours
@@ -6986,7 +7034,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         }
         const named = probe.filter(r => !r.anon);
         const vals = named.filter(r => r.value !== undefined).slice(0, 8).map(r => r.name + '=' + r.value).join(', ');
-        const broken = probe.filter(r => r.markup);
+        const broken = probe.filter(r => r.markup && r.markup.kind !== 'placeholder');
         if (broken.length) {
             const b = broken[0].markup;
             if (b.kind === 'plot' || b.kind === 'svg')
@@ -6998,6 +7046,9 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             const why = b.kind === 'text' ? ' render' + (broken.length === 1 ? 's' : '') + ' markup as literal TEXT (' + b.what + ' is a text node, not an element): a string interpolated into htl.html`\u2026` or htl.svg`\u2026` is inserted as text, never parsed' : ' put' + (broken.length === 1 ? 's' : '') + ' an HTML ' + b.what + ' inside <svg>, which the browser does not draw: it was built with htl.html`\u2026`; SVG child elements need htl.svg`\u2026`';
             return ' \xB7 \u26A0 ' + broken.map(who).join(', ') + why + '. Build each SVG part with htl.svg`<line \u2026/>` (HTML parts with htl.html`\u2026`) and interpolate those elements (an array of them works) \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
         }
+        const shown = probe.filter(r => r.markup && r.markup.kind === 'placeholder');
+        if (shown.length)
+            return ' \xB7 \u26A0 ' + shown.slice(0, 4).map(r => who(r) + ' shows "' + r.markup.what + '"').join('; ') + (shown.length > 4 ? '; \u2026' : '') + ' to the user. NaN, undefined or Infinity in displayed text comes from reading a field the value does not have (a renamed property, an array read as an object, a changed return shape) or from arithmetic on one; inspect_value the cells it reads. Do not tell the user it works \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
         const bare = bareControls(probe);
         if (bare.length)
             return ' \xB7 \u26a0 ' + bare.map(b => b.name + ' is an input CONTROL (a <' + b.tag + '> element), not its value, and ' + b.readers.join(', ') + ' list' + (b.readers.length === 1 ? 's' : '') + ' it as an input').join('; ') + ': those cells get the element, so a colour or size set from it is ignored and arithmetic gives NaN, and they never see the control change. Name the control cell "viewof ' + bare[0].name + '" and add its value cell $def("_pid","' + bare[0].name + '",["Generators","viewof ' + bare[0].name + '"],(G, v) => G.input(v)); readers keep listing "' + bare[0].name + '" (or list "viewof ' + bare[0].name + '" and read .value inside an event handler, at the time of the event) \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
@@ -23012,7 +23063,13 @@ const _qq3v7b = function _jbApply(importShim)
       }
       // F4: prune anything the file no longer contains — reload-proof, no cross-call state.
       //   user cells   → pid-bearing vars not seen this apply
-      //   import plumbing → "module @x" loaders / "@variable"-wired bindings whose name not seen
+      //   import plumbing → "module @x" loaders / import bindings whose name not seen
+      // A binding that has run is no longer "@variable"-wired: v.import() redefines it with the remote variable as its
+      // only input, so it is also recognised by an input from another module (rc5-train 20260928-0847-m35: a dropped
+      // import stayed live, erroring "summarise is not defined"). Readers go first, then bindings, then loaders: a
+      // variable deleted while another still reads it leaves an implicit "X is not defined" variable in its place.
+      const fromElsewhere = v => (v._inputs || []).some(iv => iv && typeof iv === 'object' && iv._module && iv._module !== mod && iv._module !== runtime._builtin);
+      const doomed = [];
       for (const v of [...runtime._variables]) {
         if (v._module !== mod)
           continue;
@@ -23022,19 +23079,17 @@ const _qq3v7b = function _jbApply(importShim)
         if (name && seenNames.has(name))
           continue;
         // present in file (user cell or import binding/loader) → keep, even if it acquired a pid via persistentId
-        // removed import plumbing ("module @x" loader, or a "@variable"-wired binding)
-        if (name && name.startsWith('module ') || hasVarInput(v._inputs)) {
-          if (name) {
-            v.delete();
-            changes++;
-          }
-          continue;
-        }
-        if (!v.pid || seenPids.has(v.pid))
-          continue;
-        // keep pid-less and still-present user cells
+        if (name && name.startsWith('module '))
+          doomed.push([2, v]);
+        else if (hasVarInput(v._inputs) || fromElsewhere(v)) {
+          if (name)
+            doomed.push([1, v]);
+        } else if (v.pid && !seenPids.has(v.pid))
+          doomed.push([0, v]);
+        // orphaned user cell (removed / renamed); pid-less and still-present user cells are kept
+      }
+      for (const [, v] of doomed.sort((a, b) => a[0] - b[0])) {
         v.delete();
-        // orphaned user cell (removed / renamed)
         changes++;
       }
       // A cell added mid-file is created at the END of runtime._variables; the pane and the exporter read that
