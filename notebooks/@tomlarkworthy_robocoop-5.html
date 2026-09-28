@@ -30113,29 +30113,61 @@ no runtime error", and the agent told the user the converter worked. With the gu
 `viewof_celsius.contains(document.activeElement)` and `.valueAsNumber` changed to `.value`, the same
 module passed.
 
-Two boxes that convert into each other: one cell lists both `viewof`s, adds an `input` listener to
-each, and writes the converted value to the other view's `.value`:
+Two controls that show one quantity: keep the quantity in one hidden state cell,
+`viewof celsius = Inputs.input(20)`, and bind each control to it. `Inputs.bind(target, source)` copies
+`source.value` into the control, and on the control's `input` event writes the value back to the state
+and dispatches `input` on it, so the `celsius` value cell and every other bound control update. The
+corpus binds a second control to an existing view this way: `@tomlarkworthy/dataflow-templating` `_dtv2j`
+(lopecode/notebooks/@tomlarkworthy_atlas.html) is `Inputs.bind(Inputs.range([1, 4], { label: "widgets",
+step: 1 }), $0)` on `viewof widgetCount`. `Inputs.bind` copies values unchanged, so a control that
+shows a converted value needs a bind with a function each way:
 
 ```js
-const _link = function link($c, $f, invalidation){
-  const onC = () => { if (Number.isFinite($c.value)) $f.value = Math.round(($c.value * 9 / 5 + 32) * 100) / 100; };
-  const onF = () => { if (Number.isFinite($f.value)) $c.value = Math.round(($f.value - 32) * 5 / 9 * 100) / 100; };
-  $c.addEventListener("input", onC);
-  $f.addEventListener("input", onF);
-  invalidation.then(() => { $c.removeEventListener("input", onC); $f.removeEventListener("input", onF); });
-  return "linked";
-};
-// in define(), after viewof celsius / viewof fahrenheit are declared as on the viewof page:
-$def("_link", "link", ["viewof celsius", "viewof fahrenheit", "invalidation"], _link);
+const _celsius = function celsius(Inputs){return( Inputs.input(20) )};
+const _bindVia = function bindVia(){return(
+(target, source, to, from, invalidation) => {
+  let fromTarget = false;
+  const onSource = () => { if (!fromTarget) target.value = to(source.value); };
+  const onTarget = () => {
+    if (!Number.isFinite(target.value)) return;
+    fromTarget = true;
+    source.value = from(target.value);
+    source.dispatchEvent(new Event("input", {bubbles: true}));
+    fromTarget = false;
+  };
+  onSource();
+  target.addEventListener("input", onTarget);
+  source.addEventListener("input", onSource);
+  invalidation?.then(() => source.removeEventListener("input", onSource));
+  return target;
+}
+)};
+const _cBox = function cBox(Inputs, $celsius, invalidation){return(
+  Inputs.bind(Inputs.number({label: "Celsius (°C)"}), $celsius, invalidation)
+)};
+const _fBox = function fBox(Inputs, bindVia, $celsius, invalidation){return(
+  bindVia(Inputs.number({label: "Fahrenheit (°F)"}), $celsius,
+    c => Math.round((c * 9 / 5 + 32) * 100) / 100, f => (f - 32) * 5 / 9, invalidation)
+)};
+// in define():
+$def("_celsius", "viewof celsius", ["Inputs"], _celsius);
+main.variable(observer("celsius")).define("celsius", ["Generators", "viewof celsius"], (G, _) => G.input(_));
+$def("_bindVia", "bindVia", [], _bindVia);
+$def("_cBox", "cBox", ["Inputs", "viewof celsius", "invalidation"], _cBox);
+$def("_fBox", "fBox", ["Inputs", "bindVia", "viewof celsius", "invalidation"], _fBox);
 ```
 
-Setting `.value` dispatches no event, so the write does not come back and no guard is needed. It also
-means the other box's value cell (`fahrenheit`) does not update; cells that need the temperature list
-the box the user typed into, or a cell that is written from both listeners. When the two values are
-equal rather than converted, `Inputs.bind(target, source)` does the linking:
-`@tomlarkworthy/atlas` `_5` (lopecode/notebooks/@tomlarkworthy_atlas.html) is
-`Inputs.bind(Inputs.range(), $0.left)`. On 2026-09-28 no corpus cell linked two views through a
-conversion; the listener form above is not copied from one.
+The control cells list `viewof celsius`, not `celsius`, so they are not rebuilt on each keystroke.
+Setting `.value` dispatches no event, so writes do not echo. `fromTarget` stops the state's `input`
+event from rewriting the box being typed in: without it, typing `98.60` in °F was reformatted to `98.6`
+under the cursor (probe `tools/scratch/rc5-sessions/s37-shared-state-bind.mjs`, 2026-09-28). With it,
+typing °F=212, °C=-40, °F=98.6 gave `celsius` 100, -40, 37, the other box 100, -40, 37, and the typed
+text kept each time.
+
+A listener cell that writes each box's converted value into the other box's `.value` also passes the
+converter eval, and this page recommended it until 2026-09-28. It leaves no single value to depend
+on: the `fahrenheit` value cell does not update when °C is typed, because setting `.value` dispatches
+nothing (follows from the no-echo behaviour above; not measured separately).
 </script>
 <script id="@tomlarkworthy/markdown-wiki/time-series-from-a-web-api.md" 
   type="text/plain"
