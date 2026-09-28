@@ -6603,7 +6603,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                     // an invalid attribute is only a browser console message ("<path> attribute d: Expected …"),
                     // which page code cannot read, so validate the values here (rc5-train 20260928-0235-w17)
                     for (const a of n.attributes) {
-                        const bad = a.name === 'd' ? typeof CSS !== 'undefined' && CSS.supports && CSS.supports('d', 'path("' + a.value.replace(/["\\]/g, '').replace(/\s+/g, ' ') + '")') === false && CSS.supports('d', 'path("M0,0")') : /[^/]\/$/.test(a.value) && !/href$|^src$|^data-/.test(a.name);
+                        const bad = a.name === 'd' ? typeof CSS !== 'undefined' && CSS.supports && CSS.supports('d', 'path("' + a.value.replace(/["\\]/g, '').replace(/\s+/g, ' ') + '")') === false && CSS.supports('d', 'path("M0,0")') : /[^/]\/$/.test(a.value) && !/href$|^src$|^data-/.test(a.name) || /^([xy][12]?|c[xy]|r[xy]?|width|height|points|transform)$/.test(a.name) && /(^|[^\w])(NaN|undefined)([^\w]|$)/.test(a.value);
                         if (bad)
                             return { kind: 'attr', what: '<' + n.localName + ' ' + a.name + '="' + (a.value.length > 24 ? '…' + a.value.slice(-24) : a.value) + '">' };
                     }
@@ -6611,6 +6611,34 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             }
             if (val.nodeType === 1 && val.namespaceURI !== SVG_NS && /^(line|circle|path|rect|polygon|polyline|ellipse|g|text)$/.test(val.localName))
                 return { kind: 'ns', what: '<' + val.localName + '>' };
+        } catch (e) {
+        }
+        return null;
+    };
+    // A chart that computes but draws no data (rc5-train 20260928-0610-w31: Plot.barY given y as an array of
+    // functions drew 0 bars; the agent told the user it showed coloured segments). Plot omits a mark whose every
+    // datum has a missing or non-numeric channel, leaving only axes; a d3 join over [] leaves an empty <svg>.
+    const chartDefect = val => {
+        try {
+            if (!val || typeof val.querySelectorAll !== 'function')
+                return null;
+            const svgs = (val.localName === 'svg' ? [val] : []).concat([...val.querySelectorAll('svg')]);
+            for (const s of svgs) {
+                if (s.parentElement && s.parentElement.closest('svg'))
+                    continue;
+                if (/(^|\s)plot(-[0-9a-f]+)?(\s|$)/.test(s.getAttribute('class') || '')) {
+                    const marks = [...s.querySelectorAll('g[aria-label]')].filter(g => !/axis|grid|frame|facet|tip/.test(g.getAttribute('aria-label')));
+                    if (!marks.some(g => g.childElementCount > (/^(rule|text)$/.test(g.getAttribute('aria-label')) ? 2 : 0)))
+                        return { kind: 'plot', what: 'axes' + marks.slice(0, 4).map(g => ', ' + g.getAttribute('aria-label') + ' \u00D7' + g.childElementCount).join('') };
+                    continue;
+                }
+                const w = parseFloat(s.getAttribute('width')), h = parseFloat(s.getAttribute('height')), vb = (s.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
+                if (!(w >= 100 && h >= 60 || vb[2] >= 100 && vb[3] >= 60) || s.querySelector('foreignObject') || !s.querySelector('.tick') && s.querySelector('text'))
+                    continue;
+                const shapes = [...s.querySelectorAll('rect,circle,ellipse,line,polyline,polygon,path,image,use')].filter(e => !e.closest('defs,clipPath,marker,mask,pattern,symbol,.tick') && !e.classList.contains('domain'));
+                if (!shapes.length)
+                    return { kind: 'svg', what: '<svg ' + (w >= 100 ? w + '\u00D7' + h : 'viewBox ' + vb.join(' ')) + '>' };
+            }
         } catch (e) {
         }
         return null;
@@ -6623,7 +6651,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         const uwid = watchKey(id, '(uncaught)');
         // re-registered on every write, so the same error from the rewritten code streams again
         bus.register(uwid, id + ' (uncaught)', uncaughtLog.subscribe(id, () => bus.record(uwid, uncaughtLog.text(id, false))), '');
-        return Promise.all(cells.map(async v => {
+        const rows = await Promise.all(cells.map(async v => {
             const base = await readVar(mod, v);
             const baseText = base.error ? '\u26A0 ' + base.error : summ(base.value);
             const wid = watchKey(id, v.pid, v._name);
@@ -6650,9 +6678,15 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                 error: base.error,
                 errObj: base.errObj,
                 value: base.error ? undefined : baseText,
-                markup: base.error ? null : markupDefect(base.value)
+                markup: base.error ? null : markupDefect(base.value),
+                el: base.error ? null : base.value
             };
         }));
+        // after every cell has run: a chart filled by a later cell is not empty
+        for (const r of rows)
+            if (!r.markup && r.el)
+                r.markup = chartDefect(r.el);
+        return rows;
     };
     const probeStatus = (probe, id) => {
         const uncaught = id ? uncaughtLog.text(id) : '';
@@ -6699,8 +6733,10 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         const broken = probe.filter(r => r.markup);
         if (broken.length) {
             const b = broken[0].markup;
+            if (b.kind === 'plot' || b.kind === 'svg')
+                return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + ' compute' + (broken.length === 1 ? 's' : '') + ' but draw' + (broken.length === 1 ? 's' : '') + ' NO DATA: ' + (b.kind === 'plot' ? 'the Plot drew ' + b.what + ' and no data shapes. Plot silently skips every datum whose channel value is missing or not a number, so an empty array, a misspelled field, or a channel that is not a field name, a function of one datum or an array with one value per datum draws nothing and throws nothing. For stacked or grouped parts pass long rows, one per part: Plot.barY(rows, {x: "month", y: "amount", fill: "category"})' : 'the ' + b.what + ' has no shapes outside its axes: the data join got an empty array, or its data arrived after it ran') + '. Do not describe it to the user as showing data. If its data is empty on purpose until the user acts (an event log), say it starts empty; otherwise FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
             if (b.kind === 'attr')
-                return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + ' render' + (broken.length === 1 ? 's' : '') + ' an SVG attribute the browser rejects: ' + b.what + ' (it logs "attribute \u2026: Expected \u2026" to the console, which you cannot see, and draws it wrong or not at all).' + (/\/"?>$/.test(b.what) ? ' A trailing "/" comes from an unquoted hole before a self-closing tag: in htl, <path d=${p}/> reads the "/" into the value; quote it: d="${p}" />.' : '') + ' \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
+                return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + ' render' + (broken.length === 1 ? 's' : '') + ' an SVG attribute the browser rejects: ' + b.what + ' (it logs "attribute \u2026: Expected \u2026" to the console, which you cannot see, and draws it wrong or not at all).' + (/NaN|undefined/.test(b.what) ? ' NaN/undefined comes from an accessor or scale given a missing or non-numeric value (a misspelled field, a string such as "$1,450", a value outside the scale domain).' : '') + (/\/"?>$/.test(b.what) ? ' A trailing "/" comes from an unquoted hole before a self-closing tag: in htl, <path d=${p}/> reads the "/" into the value; quote it: d="${p}" />.' : '') + ' \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
             const why = b.kind === 'text' ? ' render' + (broken.length === 1 ? 's' : '') + ' markup as literal TEXT (' + b.what + ' is a text node, not an element): a string interpolated into htl.html`\u2026` or htl.svg`\u2026` is inserted as text, never parsed' : ' put' + (broken.length === 1 ? 's' : '') + ' an HTML ' + b.what + ' inside <svg>, which the browser does not draw: it was built with htl.html`\u2026`; SVG child elements need htl.svg`\u2026`';
             return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + why + '. Build each SVG part with htl.svg`<line \u2026/>` (HTML parts with htl.html`\u2026`) and interpolate those elements (an array of them works) \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
         }
