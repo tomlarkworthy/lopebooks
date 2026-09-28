@@ -36818,6 +36818,14 @@ function createOpenRouterClient({
     referer,
     title,
     defaultModel = 'anthropic/claude-sonnet-4',
+    // No `data:` line for this long = a dead request: abort and retry. Comment lines do not count — OpenRouter
+    // sends ": OPENROUTER PROCESSING" every ~0.4 s while it waits on the provider, however long that is.
+    streamIdleMs = 180000,
+    // Thinking with no visible output (content or tool call) for this long: abort and re-ask the same step with
+    // the next, cheaper reasoning block. mimo-v2.5-pro reasoned 5-14 min on 6 of 98 sampled steps
+    // (2026-09-28), across providers; `reasoning.max_tokens` was not honoured, `effort: 'low'` was. null disables.
+    reasoningBudgetMs = 180000,
+    reasoningFallbacks = [{ effort: 'low' }, { enabled: false }],
     cacheModels   // optional Set<modelId> needing explicit cache_control; auto-detected from /models if omitted
   } = {}) {
     if (typeof fetch !== 'function') {
@@ -36884,29 +36892,51 @@ function createOpenRouterClient({
       };
       // Transient failures (network drops, 429 rate limits, 5xx) are retried with exponential backoff —
       // a single throttled request must not kill a whole agent turn. Aborts (steer/interrupt) never retry.
-      const retriable = (e) => /Failed to fetch|NetworkError|network error|load failed|stream error|stream idle|Upstream error|overloaded|ECONNRESET|OpenRouter (408|429|5\d\d)/i.test(String(e && e.message || e));
+      // A spent daily budget ("Come back tomorrow", the demo gateway's 429) is not transient: retrying it only
+      // held the step ~3.5 min before the same error.
+      const retriable = (e) => !/come back tomorrow/i.test(String(e && e.message || e)) && /Failed to fetch|NetworkError|network error|load failed|stream error|stream idle|Upstream error|overloaded|ECONNRESET|OpenRouter (408|429|5\d\d)/i.test(String(e && e.message || e));
       let lastErr;
       // 8 attempts, backoff capped at 60 s (~4 min total): a provider outage of a few minutes exhausted
       // the old 5 x <=16 s budget mid-turn (2026-09-03). steer/interrupt still aborts a waiting retry.
-      const STREAM_IDLE_MS = 180000;
+      const STREAM_IDLE_MS = streamIdleMs;
+      let thinkLevel = 0, overBudget = false;
       for (let attempt = 0; attempt < 8; attempt++) {
-        if (attempt) await new Promise((r) => setTimeout(r, Math.min(60000, 1000 * 2 ** attempt) + Math.random() * 1000));
+        if (attempt && !overBudget) await new Promise((r) => setTimeout(r, Math.min(60000, 1000 * 2 ** attempt) + Math.random() * 1000));
         if (signal && signal.aborted) throw (lastErr || new Error('aborted'));
+        let watchdog;
         try {
           // STREAMING (SSE): long generations over proxied networks die if the connection looks idle —
           // a non-streaming completion is silent for the entire generation. Streamed deltas keep the
           // socket alive; the message (content + tool_calls) is reassembled here so callers see the
           // same shape as the non-streaming API.
-          // A stream that stops delivering bytes never errors on its own (OpenRouter keeps a live stream
-          // fed with comment lines while the model reasons). A silent 3 min is a dead request: abort it
-          // and retry instead of holding the step until the turn's wall clock runs out.
+          // Progress is a `data:` line, not a byte: a request stuck upstream still receives a keep-alive comment
+          // every ~0.4 s, so a byte-reset timer never fired and a stuck step held until the turn's wall clock
+          // (2026-09-28: 320-821 s steps). No data for STREAM_IDLE_MS → abort and retry.
           const ctrl = new AbortController();
           const onAbort = () => ctrl.abort();
           if (signal) signal.addEventListener('abort', onAbort, { once: true });
-          let idleTimer;
-          const idle = (p) => Promise.race([p, new Promise((_, rej) => { idleTimer = setTimeout(() => { rej(new Error('OpenRouter stream idle for ' + STREAM_IDLE_MS + 'ms')); ctrl.abort(); }, STREAM_IDLE_MS); })]).finally(() => clearTimeout(idleTimer));
+          const sentAt = Date.now();
+          let lastData = sentAt, rejectIdle, thought = false, visible = false;
+          overBudget = false;
+          const idleP = new Promise((_, rej) => { rejectIdle = rej; });
+          idleP.catch(() => {});
+          const canFallBack = reasoningBudgetMs != null && thinkLevel < reasoningFallbacks.length;
+          watchdog = setInterval(() => {
+            if (canFallBack && thought && !visible && Date.now() - sentAt >= reasoningBudgetMs) {
+              clearInterval(watchdog);
+              overBudget = true;
+              rejectIdle(new Error('OpenRouter reasoning over budget: no visible output after ' + reasoningBudgetMs + 'ms'));
+              ctrl.abort();
+              return;
+            }
+            if (Date.now() - lastData < STREAM_IDLE_MS) return;
+            clearInterval(watchdog);
+            rejectIdle(new Error('OpenRouter stream idle: no data for ' + STREAM_IDLE_MS + 'ms'));
+            ctrl.abort();
+          }, Math.min(1000, STREAM_IDLE_MS, reasoningBudgetMs ?? Infinity));
+          const idle = (p) => Promise.race([p, idleP]);
           const res = await idle(fetch(`${baseUrl}/chat/completions`, {
-            method: 'POST', headers: headers(), body: JSON.stringify({ ...body, stream: true }), signal: ctrl.signal
+            method: 'POST', headers: headers(), body: JSON.stringify({ ...body, ...(thinkLevel ? { reasoning: reasoningFallbacks[thinkLevel - 1] } : {}), stream: true }), signal: ctrl.signal
           })).catch((e) => { if (signal) signal.removeEventListener('abort', onAbort); throw e; });
           if (!res.ok) {
             const text = await res.text().catch(() => '');
@@ -36925,16 +36955,17 @@ function createOpenRouterClient({
           // (feedback_measure_from_component_events_not_a_clock): the gap between `firstDeltaMs` and
           // `firstVisibleMs` IS the blank-screen the reasoning stream exists to fill, so both are recorded.
           const t0 = Date.now();
-          const timings = { startedAt: t0, firstDeltaMs: null, firstReasoningMs: null, firstVisibleMs: null, endMs: null };
+          const timings = { startedAt: t0, firstDeltaMs: null, firstReasoningMs: null, firstVisibleMs: null, endMs: null, attempt: attempt + 1, reasoningFallback: thinkLevel ? reasoningFallbacks[thinkLevel - 1] : null };
           for (;;) {
             const { done, value } = await idle(reader.read()).catch((e) => { if (signal) signal.removeEventListener('abort', onAbort); throw e; });
-            if (done) { if (signal) signal.removeEventListener('abort', onAbort); break; }
+            if (done) { clearInterval(watchdog); if (signal) signal.removeEventListener('abort', onAbort); break; }
             buf += decoder.decode(value, { stream: true });
             let nl;
             while ((nl = buf.indexOf('\n')) >= 0) {
               const line = buf.slice(0, nl).trim();
               buf = buf.slice(nl + 1);
               if (!line.startsWith('data: ')) continue;
+              lastData = Date.now();
               const payload = line.slice(6);
               if (payload === '[DONE]') continue;
               let j;
@@ -36950,12 +36981,14 @@ function createOpenRouterClient({
                 const rd = typeof d.reasoning === 'string' ? d.reasoning
                   : typeof d.reasoning_content === 'string' ? d.reasoning_content : null;
                 if (rd) {
+                  thought = true;
                   if (timings.firstReasoningMs == null) timings.firstReasoningMs = Date.now() - t0;
                   acc.reasoning += rd;
                   // A throwing UI handler must not kill the turn — the reasoning stream is decoration.
                   if (typeof onReasoningToken === 'function') { try { onReasoningToken(rd); } catch (e) {} }
                 }
                 if ((typeof d.content === 'string' && d.content) || (Array.isArray(d.tool_calls) && d.tool_calls.length)) {
+                  visible = true;
                   if (timings.firstVisibleMs == null) timings.firstVisibleMs = Date.now() - t0;
                 }
                 if (typeof d.content === 'string') acc.content += d.content;
@@ -36988,6 +37021,13 @@ function createOpenRouterClient({
           if (acc.reasoning) Object.defineProperty(message, 'reasoning', { value: acc.reasoning, enumerable: false, configurable: true, writable: true });
           return { message, finish_reason: finish, native_finish_reason: native, usage, provider, reasoning: acc.reasoning || null, timings, raw: { streamed: true } };
         } catch (e) {
+          clearInterval(watchdog);
+          if (overBudget && !(signal && signal.aborted)) {
+            thinkLevel++;
+            if (typeof onReasoningToken === 'function') { try { onReasoningToken('\n[no answer after ' + Math.round(reasoningBudgetMs / 1000) + ' s of thinking: asking again with reasoning ' + JSON.stringify(reasoningFallbacks[thinkLevel - 1]) + ']\n'); } catch (_) {} }
+            lastErr = e;
+            continue;
+          }
           if ((e && e.name === 'AbortError') || (signal && signal.aborted) || !retriable(e)) throw e;
           lastErr = e;
         }
