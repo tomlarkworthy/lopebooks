@@ -5831,6 +5831,15 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
   let lastTools = [];
   for (const w of watches ?? []) watchBus.poll(w.label, w.read, w);
   const sessionState = {};  // tools keep per-session facts here (e.g. which wiki docs were read)
+  const unwrittenGate = () => {
+    const u = sessionState.unwritten;
+    if (!u || !u.size) return null;
+    const miss = [...u].map(([p, why]) => p + ' (' + why + ')');
+    u.clear();
+    return 'REJECTED: your last write to ' + miss.join(', ') + ' did not land, and no later write to it did, so ' +
+      'the runtime does not hold that code. Write it again, changed as the result said, and check the result ' +
+      'says it applied. If you dropped it on purpose, tell the user it was not written and call task_complete again.';
+  };
   // Tools reach this session's bus through ctx, so a watch it sets reports to it and to no other agent.
   const bound = new WeakMap();
   const bind = t => {
@@ -5900,7 +5909,10 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
     // a task with no spec module holds a null scorecard, so the guard degenerates to the zero-tool-call check.
     // The verdict is refreshed by the per-step monitor, so it is at most one step old — never the stale
     // last-successful-write verdict the write-path-only version left behind.
-    completeGuard: info => (extraGuard && extraGuard(info)) ?? specGateCheck(rc5_specGate.scorecard, info.summary) ?? zeroToolCallGate(info),
+    // A module write that was refused or not applied, with no later write to that path that landed: the
+    // summary would describe a module that does not exist (run 20260928-0847-w9: one refused write_file,
+    // then task_complete "I created /src/@user/project-timeline.js"). Fires once per path.
+    completeGuard: info => (extraGuard && extraGuard(info)) ?? specGateCheck(rc5_specGate.scorecard, info.summary) ?? unwrittenGate() ?? zeroToolCallGate(info),
     stallNudgeLimit: 2,
     maxStepsPerTurn: 40,
     // Reasoning models spend completion budget on reasoning; give headroom for reasoning + a full write_file.
@@ -7484,6 +7496,16 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
     return 'REFUSED, nothing was written: this source uses constructs documented in ' + due.map(d => d.path).join(', ') +
       ', which you have not read in this session. read_file it, then write again, changed to follow what it says.';
   };
+  // A module write that did not land (refused, not applied, failed to compile) stays listed until a later
+  // write to the same path lands; the engine's completion guard reads the list (run 20260928-0847-w9).
+  const noteWrite = (ctx, path, output) => {
+    const st = ctx?.sessionState;
+    if (!st) return output;
+    const u = st.unwritten ??= new Map();
+    const miss = /^REFUSED|not applied|FAILED TO COMPILE/.exec(output);
+    if (miss) u.set(path, miss[0]); else u.delete(path);
+    return output;
+  };
   const read_file = defineTool({
     id: 'read_file',
     description: 'Read a file from the virtual notebook filesystem, returned with line numbers (cat -n style). ' + 'Use offset/limit for large files. Mirrors Claude Code\'s Read. /src/<id>.js is your byte-stable editable ' + 'copy; /notebook/<id>.js is the canonical live form; /content/<id> are the raw blocks/attachments; ' + '/local-disk/** is the mounted folder on the user\'s machine (real files, read where they are).',
@@ -7559,9 +7581,9 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
       }
       const refused = wikiGate(String(content ?? ''), ctx);
       if (refused)
-        return { output: refused };
+        return { output: noteWrite(ctx, file_path, refused) };
       const applied = await applyModuleSrc(m[1], String(content ?? ''), { watchBus: ctx?.watchBus });
-      return { output: 'Wrote ' + file_path + ' \u2014 ' + applied.msg };
+      return { output: noteWrite(ctx, file_path, 'Wrote ' + file_path + ' \u2014 ' + applied.msg) };
     }
   });
   const edit_file = defineTool({
@@ -7629,7 +7651,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
         return { output: 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ')' };
       }
       const applied = await applyModuleSrc(m[1], updated, { watchBus: ctx?.watchBus });
-      return { output: 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ') \u2014 ' + applied.msg };
+      return { output: noteWrite(ctx, file_path, 'Edited ' + file_path + ' (' + n + ' replacement' + (n === 1 ? '' : 's') + ') \u2014 ' + applied.msg) };
     }
   });
   // an empty search of /src or /content for a name: a published notebook is not there until imported
