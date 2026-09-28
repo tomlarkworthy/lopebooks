@@ -6080,6 +6080,11 @@ const _76otvk = function _cellHelpers(currentModules,runtime)
     return null;
   };
   const varsOf = mod => [...runtime._variables].filter(v => v._module === mod);
+  // A cell someone wrote, as opposed to what the runtime or a tool adds on its own after a write: an import's
+  // variables, a module loader, @variable, a shadowed builtin (FileAttachment after attach_file), an implicit global.
+  const authoredOf = mod => varsOf(mod).filter(v => v.pid && v._type === 1 && !/^module /.test(v._name || '') && v._name !== '@variable' &&
+    !(v._name && runtime._builtin && runtime._builtin._scope && runtime._builtin._scope.has(v._name)) &&
+    !(v._inputs || []).some(i => i && i._module !== mod && i._module !== runtime._builtin));
   const isStructural = v => !v.pid && (!v._name || String(v._name).startsWith('module ') || v._name === '@variable' || String(v._name).startsWith('initial '));
   const label = v => (v.pid ? v.pid : '(derived)') + (v._name ? ' ' + v._name : ' (anonymous)');
   const oneLine = s => String(s).replace(/\s+/g, ' ').trim();
@@ -6126,6 +6131,7 @@ const _76otvk = function _cellHelpers(currentModules,runtime)
   return {
     resolveModule,
     varsOf,
+    authoredOf,
     isStructural,
     label,
     oneLine,
@@ -6136,10 +6142,22 @@ const _76otvk = function _cellHelpers(currentModules,runtime)
 const _19x8b93 = function _rc5_store(){return(
 {
   srcFns: new Map(),
-  scratch: new Map()
+  scratch: new Map(),
+  seen: new Map()
 }
 )};
-const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module_files, exportModuleJS, importShim, localDisk) {
+const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module_files, exportModuleJS, importShim, localDisk, cellHelpers) {
+    // pid -> definition text of a module's cells as the runtime holds them now
+    const liveDefs = id => {
+        const mod = cellHelpers.resolveModule(id);
+        if (!mod)
+            return null;
+        const m = new Map();
+        for (const v of cellHelpers.authoredOf(mod))
+            m.set(v.pid, String(v._definition));
+        return m;
+    };
+    const sameDefs = (a, b) => !!a && !!b && a.size === b.size && [...a].every(([k, d]) => b.get(k) === d);
     const isStyle = id => /^https?:\/\//.test(id) || /\.css$/.test(id);
     // all_module_files names a module only through a `module <id>` loader; one created on the page has none and comes back "main"
     const files = all_module_files.map(f => {
@@ -6217,6 +6235,7 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         } catch (e) {
         }
         fn.src = ex.source;
+        fn.live = liveDefs(id);
         rc5_store.srcFns.set(id, fn);
         return ex.source;
     };
@@ -6237,8 +6256,17 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         let m = /^\/src\/(.+)\.js$/.exec(path);
         if (m) {
             const ent = rc5_store.srcFns.get(m[1]);
-            if (ent && typeof ent.src === 'string')
+            // The kept text is the agent's last write. A cell the user added or edited in the notebook since is only in
+            // the runtime, and an edit made from the kept text deleted it (pairing 2026-09-28: the user's drumPad display cell).
+            // Re-read from the runtime when it moved; an unapplied draft is kept, it is the agent's work in progress.
+            if (ent && typeof ent.src === 'string' && (ent.draft || !ent.live || sameDefs(ent.live, liveDefs(m[1]))))
                 return ent.src;
+            if (ent && ent.live)
+                try {
+                    return (await exportModuleJS(m[1])).source;
+                } catch (e) {
+                    return ent.src;
+                }
             try {
                 return await seedSrc(m[1]);
             } catch (e) {
@@ -6293,6 +6321,7 @@ const _o37ix1 = function _pathLib(currentModules, runtime, rc5_store, all_module
         isDisk,
         readPath,
         seedSrc,
+        liveDefs,
         globToRe,
         files
     };
@@ -7306,9 +7335,10 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             return '';
         const isNode = x => typeof Node !== 'undefined' && x instanceof Node;
         const tests = removed.filter(c => /^test_/.test(c.label));
-        const shown = removed.filter(c => !tests.includes(c) && isNode(c.value));
+        // an anonymous cell cannot be read by name, so it exists to be shown (pairing 2026-09-28: `drumPad` under the pad)
+        const shown = removed.filter(c => !tests.includes(c) && (isNode(c.value) || c.anon));
         const lbl = c => c.anon ? c.label + ' (anonymous)' : c.label;
-        const what = c => { const t = oneLine(String(c.value.textContent || '')).slice(0, 40); return '<' + String(c.value.nodeName).toLowerCase() + '>' + (t ? ' "' + t + '"' : ''); };
+        const what = c => { if (!isNode(c.value)) return '= ' + oneLine(String(c.value)).slice(0, 40); const t = oneLine(String(c.value.textContent || '')).slice(0, 40); return '<' + String(c.value.nodeName).toLowerCase() + '>' + (t ? ' "' + t + '"' : ''); };
         let msg = ' \xB7 removed ' + removed.length + ' cell' + (removed.length === 1 ? '' : 's') + ': ' + removed.slice(0, 12).map(lbl).join(', ') + (removed.length > 12 ? ' …' : '');
         if (tests.length)
             msg += ' \xB7 ⚠ ' + tests.map(c => c.label).join(', ') + (tests.length === 1 ? ' is a TEST cell' : ' are TEST cells') + ': the tests runner runs every test_* cell, and no cell ever lists a test as an input, so having no dependents does not make it unused';
@@ -7388,6 +7418,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             const holder = prev || function pendingDefine() {
             };
             holder.src = src;
+            holder.draft = true;
             rc5_store.srcFns.set(id, holder);
         };
         if (!/export\s+default/.test(src)) {
@@ -7398,6 +7429,26 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             };
         }
         const wasNew = !moduleExists(id);
+        const liveNow = () => {
+            const mod = resolveModule(id);
+            const m = new Map();
+            if (mod)
+                for (const v of cellHelpers.authoredOf(mod))
+                    m.set(v.pid, { d: String(v._definition), name: v._name });
+            return m;
+        };
+        // A cell added in the notebook since the agent's copy (by the user) that this text does not carry would be deleted.
+        // The edit tools re-read from the runtime first; a whole-file write from memory does not, so refuse it.
+        const prev = rc5_store.srcFns.get(id);
+        if (!wasNew && prev && prev.live && !prev.draft) {
+            const seen = rc5_store.seen.get(id) || new Set();
+            const lost = [...liveNow()].filter(([k]) => !prev.live.has(k) && !seen.has(k) && !src.includes('"' + k + '"') && !src.includes("'" + k + "'"));
+            if (lost.length)
+                return {
+                    ok: false,
+                    msg: 'not applied: this would delete ' + lost.length + ' cell' + (lost.length === 1 ? '' : 's') + ' added to ' + id + ' outside your writes (by the user, in the notebook): ' + lost.slice(0, 8).map(([k, c]) => c.name ? c.name : k + ' (anonymous)').join(', ') + '. read_file /src/' + id + '.js again (it now includes them) and make your change on that text, keeping their cells'
+                };
+        }
         const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
         uncaughtLog.track(url, id, src);
         try {
@@ -7427,6 +7478,8 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                 };
             }
             mod.default.src = src;
+            mod.default.live = new Map([...liveNow()].map(([k, c]) => [k, c.d]));
+            rc5_store.seen.delete(id);
             rc5_store.srcFns.set(id, mod.default);
             const n = r.changes || 0;
             const surfaced = wasNew && /\bviewof\s|\bmd`|\bhtml`/.test(src) && surfaceInView(id);
@@ -8057,7 +8110,10 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const el = c.v._value;
     const valueName = c.name.slice(7);
     const button = value === undefined ? (el.matches('button') ? el : el.querySelector('button')) : null;
-    if (value === undefined && !button) return { out: c.name + ' is not a button; pass `value`. Current value: ' + summary(el.value, 200), dead: false };
+    // A custom view (a pad, a canvas, an svg) has no input to type into: a user presses it (pairing 2026-09-28: a drum pad
+    // whose value lagged one press behind, which only pressing it shows).
+    const pad = value === undefined && !button && !el.matches('input, select, textarea') && !el.querySelector('input, select, textarea') ? el : null;
+    if (value === undefined && !button && !pad) return { out: c.name + ' is not a button; pass `value`. Current value: ' + summary(el.value, 200), dead: false };
     const before = snapshotOf(mod);
     const t0 = performance.now();
     const raw = el.value;
@@ -8067,6 +8123,19 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     // coerces ("" -> 0 in Inputs.number), so the tool reported "empty -> 0" where a user sees the old result.
     const box = !button && (typeof value === 'string' || typeof value === 'number') ? typingBoxOf(el) : null;
     if (button) await ui_set(button);
+    else if (pad) {
+      const r = pad.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+      const hit = typeof document !== 'undefined' && document.elementFromPoint(x, y);
+      const at = hit && pad.contains(hit) ? hit : pad;
+      const o = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      const P = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+      at.dispatchEvent(new P('pointerdown', { ...o, buttons: 1 }));
+      at.dispatchEvent(new MouseEvent('mousedown', { ...o, buttons: 1 }));
+      await new Promise(r => setTimeout(r, 30));
+      at.dispatchEvent(new P('pointerup', o));
+      at.dispatchEvent(new MouseEvent('mouseup', o));
+      at.dispatchEvent(new MouseEvent('click', o));
+    }
     else if (box) { box.value = String(value); box.dispatchEvent(new Event('input', { bubbles: true })); box.dispatchEvent(new Event('change', { bubbles: true })); }
     else await ui_set(el, value);
     await ui_settle();
@@ -8093,12 +8162,14 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const shown = box ? box.value : null;
     const refused = box && String(value) !== String(raw) && summary(el.value, 200) === was;
     const dead = !refused && !changed.some(l => !l.startsWith(valueName + ':'));
-    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (button ? ' by clicking' : box ? '' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
+    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (button ? ' by clicking' : pad ? ' by pressing it (pointer down, up, click at its centre)' : box ? '' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
     if (box && shown !== String(value)) out += 'The box shows ' + JSON.stringify(shown) + ' (a ' + (box.type || 'text') + ' box cannot hold ' + JSON.stringify(String(value)) + ').\n';
     if (refused) out += '⚠ NOT ACCEPTED: the box shows ' + JSON.stringify(shown) + ' but ' + valueName + ' stayed ' + was + ', so every output still shows the previous result and nothing tells the user their input was rejected. If this input is invalid, show a message that names the problem; if it is valid, the control is refusing it (e.g. outside its [min, max] extent).\n';
     out += changed.length ? 'Changed:\n  ' + changed.join('\n  ') : 'Nothing changed, not even ' + valueName + '.';
     if (dead) out += '\n⚠ NO VISIBLE EFFECT: no cell other than ' + valueName + ' changed, so a user using this control sees nothing happen. Look for where ' + valueName + ' should be used: a cell that lists "viewof ' + valueName + '" (the element) where it needs "' + valueName + '", or an output that interpolates a different cell.';
     if (bad.length) out += '\n⚠ NaN/undefined/[object …] appeared in: ' + bad.join(', ') + '.';
+    if (pad && summary(el.value, 200) !== was && !changed.some(l => l.startsWith(valueName + ':')))
+      out += '\n⚠ the element\'s .value is now ' + summary(el.value, 80) + ' but ' + valueName + ' still reads ' + was + ': the runtime reads .value when the `input` event fires, so this view dispatched it before setting .value and every press shows the previous one. Set el.value first, then dispatch.';
     const logged = id ? uncaughtLog.since(id, t0) : '';
     if (logged) out += '\n' + logged + '.';
     return { out, dead, was: raw, failed };
@@ -8106,7 +8177,8 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   // A value a user might pick that differs from the current one; undefined means "click it".
   const probeValue = el => {
     const input = el.matches('input, select, textarea') ? el : el.querySelector('input, select, textarea');
-    if (!input) return el.querySelector?.('button') || el.matches?.('button') ? undefined : null;
+    // no input: a button is clicked, a custom view pressed (tryOne)
+    if (!input) return undefined;
     if (input.type === 'range' || input.type === 'number') {
       const lo = +(input.min || 0), hi = +(input.max || 100), cur = +el.value;
       const step = +(input.step) || 0;
@@ -8133,14 +8205,14 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   };
   const try_control = defineTool({
     id: 'try_control',
-    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards), plus each slider\'s min and max and each select option, flagging a cell that throws or shows NaN at any of them: do this ' + 'first when asked whether a notebook works or what is wrong with it. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
+    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button, or a custom pad/canvas/svg view, which is pressed with the pointer) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards), plus each slider\'s min and max and each select option, flagging a cell that throws or shows NaN at any of them: do this ' + 'first when asked whether a notebook works or what is wrong with it. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button or press a custom view. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
     parameters: {
       type: 'object',
       required: ['module'],
       properties: {
         module: { type: 'string', description: 'Module id, e.g. "@user/stats".' },
         control: { type: 'string', description: 'The viewof cell ("viewof rate" or "rate") or the text of its label ("Rate"). Omit to try every control.' },
-        value: { description: 'The new value (number, string, boolean, array for a multi-select). Omit to click a button.' }
+        value: { description: 'The new value (number, string, boolean, array for a multi-select). Omit to click a button, or to press a custom control (a pad, canvas or svg with no input) with the pointer.' }
       },
       additionalProperties: false
     },
@@ -8227,6 +8299,13 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
 {
   const {listPathsAsync, readPath, globToRe, isDisk} = pathLib;
   const {applyModuleSrc} = applyLib;
+  // the cells a read showed the agent: a write may drop those, not ones added since (applyModuleSrc)
+  const markSeen = path => {
+    const m = /^\/(?:notebook|src)\/(.+)\.js$/.exec(path);
+    const live = m && pathLib.liveDefs(m[1]);
+    if (live)
+      rc5_store.seen.set(m[1], new Set(live.keys()));
+  };
   const MODULE_PATH = /^\/(?:notebook|src)\/(.+)\.js$/;
   // A wiki doc's write-triggers name constructs it documents; a module write using one is refused until
   // the session has read that doc. The state is per session (ctx.sessionState); without it, no gate.
@@ -8287,6 +8366,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
       let text;
       try {
         text = await readPath(file_path);
+        markSeen(file_path);
       } catch (e) {
         return { output: 'ERROR: cannot read ' + file_path + ': ' + (e && e.message || e) };
       }
@@ -8403,6 +8483,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
       let text;
       try {
         text = await readPath(file_path);
+        markSeen(file_path);
       } catch (e) {
         return { output: 'ERROR: cannot read ' + file_path + ': ' + (e && e.message || e) };
       }
@@ -9352,7 +9433,7 @@ export default function define(runtime, observer) {
   $def("_yyrxg4", null, ["md"], _yyrxg4);  
   $def("_76otvk", "cellHelpers", ["currentModules","runtime"], _76otvk);  
   $def("_19x8b93", "rc5_store", [], _19x8b93);  
-  $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim","localDisk"], _o37ix1);  
+  $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim","localDisk","cellHelpers"], _o37ix1);  
   $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
   $def("_rc5uncaught", "uncaughtLog", ["invalidation","runtime"], _rc5uncaught);
   $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib","uncaughtLog","acorn"], _190yjiu);
@@ -30461,6 +30542,7 @@ Before adding a notebook to lopebooks:
 >
 ---
 write-triggers:
+  - "new Worker\\("
   - "(\\$def|\\.define)\\([^\\n]*\\[[^\\]\\n]*\"(topojson|vl|SQLite|mermaid|Arrow|aq)\""
 ---
 
@@ -30738,6 +30820,28 @@ reload → `importShim("@user/lib/index.js")`) is the obvious next experiment an
 Recommendation until that is tested: prefer a single bundled file. Reach for multi-file only when
 bundling is genuinely impossible, and then use the rewrite route, which is at least known to export.
 
+### 3.1 A package that runs in a Web Worker (a WASM engine)
+
+Two limits of the places a notebook runs, each measured in Chromium:
+
+```
+2026-08-09  file:// and GitHub Pages   crossOriginIsolated false, typeof SharedArrayBuffer undefined,
+                                       postMessage(shared WebAssembly.Memory) -> DataCloneError
+2026-09-26  file://                    new Worker(blobURL, {type: "module"}) fires error at once;
+                                       new Worker(blobURL) (classic) and a data: module worker post their message
+```
+
+So a multi-threaded WASM build, which shares memory between its threads, cannot start; take the
+package's single-threaded build. The notebook's blob URLs are `blob:null/…`, so a worker built from
+an attachment is spawned classic: bundle its entry with esbuild `--format=iife`. A library that
+hard-codes `{type: "module"}` needs its worker factory replaced (`tools/monty/monty-module.js` `_pool`
+does this for `@pydantic/monty`). A worker that fetches its `.wasm` from a CDN fails offline; hand it
+the attachment's bytes or blob URL instead.
+
+Not tested here: a chess engine specifically. The agent proposed Stockfish 16 in a pairing session
+on 2026-09-28 after checking only that the npm package existed; which of its builds are
+single-threaded was not checked.
+
 ## 4. Gzip
 
 Every JS attachment in the corpus is stored gzipped; 49 library attachments across the two content
@@ -30871,9 +30975,10 @@ write-triggers:
   - "<button\\b"
   - "Inputs\\.button\\("
   - "Inputs\\.number\\(\\s*\\{[^}]*\\b(min|max)\\s*:"
+  - "addEventListener\\(\\s*[\"']pointer(down|up|move)[\"']"
 ---
 
-# Event handlers and buttons in cells: htl.html, not html; a button that acts on another cell's input; a download button; two inputs that update each other; limiting a number box to a range
+# Event handlers and buttons in cells: htl.html, not html; a button that acts on another cell's input; a download button; two inputs that update each other; a custom control (pad, canvas); limiting a number box to a range
 
 A cell that builds a clickable element and passes it a function (`onclick=${() => …}`) must build it
 with `htl.html`. The bare `html` built-in in a Lopecode notebook is the legacy stdlib template: it
@@ -31070,6 +31175,28 @@ A listener cell that writes each box's converted value into the other box's `.va
 converter eval, and this page recommended it until 2026-09-28. It leaves no single value to depend
 on: the `fahrenheit` value cell does not update when °C is typed, because setting `.value` dispatches
 nothing (follows from the no-echo behaviour above; not measured separately).
+
+## A custom control: set `.value`, then dispatch `input`
+
+A `viewof` cell can return any element: a pad, a canvas, an svg. The runtime reads the element's
+`.value` when the element dispatches `input`, so the value has to be set before the event:
+
+```js
+el.addEventListener("pointerdown", () => {
+  el.value = el.value + 1;                              // first
+  el.dispatchEvent(new Event("input", {bubbles: true})); // then
+});
+```
+
+Observed (robocoop-5 pairing, drum pad, 2026-09-28): the agent's pad dispatched `input` and then set
+`.value`, so each hit showed the previous hit's value. Every cell computed and the write reported no
+error. The user found it by playing the pad. `try_control` now presses a custom control with the
+pointer (down, up, click at its centre) when no `value` is given, and names this cause when the
+element's `.value` moved but the value cell did not. Probe `tools/scratch/rc5-sessions/s69-try-control-presses-custom-view.mjs`
+builds both orders: the lagging pad is flagged, the other reports `hits 0 → 1`.
+
+`setPointerCapture` inside a synthetic or already-released pointer event throws `NotFoundError`
+(seen in the same session, uncaught). Wrap it in `try`, or leave it out for a press that does not drag.
 
 ## Limiting a number box: the range is the first argument
 
@@ -46750,7 +46877,15 @@ const _ctx_notebook = function _ctx_notebook(runtime){return(
       } catch (e) {}
       const lines = [];
       // the host's own mains: the chat (robocoop-5*) and its page chrome. The rest is the user's work.
-      const host = (m) => /^@tomlarkworthy\/(robocoop-5|lopepage|save-in-place$|inputs-reference$)/.test(m);
+      // A chat log (a module with a session_meta cell) is in mains under the chat's own group, not the user's
+      // namespace; listed as the user's, the agent named new modules @robocoop5-session/… and eval'd in the log.
+      const logs = new Set();
+      try {
+        const withMeta = new Set();
+        for (const v of runtime._variables) if (v._name === 'session_meta') withMeta.add(v._module);
+        for (const [n, m] of runtime.mains) if (withMeta.has(m)) logs.add(n);
+      } catch (e) {}
+      const host = (m) => logs.has(m) || /^@tomlarkworthy\/(robocoop-5|lopepage|save-in-place$|inputs-reference$)/.test(m);
       if (mains.length) {
         const own = mains.filter((m) => !host(m));
         lines.push("the user's modules (\"my notebook\" means these): " + (own.join(', ') || (orphans.length ? 'none booted' : 'none yet')));
