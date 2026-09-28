@@ -7595,6 +7595,7 @@ write-triggers:
   - "Inputs\\.table\\([^;]*?\\bedit(able)?\\s*:"
   - "jspdf|jsPDF|html2pdf|pdfmake"
   - "application/msword|wordprocessingml|\\.docx?[\"'`]"
+  - "spreadsheetml|\\bxlsx@|\\.xlsx[\"'`]"
 ---
 
 # Asked for a spreadsheet or editable table, a document the reader edits in place, a slide deck, drawing, diagram, saved setting, PDF or other file download? Import the published module
@@ -7927,6 +7928,27 @@ $def("_saveDocx", "saveDocx", ["htl", "docxBlob", "notes"], (htl, docxBlob, note
 main.define("module @tomlarkworthy/jszip-3-10-1", async () => runtime.module((await import("/@tomlarkworthy/jszip-3-10-1.js?v=4")).default));
 main.define("JSZip", ["module @tomlarkworthy/jszip-3-10-1", "@variable"], (_, v) => v.import("JSZip", _));
 ```
+
+An `.xlsx` is the same zip with five parts. `rows` is an array of arrays, the first the header; a
+number cell is `<c><v>` and a text cell is an inline string, so no sharedStrings part is needed:
+
+```js
+$def("_xlsxBlob", "xlsxBlob", ["JSZip"], (JSZip) => async (rows) => {
+  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const cell = v => typeof v === "number" ? "<c><v>" + v + "</v></c>" : '<c t="inlineStr"><is><t>' + esc(v) + "</t></is></c>";
+  const R = "http://schemas.openxmlformats.org/", X = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", X + '<Types xmlns="' + R + 'package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>');
+  zip.file("_rels/.rels", X + '<Relationships xmlns="' + R + 'package/2006/relationships"><Relationship Id="rId1" Type="' + R + 'officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
+  zip.file("xl/workbook.xml", X + '<workbook xmlns="' + R + 'spreadsheetml/2006/main" xmlns:r="' + R + 'officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>');
+  zip.file("xl/_rels/workbook.xml.rels", X + '<Relationships xmlns="' + R + 'package/2006/relationships"><Relationship Id="rId1" Type="' + R + 'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
+  zip.file("xl/worksheets/sheet1.xml", X + '<worksheet xmlns="' + R + 'spreadsheetml/2006/main"><sheetData>' + rows.map(r => "<row>" + r.map(cell).join("") + "</row>").join("") + "</sheetData></worksheet>");
+  return zip.generateAsync({type: "blob", mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+});
+```
+
+Vendoring SheetJS (`xlsx`) instead cost a whole 10-minute turn on 2026-09-28 (rc5-train w14): its
+UMD build, imported from a blob URL, exported an empty object.
 
 Applied with `write_file` on 2026-09-28 (`notes` a textarea); after a save and an offline reopen the
 cells still computed, and the file parsed with python-docx. The file is built when the button is

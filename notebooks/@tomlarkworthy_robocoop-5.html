@@ -6609,6 +6609,10 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                     const m = /<\/?[a-zA-Z][\w:-]*(\s+[\w:-]+\s*=\s*["'][^"'<>]*["'])+\s*\/?>/.exec(n.data);
                     if (m)
                         return { kind: 'text', what: m[0].replace(/\s+/g, ' ').slice(0, 60) };
+                    // rc5-train 20260928-0847-w14: Inputs.input(v) (a bare EventTarget) interpolated as a form field
+                    const o = /\[object [A-Z]\w*\]/.exec(n.data);
+                    if (o)
+                        return { kind: 'object', what: o[0] };
                 } else if (n.namespaceURI !== SVG_NS && n.parentElement && n.parentElement.namespaceURI === SVG_NS && n.parentElement.localName !== 'foreignObject') {
                     return { kind: 'ns', what: '<' + n.localName + '>' };
                 } else if (n.namespaceURI === SVG_NS) {
@@ -6749,6 +6753,8 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                 return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + ' compute' + (broken.length === 1 ? 's' : '') + ' but draw' + (broken.length === 1 ? 's' : '') + ' NO DATA: ' + (b.kind === 'plot' ? 'the Plot drew ' + b.what + ' and no data shapes. Plot silently skips every datum whose channel value is missing or not a number, so an empty array, a misspelled field, or a channel that is not a field name, a function of one datum or an array with one value per datum draws nothing and throws nothing. For stacked or grouped parts pass long rows, one per part: Plot.barY(rows, {x: "month", y: "amount", fill: "category"})' : 'the ' + b.what + ' has no shapes outside its axes: the data join got an empty array, or its data arrived after it ran') + '. Do not describe it to the user as showing data. If its data is empty on purpose until the user acts (an event log), say it starts empty; otherwise FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
             if (b.kind === 'attr')
                 return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + ' render' + (broken.length === 1 ? 's' : '') + ' an SVG attribute the browser rejects: ' + b.what + ' (it logs "attribute \u2026: Expected \u2026" to the console, which you cannot see, and draws it wrong or not at all).' + (/NaN|undefined/.test(b.what) ? ' NaN/undefined comes from an accessor or scale given a missing or non-numeric value (a misspelled field, a string such as "$1,450", a value outside the scale domain).' : '') + (/\/"?>$/.test(b.what) ? ' A trailing "/" comes from an unquoted hole before a self-closing tag: in htl, <path d=${p}/> reads the "/" into the value; quote it: d="${p}" />.' : '') + ' \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
+            if (b.kind === 'object')
+                return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + ' show' + (broken.length === 1 ? 's' : '') + ' the text "' + b.what + '" to the user: a value interpolated into htl.html`\u2026` that is not a DOM node, string or number is converted with String(). ' + (/EventTarget/.test(b.what) ? 'Inputs.input(v) is an invisible state holder (an EventTarget), not a control: nothing is drawn and the user cannot type into it. For a field the user fills in use Inputs.text / Inputs.number / Inputs.date / Inputs.select (each is an element with .value and an input event). ' : 'Interpolate an element, or format the object\'s fields into text. ') + 'Do not tell the user it works \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
             const why = b.kind === 'text' ? ' render' + (broken.length === 1 ? 's' : '') + ' markup as literal TEXT (' + b.what + ' is a text node, not an element): a string interpolated into htl.html`\u2026` or htl.svg`\u2026` is inserted as text, never parsed' : ' put' + (broken.length === 1 ? 's' : '') + ' an HTML ' + b.what + ' inside <svg>, which the browser does not draw: it was built with htl.html`\u2026`; SVG child elements need htl.svg`\u2026`';
             return ' \xB7 \u26A0 ' + broken.map(r => r.name).join(', ') + why + '. Build each SVG part with htl.svg`<line \u2026/>` (HTML parts with htl.html`\u2026`) and interpolate those elements (an array of them works) \u2014 FIX before task_complete' + (vals ? ' \xB7 values: ' + vals : '');
         }
@@ -31017,6 +31023,7 @@ write-triggers:
   - "Inputs\\.table\\([^;]*?\\bedit(able)?\\s*:"
   - "jspdf|jsPDF|html2pdf|pdfmake"
   - "application/msword|wordprocessingml|\\.docx?[\"'`]"
+  - "spreadsheetml|\\bxlsx@|\\.xlsx[\"'`]"
 ---
 
 # Asked for a spreadsheet or editable table, a document the reader edits in place, a slide deck, drawing, diagram, saved setting, PDF or other file download? Import the published module
@@ -31349,6 +31356,27 @@ $def("_saveDocx", "saveDocx", ["htl", "docxBlob", "notes"], (htl, docxBlob, note
 main.define("module @tomlarkworthy/jszip-3-10-1", async () => runtime.module((await import("/@tomlarkworthy/jszip-3-10-1.js?v=4")).default));
 main.define("JSZip", ["module @tomlarkworthy/jszip-3-10-1", "@variable"], (_, v) => v.import("JSZip", _));
 ```
+
+An `.xlsx` is the same zip with five parts. `rows` is an array of arrays, the first the header; a
+number cell is `<c><v>` and a text cell is an inline string, so no sharedStrings part is needed:
+
+```js
+$def("_xlsxBlob", "xlsxBlob", ["JSZip"], (JSZip) => async (rows) => {
+  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const cell = v => typeof v === "number" ? "<c><v>" + v + "</v></c>" : '<c t="inlineStr"><is><t>' + esc(v) + "</t></is></c>";
+  const R = "http://schemas.openxmlformats.org/", X = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", X + '<Types xmlns="' + R + 'package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>');
+  zip.file("_rels/.rels", X + '<Relationships xmlns="' + R + 'package/2006/relationships"><Relationship Id="rId1" Type="' + R + 'officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
+  zip.file("xl/workbook.xml", X + '<workbook xmlns="' + R + 'spreadsheetml/2006/main" xmlns:r="' + R + 'officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>');
+  zip.file("xl/_rels/workbook.xml.rels", X + '<Relationships xmlns="' + R + 'package/2006/relationships"><Relationship Id="rId1" Type="' + R + 'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
+  zip.file("xl/worksheets/sheet1.xml", X + '<worksheet xmlns="' + R + 'spreadsheetml/2006/main"><sheetData>' + rows.map(r => "<row>" + r.map(cell).join("") + "</row>").join("") + "</sheetData></worksheet>");
+  return zip.generateAsync({type: "blob", mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+});
+```
+
+Vendoring SheetJS (`xlsx`) instead cost a whole 10-minute turn on 2026-09-28 (rc5-train w14): its
+UMD build, imported from a blob URL, exported an empty object.
 
 Applied with `write_file` on 2026-09-28 (`notes` a textarea); after a save and an offline reopen the
 cells still computed, and the file parsed with python-docx. The file is built when the button is
