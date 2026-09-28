@@ -8277,12 +8277,11 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
   });
   const write_file = defineTool({
     id: 'write_file',
-    description: 'Create or overwrite a file. Mirrors Claude Code\'s Write. Writing a module file under ' + '/src/<id>.js APPLIES it to the live runtime and reports whether it compiled; your file keeps your ' + 'EXACT text (it is never reformatted), so you can keep editing it with edit_file. A path under ' + '/local-disk/ is written to the user\'s mounted folder on disk (directories created as needed); ' + 'for a LARGE computed result, write it from a cell with localDisk.write(path, data) instead of ' + 'pasting it through this tool.',
+    description: 'Create or overwrite a file. Mirrors Claude Code\'s Write. Writing a module file under ' + '/src/<id>.js APPLIES it to the live runtime and reports whether it compiled; your file keeps your ' + 'EXACT text (it is never reformatted), so you can keep editing it with edit_file. A path under ' + '/local-disk/ is written to the user\'s mounted folder on disk (directories created as needed); ' + 'for a LARGE computed result, write it from a cell with localDisk.write(path, data) instead of ' + 'pasting it through this tool. To copy a file byte-for-byte, give `from` instead of content.',
     parameters: {
       type: 'object',
       required: [
-        'file_path',
-        'content'
+        'file_path'
       ],
       properties: {
         file_path: {
@@ -8292,10 +8291,23 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
         content: {
           type: 'string',
           description: 'Full file contents.'
+        },
+        from: {
+          type: 'string',
+          description: 'Instead of content: the path of a file whose exact text is written, e.g. /content/<id> to boot a module block the file carries but does not boot (write it to /src/<id>.js). Nothing is retyped.'
         }
       }
     },
-    execute: async ({file_path, content}, ctx) => {
+    execute: async ({file_path, content, from}, ctx) => {
+      // rc5-train 20260928-0847-m39: retyping a 200-line block through content changed its formula
+      let copied = '';
+      if (from != null) {
+        let t = null;
+        try { t = await readPath(String(from)); } catch (e) {}
+        if (t == null) return { output: 'ERROR: cannot read ' + from + ': not found' };
+        content = copied = t;
+      }
+      if (content == null) return { output: 'ERROR: give content (the full text) or from (a path to copy)' };
       if (isDisk(file_path)) {
         try {
           const r = await localDisk.write(file_path, String(content ?? ''));
@@ -8309,13 +8321,24 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
         rc5_store.scratch.set(file_path, String(content ?? ''));
         return { output: 'Wrote ' + file_path };
       }
-      let before = null;
+      let before = null, saved = null;
       if (pathLib.moduleIds().includes(m[1])) try { before = await readPath(file_path); } catch (e) {}
-      const refused = wikiGate(String(content ?? ''), ctx, heldText(m[1], before));
+      // a block the file carries but does not boot is the user's existing code: held for the gate, and compared below
+      else try { saved = before = await readPath('/content/' + m[1]); } catch (e) {}
+      // a copy adds no text of its own, except from a library module (a template, gated as when retyped)
+      const held = /^\/(?:src|notebook|content)\/@tomlarkworthy\//.test(String(from)) ? '' : copied;
+      const refused = wikiGate(String(content ?? ''), ctx, heldText(m[1], before) + '\n' + held);
       if (refused)
         return { output: noteWrite(ctx, file_path, refused) };
       const applied = await applyModuleSrc(m[1], String(content ?? ''), { watchBus: ctx?.watchBus });
-      return { output: noteWrite(ctx, file_path, 'Wrote ' + file_path + ' \u2014 ' + applied.msg) };
+      let differs = '';
+      if (saved != null && String(content) !== saved) {
+        const decls = t => String(t).split(/\n(?=const _)/);
+        const had = new Set(decls(saved)), changed = decls(content).filter(d => !had.has(d)).map(d => '`' + d.split('\n')[0].slice(0, 70) + '`');
+        differs = ' \u00b7 \u26a0 the file also saves this module at /content/' + m[1] + ', and the BODY of ' + changed.length +
+          ' cell' + (changed.length === 1 ? '' : 's') + ' you wrote differs from it (first lines: ' + changed.slice(0, 6).join(', ') + '). To restore the saved module exactly, write_file {file_path: "' + file_path + '", from: "/content/' + m[1] + '"}';
+      }
+      return { output: noteWrite(ctx, file_path, 'Wrote ' + file_path + ' \u2014 ' + applied.msg + differs) };
     }
   });
   const edit_file = defineTool({
@@ -32656,8 +32679,10 @@ When the user's work "is not there" after reopening, the save code is not the fa
 either not booted or not in the layout. Fix the page, then the next save carries it:
 
 1. Not booted (the environment lists it as saved but NOT booted; its text is at `/content/<id>`):
-   `read_file /content/<id>` and `write_file /src/<id>.js` with that text unchanged. The write boots
-   it and adds it to `runtime.mains`; a module with `md`, `html` or `viewof` cells is opened as a tab.
+   copy it, do not retype it: `write_file {file_path: "/src/<id>.js", from: "/content/<id>"}`. The
+   write boots the block's exact text and adds it to `runtime.mains`; a module with `md`, `html` or
+   `viewof` cells is opened as a tab. Retyping a long module through `content` changes it (quotes,
+   formulas) without any error.
 2. Not visible: give it its own stack in the layout, keeping the other panes, with `eval_js`:
    ```js
    location.hash = "#view=R100(S50(@user/mine),S35(@tomlarkworthy/robocoop-5),S15(@tomlarkworthy/robocoop-5-srctools))";
@@ -46678,7 +46703,8 @@ const _ctx_notebook = function _ctx_notebook(runtime){return(
         const own = mains.filter((m) => !host(m));
         lines.push("the user's modules (\"my notebook\" means these): " + (own.join(', ') || (orphans.length ? 'none booted' : 'none yet')));
         if (orphans.length) lines.push("also the user's, saved in this file but NOT booted — absent from bootconf.json mains and imported by nothing, so the page opens without them: " +
-          orphans.map((id) => id + ' (source: /content/' + id + ')').join(', '));
+          orphans.map((id) => id + ' (source: /content/' + id + ')').join(', ') +
+          '. Boot one unchanged, without retyping it: write_file {file_path: "/src/<id>.js", from: "/content/<id>"}');
         lines.push("the chat you run in (not the user's notebook): " + mains.filter(host).join(', '));
       }
       if (mods.length) lines.push(mods.length + ' modules bundled (glob /src/**/*.js to list; read one as a template)');
