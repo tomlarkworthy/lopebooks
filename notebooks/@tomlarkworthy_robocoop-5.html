@@ -7649,7 +7649,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   };
   const try_control = defineTool({
     id: 'try_control',
-    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards): do this ' + 'first when asked whether a notebook works. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button; that control keeps the new value.',
+    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards): do this ' + 'first when asked whether a notebook works. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
     parameters: {
       type: 'object',
       required: ['module'],
@@ -7681,7 +7681,10 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       const want = String(control).trim().replace(/^viewof\s+/, '');
       const c = all.find(x => x.name === 'viewof ' + want) || all.find(x => x.label && x.label.toLowerCase() === want.toLowerCase()) || all.find(x => x.label && x.label.toLowerCase().includes(want.toLowerCase()));
       if (!c) return { title: 'try_control', output: 'No control "' + control + '" in ' + module + '. Controls: ' + list() };
-      return { title: 'try_control ' + module, output: (await tryOne(mod, c, value)).out };
+      const r = await tryOne(mod, c, value);
+      // rc5-train 20260928-0847-m7: a test term left in a search box kept the user's list filtered, unmentioned (2 of 2 runs)
+      if (value !== undefined) { try { await ui_set(c.v._value, r.was); await ui_settle(); } catch (e) {} }
+      return { title: 'try_control ' + module, output: r.out + (value !== undefined ? '\n(' + c.name + ' put back to ' + summary(r.was, 80) + ' afterwards.)' : '') };
     }
   });
   return [
@@ -22444,6 +22447,8 @@ const _qq3v7b = function _jbApply(importShim)
       const cells = probeDefine(defineFn);
       const seenPids = new Set();
       const seenNames = new Set();
+      // user cells in file order, to put the module's variables in that order afterwards (page and export order)
+      const placed = [];
       // import plumbing tracked by name (loaders/bindings carry no pid)
       let changes = 0;
       for (const cell of cells) {
@@ -22553,9 +22558,11 @@ const _qq3v7b = function _jbApply(importShim)
           existingByPid.set(pid, v);
           if (cell.name)
             existingByName.set(cell.name, v);
+          placed.push(v);
           changes++;
           continue;
         }
+        placed.push(existing);
         const existingInputNames = (existing._inputs || []).map(iv => typeof iv === 'string' ? iv : iv._name);
         const inputsMatch = JSON.stringify(existingInputNames) === JSON.stringify(cell.inputs);
         const defnMatch = existing._definition && existing._definition.toString() === (cell.definition ? cell.definition.toString() : '');
@@ -22592,6 +22599,22 @@ const _qq3v7b = function _jbApply(importShim)
         // keep pid-less and still-present user cells
         v.delete();
         // orphaned user cell (removed / renamed)
+        changes++;
+      }
+      // A cell added mid-file is created at the END of runtime._variables; the pane and the exporter read that
+      // order, so put the user cells back in file order (same rewrite as filesToNotebook).
+      const order = [...new Set(placed)].filter(v => v._module === mod && runtime._variables.has(v));
+      const orderSet = new Set(order);
+      const arr = [...runtime._variables];
+      const current = arr.filter(x => orderSet.has(x));
+      if (order.some((v, i) => v !== current[i])) {
+        let oi = 0;
+        for (let i = 0; i < arr.length; i++)
+          if (orderSet.has(arr[i]))
+            arr[i] = order[oi++];
+        runtime._variables.clear();
+        for (const v of arr)
+          runtime._variables.add(v);
         changes++;
       }
       return {
