@@ -6480,12 +6480,14 @@ const _1e7rc5x = function _srcContext(rc5_store, cellHelpers) {
 };
 const _rc5uncaught = function _uncaughtLog(invalidation)
 {
-    // Exceptions the runtime never sees: thrown in a timer, an event handler or an unawaited promise
-    // (rc5-train 20260928-0205-w14: a floating `for await` rejected 8x/s while write_file said "all cells compute").
-    // Each write is imported from its own blob: URL, and that URL is in the stack, so an error is charged to
-    // the module whose code threw it; errors with no tracked URL (the notebook's own code) are ignored.
+    // What a module's code sends to the browser console that no cell value shows: exceptions thrown in a timer,
+    // an event handler or an unawaited promise (rc5-train 20260928-0205-w14), console.warn/console.error calls
+    // (a library warning such as Plot's) and failed fetches (rc5-train 20260928-0847-m33: all three reached the
+    // console and none reached the agent). Each write is imported from its own blob: URL, and that URL is in the
+    // stack, so an entry is charged to the module whose code made it; entries with no tracked URL (the notebook's
+    // own code) are ignored. A write redefines only the cells it changed, so the others keep running code from
+    // an earlier write's URL: every URL a module was written from is charged to it.
     const urls = new Map();
-    const current = new Map();  // module id -> the url of its latest write; code from a replaced write is not charged
     const seen = new Map();
     const subs = new Map();
     const cellAt = (src, line) => {
@@ -6499,23 +6501,20 @@ const _rc5uncaught = function _uncaughtLog(invalidation)
         }
         return null;
     };
-    const note = (err, fallback) => {
-        const stack = String(err && err.stack || '');
+    const note = (kind, msg, stack) => {
+        stack = String(stack || '');
         for (const [url, rec] of urls) {
-            const at = stack.indexOf(url) >= 0 ? stack : String(fallback || '').indexOf(url) >= 0 ? url + ':' + (fallback.split(url + ':')[1] || '') : '';
-            if (!at)
+            if (stack.indexOf(url) < 0)
                 continue;
-            if (current.get(rec.id) !== url)
-                return;
-            const lm = new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':(\\d+)').exec(at);
+            const lm = new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':(\\d+)').exec(stack);
             const cell = lm ? cellAt(rec.src, +lm[1]) : null;
-            const msg = (err && (err.name ? err.name + ': ' : '') + (err.message || '')) || String(err);
-            const shown = (cell ? cell + ': ' : '') + msg.slice(0, 200);
-            const key = shown.replace(/\d+/g, '#');
+            const shown = (cell ? cell + ': ' : '') + String(msg).replace(/\s+/g, ' ').slice(0, 200);
+            const key = kind + '|' + shown.replace(/\d+/g, '#');
             const m = seen.get(rec.id) || new Map();
             seen.set(rec.id, m);
-            const e = m.get(key) || { shown, n: 0 };
+            const e = m.get(key) || { kind, shown, n: 0 };
             e.n++;
+            e.at = performance.now();
             m.set(key, e);
             for (const f of subs.get(rec.id) || [])
                 try {
@@ -6525,33 +6524,96 @@ const _rc5uncaught = function _uncaughtLog(invalidation)
             return;
         }
     };
-    const onError = e => note(e.error || { message: e.message }, e.filename ? e.filename + ':' + e.lineno : '');
-    const onRejection = e => note(e.reason);
-    window.addEventListener('error', onError);
+    const errText = err => (err && (err.name ? err.name + ': ' : '') + (err.message || '')) || String(err);
+    const onError = e => {
+        const t = e.target;
+        if (t && t !== window && t.tagName)
+            return;  // a resource load error has no stack to charge
+        const err = e.error || { message: e.message };
+        note('uncaught', errText(err), (err && err.stack || '') + '\n' + (e.filename ? e.filename + ':' + e.lineno : ''));
+    };
+    const onRejection = e => note('uncaught', errText(e.reason), e.reason && e.reason.stack);
+    window.addEventListener('error', onError, true);
     window.addEventListener('unhandledrejection', onRejection);
+    const str = x => x instanceof Error ? errText(x) : typeof x === 'string' ? x : (() => {
+        try {
+            return JSON.stringify(x);
+        } catch (e) {
+            return String(x);
+        }
+    })();
+    const orig = { warn: console.warn, error: console.error, fetch: window.fetch };
+    const wrapped = {};
+    for (const k of ['warn', 'error']) {
+        wrapped[k] = function (...a) {
+            try {
+                if (urls.size)
+                    note('console', 'console.' + k + ': ' + a.map(str).join(' '), new Error().stack);
+            } catch (e) {
+            }
+            return orig[k].apply(this, a);
+        };
+        console[k] = wrapped[k];
+    }
+    if (typeof orig.fetch === 'function') {
+        wrapped.fetch = function (input) {
+            const p = orig.fetch.apply(this, arguments);
+            if (urls.size) {
+                const stack = new Error().stack, url = String(input && input.url || input).slice(0, 120);
+                p.then(r => {
+                    if (!r.ok)
+                        note('request', 'fetch ' + url + ' → HTTP ' + r.status, stack);
+                }, e => note('request', 'fetch ' + url + ' failed: ' + (e && e.message || e), stack));
+            }
+            return p;
+        };
+        window.fetch = wrapped.fetch;
+    }
     invalidation.then(() => {
-        window.removeEventListener('error', onError);
+        window.removeEventListener('error', onError, true);
         window.removeEventListener('unhandledrejection', onRejection);
+        for (const k of ['warn', 'error'])
+            if (console[k] === wrapped[k])
+                console[k] = orig[k];
+        if (wrapped.fetch && window.fetch === wrapped.fetch)
+            window.fetch = orig.fetch;
     });
+    const LEAD = {
+        uncaught: '⚠ uncaught, outside any cell\'s value (a timer, event handler or unawaited promise; the runtime does not see it): ',
+        console: '⚠ browser console output from this module\'s code (the user sees it in devtools; no cell shows it): ',
+        request: '⚠ failed network request from this module\'s code (logged in the browser console): '
+    };
+    const render = (entries, counted) => Object.keys(LEAD).map(kind => {
+        const es = entries.filter(e => e.kind === kind);
+        if (!es.length)
+            return '';
+        return LEAD[kind] + es.slice(0, 3).map(({shown, n}) => shown + (n > 1 ? counted ? ' (\xD7' + n + ')' : ' (repeating)' : '')).join('; ') + (es.length > 3 ? '; +' + (es.length - 3) + ' more' : '');
+    }).filter(Boolean).join(' \xB7 ');
     // counted: the write result, read once. Not counted: the watch stream, so a repeating error streams once
     // (and once more as "repeating"), not on every step
     const text = (id, counted = true) => {
         const m = seen.get(id);
-        if (!m || !m.size)
-            return '';
-        const parts = [...m.values()].slice(0, 3).map(({shown, n}) => shown + (n > 1 ? counted ? ' (\xD7' + n + ')' : ' (repeating)' : ''));
-        return '⚠ uncaught, outside any cell\'s value (a timer, event handler or unawaited promise; the runtime does not see it): ' + parts.join('; ') + (m.size > 3 ? '; +' + (m.size - 3) + ' more' : '');
+        return m && m.size ? render([...m.values()], counted) : '';
     };
     return {
-        // a new write of `id`: its code runs from `url`; earlier counts belong to the replaced code
+        // a new write of `id`: its changed cells run from `url`; earlier counts belong to the replaced code
         track(url, id, src) {
             urls.set(url, { id, src });
-            current.set(id, url);
             seen.delete(id);
             if (urls.size > 200)
                 urls.delete(urls.keys().next().value);
         },
         text,
+        // what was logged for `id` after performance.now() == t (a control the agent just used)
+        since(id, t) {
+            const m = seen.get(id);
+            return m ? render([...m.values()].filter(e => e.at > t), true) : '';
+        },
+        // uncaught only: the write result says "FIX before task_complete" for these
+        hasUncaught(id) {
+            const m = seen.get(id);
+            return !!m && [...m.values()].some(e => e.kind === 'uncaught');
+        },
         subscribe(id, f) {
             const s = subs.get(id) || new Set();
             subs.set(id, s);
@@ -6872,6 +6934,8 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             st += ' \xB7 \u26A0 ' + orphans.length + ' cell function' + (orphans.length === 1 ? ' is' : 's are') + ' defined but no $def in define() registers ' + (orphans.length === 1 ? 'it' : 'them') + ', so ' + (orphans.length === 1 ? 'it never runs' : 'they never run') + ' and no cell can read ' + (orphans.length === 1 ? 'it' : 'them') + ': ' + orphans.slice(0, 6).join(', ') + (orphans.length > 6 ? ', \u2026' : '') + '. Add a $def line for each, or delete ' + (orphans.length === 1 ? 'it' : 'them') + ' \u2014 FIX before task_complete';
         if (!uncaught)
             return st;
+        if (!uncaughtLog.hasUncaught(id))
+            return st + ' \xB7 ' + uncaught;
         return st.replace(' \xB7 \u2713 all ', ' \xB7 all ').replace(' compute with no runtime error', ' return a value') + ' \xB7 ' + uncaught + ' \u2014 FIX before task_complete';
     };
     const probeStatus1 = (probe, id) => {
@@ -7358,7 +7422,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         moduleExists
     };
 };
-const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus,srcContext,localDisk,py,ui_set,ui_settle)
+const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,rc5_watchBus,srcContext,localDisk,py,ui_set,ui_settle,uncaughtLog)
 {
   const {resolveModule, varsOf, isStructural, label, oneLine, watchKey, canvasNote} = cellHelpers;
   const nudge = mod => {
@@ -7892,12 +7956,13 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   const controlsOf = mod => varsOf(mod).filter(v => /^viewof /.test(v._name || '') && v._value instanceof Element).map(v => ({
     v, name: v._name, label: oneLine(v._value.querySelector?.('label')?.textContent || v._value.getAttribute?.('aria-label') || '')
   }));
-  const tryOne = async (mod, c, value) => {
+  const tryOne = async (mod, c, value, id) => {
     const el = c.v._value;
     const valueName = c.name.slice(7);
     const button = value === undefined ? (el.matches('button') ? el : el.querySelector('button')) : null;
     if (value === undefined && !button) return { out: c.name + ' is not a button; pass `value`. Current value: ' + summary(el.value, 200), dead: false };
     const before = snapshotOf(mod);
+    const t0 = performance.now();
     const raw = el.value;
     const was = summary(raw, 200);
     await ui_settle();
@@ -7930,6 +7995,8 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     out += changed.length ? 'Changed:\n  ' + changed.join('\n  ') : 'Nothing changed, not even ' + valueName + '.';
     if (dead) out += '\n⚠ NO VISIBLE EFFECT: no cell other than ' + valueName + ' changed, so a user using this control sees nothing happen. Look for where ' + valueName + ' should be used: a cell that lists "viewof ' + valueName + '" (the element) where it needs "' + valueName + '", or an output that interpolates a different cell.';
     if (bad.length) out += '\n⚠ NaN/undefined/[object …] appeared in: ' + bad.join(', ') + '.';
+    const logged = id ? uncaughtLog.since(id, t0) : '';
+    if (logged) out += '\n' + logged + '.';
     return { out, dead, was: raw };
   };
   // A value a user might pick that differs from the current one; undefined means "click it".
@@ -7972,7 +8039,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
         for (const c of all) {
           const v = probeValue(c.v._value);
           if (v === null) { parts.push(c.name + ': skipped (no value to pick automatically; call with control and value)'); continue; }
-          const r = await tryOne(mod, c, v);
+          const r = await tryOne(mod, c, v, module);
           parts.push(r.out.length > 1500 ? r.out.slice(0, 1500) + ' …' : r.out);
           if (r.dead) dead.push(c.label || c.name);
           if (v !== undefined) { try { await ui_set(c.v._value, r.was); await ui_settle(); } catch (e) {} }
@@ -7982,7 +8049,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       const want = String(control).trim().replace(/^viewof\s+/, '');
       const c = all.find(x => x.name === 'viewof ' + want) || all.find(x => x.label && x.label.toLowerCase() === want.toLowerCase()) || all.find(x => x.label && x.label.toLowerCase().includes(want.toLowerCase()));
       if (!c) return { title: 'try_control', output: 'No control "' + control + '" in ' + module + '. Controls: ' + list() };
-      const r = await tryOne(mod, c, value);
+      const r = await tryOne(mod, c, value, module);
       // rc5-train 20260928-0847-m7: a test term left in a search box kept the user's list filtered, unmentioned (2 of 2 runs)
       if (value !== undefined) { try { await ui_set(c.v._value, r.was); await ui_settle(); } catch (e) {} }
       return { title: 'try_control ' + module, output: r.out + (value !== undefined ? '\n(' + c.name + ' put back to ' + summary(r.was, 80) + ' afterwards.)' : '') };
@@ -8030,7 +8097,7 @@ const _rc5punct = function _punctuationMatch(){return(
   return { at, diffs };
 }
 )};
-const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHelpers,setFileAttachment,localDisk,wiki_triggers,newTriggerMatch,punctuationMatch)
+const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHelpers,setFileAttachment,localDisk,wiki_triggers,newTriggerMatch,punctuationMatch,uncaughtLog)
 {
   const {listPathsAsync, readPath, globToRe, isDisk} = pathLib;
   const {applyModuleSrc} = applyLib;
@@ -8105,7 +8172,10 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
       const body = lines.slice(start, end).map((l, i) => String(start + i + 1).padStart(6) + '\t' + (l.length > 2000 ? l.slice(0, 2000) + '\u2026 [line truncated]' : l)).join('\n');
       if (file_path.startsWith(WIKI) && ctx?.sessionState)
         (ctx.sessionState.wikiRead ??= new Set()).add(file_path);
-      return { output: body || '(empty file)' };
+      // rc5-train 20260928-0847-m33: what the module's code has logged is not in its source
+      const mp = MODULE_PATH.exec(file_path);
+      const logged = mp ? uncaughtLog.text(mp[1]) : '';
+      return { output: (body || '(empty file)') + (logged ? '\n\n' + logged : '') };
     }
   });
   const write_file = defineTool({
@@ -9124,10 +9194,10 @@ export default function define(runtime, observer) {
   $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
   $def("_rc5uncaught", "uncaughtLog", ["invalidation"], _rc5uncaught);
   $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib","uncaughtLog","acorn"], _190yjiu);
-  $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py","ui_set","ui_settle"], _ual70b);
+  $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","py","ui_set","ui_settle","uncaughtLog"], _ual70b);
   $def("_rc5newTrigger", "newTriggerMatch", [], _rc5newTrigger);
   $def("_rc5punct", "punctuationMatch", [], _rc5punct);
-  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","cellHelpers","setFileAttachment","localDisk","wiki_triggers","newTriggerMatch","punctuationMatch"], _6aumvx);  
+  $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","cellHelpers","setFileAttachment","localDisk","wiki_triggers","newTriggerMatch","punctuationMatch","uncaughtLog"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS","mountLocalDisk"], _qc0bl);  
   $def("_pytl01", "pythonTools", ["defineTool","py"], _pytl01);
   $def("_1nb19yl", "hostSetup", ["valueTools","fileTools","pythonTools","registerTool","invalidation","unregisterTool"], _1nb19yl);  
