@@ -7110,6 +7110,38 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         }));
         return m;
     };
+    // A write that deletes cells names them, and flags the two kinds "no cell lists it as an input" does not make unused
+    // (rc5-train 20260928-0847-m20: a tidy-up deleted test_breakpoints as "nothing depended on it" under "✓ values unchanged").
+    // Keyed by pid so a rename is not a removal.
+    const cellsByPid = id => {
+        const mod = resolveModule(id);
+        const m = new Map();
+        if (mod)
+            for (const v of varsOf(mod))
+                if (v._name ? !isStructural(v) && !/^(mutable|initial) /.test(v._name) : v.pid)
+                    m.set(v.pid || v._name, { label: v._name || v.pid, value: v._value, anon: !v._name });
+        return m;
+    };
+    const removedStatus = (before, after) => {
+        if (!before || !after)
+            return '';
+        const removed = [...before.keys()].filter(k => !after.has(k)).map(k => before.get(k));
+        if (!removed.length)
+            return '';
+        const isNode = x => typeof Node !== 'undefined' && x instanceof Node;
+        const tests = removed.filter(c => /^test_/.test(c.label));
+        const shown = removed.filter(c => !tests.includes(c) && isNode(c.value));
+        const lbl = c => c.anon ? c.label + ' (anonymous)' : c.label;
+        const what = c => { const t = oneLine(String(c.value.textContent || '')).slice(0, 40); return '<' + String(c.value.nodeName).toLowerCase() + '>' + (t ? ' "' + t + '"' : ''); };
+        let msg = ' \xB7 removed ' + removed.length + ' cell' + (removed.length === 1 ? '' : 's') + ': ' + removed.slice(0, 12).map(lbl).join(', ') + (removed.length > 12 ? ' …' : '');
+        if (tests.length)
+            msg += ' \xB7 ⚠ ' + tests.map(c => c.label).join(', ') + (tests.length === 1 ? ' is a TEST cell' : ' are TEST cells') + ': the tests runner runs every test_* cell, and no cell ever lists a test as an input, so having no dependents does not make it unused';
+        if (shown.length)
+            msg += ' \xB7 ⚠ ' + shown.map(c => lbl(c) + ' ' + what(c)).join(', ') + ' DISPLAYED output or a control: a display cell never has dependents, so having none does not make it unused; it is what the reader sees';
+        if (tests.length || shown.length)
+            msg += '. "Unused" means a cell nobody reads AND nobody sees. Unless the user asked for these to go, or this write replaced them with cells showing the same thing, restore them before task_complete';
+        return msg;
+    };
     const valueDiffStatus = (before, after) => {
         if (!before || !after)
             return '';
@@ -7161,7 +7193,11 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                     msg: 'written, but no default export define() \u2014 not applied'
                 };
             }
-            let before = null;
+            let before = null, beforeCells = null;
+            try {
+                beforeCells = wasNew ? null : cellsByPid(id);
+            } catch (e) {
+            }
             try {
                 before = await snapshotValues(id);
             } catch (e) {
@@ -7204,6 +7240,10 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             let valueDiff = '';
             try {
                 valueDiff = valueDiffStatus(before, await snapshotValues(id));
+            } catch (e) {
+            }
+            try {
+                valueDiff = removedStatus(beforeCells, cellsByPid(id)) + valueDiff;
             } catch (e) {
             }
             return {
