@@ -7830,6 +7830,44 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
       return { output: 'Attached ' + name + ' (' + file.size + ' bytes, ' + file.type + ') to ' + moduleId + '. Cells read it with FileAttachment(' + JSON.stringify(name) + ').' + gzNote };
     }
   });
+  // Values a preview hides: in a mostly-numeric column, entries +x cannot read (what .csv({typed: true}) leaves
+  // as strings, and d3.sum / Plot then drop); in a text column, spellings that differ only in case or spaces.
+  const columnCheck = (all, sep) => {
+    const split = line => {
+      const out = [];
+      let cur = '', q = false;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (q) { if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; } else if (c === '"') q = false; else cur += c; }
+        else if (c === '"') q = true;
+        else if (c === sep) { out.push(cur); cur = ''; }
+        else cur += c;
+      }
+      out.push(cur.replace(/\r$/, ''));
+      return out;
+    };
+    const header = split(all[0]), rows = all.slice(1).filter(l => l.trim()).map(split);
+    const notes = [];
+    const ex = (m, k = 3) => [...m].sort((a, b) => b[1] - a[1]).slice(0, k).map(([v, n]) => JSON.stringify(v) + (n > 1 ? ' \u00d7' + n : '')).join(', ');
+    header.forEach((h, j) => {
+      const vals = rows.map(r => (r[j] ?? '').trim());
+      const filled = vals.filter(v => v !== '');
+      const blank = vals.length - filled.length;
+      const bad = new Map();
+      let nums = 0, like = 0;
+      for (const v of filled) if (!isNaN(+v)) nums++; else { bad.set(v, (bad.get(v) || 0) + 1); if (!isNaN(+v.replace(/[$\u20ac\u00a3,%\s]/g, ''))) like++; }
+      if (nums + like >= filled.length / 2 && nums + like > 0) {
+        if (bad.size) notes.push(h + ': ' + nums + ' numbers, ' + (filled.length - nums) + ' not numbers as written (' + ex(bad) + ')' + (blank ? ', ' + blank + ' blank' : '') + ' \u2014 .csv({typed: true}) leaves those as strings and d3.sum/Plot skip them');
+        else if (blank) notes.push(h + ': ' + blank + ' blank of ' + vals.length + ' (typed: null)');
+        return;
+      }
+      const spell = new Map();
+      for (const v of filled) { const k = v.toLowerCase().replace(/\s+/g, ' '); if (!spell.has(k)) spell.set(k, new Map()); const m = spell.get(k); m.set(v, (m.get(v) || 0) + 1); }
+      const clash = [...spell.values()].filter(m => m.size > 1);
+      if (clash.length && spell.size <= 200) notes.push(h + ': ' + [...spell.values()].reduce((s, m) => s + m.size, 0) + ' spellings of ' + spell.size + ' values that differ only in case or spaces (' + clash.slice(0, 3).map(m => ex(m, 3)).join('; ') + ') \u2014 grouping on the raw value splits them');
+    });
+    return notes.length ? '\n  column check (all ' + rows.length + ' rows): ' + notes.join('; ') : '';
+  };
   const request_files = defineTool({
     id: 'request_files',
     description: 'Ask the human to give you files (a dataset, an image, a document) through a picker in the chat \u2014 they may ' + 'also answer with a URL, which is fetched \u2014 and attach what they choose to a module as FileAttachments. Use it when a task needs the user\'s own data ' + 'instead of inventing sample data. The turn waits until they choose or skip. Ask before writing code when the data decides the design. Its cells ' + 'read each file with FileAttachment(name) (.csv({typed: true}) / .json() / .text() / .blob() / .url()). ' + 'The result names each attached file and shows the first lines of text files.',
@@ -7892,6 +7930,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,all_mo
             const shown = (all || (await f.slice(0, 4000).text()).split('\n')).slice(0, 5);
             const of = all ? (all.length <= 5 ? 'all ' + all.length + ' lines' : 'first 5 of ' + all.length + ' lines (the preview is not the data: cells read the whole file)') : 'first lines';
             head = '\n  ' + of + ':\n    ' + shown.map(l => l.slice(0, 200)).join('\n    ');
+            if (all && /\.(csv|tsv)$/i.test(f.name)) head += columnCheck(all, /\.tsv$/i.test(f.name) ? '\t' : ',');
           } catch (e) {}
         }
         lines.push('Attached ' + f.name + ' (' + f.size + ' bytes, ' + (f.type || 'unknown type') + ') to ' + moduleId + ' \u2014 cells read it with FileAttachment(' + JSON.stringify(f.name) + ')' + head);
