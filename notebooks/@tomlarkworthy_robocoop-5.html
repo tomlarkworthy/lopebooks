@@ -8475,6 +8475,51 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
   // write to the same path lands; the engine's completion guard reads the list (run 20260928-0847-w9).
   // other modules count only when they are the user's: a line copied from a library module read as a template still gates
   const heldText = (id, current) => [current ?? '', ...[...rc5_store.srcFns].filter(([k, f]) => k !== id && !/^@tomlarkworthy\//.test(k) && typeof f?.src === 'string').map(([, f]) => f.src)].join('\n');
+  // rc5-train 20260929-0620-m60: a whole-file rewrite retypes the file's ’ “ ” — as ASCII. Text the rewrite did not
+  // change keeps the file's characters (as edit_file does); an ASCII char counts as unchanged only inside a run of 3 aligned chars.
+  const keepTypography = (old, neu) => {
+    const fold = c => c.replace(/[‘’‚‛′]/g, "'").replace(/[“”„‟″]/g, '"').replace(/[‐-―−]/g, '-').replace(/[   ]/g, ' ');
+    if (old == null || old === neu || fold(old) === old) return { text: neu, n: 0 };
+    let n = 0;
+    const lcs = (a, b, eq) => {
+      if ((a.length + 1) * (b.length + 1) > 4e6) return null;
+      const W = b.length + 1, L = new Uint32Array((a.length + 1) * W), pairs = [];
+      for (let i = a.length - 1; i >= 0; i--)
+        for (let j = b.length - 1; j >= 0; j--)
+          L[i * W + j] = eq(a[i], b[j]) ? L[(i + 1) * W + j + 1] + 1 : Math.max(L[(i + 1) * W + j], L[i * W + j + 1]);
+      let i = 0, j = 0;
+      while (i < a.length && j < b.length) {
+        if (eq(a[i], b[j])) { pairs.push([i, j]); i++; j++; }
+        else if (L[(i + 1) * W + j] >= L[i * W + j + 1]) i++;
+        else j++;
+      }
+      return pairs;
+    };
+    const take = (o, c) => c !== o && c === fold(o) ? (n++, o) : c;
+    const hunk = (a, b) => {
+      const fa = fold(a).split(''), fb = fold(b).split(''), out = b.split('');
+      const pairs = lcs(fa, fb, (x, y) => x === y);
+      if (!pairs) return b;
+      const at = new Map(pairs.map(([i, j]) => [j, i]));
+      for (const [i, j] of pairs) {
+        const ok = k => k < 0 || k >= b.length || at.get(k) === i + (k - j);
+        if (ok(j - 1) && ok(j + 1)) out[j] = take(a[i], b[j]);
+      }
+      return out.join('');
+    };
+    const la = old.split('\n'), lb = neu.split('\n'), fa = la.map(fold), fb = lb.map(fold);
+    const pairs = lcs(fa, fb, (x, y) => x === y);
+    if (!pairs) return { text: neu, n: 0 };
+    const res = [];
+    let i = 0, j = 0;
+    for (const [pi, pj] of [...pairs, [la.length, lb.length]]) {
+      if (pj > j) res.push(...(pi > i ? hunk(la.slice(i, pi).join('\n'), lb.slice(j, pj).join('\n')).split('\n') : lb.slice(j, pj)));
+      if (pi < la.length) res.push(lb[pj].split('').map((c, k) => take(la[pi][k], c)).join(''));
+      i = pi + 1; j = pj + 1;
+    }
+    return { text: res.join('\n'), n };
+  };
+  const typoNote = n => n ? ' \xB7 kept the file\'s typographic punctuation (’ “ ” —) in ' + n + ' place' + (n === 1 ? '' : 's') + ' you retyped as ASCII in text you did not change; text you added is as you wrote it. To change them on purpose, edit_file with the file\'s exact characters in old_string.' : '';
   const noteWrite = (ctx, path, output) => {
     const st = ctx?.sessionState;
     if (!st) return output;
@@ -8534,7 +8579,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
   });
   const write_file = defineTool({
     id: 'write_file',
-    description: 'Create or overwrite a file. Mirrors Claude Code\'s Write. Writing a module file under ' + '/src/<id>.js APPLIES it to the live runtime and reports whether it compiled; your file keeps your ' + 'EXACT text (it is never reformatted), so you can keep editing it with edit_file. A path under ' + '/local-disk/ is written to the user\'s mounted folder on disk (directories created as needed); ' + 'for a LARGE computed result, write it from a cell with localDisk.write(path, data) instead of ' + 'pasting it through this tool. To copy a file byte-for-byte, give `from` instead of content.',
+    description: 'Create or overwrite a file. Mirrors Claude Code\'s Write. Writing a module file under ' + '/src/<id>.js APPLIES it to the live runtime and reports whether it compiled; your file keeps your ' + 'EXACT text (it is never reformatted; only the file\'s ’ “ ” — in text you did not change are kept), so you can keep editing it with edit_file. A path under ' + '/local-disk/ is written to the user\'s mounted folder on disk (directories created as needed); ' + 'for a LARGE computed result, write it from a cell with localDisk.write(path, data) instead of ' + 'pasting it through this tool. To copy a file byte-for-byte, give `from` instead of content.',
     parameters: {
       type: 'object',
       required: [
@@ -8565,23 +8610,28 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
         content = copied = t;
       }
       if (content == null) return { output: 'ERROR: give content (the full text) or from (a path to copy)' };
+      let typo = 0;
+      const keep = prior => { if (from == null && prior != null) { const k = keepTypography(String(prior), String(content)); content = k.text; typo = k.n; } };
       if (isDisk(file_path)) {
         try {
+          try { keep(await readPath(file_path)); } catch (e) {}
           const r = await localDisk.write(file_path, String(content ?? ''));
-          return { output: 'Wrote ' + file_path + ' (' + r.size + ' bytes, on disk)' };
+          return { output: 'Wrote ' + file_path + ' (' + r.size + ' bytes, on disk)' + typoNote(typo) };
         } catch (e) {
           return { output: 'ERROR: cannot write ' + file_path + ': ' + (e && e.message || e) };
         }
       }
       const m = MODULE_PATH.exec(file_path);
       if (!m) {
+        keep(rc5_store.scratch.get(file_path));
         rc5_store.scratch.set(file_path, String(content ?? ''));
-        return { output: 'Wrote ' + file_path };
+        return { output: 'Wrote ' + file_path + typoNote(typo) };
       }
       let before = null, saved = null;
       if (pathLib.moduleIds().includes(m[1])) try { before = await readPath(file_path); } catch (e) {}
       // a block the file carries but does not boot is the user's existing code: held for the gate, and compared below
       else try { saved = before = await readPath('/content/' + m[1]); } catch (e) {}
+      keep(before);
       // a copy adds no text of its own, except from a library module (a template, gated as when retyped)
       const held = /^\/(?:src|notebook|content)\/@tomlarkworthy\//.test(String(from)) ? '' : copied;
       const refused = wikiGate(String(content ?? ''), ctx, heldText(m[1], before) + '\n' + held);
@@ -8595,7 +8645,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
         differs = ' \u00b7 \u26a0 the file also saves this module at /content/' + m[1] + ', and the BODY of ' + changed.length +
           ' cell' + (changed.length === 1 ? '' : 's') + ' you wrote differs from it (first lines: ' + changed.slice(0, 6).join(', ') + '). To restore the saved module exactly, write_file {file_path: "' + file_path + '", from: "/content/' + m[1] + '"}';
       }
-      return { output: noteWrite(ctx, file_path, 'Wrote ' + file_path + ' \u2014 ' + applied.msg + differs) };
+      return { output: noteWrite(ctx, file_path, 'Wrote ' + file_path + ' \u2014 ' + applied.msg + differs + typoNote(typo)) };
     }
   });
   const edit_file = defineTool({
