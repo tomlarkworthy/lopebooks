@@ -4570,14 +4570,17 @@ Every chat lists every session on the page. Writes into a saved session module, 
 
 A re-run cell shows the session it was showing, found by \`group\`. The cells below it hold state shared by every chat on the page.`
 )};
-const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,rc5_controller,rc5_agents,rc5_lastShown,rc5_module,keepalive,guardTools,DEFAULT_GROUP,runtime,linkTo,rc5_palette,rc5_unsnapshotted,rc5_pageSheets,rc5_settingsPanel,rc5_heights,defaultWatches){return(
+const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,rc5_controller,rc5_agents,rc5_lastShown,rc5_module,keepalive,guardTools,DEFAULT_GROUP,runtime,linkTo,rc5_palette,rc5_unsnapshotted,rc5_pageSheets,rc5_settingsPanel,rc5_heights,defaultWatches,rc5_pendingStarts,rc5_folds){return(
 // One chat. Every option is optional. `group` names the modules its sessions are saved as (@<group>/<id>)
 // and is how a re-run cell finds the session it was showing; `model`/`system` are a value or a function
 // read every step (omitted = the settings panel's); `tools` maps the registered tools; `hooks` holds
 // beforeTool / afterTool / beforeComplete; `persist` saves every session after its first turn; `height` is px or a CSS length, and the grip under
 // the input bar resizes it (kept per group across re-runs until `height` itself changes). Only one chat per page can host the settings panel.
-// This cell depends on constants only, so a module write does not rebuild a chat.
-({ group = DEFAULT_GROUP, model = null, system = null, tools = null, hooks = {}, persist = false, height = 600, settings = false, watches = defaultWatches, invalidation = null } = {}) => {
+// `session` shows one session by id instead of the group's last one; `compact` drops the session bar, settings,
+// model line and ⟲ and folds to a 💬 N badge; `start` is sent when the chat opens on a session with no turns.
+// `controller` and `agent` (a function returning a session) replace the page's controller and makeSession; tests
+// pass a fake agent. This cell depends on constants only, so a module write does not rebuild a chat.
+({ group = DEFAULT_GROUP, session: sessionId = null, compact = false, start = null, model = null, system = null, tools = null, hooks = {}, persist = false, height = 600, settings = false, watches = defaultWatches, controller: ctl = rc5_controller, agent = null, invalidation = null } = {}) => {
   keepalive(rc5_module, 'rc5_boot');  // registers the tools and context providers, and tracks makeSession
   const C = rc5_palette;
   const read = v => typeof v === 'function' ? v() : v;
@@ -4585,22 +4588,28 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
   // swaps the agent under the entry and keeps its messages.
   let built = { makeSession: null, build: null };
   const builder = () => {
-    const ms = rc5_agents.makeSession;
+    const ms = agent ?? rc5_agents.makeSession;
     if (built.makeSession !== ms)
       built = { makeSession: ms, build: () => ms({ model, system, toolsTransform: ts => guardTools(tools ? tools(ts) : ts, hooks), completeGuard: hooks.beforeComplete ?? null,
         watches: typeof watches === 'function' ? watches() : watches ?? [] }) };
     return built.build;
   };
-  const ready = e => rc5_agents.ready.then(() => rc5_controller.use(e, builder()));
+  const ready = e => (agent ? Promise.resolve() : rc5_agents.ready).then(() => ctl.use(e, builder()));
   // The chat is a facade over the controller's sessions; `entry`/`session` are whichever one it shows.
-  let entry = rc5_lastShown.get(group) ?? rc5_controller.create({ group });
-  rc5_lastShown.set(group, entry);
+  // rc5_lastShown belongs to the page's controller; a chat on another controller keeps its own.
+  const shown = ctl === rc5_controller ? rc5_lastShown : new Map();
+  const sid = sessionId == null ? null : String(sessionId);
+  let entry = sid != null ? ctl.open({ group, id: sid }) : shown.get(group) ?? ctl.create({ group });
+  if (sid == null) shown.set(group, entry);
   let session = entry.session;
   const size = rc5_heights.get(group);
   const cssHeight = typeof height === 'number' ? height + 'px' : String(height);
-  const root = html`<div style="display:flex;flex-direction:column;height:${ size?.param === cssHeight ? size.px + 'px' : cssHeight };min-height:200px;box-sizing:border-box;font:13px/1.55 ui-monospace,Menlo,monospace;color:${ C.fg };background:${ C.bg }"><h1 style="display: none;">Roboco-op 5</h1></div>`;
+  const root = html`<div style="display:flex;flex-direction:column;height:${ size?.param === cssHeight && !compact ? size.px + 'px' : cssHeight };min-height:${ compact ? 160 : 200 }px;box-sizing:border-box;font:13px/1.55 ui-monospace,Menlo,monospace;color:${ C.fg };background:${ C.bg }"><h1 style="display: none;">Roboco-op 5</h1></div>`;
   root.dataset.rc5Group = group;
-  if (settings) root.append(rc5_settingsPanel());
+  if (sid != null) root.dataset.rc5Session = sid;
+  // Compact: everything but the badge lives in `shell`, so folding hides one node.
+  const shell = compact ? html`<div style="display:flex;flex-direction:column;flex:1 1 auto;min-height:0"></div>` : root;
+  if (settings && !compact) root.append(rc5_settingsPanel());
   const unsnapshotted = rc5_unsnapshotted, pageSheets = rc5_pageSheets;
   // ── sessions ─────────────────────────────────────────────────────────────
   const picker = html`<select title="Switch session" style="flex:1;min-width:0;background:${ C.input };color:${ C.fg };border:1px solid ${ C.border };border-radius:6px;font:inherit;padding:2px 4px"></select>`;
@@ -4611,17 +4620,21 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
   const sessionLink = html`<a title="Open the session module" style="color:${ C.muted };text-decoration:none;display:none">open ↗</a>`;
   const savedName = () => entry.log && [...(runtime.mains ?? [])].find(([, m]) => m === entry.log.module)?.[0];
   sessionLink.addEventListener('click', () => { const n = savedName(); if (n) sessionLink.href = linkTo(n); });
-  sessBar.append(unsnapshotted(picker, 'flex:1;min-width:0;display:flex'), sessionLink, saveLabel);
-  root.append(sessBar);
+  // A session another module flagged as orphaned (its annotation or prompt cell is gone) can be deleted here.
+  const dropBtn = html`<button title="Delete this session: its annotation or prompt cell no longer exists" style="display:none;background:none;border:1px solid ${ C.err };color:${ C.err };border-radius:6px;cursor:pointer;font:inherit;padding:0 6px">delete orphan</button>`;
+  sessBar.append(unsnapshotted(picker, 'flex:1;min-width:0;display:flex'), sessionLink, dropBtn, saveLabel);
+  if (!compact) root.append(sessBar);
   const renderBar = () => {
-    picker.replaceChildren(...rc5_controller.entries.map((e, i) => {
+    picker.replaceChildren(...ctl.entries.map((e, i) => {
       const o = document.createElement('option');
       o.value = String(i);
-      o.textContent = (e.saved ? '\u25CF ' : '\u25CB ') + (e.group === group ? '' : e.group + ': ') + e.title + (e.busy ? '  \u2026' : '');
+      o.textContent = (e.orphaned ? '\u26A0 orphaned \u00B7 ' : '') + (e.saved ? '\u25CF ' : '\u25CB ') + (e.group === group ? '' : e.group + ': ') + e.title + (e.busy ? '  \u2026' : '');
       o.selected = e === entry;
       return o;
     }));
     saveBox.checked = !!entry.saved;
+    dropBtn.style.display = entry.orphaned ? '' : 'none';
+    headTitle.textContent = entry.title;
     const n = entry.saved && savedName();
     sessionLink.style.display = n ? '' : 'none';
     if (n) sessionLink.href = linkTo(n);
@@ -4630,7 +4643,75 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
   // flex:1 + min-height:0 scrolls when the pane bounds us; max-height is a fallback so the log
   // scrolls (and the input bar stays reachable) even when lopepage gives the cell an unbounded height.
   const log = html`<div style="flex:1 1 0;min-height:0;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px"></div>`;
-  root.append(unsnapshotted(log, 'flex:1 1 0;min-height:0;display:flex;flex-direction:column', pageSheets()));
+  // ── compact header, badge and fold ─────────────────────────────────────────
+  const headTitle = html`<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>`;
+  const hbtn = (label, title) => html`<button title="${ title }" style="background:none;border:0;color:inherit;cursor:pointer;font:inherit;padding:0 3px">${ label }</button>`;
+  const resolveBtn = hbtn('\u2713 resolve', 'Mark this thread resolved (its annotation dims)');
+  resolveBtn.style.display = 'none';
+  const fullLink = html`<a title="Continue in the full chat" style="color:inherit;text-decoration:none">\u2922 full chat</a>`;
+  fullLink.href = linkTo('@tomlarkworthy/robocoop-5');
+  const foldBtn = hbtn('\u25BE', 'Fold to a badge');
+  const head = html`<div style="display:flex;gap:6px;align-items:center;padding:3px 8px;border-bottom:1px solid ${ C.border };font-size:11px;color:${ C.muted }"><span>\u{1F4AC}</span></div>`;
+  head.append(headTitle, resolveBtn, fullLink, foldBtn);
+  const badge = html`<button data-rc5-badge title="Open the thread" style="display:none;align-self:flex-start;background:${ C.bg };color:${ C.fg };border:1px solid ${ C.border };border-radius:12px;cursor:pointer;font:12px/1.4 system-ui,sans-serif;padding:2px 9px;box-shadow:0 1px 4px rgba(0,0,0,.18)"></button>`;
+  const count = () => (session?.messages ?? []).filter(m => m.role === 'user' || (m.role === 'assistant' && m.content)).length;
+  // The annotation box around this chat, when there is one (annotate's DOM, not an import).
+  const annBox = () => root.closest?.('[data-ann-id]') ?? null;
+  const isResolved = () => annBox()?.dataset.a2State === 'resolved';
+  const syncResolved = () => {
+    const box = annBox();
+    resolveBtn.style.display = box ? '' : 'none';
+    resolveBtn.textContent = isResolved() ? '\u21BA reopen' : '\u2713 resolve';
+    badge.style.opacity = isResolved() ? '0.5' : '1';
+    badge.textContent = (isResolved() ? '\u2713 ' : '\u{1F4AC} ') + count();
+    root.dataset.rc5Resolved = String(isResolved());
+  };
+  const tell = (type, detail) => root.dispatchEvent(new CustomEvent(type, { bubbles: true, detail }));
+  const foldKey = sid ?? group;
+  const foldChosen = rc5_folds.has(foldKey);
+  let folded = compact && (rc5_folds.get(foldKey) ?? true);
+  const setFolded = f => {
+    folded = !!f;
+    rc5_folds.set(foldKey, folded);
+    shell.style.display = folded ? 'none' : 'flex';
+    badge.style.display = folded ? '' : 'none';
+    root.style.height = folded ? 'auto' : cssHeight;
+    root.style.minHeight = folded ? '0' : '160px';
+    root.style.background = folded ? 'transparent' : C.bg;
+    root.dataset.rc5Folded = String(folded);
+    syncResolved();
+    tell('a2-fold', { folded });
+    if (!folded) whenShown(() => { ta.focus(); log.scrollTop = log.scrollHeight; });
+  };
+  // Runs `f` once the chat is in the document (an annotation box adopts it after the cell computes).
+  const whenShown = (f, tries = 120) => root.isConnected ? f() : tries > 0 && window.requestAnimationFrame(() => whenShown(f, tries - 1));
+  let stateObs = null;
+  whenShown(() => {
+    const box = annBox();
+    if (box && compact) {
+      stateObs = new MutationObserver(syncResolved);
+      stateObs.observe(box, { attributes: true, attributeFilter: ['data-a2-state'] });
+      tell('a2-fold', { folded });
+    }
+    syncResolved();
+  });
+  if (compact) {
+    resolveBtn.addEventListener('click', () => {
+      const next = isResolved() ? 'open' : 'resolved';
+      tell('a2-state', { state: next });
+      if (next === 'resolved') setFolded(true);
+    });
+    fullLink.addEventListener('click', () => {
+      rc5_lastShown.set(DEFAULT_GROUP, entry);
+      fullLink.href = linkTo('@tomlarkworthy/robocoop-5');
+      ctl.touch?.();
+    });
+    foldBtn.addEventListener('click', () => setFolded(true));
+    badge.addEventListener('click', () => setFolded(false));
+    shell.append(head);
+    root.append(badge, shell);
+  }
+  shell.append(unsnapshotted(log, 'flex:1 1 0;min-height:0;display:flex;flex-direction:column', pageSheets()));
   const bubble = (side, bgc, node) => {
     const wrap = document.createElement('div');
     wrap.style.cssText = 'display:flex;justify-content:' + (side === 'right' ? 'flex-end' : 'flex-start');
@@ -4745,7 +4826,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     return d;
   };
   const cacheKey = m => m.role === 'user'
-    ? 'u|' + rc5_controller.nodeOf(m) + '|' + rc5_controller.siblings(entry, rc5_controller.nodeOf(m)).join(',')
+    ? 'u|' + ctl.nodeOf(m) + '|' + ctl.siblings(entry, ctl.nodeOf(m)).join(',')
     : String(m.content ?? '') + '|' + (Array.isArray(m.tool_calls) ? m.tool_calls.length : 0);
   // Turns form a tree: a committed user message can be edited (a new sibling branch) or its siblings shown.
   const afterCheckout = () => {
@@ -4756,7 +4837,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     render();
   };
   const branchControls = m => {
-    const id = rc5_controller.nodeOf(m);
+    const id = ctl.nodeOf(m);
     if (!id) return null;
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;justify-content:flex-end;gap:6px;align-items:center;color:' + C.muted + ';font-size:11px;padding:0 4px';
@@ -4772,18 +4853,18 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
       });
       return b;
     };
-    const sibs = rc5_controller.siblings(entry, id);
+    const sibs = ctl.siblings(entry, id);
     if (sibs.length > 1) {
       const k = sibs.indexOf(id);
       const pos = document.createElement('span');
       pos.textContent = (k + 1) + '/' + sibs.length;
       row.append(
-        btn('\u2039', 'Previous branch', () => k > 0 && rc5_controller.showBranch(entry, sibs[k - 1])),
+        btn('\u2039', 'Previous branch', () => k > 0 && ctl.showBranch(entry, sibs[k - 1])),
         pos,
-        btn('\u203A', 'Next branch', () => k < sibs.length - 1 && rc5_controller.showBranch(entry, sibs[k + 1])));
+        btn('\u203A', 'Next branch', () => k < sibs.length - 1 && ctl.showBranch(entry, sibs[k + 1])));
     }
     row.append(btn('\u270E edit', 'Edit and resend: a new branch from here, the original stays in the session', async () => {
-      await rc5_controller.forkBefore(entry, m);
+      await ctl.forkBefore(entry, m);
       const parts = Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content ?? '') }];
       ta.value = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
       pendingImages.push(...parts.filter(p => p?.type === 'image_url').map(p => p.image_url.url));
@@ -4886,6 +4967,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     }
     log.replaceChildren(...desired);
     log.scrollTop = log.scrollHeight;
+    if (compact) syncResolved();
   };
   render();
   // ── input (with image attachments — paste, drop, or 📎) ─────────────────────
@@ -5008,7 +5090,12 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     askOff = bus?.onChange(renderAsk) ?? null;
     renderAsk();
   };
-  root.append(thumbs, askEl, statusEl, modelEl, bar, grip);
+  if (compact) {
+    newchat.style.display = 'none';
+    attach.style.display = 'none';
+    ta.placeholder = 'Ask robocoop-5 about this\u2026  (Enter to send)';
+    shell.append(thumbs, askEl, statusEl, bar);
+  } else root.append(thumbs, askEl, statusEl, modelEl, bar, grip);
   if (busy) {
     send.textContent = 'Steer';
     stop.style.display = '';
@@ -5097,7 +5184,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
       // immediately shows the user's bubble right away. Tool calls land in the transcript as activity lines
       // (render on each tool call), and the cheap statusEl carries the live signal. The controller commits
       // the finished turn to the session log.
-      const p = rc5_controller.send(mine, input, {
+      const p = ctl.send(mine, input, {
         onStep: shown(i => {
           stepN = (i | 0) + 1;
           thinkReset();  // each step thinks afresh; the previous step's deliberation is spent
@@ -5135,7 +5222,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
       if (entry === mine) errors.push(err && err.message ? err.message : String(err));
     } finally {
       // the turn is committed once send() settles, so the log exists to save
-      if (persist && mine.log && !mine.saved) await rc5_controller.setSaved(mine, true);
+      if (persist && mine.log && !mine.saved) await ctl.setSaved(mine, true);
       if (entry !== mine) return;
       busy = false;
       send.textContent = 'Send';
@@ -5157,7 +5244,7 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
   // Show another session. A turn still running in the old one carries on and commits when it settles.
   const switchTo = e => {
     entry = e;
-    rc5_lastShown.set(group, e);
+    if (sid == null) shown.set(group, e);
     session = e.session;
     busy = !!e.busy;
     send.textContent = busy ? 'Steer' : 'Send';
@@ -5173,14 +5260,20 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
     ta.focus();
   };
   // New chat = a new session; the old one stays in the picker (and in the notebook if saved).
-  newchat.addEventListener('click', () => switchTo(rc5_controller.create({ group })));
+  newchat.addEventListener('click', () => switchTo(ctl.create({ group })));
   picker.addEventListener('change', async () => {
-    const e = rc5_controller.entries[Number(picker.value)];
+    const e = ctl.entries[Number(picker.value)];
     if (e && e !== entry) switchTo(await ready(e));
   });
-  saveBox.addEventListener('change', () => rc5_controller.setSaved(entry, saveBox.checked));
+  saveBox.addEventListener('change', () => ctl.setSaved(entry, saveBox.checked));
+  dropBtn.addEventListener('click', () => {
+    if (busy || !entry.orphaned) return;
+    ctl.remove(entry);
+    const next = ctl.entries.find(x => x.group === group && !x.orphaned) ?? ctl.create({ group });
+    ready(next).then(switchTo);
+  });
   // A UI rebuilt mid-turn gets none of that turn's callbacks; catch up when the controller says it settled.
-  const off = rc5_controller.onChange(() => {
+  const off = ctl.onChange(() => {
     session = entry.session;
     bindAsk();
     renderBar();
@@ -5190,28 +5283,122 @@ const _rc5build = function _robocoop5(html,md,modelView,toolLabel,summarizeTurn,
       stop.style.display = 'none';
       setStatus('');
       render();
-    }
+    } else if (!busy) render();  // refresh can adopt a saved log into the shown entry
+    // A compact chat's "full chat" link asks the group's full chat to show its session.
+    const want = sid == null ? shown.get(group) : null;
+    if (want && want !== entry && !busy) ready(want).then(switchTo);
   });
   invalidation?.then(() => {
     off();
+    stateObs?.disconnect();
     askOff?.();
     modelView.removeEventListener('input', onModelInput);
   });
   renderBar();
-  rc5_controller.refresh();
+  ctl.refresh();
+  // A thread's first message (or focus request) is handed over once per page life through rc5_pendingStarts,
+  // so re-running the cell that holds the chat never re-sends it.
+  const pend = sid != null ? rc5_pendingStarts.get(sid) : null;
+  if (pend) rc5_pendingStarts.delete(sid);
+  if (compact) setFolded(pend ? false : folded);
   // A saved or earlier session opens at its latest turn.
-  ready(entry).then(() => { session = entry.session; bindAsk(); render(); });
+  ready(entry).then(() => {
+    session = entry.session;
+    bindAsk();
+    render();
+    const text = pend?.text ?? (start && !count() ? start : null);
+    if (compact && !foldChosen && !pend && !count()) setFolded(false);  // nothing to fold yet
+    if (text && !busy) { ta.value = text; submit(); }
+    else if (pend?.focus) whenShown(() => ta.focus());
+  });
   ta.addEventListener('keydown', ev => {
     if (ev.key === 'Enter' && !ev.shiftKey) {
       ev.preventDefault();
       submit();
     }
   });
-  root.controller = rc5_controller;
+  root.controller = ctl;
+  root.fold = setFolded;
   Object.defineProperty(root, 'active', { get: () => entry });
   return root;
 }
 )};
+const _rc5test_thread = async function _test_robocoop5_session_thread(robocoop5,createSessionController,disposeSession,rc5_pendingStarts,runtime,expect){
+  // Model-free: a fake agent stands in for makeSession, and a private controller keeps the page's picker clean.
+  const sent = [];
+  const agent = () => {
+    const messages = [];
+    return { messages, async send(input) { sent.push(input); messages.push({ role: "user", content: input }, { role: "assistant", content: "re: " + input }); } };
+  };
+  const sleep = ms => new Promise(r => window.setTimeout(r, ms));
+  const until = async (f, what, ms = 5000) => {
+    for (const t0 = Date.now(); !f(); await sleep(20)) if (Date.now() - t0 > ms) throw new Error("timed out waiting for " + what);
+  };
+  const group = "rc5-thread-test", rnd = () => "t" + Math.random().toString(36).slice(2, 8);
+  const id = rnd(), id2 = rnd();
+  const ctl = createSessionController({ runtime });
+  const stops = [];
+  const inv = () => new Promise(r => stops.push(r));
+  const opts = { group, session: id, compact: true, persist: true, height: 280, controller: ctl, agent };
+  const box = document.createElement("div");
+  const logs = [];
+  try {
+    rc5_pendingStarts.set(id, { text: "hello" });
+    const a = robocoop5({ ...opts, invalidation: inv() });
+    await until(() => a.active.saved, "the first turn to save");
+    logs.push(a.active.log);
+    expect(sent).toEqual(["hello"]);
+    expect(a.dataset.rc5Session).toBe(id);
+    expect(a.active.log.meta.id).toBe(id);
+    expect(runtime.mains.get("@" + group + "/" + id)).toBe(a.active.log.module);
+    expect(rc5_pendingStarts.has(id)).toBe(false);
+    // compact: no session bar, model line or new-chat button in the chat
+    expect([...a.querySelectorAll("button")].filter(b => b.textContent === "\u27F2" && b.style.display !== "none").length).toBe(0);
+    expect(a.textContent).not.toContain("model:");
+    expect(a.dataset.rc5Folded).toBe("false");
+    // a re-run of the cell holding the chat shows the same entry and sends nothing
+    const b = robocoop5({ ...opts, invalidation: inv() });
+    await sleep(50);
+    expect(b.active).toBe(a.active);
+    expect(sent.length).toBe(1);
+    b.fold(true);
+    expect(b.dataset.rc5Folded).toBe("true");
+    expect(b.querySelector("[data-rc5-badge]").textContent).toBe("\u{1F4AC} 2");
+    // another id is another entry
+    const c = robocoop5({ ...opts, session: id2, invalidation: inv() });
+    expect(c.active).not.toBe(a.active);
+    expect(ctl.entries.filter(e => e.group === group).length).toBe(2);
+    // a reload: a fresh controller, the chat built before refresh has run; one entry, the turn shown, nothing sent
+    const ctl2 = createSessionController({ runtime });
+    const d = robocoop5({ ...opts, controller: ctl2, invalidation: inv() });
+    await until(() => d.active.session?.messages.length === 2, "the saved turn to load");
+    expect(ctl2.entries.filter(e => e.group === group && (e.id ?? e.log?.meta.id) === id).length).toBe(1);
+    expect(d.dataset.rc5Folded).toBe("true");
+    expect(sent.length).toBe(1);
+    // inside an annotation box: resolve asks the box to set its state, and the chat follows the box
+    box.style.cssText = "position:fixed;left:-10000px;top:0;width:400px";  // off screen: this runs at every boot
+    box.dataset.annId = "x";
+    box.dataset.a2State = "open";
+    const events = [];
+    box.addEventListener("a2-state", ev => { events.push(ev.detail.state); box.dataset.a2State = ev.detail.state; });
+    box.addEventListener("a2-fold", ev => events.push("fold:" + ev.detail.folded));
+    box.append(d);
+    document.body.append(box);
+    d.fold(false);
+    const resolveBtn = [...d.querySelectorAll("button")].find(x => /resolve/.test(x.textContent));
+    await until(() => resolveBtn.style.display !== "none", "the resolve button");
+    resolveBtn.click();
+    await until(() => d.dataset.rc5Resolved === "true", "the resolved state");
+    expect(events).toContain("resolved");
+    expect(d.dataset.rc5Folded).toBe("true");
+    expect(d.querySelector("[data-rc5-badge]").textContent).toBe("\u2713 2");
+    return "session by id, compact, start sent once, re-run sends nothing, reload adopts the saved log, fold badge, resolve via the box";
+  } finally {
+    box.remove();
+    for (const s of stops) s();
+    for (const l of logs) disposeSession(l);
+  }
+};
 const _rc5ctl = function _rc5_controller(createSessionController,runtime,rc5_agents){return(
 // One controller per page, kept in rc5_agents (a cell with no inputs) like makeSession: a write to this
 // module can recompute createSessionController, and a chat rebuilt mid-turn on a NEW controller never
@@ -5239,6 +5426,15 @@ thisModule()
 )};
 const _rc5modv = (G, _) => G.input(_);
 const _rc5heights = function _rc5_heights(){return(
+new Map()
+)};
+const _rc5starts = function _rc5_pendingStarts(){return(
+// session id -> {text} or {focus: true}: what a new thread's chat does when it first opens. Taken on first
+// use, so a reload (or a re-run of the cell holding the chat) finds nothing and sends nothing.
+new Map()
+)};
+const _rc5folds = function _rc5_folds(){return(
+// session id -> folded, for the page's life; a compact chat re-run keeps its fold.
 new Map()
 )};
 const _rc5last = function _rc5_lastShown(){return(
@@ -5325,7 +5521,10 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/robocoop-5-context", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-context.js?v=4")).default));
   $def("_ka663b", "robocoop_5", ["robocoop5","invalidation"], _ka663b);
   $def("_rc5doc", null, ["md"], _rc5doc);
-  $def("_rc5build", "robocoop5", ["html","md","modelView","toolLabel","summarizeTurn","rc5_controller","rc5_agents","rc5_lastShown","rc5_module","keepalive","guardTools","DEFAULT_GROUP","runtime","linkTo","rc5_palette","rc5_unsnapshotted","rc5_pageSheets","rc5_settingsPanel","rc5_heights","defaultWatches"], _rc5build);
+  $def("_rc5build", "robocoop5", ["html","md","modelView","toolLabel","summarizeTurn","rc5_controller","rc5_agents","rc5_lastShown","rc5_module","keepalive","guardTools","DEFAULT_GROUP","runtime","linkTo","rc5_palette","rc5_unsnapshotted","rc5_pageSheets","rc5_settingsPanel","rc5_heights","defaultWatches","rc5_pendingStarts","rc5_folds"], _rc5build);
+  $def("_rc5starts", "rc5_pendingStarts", [], _rc5starts);
+  $def("_rc5folds", "rc5_folds", [], _rc5folds);
+  $def("_rc5test_thread", "test_robocoop5_session_thread", ["robocoop5","createSessionController","disposeSession","rc5_pendingStarts","runtime","expect"], _rc5test_thread);
   $def("_rc5ctl", "rc5_controller", ["createSessionController","runtime","rc5_agents"], _rc5ctl);
   $def("_rc5agents", "rc5_agents", [], _rc5agents);
   $def("_rc5boot", "rc5_boot", ["hostSetup","contextSetup","makeSession","rc5_agents"], _rc5boot);
@@ -5341,6 +5540,9 @@ export default function define(runtime, observer) {
   main.define("createSessionController", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("createSessionController", _));
   main.define("guardTools", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("guardTools", _));
   main.define("DEFAULT_GROUP", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("DEFAULT_GROUP", _));
+  main.define("disposeSession", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("disposeSession", _));
+  main.define("module @tomlarkworthy/jest-expect-standalone", async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone", "@variable"], (_, v) => v.import("expect", _));
   main.define("keepalive", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("keepalive", _));
   main.define("thisModule", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("thisModule", _));
   main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
@@ -49027,14 +49229,15 @@ const _rs_test_storable = function _test_storableMessages(storableMessages,expec
   return "drops prompt, earlier turns and environment blocks; keeps notices";
 };
 
-const _rs_controller = function _createSessionController(listSessions,openSessionLog,createSessionLog,appendTurn,readTurns,latestTurn,turnChain,restoreMessages,saveSession,unsaveSession,storableMessages,DEFAULT_GROUP){return(
+const _rs_controller = function _createSessionController(listSessions,openSessionLog,createSessionLog,appendTurn,readTurns,latestTurn,turnChain,restoreMessages,saveSession,unsaveSession,storableMessages,disposeSession,DEFAULT_GROUP){return(
 // Every session known to this page, and the one path that commits a turn. One controller serves every chat
 // on the page; which session a chat shows is the chat's business. Turns stream into session.messages; the log
 // is written once, when send() settles, so a background turn still commits after its chat switched away.
 // An entry's `head` is the turn its transcript ends at; the next turn is committed as its child.
 // Agents are built by the caller: `use(e, build)` gives an entry a session from `build()`, and a different
 // `build` (another chat's options, or a new makeSession once a key is entered) swaps the agent and keeps
-// the messages.
+// the messages. An entry can be asked for by id (`open`): until refresh() finds a saved log with that id it is a
+// placeholder, and refresh adopts the log into it rather than listing the same session twice.
 ({ runtime }) => {
   const entries = [];
   const listeners = new Set();
@@ -49060,6 +49263,27 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
     e.session.messages.push(...msgs);
     e.head = head;
   };
+  let refreshing = Promise.resolve();
+  const refreshOnce = async () => {
+    for (const s of await listSessions(runtime)) {
+      const group = s.meta.group ?? DEFAULT_GROUP;
+      let e = entries.find(x => x.log?.module === s.module);
+      if (!e && (e = entries.find(x => !x.log && x.id === s.id && x.group === group))) {
+        e.log = await openSessionLog(runtime, s.module);
+        e.title = s.meta.title || e.title;
+        e.created = s.meta.created;
+        if (e.session && !e.busy && !e.session.messages.length) await load(e, undefined);
+      }
+      if (!e) {
+        e = { id: s.id, group, title: s.meta.title || s.id, created: s.meta.created, session: null, build: null, log: await openSessionLog(runtime, s.module), saved: s.saved, busy: false, head: null, turns: new Map() };
+        entries.push(e);
+      }
+      e.saved = s.saved;
+    }
+    entries.sort((a, b) => String(b.created).localeCompare(String(a.created)));
+    emit();
+    return entries;
+  };
   const ctl = {
     entries,
     nodeOf: m => nodeOf.get(m) ?? null,
@@ -49084,24 +49308,28 @@ const _rs_controller = function _createSessionController(listSessions,openSessio
     // Show the branch rooted at turn `id`, at its most recent turn.
     showBranch(e, id) { return ctl.checkout(e, latestTurn(e.turns, id)); },
     onChange(f) { listeners.add(f); return () => listeners.delete(f); },
-    async refresh() {
-      for (const s of await listSessions(runtime)) {
-        let e = entries.find(x => x.log?.module === s.module);
-        if (!e) {
-          e = { id: s.id, group: s.meta.group ?? DEFAULT_GROUP, title: s.meta.title || s.id, created: s.meta.created, session: null, build: null, log: await openSessionLog(runtime, s.module), saved: s.saved, busy: false, head: null, turns: new Map() };
-          entries.push(e);
-        }
-        e.saved = s.saved;
-      }
-      entries.sort((a, b) => String(b.created).localeCompare(String(a.created)));
-      emit();
-      return entries;
-    },
-    create({ group = DEFAULT_GROUP } = {}) {
-      const e = { id: null, group, title: "new session", created: new Date().toISOString(), session: null, build: null, log: null, saved: false, busy: false, head: null, turns: new Map() };
+    // Tell the chats an entry changed outside the controller (another module set a flag such as `orphaned`).
+    touch() { emit(); },
+    // Serialised: every chat calls refresh when it is built, and two overlapping passes both pushed an entry for
+    // the same new module.
+    refresh() { return (refreshing = refreshing.then(refreshOnce, refreshOnce)); },
+    create({ group = DEFAULT_GROUP, id = null } = {}) {
+      const e = { id, group, title: "new session", created: new Date().toISOString(), session: null, build: null, log: null, saved: false, busy: false, head: null, turns: new Map() };
       entries.unshift(e);
       emit();
       return e;
+    },
+    // The entry for session `id` in `group`, or a placeholder that the first send (or refresh) gives a log.
+    open({ group = DEFAULT_GROUP, id }) {
+      return entries.find(x => x.group === group && (x.id ?? x.log?.meta.id) === id) ?? ctl.create({ group, id });
+    },
+    // Delete a session: its log module leaves mains and loses its cells.
+    remove(e) {
+      if (e.busy) throw new Error("session is busy");
+      if (e.log) disposeSession(e.log);
+      const i = entries.indexOf(e);
+      if (i >= 0) entries.splice(i, 1);
+      emit();
     },
     async use(e, build) {
       if (e.session && e.build === build) return e;
@@ -49227,6 +49455,42 @@ const _rs_test_controller = async function _test_session_controller(createSessio
     for (const l of logs) disposeSession(l);
   }
 };
+const _rs_test_open = async function _test_session_controller_open_by_id(createSessionController,runtime,expect){
+  const fake = () => {
+    const messages = [];
+    return { messages, async send(input) { messages.push({ role: "user", content: input }, { role: "assistant", content: "re: " + input }); } };
+  };
+  const group = "rc5-open-test", id = "t" + Math.random().toString(36).slice(2, 8);
+  const a = createSessionController({ runtime });
+  const e = a.open({ group, id });
+  expect(a.open({ group, id })).toBe(e);
+  expect(a.open({ group: "other-" + group, id })).not.toBe(e);
+  await a.use(e, fake);
+  try {
+    await a.send(e, "first");
+    expect(e.log.meta.id).toBe(id);
+    await a.setSaved(e, true);
+    expect(runtime.mains.get("@" + group + "/" + id)).toBe(e.log.module);
+    // a reload: the chat asks for the id before refresh has run, then refresh finds the saved log
+    const b = createSessionController({ runtime });
+    const early = b.open({ group, id });
+    await b.use(early, fake);
+    expect(early.session.messages).toEqual([]);
+    await Promise.all([b.refresh(), b.refresh()]);
+    expect(b.entries.filter(x => x.group === group && (x.id ?? x.log?.meta.id) === id).length).toBe(1);
+    expect(early.log.module).toBe(e.log.module);
+    expect(early.session.messages.map(m => m.content)).toEqual(["first", "re: first"]);
+    // remove disposes the log: out of mains, and a fresh controller no longer finds it
+    b.remove(early);
+    expect(runtime.mains.has("@" + group + "/" + id)).toBe(false);
+    const c = createSessionController({ runtime });
+    await c.refresh();
+    expect(c.entries.some(x => x.id === id && x.group === group)).toBe(false);
+    return "open by id, placeholder adopted by refresh (one entry), concurrent refreshes, remove";
+  } finally {
+    if (runtime.mains.get("@" + group + "/" + id)) runtime.mains.delete("@" + group + "/" + id);
+  }
+};
 
 const _rs_guardTools = function _guardTools(runtime,SESSION_KIND){return(
 // Wraps an agent's tools with its hooks: `beforeTool({name, args})` may refuse a call with a reason the model
@@ -49345,7 +49609,8 @@ export default function define(runtime, observer) {
   $def("_rs_unsave", "unsaveSession", ["rehomeSession"], _rs_unsave);
   $def("_rs_dispose", "disposeSession", [], _rs_dispose);
   $def("_rs_storable", "storableMessages", [], _rs_storable);
-  $def("_rs_controller", "createSessionController", ["listSessions","openSessionLog","createSessionLog","appendTurn","readTurns","latestTurn","turnChain","restoreMessages","saveSession","unsaveSession","storableMessages","DEFAULT_GROUP"], _rs_controller);
+  $def("_rs_controller", "createSessionController", ["listSessions","openSessionLog","createSessionLog","appendTurn","readTurns","latestTurn","turnChain","restoreMessages","saveSession","unsaveSession","storableMessages","disposeSession","DEFAULT_GROUP"], _rs_controller);
+  $def("_rs_test_open", "test_session_controller_open_by_id", ["createSessionController","runtime","expect"], _rs_test_open);
   $def("_rs_test_peek", "test_peekValues", ["peekValues","defineLiteral","realize","runtime","expect"], _rs_test_peek);
   $def("_rs_test_controller", "test_session_controller", ["createSessionController","disposeSession","runtime","expect"], _rs_test_controller);
   $def("_rs_guardTools", "guardTools", ["runtime","SESSION_KIND"], _rs_guardTools);
@@ -51217,13 +51482,148 @@ export default function define(runtime, observer) {
   return main;
 }</script>
 
+<script id="@tomlarkworthy/robocoop-5-entrances" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _ent_doc = function _doc(md){return(
+md`# robocoop-5 entrances
+
+Two ways to start a robocoop-5 session from where the work is, and the thread UI both use. \`rc5Thread\` is the robocoop-5 chat in compact mode on one session, \`@rc5-threads/<id>\`, saved after its first turn. It folds to a 💬 N badge; a click opens it. Design: \`plan/rc5-entrances.md\`.
+
+A thread whose annotation or prompt cell was deleted is kept and flagged in the full chat's session picker as orphaned, with a delete button.`
+)};
+const _ent_group = function _THREAD_GROUP(){return(
+"rc5-threads"
+)};
+const _ent_ctx = function _threadContext(runtime){return(
+// What the agent is told about where the thread sits: the context baked into the cell at creation, plus the
+// anchored cell's definition as it is now (a read, not a copy taken when the thread started).
+ctx => {
+  const out = { ...ctx };
+  if (ctx?.module && ctx?.cell) {
+    const mod = runtime.mains?.get(ctx.module);
+    const v = mod && [...runtime._variables].find(x => x._module === mod && x._name === ctx.cell && x._type === 1);
+    if (v) out.cellDefinition = String(v._definition).slice(0, 2000);
+  }
+  return out;
+}
+)};
+const _ent_thread = function _rc5Thread(robocoop5,defaultWatches,threadContext,THREAD_GROUP){return(
+// The chat a thread cell holds. Generated cells call this rather than robocoop5 with every option spelled
+// out, so a change here reaches threads already written. Other options pass through to robocoop5.
+({ id, context = {}, invalidation = null, ...rest } = {}) => robocoop5({
+  group: THREAD_GROUP,
+  session: id,
+  compact: true,
+  persist: true,
+  height: 280,
+  watches: () => [...defaultWatches(), { label: "thread", read: () => threadContext(context) }],
+  invalidation,
+  ...rest
+})
+)};
+const _ent_home = function _threadHasHome(runtime){return(
+// A thread lives in an annotation (annotation_<id>) or a prompt cell (prompt_<id>), in any module.
+id => {
+  const names = new Set(["annotation_" + id, "prompt_" + id]);
+  for (const v of runtime._variables) if (v._type === 1 && names.has(v._name)) return true;
+  return false;
+}
+)};
+const _ent_mark = function _markOrphans(threadHasHome,THREAD_GROUP){return(
+// Flags each thread session of `ctl` whose cell is gone; returns whether any flag changed.
+ctl => {
+  let changed = false;
+  for (const e of ctl.entries) {
+    const id = e.group === THREAD_GROUP ? e.id ?? e.log?.meta.id : null;
+    if (!id) continue;
+    const o = !threadHasHome(id);
+    if (!!e.orphaned !== o) { e.orphaned = o; changed = true; }
+  }
+  return changed;
+}
+)};
+const _ent_orphans = function _rc5_threadOrphans(rc5_controller,markOrphans,onCodeChange,invalidation){
+  // Re-checked when code changes (a cell deleted) or the session list changes; touch() repaints the pickers.
+  let t = null;
+  const check = () => { if (markOrphans(rc5_controller)) rc5_controller.touch(); };
+  const soon = () => { if (!t) t = window.setTimeout(() => { t = null; check(); }, 300); };
+  const offCode = onCodeChange(soon);
+  const offCtl = rc5_controller.onChange(soon);
+  invalidation.then(() => { offCode(); offCtl(); window.clearTimeout(t); });
+  check();
+  return "watching " + rc5_controller.entries.length + " sessions for orphaned threads";
+};
+const _ent_test_thread = async function _test_rc5Thread(rc5Thread,createSessionController,runtime,THREAD_GROUP,expect){
+  const ctl = createSessionController({ runtime });
+  const agent = () => ({ messages: [], async send() {} });
+  let stop;
+  const chat = rc5Thread({ id: "tt1", context: { module: "@x/y", cell: "c" }, controller: ctl, agent, invalidation: new Promise(r => stop = r) });
+  try {
+    expect(chat.dataset.rc5Session).toBe("tt1");
+    expect(chat.dataset.rc5Group).toBe(THREAD_GROUP);
+    expect(chat.querySelector("[data-rc5-badge]")).toBeTruthy();
+    expect(chat.active.group).toBe(THREAD_GROUP);
+    return "compact chat on session tt1 in " + THREAD_GROUP;
+  } finally { stop(); }
+};
+const _ent_test_orphans = function _test_markOrphans(markOrphans,createSessionController,runtime,THREAD_GROUP,expect){
+  const ctl = createSessionController({ runtime });
+  const id = "o" + Math.random().toString(36).slice(2, 8);
+  const e = ctl.open({ group: THREAD_GROUP, id });
+  const other = ctl.open({ group: "not-threads", id });
+  const m = runtime.module();
+  try {
+    expect(markOrphans(ctl)).toBe(true);
+    expect(e.orphaned).toBe(true);
+    expect(other.orphaned).toBe(undefined);
+    m.variable().define("prompt_" + id, [], () => 1);
+    expect(markOrphans(ctl)).toBe(true);
+    expect(e.orphaned).toBe(false);
+    expect(markOrphans(ctl)).toBe(false);
+    return "flagged without a cell, cleared by prompt_<id>, other groups untouched";
+  } finally {
+    for (const v of [...runtime._variables]) if (v._module === m) v.delete();
+  }
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+
+  main.define("module @tomlarkworthy/robocoop-5", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5.js?v=4")).default));
+  main.define("module @tomlarkworthy/robocoop-5-sessions", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-sessions.js?v=4")).default));
+  main.define("module @tomlarkworthy/runtime-sdk", async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
+  main.define("module @tomlarkworthy/jest-expect-standalone", async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
+  $def("_ent_doc", null, ["md"], _ent_doc);
+  $def("_ent_group", "THREAD_GROUP", [], _ent_group);
+  $def("_ent_ctx", "threadContext", ["runtime"], _ent_ctx);
+  $def("_ent_thread", "rc5Thread", ["robocoop5","defaultWatches","threadContext","THREAD_GROUP"], _ent_thread);
+  $def("_ent_home", "threadHasHome", ["runtime"], _ent_home);
+  $def("_ent_mark", "markOrphans", ["threadHasHome","THREAD_GROUP"], _ent_mark);
+  $def("_ent_orphans", "rc5_threadOrphans", ["rc5_controller","markOrphans","onCodeChange","invalidation"], _ent_orphans);
+  $def("_ent_test_thread", "test_rc5Thread", ["rc5Thread","createSessionController","runtime","THREAD_GROUP","expect"], _ent_test_thread);
+  $def("_ent_test_orphans", "test_markOrphans", ["markOrphans","createSessionController","runtime","THREAD_GROUP","expect"], _ent_test_orphans);
+  main.define("robocoop5", ["module @tomlarkworthy/robocoop-5", "@variable"], (_, v) => v.import("robocoop5", _));
+  main.define("defaultWatches", ["module @tomlarkworthy/robocoop-5", "@variable"], (_, v) => v.import("defaultWatches", _));
+  main.define("rc5_controller", ["module @tomlarkworthy/robocoop-5", "@variable"], (_, v) => v.import("rc5_controller", _));
+  main.define("createSessionController", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("createSessionController", _));
+  main.define("runtime", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("runtime", _));
+  main.define("onCodeChange", ["module @tomlarkworthy/runtime-sdk", "@variable"], (_, v) => v.import("onCodeChange", _));
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone", "@variable"], (_, v) => v.import("expect", _));
+  return main;
+}</script>
+
 <!-- Bootloader -->
 <script id="bootconf.json"
         type="text/plain"
         data-mime="application/json"
 >
 {
-  "mains": ["@tomlarkworthy/lopepage-2","@tomlarkworthy/robocoop-5","@tomlarkworthy/robocoop-5-engine","@tomlarkworthy/robocoop-5-srctools","@tomlarkworthy/inputs-reference","@tomlarkworthy/save-in-place"],
+  "mains": ["@tomlarkworthy/lopepage-2","@tomlarkworthy/robocoop-5","@tomlarkworthy/robocoop-5-engine","@tomlarkworthy/robocoop-5-srctools","@tomlarkworthy/robocoop-5-entrances","@tomlarkworthy/inputs-reference","@tomlarkworthy/save-in-place"],
   "hash": "#view=R100(S75(@tomlarkworthy/robocoop-5),S25(@tomlarkworthy/robocoop-5-srctools))",
   "headless": true
 }
