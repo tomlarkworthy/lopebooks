@@ -9492,7 +9492,7 @@ const _a2cellEditor = function _a2cellEditor(runtime,importShim){
   })());
 };
 
-const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeChange,invalidation,$1)
+const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeChange,invalidation,$1,a2KindsRef)
 {
   // `$1` is `viewof a2Self`: its getter starts the search and fires `input` when it lands.
   const self = $1.value || await window.Promise.race([
@@ -9636,6 +9636,13 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
 
   const normalise = await self.value("annotation");
 
+  // A kind (plugin set "annotate-kinds") supplies the note's source and the imports it needs in the
+  // annotated module. "note" is the built-in md note. The kind's id is kept in the record.
+  const kindOf = (id) => (id && id !== "note" ? a2KindsRef.all().find((k) => k.id === id) : null) || null;
+  const runImports = (mod, kind) => {
+    for (const im of (kind && kind.imports) || []) ensureImport(mod, "module " + im.module, im.name, im.load);
+  };
+
   // ---- discovery: ask the runtime, don't keep an index -------------------
   const idFromName = (n) => (n.indexOf("annotation_") === 0 ? n.slice(11) : n);
   const cellsInGraph = () => {
@@ -9750,8 +9757,15 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
       const mod = moduleNamed(home) || fallback;
       const varName = "annotation_" + id;
       const f = window.Object.assign({}, fields || {});
-      const src = f.src;
+      let src = f.src;
       delete f.src;
+      const kind = kindOf(f.kind);
+      if (kind) {
+        f.kind = kind.id;
+        runImports(mod, kind);
+        src = src || kind.note({ id, anchor, module: home });
+        f.box = window.Object.assign({ dx: 120, dy: -80, w: 240 }, kind.box || {}, f.box || {});
+      } else delete f.kind;
       const spec = window.Object.assign({ anchor: anchor }, f,
         { createdAt: new window.Date().toISOString() });
       defineSource(mod, noteName(varName), src || NOTE_SRC);
@@ -9759,6 +9773,10 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
       const a = window.Object.assign({}, normalise(spec),
         { id, home, cell: noteName(varName), varName });
       commit(store.all().concat([a]));
+      if (kind && kind.created) {
+        try { kind.created({ id, anchor, module: home, varName }); }
+        catch (e) { window.console.warn("annotate kind " + kind.id + ": " + e.message); }
+      }
       return a;
     },
     patch: (id, fields) => {
@@ -9781,6 +9799,7 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
         const nv = lookup(fromMod, rec.cell);
         if (nv) {
           ensureMd(toMod);
+          runImports(toMod, kindOf(rec.kind));
           defineIn(toMod, rec.cell, [...(nv._inputs || [])].map((i) => i._name), nv._definition);
           deleteCell(fromMod, rec.cell);
         }
@@ -9797,6 +9816,7 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
       deleteCell(mod, store.varOf(a));
       commit(store.all().filter((x) => x.id !== id));
     },
+    kindOf,
     refresh: () => refresh(true)
   };
 
@@ -9824,7 +9844,7 @@ const _a2Store = async function _a2Store(runtime,$0,compile,importShim,onCodeCha
   return store;
 };
 
-const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,invalidation,observe,Inspector,cellEditor,decompile,$1,isOnObservableCom)
+const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,invalidation,observe,Inspector,cellEditor,decompile,$1,isOnObservableCom,a2KindsRef)
 {
   const doc = window.document;
   const view = $0;
@@ -9867,7 +9887,7 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
     status.isArmed = () => false;
     status.disarm = () => {};
     // turning the layer on rebuilds this cell; the new instance picks the intent up
-    status.arm = () => { $1.__a2armOnEnable = true; enable(); };
+    status.arm = (kind) => { $1.__a2armOnEnable = kind || "note"; enable(); };
     status.toggle = () => enable();
     return status;
   }
@@ -10128,6 +10148,18 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
 
   const wire = (id, p) => {
     p.del.addEventListener("click", () => store.remove(id));
+    // A note may drive its own box: `a2-state` sets the record's state ("resolved" dims the box), and
+    // `a2-fold` shrinks the box to the note alone, placed at the anchor with no bar or leader.
+    p.box.addEventListener("a2-state", (ev) => {
+      ev.stopPropagation();
+      const st = ev.detail && ev.detail.state;
+      if (typeof st === "string") store.patch(id, { state: st });
+    });
+    p.box.addEventListener("a2-fold", (ev) => {
+      ev.stopPropagation();
+      p.folded = !!(ev.detail && ev.detail.folded);
+      schedule();
+    });
     p.edit.addEventListener("click", (ev) => {
       ev.stopPropagation();
       if (p.editing) closeEditor(p); else openEditor(id, p);
@@ -10285,11 +10317,18 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
 
       const sel = a.id === selectedId;
       const reanchoring = a.id === armedFor;
+      const folded = !!p.folded && !p.editing && !reanchoring;
+      p.box.dataset.a2State = a.state || "open";
+      p.box.dataset.a2Folded = String(folded);
+      p.bar.style.display = folded ? "none" : "";
+      p.grip.style.display = folded ? "none" : "";
+      p.box.style.background = folded ? "transparent" : BG;
+      p.box.style.boxShadow = folded ? "none" : "0 2px 10px rgba(0,0,0,.18)";
       const w = p.editing ? window.Math.max((a.box && a.box.w) || 240, 460) : (a.box && a.box.w) || 240;
-      p.box.style.width = w + "px";
+      p.box.style.width = folded ? "max-content" : w + "px";
       // An explicit height means the note scrolls inside the box; without one the box
       // fits its note, which is the default.
-      const h = a.box && a.box.h ? (p.editing ? window.Math.max(a.box.h, 320) : a.box.h) : null;
+      const h = a.box && a.box.h && !folded ? (p.editing ? window.Math.max(a.box.h, 320) : a.box.h) : null;
       p.box.style.height = h ? h + "px" : "";
       p.body.style.flex = h ? "1 1 auto" : "";
       p.body.style.maxHeight = h ? "none" : "340px";
@@ -10297,13 +10336,17 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
       // text and scrolls with it; the record keeps the offset the user dragged.
       const bw = p.box.offsetWidth || w;
       const bh = p.box.offsetHeight || 60;
-      const bx = window.Math.max(4, window.Math.min(ax + a.box.dx, dim.w - bw - 4));
-      const by = window.Math.max(4, window.Math.min(ay + a.box.dy, dim.h - bh - 4));
+      // Folded, the note sits at the anchor: after the last line of a quote, else beside the point.
+      const lastRect = res.kind === "rects" && res.rects.length ? res.rects[res.rects.length - 1] : null;
+      const fx = lastRect ? lastRect.right + O.x + 4 : ax + 6;
+      const fy = lastRect ? lastRect.top + O.y + (lastRect.height - bh) / 2 : ay - bh / 2;
+      const bx = window.Math.max(4, window.Math.min(folded ? fx : ax + a.box.dx, dim.w - bw - 4));
+      const by = window.Math.max(4, window.Math.min(folded ? fy : ay + a.box.dy, dim.h - bh - 4));
       p.box.style.left = bx + "px";
       p.box.style.top = by + "px";
       p.box.style.zIndex = sel ? "2" : "1";
-      p.box.style.opacity = res.stale ? "0.65" : "1";
-      p.box.style.borderWidth = sel || reanchoring ? "2px" : "1px";
+      p.box.style.opacity = a.state === "resolved" ? "0.5" : res.stale ? "0.65" : "1";
+      p.box.style.borderWidth = folded ? "0" : sel || reanchoring ? "2px" : "1px";
       p.box.style.borderColor = reanchoring || res.adrift ? "#b45309" : ACCENT;
       p.box.style.borderStyle = res.rung === "quote" || res.rung === "svg" || res.rung === "image" || res.rung === "path" ? "solid" : "dashed";
       p.line.setAttribute("stroke-width", sel || reanchoring ? "2.5" : "1.5");
@@ -10316,7 +10359,7 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
       p.line.setAttribute("stroke", drifted ? "#b45309" : ACCENT);
       p.head.setAttribute("fill", drifted ? "#b45309" : ACCENT);
       // adrift on the page itself: there is nothing left to point at
-      const noTarget = res.rung === "page";
+      const noTarget = res.rung === "page" || folded;
       p.line.style.display = noTarget ? "none" : "";
       p.head.style.display = noTarget ? "none" : "";
       p.edit.style.color = p.editing ? ACCENT : FAINT;
@@ -10364,7 +10407,7 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
     }
 
     setStatus(armedFor === "new"
-      ? "annotating · select text or click a target"
+      ? "annotating" + (armedKind !== "note" ? " (" + armedKind + ")" : "") + " · select text or click a target"
       : armedFor
       ? "re-anchoring " + armedFor + " · select text or click a target"
       : list.length + " annotation" + (list.length === 1 ? "" : "s") +
@@ -10424,14 +10467,29 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
   for (const pane of doc.querySelectorAll(A.PANE_SEL)) ro.observe(pane);
 
   // ---- selection chip (text surface) -------------------------------------
-  const chip = doc.createElement("button");
-  chip.setAttribute("data-a2-chip", "");
-  chip.textContent = "✎ annotate";
-  chip.style.cssText =
-    "position:absolute; display:none; pointer-events:auto; cursor:pointer; border:1px solid " + ACCENT +
-    "; border-radius:12px; background:" + BG + "; color:" + ACCENT +
-    "; font:11px system-ui, sans-serif; padding:3px 9px; box-shadow:0 2px 8px rgba(0,0,0,.2)";
+  // One button per kind; the built-in note's is `data-a2-chip`.
+  const chip = doc.createElement("div");
+  chip.setAttribute("data-a2-chips", "");
+  chip.style.cssText = "position:absolute; display:none; pointer-events:auto; gap:4px";
   root.appendChild(chip);
+  const chipButton = (kind) => {
+    const b = doc.createElement("button");
+    if (kind.id === "note") { b.setAttribute("data-a2-chip", ""); b.textContent = "✎ annotate"; }
+    else { b.setAttribute("data-a2-chip-kind", kind.id); b.textContent = (kind.icon || "") + " " + (kind.chip || kind.label); }
+    b.style.cssText =
+      "cursor:pointer; border:1px solid " + ACCENT + "; border-radius:12px; background:" + BG + "; color:" + ACCENT +
+      "; font:11px system-ui, sans-serif; padding:3px 9px; box-shadow:0 2px 8px rgba(0,0,0,.2); white-space:nowrap";
+    b.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault(); // keep the selection alive through the press
+      ev.stopPropagation();
+      const anchor = A.describeSelection(doc.getSelection());
+      hideChip();
+      const sel = doc.getSelection();
+      if (sel) sel.removeAllRanges();
+      if (anchor) select((store.create(anchor, kind.id === "note" ? undefined : { kind: kind.id }) || {}).id);
+    });
+    return b;
+  };
   const hideChip = () => { chip.style.display = "none"; };
   let chipTimer = null;
   const onSelectionChange = () => {
@@ -10449,23 +10507,16 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
       const rects = sel.getRangeAt(0).getClientRects();
       if (!rects.length) return hideChip();
       const last = rects[rects.length - 1];
-      chip.style.left = window.Math.min(last.right + 6, window.innerWidth - 110) + "px";
+      const kinds = a2KindsRef.all();
+      chip.replaceChildren(...kinds.map(chipButton));
+      chip.style.left = window.Math.min(last.right + 6, window.innerWidth - 110 * kinds.length) + "px";
       chip.style.top = window.Math.max(4, last.top - 30) + "px";
-      chip.style.display = "block";
+      chip.style.display = "flex";
     }, 150);
   };
   doc.addEventListener("selectionchange", onSelectionChange);
   const chipScrollHide = () => hideChip();
   doc.addEventListener("scroll", chipScrollHide, true);
-  chip.addEventListener("pointerdown", (ev) => {
-    ev.preventDefault(); // keep the selection alive through the press
-    ev.stopPropagation();
-    const anchor = A.describeSelection(doc.getSelection());
-    hideChip();
-    const sel = doc.getSelection();
-    if (sel) sel.removeAllRanges();
-    if (anchor) select((store.create(anchor) || {}).id);
-  });
 
   // ---- armed point placement (svg / image / element) ----------------------
   // No affordance of its own: arming is a verb the notebook's own chrome offers (burger
@@ -10477,6 +10528,7 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
   // otherwise open the target cell's inline editor and re-apply its definition.
   const swallow = (e) => { e.preventDefault(); e.stopPropagation(); };
   let armedFor = null;
+  let armedKind = "note";
   let downPt = null;
 
   const armedDown = (ev) => {
@@ -10488,6 +10540,7 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
     const start = downPt;
     downPt = null;
     const target = armedFor;
+    const kind = armedKind;
     doc.addEventListener("click", swallow, { capture: true, once: true });
     window.setTimeout(() => doc.removeEventListener("click", swallow, true), 400);
     disarm();
@@ -10497,7 +10550,7 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
     if (anchor && sel) sel.removeAllRanges();
     if (!anchor) anchor = A.describePoint(start.x, start.y, start.hit);
     if (!anchor) return;
-    if (target === "new") select((store.create(anchor) || {}).id);
+    if (target === "new") select((store.create(anchor, kind === "note" ? undefined : { kind }) || {}).id);
     else store.patch(target, { anchor });
   };
 
@@ -10510,9 +10563,10 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
     doc.documentElement.style.cursor = "";
     schedule();
   };
-  const arm = (target) => {
+  const arm = (target, kind) => {
     if (armedFor) disarm();
     armedFor = target;
+    armedKind = kind || "note";
     hideChip();
     doc.documentElement.style.cursor = "crosshair";
     doc.addEventListener("pointerdown", armedDown, true);
@@ -10567,7 +10621,8 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
 
   status.enabled = true;
   status.isArmed = () => armedFor !== null;
-  status.arm = () => (armedFor ? disarm() : arm("new"));
+  status.armedKind = () => (armedFor ? armedKind : null);
+  status.arm = (kind) => (armedFor === "new" && armedKind === (kind || "note") ? disarm() : arm("new", kind));
   status.disarm = () => disarm();
   status.toggle = () => {
     $1.value = false;
@@ -10576,7 +10631,11 @@ const _a2Layer = function _a2Layer($0,annotationsEnabled,a2Anchors,a2Store,inval
   };
 
   render();
-  if ($1.__a2armOnEnable) { $1.__a2armOnEnable = false; arm("new"); }
+  if ($1.__a2armOnEnable) {
+    const k = $1.__a2armOnEnable;
+    $1.__a2armOnEnable = false;
+    arm("new", typeof k === "string" ? k : "note");
+  }
   return status;
 };
 
@@ -10766,22 +10825,28 @@ Inputs.button("rewrite the paragraph", {value: 0, reduce: (n) => n + 1})
 
 const _a2vshvf = (G, _) => G.input(_);
 
-const _a2MenuItem = function _a2MenuItem(plugins,a2Layer,invalidation)
+const _a2MenuItem = function _a2MenuItem(plugins,a2Layer,a2Kinds,a2KindsRef,invalidation)
 {
   // Annotating is a global verb, so it belongs in the page's own chrome rather than in a
   // floating button annotate paints over the document. Registers straight onto the
-  // shared plugin-registry "lp2-menu" set — no import of lopepage-2.
-  plugins.add("lp2-menu", {
+  // shared plugin-registry "lp2-menu" set — no import of lopepage-2. With more than one
+  // kind registered, the item opens a submenu with one entry per kind.
+  const kinds = a2KindsRef.sorted([a2KindsRef.builtin, ...a2Kinds]);
+  const item = {
     id: "annotate",
     order: 4,
     label: "Annotate",
-    svg: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.4 3.4h11.2v7.2H6.9L3.9 13.2v-2.6H2.4Z"/><path d="M5.2 6.1h5.6M5.2 8.2h3.4"/></svg>',
-    action: () => a2Layer.arm()
-  }, { invalidation });
-  return "registered: annotate menu item";
+    svg: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.4 3.4h11.2v7.2H6.9L3.9 13.2v-2.6H2.4Z"/><path d="M5.2 6.1h5.6M5.2 8.2h3.4"/></svg>'
+  };
+  if (kinds.length > 1) item.children = kinds.map((k) => ({
+    id: "annotate-" + k.id, label: k.label, svg: k.svg || k.icon || "", action: () => a2Layer.arm(k.id)
+  }));
+  else item.action = () => a2Layer.arm();
+  plugins.add("lp2-menu", item, { invalidation });
+  return "registered: annotate menu item (" + kinds.map((k) => k.id).join(", ") + ")";
 };
 
-const _a2Commands = function _a2Commands(plugins,a2Layer,invalidation)
+const _a2Commands = function _a2Commands(plugins,a2Layer,a2KindsRef,invalidation)
 {
   // ⌘K provider. Commands carry an `action`, so they run the verb instead of navigating.
   const WORDS = ["annotate", "annotation", "note", "comment", "callout", "highlight"];
@@ -10798,15 +10863,17 @@ const _a2Commands = function _a2Commands(plugins,a2Layer,invalidation)
     if (!score) return [];
     const on = a2Layer.enabled !== false;
     const armed = typeof a2Layer.isArmed === "function" && a2Layer.isArmed();
+    const armedKind = typeof a2Layer.armedKind === "function" ? a2Layer.armedKind() : null;
+    const kinds = a2KindsRef.all();
     return [
-      {
-        label: "\uD83D\uDCAC Annotate",
+      ...kinds.map((k, i) => ({
+        label: k.id === "note" ? "\uD83D\uDCAC Annotate" : (k.icon || "\uD83D\uDCAC") + " Annotate: " + k.label,
         module: "annotate",
-        hint: armed ? "armed — select text or click a target" : "select text or click a target",
-        badge: armed ? "armed" : null,
-        action: () => a2Layer.arm(),
-        score: score
-      },
+        hint: armed && armedKind === k.id ? "armed — select text or click a target" : "select text or click a target",
+        badge: armed && armedKind === k.id ? "armed" : null,
+        action: () => a2Layer.arm(k.id),
+        score: score - i
+      })),
       {
         label: "\uD83D\uDCAC Annotations: " + (on ? "hide the layer" : "show the layer"),
         module: "annotate",
@@ -10817,6 +10884,39 @@ const _a2Commands = function _a2Commands(plugins,a2Layer,invalidation)
   };
   plugins.add("lopecode_commands", provider, { invalidation });
   return "registered: annotate commands";
+};
+
+const _a2Kinds = function _a2Kinds(plugins){return(
+// Ways to start an annotation, registered by other notebooks on the "annotate-kinds" set:
+//   plugins.add("annotate-kinds", {
+//     id, label, icon, order,                      // menu, ⌘K and selection-chip entries
+//     box: { w, h },                               // merged into the new record's box
+//     imports: [{ name, module, load }],           // defined in the annotated module; load's source must
+//                                                  // contain the module URL as a string literal
+//     note: ({ id, anchor, module }) => "expr",    // the note cell's source (right-hand side)
+//     created: ({ id, anchor, module, varName }) => {}  // optional, after both cells exist
+//   }, { invalidation })
+plugins.get("annotate-kinds")
+)};
+
+const _a2KindsRef = function _a2KindsRef(){return(
+// A constant holder a2Store and a2Layer read, so registering a kind does not rebuild the layer.
+{
+  builtin: { id: "note", label: "Note", icon: "\u270E", order: 0 },
+  registered: [],
+  sorted(ks) {
+    const seen = new Set();
+    return ks.filter((k) => k && k.id && !seen.has(k.id) && seen.add(k.id))
+      .sort((a, b) => (a.order || 0) - (b.order || 0));
+  },
+  all() { return this.sorted([this.builtin, ...this.registered]); }
+}
+)};
+
+const _a2KindsSync = function _a2KindsSync(a2Kinds,a2KindsRef)
+{
+  a2KindsRef.registered = [...a2Kinds];
+  return a2KindsRef.all().map((k) => k.id);
 };
 
 export default function define(runtime, observer) {
@@ -10869,14 +10969,17 @@ export default function define(runtime, observer) {
   $def("_a2selfv", "a2Self", ["Generators", "viewof a2Self"], _a2selfv);
   $def("_a2ced", "cellEditor", ["runtime", "importShim"], _a2cellEditor);
   $def("_a2store", "a2Store", ["runtime", "viewof annotations", "compile", "importShim",
-                               "onCodeChange", "invalidation", "viewof a2Self"], _a2Store);
+                               "onCodeChange", "invalidation", "viewof a2Self", "a2KindsRef"], _a2Store);
   $def("_a2docLayer", null, ["md"], _a2docLayer);
   $def("_a2layer", "a2Layer", ["viewof annotations", "annotationsEnabled", "a2Anchors", "a2Store", "invalidation",
                                "observe", "Inspector", "cellEditor", "decompile",
-                               "viewof annotationsEnabled", "isOnObservableCom"], _a2Layer);
+                               "viewof annotationsEnabled", "isOnObservableCom", "a2KindsRef"], _a2Layer);
   $def("_a2docPlugins", null, ["md"], _a2docPlugins);
-  $def("_a2menu", "a2MenuItem", ["plugins", "a2Layer", "invalidation"], _a2MenuItem);
-  $def("_a2cmds", "a2Commands", ["plugins", "a2Layer", "invalidation"], _a2Commands);
+  $def("_a2menu", "a2MenuItem", ["plugins", "a2Layer", "a2Kinds", "a2KindsRef", "invalidation"], _a2MenuItem);
+  $def("_a2cmds", "a2Commands", ["plugins", "a2Layer", "a2KindsRef", "invalidation"], _a2Commands);
+  $def("_a2kinds", "a2Kinds", ["plugins"], _a2Kinds);
+  $def("_a2kindsref", "a2KindsRef", [], _a2KindsRef);
+  $def("_a2kindssync", "a2KindsSync", ["a2Kinds", "a2KindsRef"], _a2KindsSync);
   $def("_a2docTourCells", null, ["md"], _a2docTourCells);
   $def("_a2tourTitle", "annotation_tour_title", ["annotation"], _a2tourTitle);
   $def("_a2tourTitleNote", "annotation_tour_title_note", ["md"], _a2tourTitleNote);
