@@ -8083,13 +8083,23 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       const val = v._value;
       snap.set(key, v._error != null ? { err: String(v._error?.message ?? v._error) }
         : val instanceof Element ? { el: fingerprint(val), node: val }
-        : { s: summary(val, 300), v });
+        : { s: summary(val, 300), v, x: val });
     }
     return snap;
   };
   const BAD = /NaN|undefined|\[object \w+\]/;
   const diffOf = (a, b) => {
     if (a.err || b.err) return a.err === b.err ? null : ['error: ' + (a.err || 'none') + ' → ' + (b.err || 'none')];
+    // rc5-train 20260929-0620-m46: two theme css arrays share their first 300 chars; the switch read as NO VISIBLE EFFECT
+    if (a.s !== undefined && a.s === b.s && a.x !== b.x && a.x && b.x && typeof a.x === 'object') {
+      const full = x => { try { return JSON.stringify(x, (k, y) => typeof y === 'function' ? String(y) : y instanceof Element ? '<' + y.tagName.toLowerCase() + '>' : y); } catch (e) { return null; } };
+      const A = full(a.x), B = full(b.x);
+      if (A == null || B == null || A === B) return null;
+      let i = 0;
+      while (i < A.length && A[i] === B[i]) i++;
+      const at = Math.max(0, i - 30);
+      return ['(same start, differs at char ' + i + ') …' + oneLine(A.slice(at, i + 60)) + ' → …' + oneLine(B.slice(at, i + 60))];
+    }
     if (a.s !== undefined || b.s !== undefined) return a.s === b.s ? null : [oneLine(a.s ?? '(element)').slice(0, 120) + ' → ' + oneLine(b.s ?? '(element)').slice(0, 120)];
     const lines = [];
     for (const [k, x] of b.el) { const y = a.el.get(k); if (!y) lines.push('+ ' + x.tag + ' ' + x.key + '=' + x.v); else if (y.v !== x.v) lines.push(x.tag + ' ' + x.key + ': ' + y.v.slice(0, 60) + ' → ' + x.v.slice(0, 60)); }
@@ -8154,6 +8164,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const pad = value === undefined && !button && !act && !el.matches('input, select, textarea') && !el.querySelector('input, select, textarea') ? el : null;
     if (value === undefined && !button && !pad && !act) return { out: c.name + ' is not a button; pass `value`. Current value: ' + summary(el.value, 200), dead: false };
     const before = snapshotOf(mod);
+    const promisesBefore = new Map(varsOf(mod).map(v => [v, v._promise]));
     const t0 = performance.now();
     const raw = el.value;
     const was = summary(raw, 200);
@@ -8161,6 +8172,11 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     // rc5-train 20260928-0847-m26: a typed value goes into the box, not the view's .value setter. The setter
     // coerces ("" -> 0 in Inputs.number), so the tool reported "empty -> 0" where a user sees the old result.
     const box = !button && (typeof value === 'string' || typeof value === 'number') ? typingBoxOf(el) : null;
+    // rc5-train 20260929-0620-m46: a select over a Map or objects has values that are not its labels; a user picks the
+    // option they see. `value: "solarized-light"` went into the .value setter and set theme_assets to null.
+    const sel = !button && !box && typeof value === 'string' ? (el.matches('select') ? el : el.querySelectorAll('select').length === 1 ? el.querySelector('select') : null) : null;
+    const opt = sel && !sel.multiple ? [...sel.options].find(o => o.textContent.trim() === value.trim()) || [...sel.options].find(o => o.textContent.trim().toLowerCase() === value.trim().toLowerCase()) : null;
+    if (sel && !opt && typeof raw !== 'string') return { out: 'No option ' + JSON.stringify(value) + ' in ' + c.name + '. Options: ' + [...sel.options].map(o => JSON.stringify(o.textContent.trim())).join(', ') + '. Nothing was changed.', dead: false, was: raw, failed: [] };
     if (button) await ui_set(button);
     else if (act && act.keys) await pressKeys(el, act.keys);
     else if (act && act.drag) await drag(el, act.drag.from || [0.25, 0.5], act.drag.to || [0.75, 0.5]);
@@ -8171,11 +8187,21 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       pointerAt(pad, x, y, 'up', 0);
       at.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0 }));
     }
+    else if (opt) { sel.selectedIndex = opt.index; sel.dispatchEvent(new Event('input', { bubbles: true })); sel.dispatchEvent(new Event('change', { bubbles: true })); }
     else if (box) { box.value = String(value); box.dispatchEvent(new Event('input', { bubbles: true })); box.dispatchEvent(new Event('change', { bubbles: true })); }
     else await ui_set(el, value);
     await ui_settle();
     await new Promise(r => setTimeout(r, 50));
     await ui_settle();
+    // rc5-train 20260929-0620-m46: settle() returns while an async cell recomputed by the change (a fetch) is pending; the
+    // theme css landed ~700 ms later and a working Theme picker read as NO VISIBLE EFFECT. Cells already pending before are skipped.
+    for (let k = 0; k < 3; k++) {
+      const fresh = varsOf(mod).filter(v => v._promise && v._promise !== promisesBefore.get(v)).map(v => v._promise);
+      if (!fresh.length) break;
+      const late = await Promise.race([Promise.allSettled(fresh).then(() => false), new Promise(r => setTimeout(() => r(true), 3000))]);
+      await ui_settle();
+      if (late) break;
+    }
     const after = snapshotOf(mod);
     // rc5-train 20260928-0847-m40: a cell that threw after the change showed as "→ undefined"; read its promise
     for (const b of after.values()) if (b.v && b.v._value === undefined) {
@@ -8197,7 +8223,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const shown = box ? box.value : null;
     const refused = box && String(value) !== String(raw) && summary(el.value, 200) === was;
     const dead = !refused && !changed.some(l => !l.startsWith(valueName + ':'));
-    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (act && act.keys ? ' by pressing keys ' + JSON.stringify(act.keys) : act && act.drag ? ' by dragging from ' + JSON.stringify(act.drag.from || [0.25, 0.5]) + ' to ' + JSON.stringify(act.drag.to || [0.75, 0.5]) + ' (fractions of its box)' : button ? ' by clicking' : pad ? ' by pressing it (pointer down, up, click at its centre)' : box ? '' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
+    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (act && act.keys ? ' by pressing keys ' + JSON.stringify(act.keys) : act && act.drag ? ' by dragging from ' + JSON.stringify(act.drag.from || [0.25, 0.5]) + ' to ' + JSON.stringify(act.drag.to || [0.75, 0.5]) + ' (fractions of its box)' : button ? ' by clicking' : opt ? ' by picking the option ' + JSON.stringify(opt.textContent.trim()) : pad ? ' by pressing it (pointer down, up, click at its centre)' : box ? '' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
     if (box && shown !== String(value)) out += 'The box shows ' + JSON.stringify(shown) + ' (a ' + (box.type || 'text') + ' box cannot hold ' + JSON.stringify(String(value)) + ').\n';
     if (refused) out += '⚠ NOT ACCEPTED: the box shows ' + JSON.stringify(shown) + ' but ' + valueName + ' stayed ' + was + ', so every output still shows the previous result and nothing tells the user their input was rejected. If this input is invalid, show a message that names the problem; if it is valid, the control is refusing it (e.g. outside its [min, max] extent).\n';
     out += changed.length ? 'Changed:\n  ' + changed.join('\n  ') : 'Nothing changed, not even ' + valueName + '.';
@@ -8222,7 +8248,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       return x;
     }
     if (input.type === 'checkbox') return Array.isArray(el.value) ? (el.value.length ? [] : null) : !el.value;
-    if (input.tagName === 'SELECT') { const o = [...input.options].find(o => !o.selected); return o ? (el.value !== undefined && typeof el.value !== 'string' ? null : o.textContent) : null; }
+    if (input.tagName === 'SELECT') { const o = [...input.options].find(o => !o.selected); return o && !input.multiple ? o.textContent.trim() : null; }
     if (typeof el.value === 'string') return el.value + ' test';
     return null;
   };
@@ -8235,12 +8261,12 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     if (input.type === 'range' || input.type === 'number') {
       if (input.min === '' || input.max === '') return [];
       xs = [+input.min, +input.max];
-    } else if (input.tagName === 'SELECT' && !input.multiple && typeof el.value === 'string') xs = [...input.options].map(o => o.textContent).slice(0, 8);
+    } else if (input.tagName === 'SELECT' && !input.multiple) xs = [...input.options].filter(o => !o.selected).map(o => o.textContent.trim()).slice(0, 8);
     return xs.filter(x => Number.isFinite(x) || typeof x === 'string').filter(x => x !== tried && String(x) !== String(el.value));
   };
   const try_control = defineTool({
     id: 'try_control',
-    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button, or a custom pad/canvas/svg view, which is pressed with the pointer) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards), plus each slider\'s min and max and each select option, flagging a cell that throws or shows NaN at any of them: do this ' + 'first when asked whether a notebook works or what is wrong with it. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button or press a custom view; pass `keys` to press keys on it or `drag` to drag across it. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
+    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button, or a custom pad/canvas/svg view, which is pressed with the pointer) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards), plus each slider\'s min and max and each select option, flagging a cell that throws or shows NaN at any of them: do this ' + 'first when asked whether a notebook works or what is wrong with it. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button or press a custom view; pass `keys` to press keys on it or `drag` to drag across it. A select\'s option is picked by its label (`value: "Large"`), whatever value it stands for. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
     parameters: {
       type: 'object',
       required: ['module'],
