@@ -39967,6 +39967,7 @@ const _createAgentSession = function _createAgentSession(AbortController,truncat
       let malformed = 0;
       let turnToolCalls = 0;     // executed (non-completion) tool calls this turn — feeds completeGuard
       let completeVetoed = false;
+      let batchVetoed = false;   // completion sent alongside other tool calls, refused once per turn
       const startLen = messages.length;
 
       for (step = 0; step < maxStepsPerTurn; step++) {
@@ -40142,6 +40143,16 @@ const _createAgentSession = function _createAgentSession(AbortController,truncat
           }
           // completion signal — reply to satisfy the tool_call, capture the summary, end after this batch
           if (completeSpec && name === completeToolName) {
+            // Its summary was written before the batch's other results existed (20260929-0620-m58-before:
+            // request_files + task_complete told the user "I don't see the file" while the file had arrived).
+            const others = calls.filter((c) => c?.function?.name !== completeToolName).length;
+            if (others && !batchVetoed) {
+              batchVetoed = true;
+              pushToolResult(callId, 'NOT ended: ' + completeToolName + ' was sent in the same step as ' + others +
+                ' other tool call' + (others === 1 ? '' : 's') + ', so your summary was written before ' + (others === 1 ? 'its result' : 'their results') +
+                ' existed. ' + (others === 1 ? 'It' : 'They') + ' ran: read the result' + (others === 1 ? '' : 's') + ', act on ' + (others === 1 ? 'it' : 'them') + ', then call ' + completeToolName + ' on its own.');
+              continue;
+            }
             if (completeGuard && !completeVetoed) {
               let veto = null;
               try {
