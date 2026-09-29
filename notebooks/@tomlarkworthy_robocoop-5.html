@@ -8183,8 +8183,11 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const t = el.matches('input, textarea, select, button, [tabindex], canvas') ? el : el.querySelector('input, textarea, select, button, [tabindex], canvas') || el;
     try { t.focus({ preventScroll: true }); } catch (e) {}
     for (const tok of String(keys).trim().split(/\s+/)) {
-      const parts = tok.split('+'), key = parts.pop() === 'Space' ? ' ' : tok.split('+').pop();
+      const parts = tok.split('+'), last = parts.pop();
       const mods = { shiftKey: parts.includes('Shift'), ctrlKey: parts.includes('Ctrl') || parts.includes('Control'), altKey: parts.includes('Alt'), metaKey: parts.includes('Meta') || parts.includes('Cmd') };
+      // rc5-train 20260929-0620-m56: Chromium sends key "L" for Meta+Shift+L and "l" for Meta+L; sending "l" with Shift
+      // confirmed a handler (`e.key === 'l' && e.shiftKey`) that never fires for a user.
+      const key = last === 'Space' ? ' ' : /^[a-z]$/i.test(last) ? (mods.shiftKey ? last.toUpperCase() : last.toLowerCase()) : last;
       const code = key.length === 1 ? (/[a-z]/i.test(key) ? 'Key' + key.toUpperCase() : /\d/.test(key) ? 'Digit' + key : key === ' ' ? 'Space' : '') : key;
       const o = { key, code, bubbles: true, cancelable: true, composed: true, ...mods };
       t.dispatchEvent(new KeyboardEvent('keydown', o));
@@ -8312,7 +8315,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
         module: { type: 'string', description: 'Module id, e.g. "@user/stats".' },
         control: { type: 'string', description: 'The viewof cell ("viewof rate" or "rate") or the text of its label ("Rate"). Omit to try every control.' },
         value: { description: 'The new value (number, string, boolean, array for a multi-select). Omit to click a button, or to press a custom control (a pad, canvas or svg with no input) with the pointer.' },
-        keys: { type: 'string', description: 'Press keys on the control instead of setting a value, space-separated: "ArrowUp ArrowUp Enter", "a", "Space", "Shift+Tab", "Meta+k". keydown/keyup go to its focusable part and bubble to document/window listeners.' },
+        keys: { type: 'string', description: 'Press keys on the control instead of setting a value, space-separated: "ArrowUp ArrowUp Enter", "a", "Space", "Shift+Tab", "Meta+k". keydown/keyup go to its focusable part and bubble to document/window listeners. A letter is sent as Chromium sends it: "Meta+Shift+l" arrives as key "L", code "KeyL".' },
         drag: { type: 'object', description: 'Drag across the control with the pointer instead: {from: [x, y], to: [x, y]} as fractions of its box (0..1), e.g. {from: [0.1, 0.5], to: [0.9, 0.5]}. Pointer down, 8 moves, up.', properties: { from: { type: 'array', items: { type: 'number' } }, to: { type: 'array', items: { type: 'number' } } } }
       },
       additionalProperties: false
@@ -31878,6 +31881,44 @@ until the first key press: a loop that starts on write has usually finished befo
 A listener on the element is removed with the element when the cell re-runs. A listener on
 `window` or `document` stays on the page after the cell re-runs, so every edit adds another one;
 if one is unavoidable, remove it on `invalidation`.
+
+## Shortcuts with a modifier: match `e.code` or the lower-cased `e.key`
+
+A page-wide shortcut (Cmd+Shift+L, Cmd+Z) is the exception to listening on an element: it goes on
+`document` and is removed on `invalidation`. Holding Shift makes `e.key` the capital letter.
+Measured 2026-09-29 in Playwright's Chromium 151 with `page.keyboard.press`:
+
+```
+Meta+Shift+L     key=L code=KeyL
+Control+Shift+L  key=L code=KeyL
+Shift+KeyL       key=L code=KeyL   (a textarea receives "L")
+Meta+KeyL        key=l code=KeyL
+```
+
+A test written as `e.key === 'l' && e.shiftKey` therefore never fires. Compare `e.code` (`'KeyL'`,
+the physical key) or `e.key.toLowerCase()`; both hold whatever the case. Not measured: Firefox and
+WebKit (not installed for Playwright here), and a physical keypress on macOS, where `key` is set by
+the OS rather than by Playwright. `@tomlarkworthy/svg-lens` `toolbar`
+(lopebooks/notebooks/tomlarkworthy_svg-lens.html) reads undo and redo from one comparison, with
+Shift choosing between them:
+
+```js
+if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z' && !typing) {
+  e.preventDefault();
+  return void (e.shiftKey ? drawing.redo() : drawing.undo());
+}
+```
+
+Observed (robocoop-5, "Add a keyboard shortcut, Cmd+Shift+L, that clears this chat and starts a
+fresh conversation", 20260929-0620-m56): the agent wrote `ev.key === 'l' && ev.metaKey &&
+ev.shiftKey`, reported "The shortcut is live", and the shortcut did nothing when pressed. Until
+2026-09-29 `try_control`'s `keys` sent `"Meta+Shift+l"` as key `"l"` and so confirmed that handler;
+it now sends the capital letter, as Chromium does.
+
+A chord with Cmd or Ctrl types no text, so it can also fire while the focus is in a text field. A
+shortcut with no modifier, or with Shift alone, must not: a user typing a capital L in a text field
+would trigger it. `svg-lens` `toolbar` checks `/^(INPUT|TEXTAREA)$/.test(e.target.tagName) ||
+e.target.isContentEditable` for that.
 
 ## Stop the loop on invalidation
 
