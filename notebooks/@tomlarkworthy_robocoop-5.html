@@ -8106,14 +8106,53 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   const controlsOf = mod => varsOf(mod).filter(v => /^viewof /.test(v._name || '') && v._value instanceof Element).map(v => ({
     v, name: v._name, label: oneLine(v._value.querySelector?.('label')?.textContent || v._value.getAttribute?.('aria-label') || '')
   }));
-  const tryOne = async (mod, c, value, id) => {
+  // A pointer event at viewport point (x, y) of el, sent to the element drawn there when it is el's
+  const pointerAt = (el, x, y, type, buttons) => {
+    const hit = typeof document !== 'undefined' && document.elementFromPoint(x, y);
+    const at = hit && el.contains(hit) ? hit : el;
+    const o = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, buttons, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    const P = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+    at.dispatchEvent(new P('pointer' + type, o));
+    at.dispatchEvent(new MouseEvent('mouse' + type, o));
+    return at;
+  };
+  const pointAt = (el, f) => { const r = el.getBoundingClientRect(); return [r.left + r.width * f[0], r.top + r.height * f[1]]; };
+  const drag = async (el, from, to) => {
+    const [x0, y0] = pointAt(el, from), [x1, y1] = pointAt(el, to);
+    const at = pointerAt(el, x0, y0, 'down', 1);
+    // moves go to the element the press landed on (as with pointer capture) and bubble to window listeners
+    for (let i = 1; i <= 8; i++) {
+      const x = x0 + (x1 - x0) * i / 8, y = y0 + (y1 - y0) * i / 8;
+      const o = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      at.dispatchEvent(new (typeof PointerEvent === 'function' ? PointerEvent : MouseEvent)('pointermove', o));
+      at.dispatchEvent(new MouseEvent('mousemove', o));
+      await new Promise(r => setTimeout(r, 16));
+    }
+    pointerAt(el, x1, y1, 'up', 0);
+  };
+  // "ArrowUp ArrowUp Enter", "a", "Shift+Tab", "Meta+k": keydown/keyup on the focused part of the control
+  const pressKeys = async (el, keys) => {
+    const t = el.matches('input, textarea, select, button, [tabindex], canvas') ? el : el.querySelector('input, textarea, select, button, [tabindex], canvas') || el;
+    try { t.focus({ preventScroll: true }); } catch (e) {}
+    for (const tok of String(keys).trim().split(/\s+/)) {
+      const parts = tok.split('+'), key = parts.pop() === 'Space' ? ' ' : tok.split('+').pop();
+      const mods = { shiftKey: parts.includes('Shift'), ctrlKey: parts.includes('Ctrl') || parts.includes('Control'), altKey: parts.includes('Alt'), metaKey: parts.includes('Meta') || parts.includes('Cmd') };
+      const code = key.length === 1 ? (/[a-z]/i.test(key) ? 'Key' + key.toUpperCase() : /\d/.test(key) ? 'Digit' + key : key === ' ' ? 'Space' : '') : key;
+      const o = { key, code, bubbles: true, cancelable: true, composed: true, ...mods };
+      t.dispatchEvent(new KeyboardEvent('keydown', o));
+      await new Promise(r => setTimeout(r, 16));
+      t.dispatchEvent(new KeyboardEvent('keyup', o));
+    }
+  };
+  const tryOne = async (mod, c, value, id, act = null) => {
     const el = c.v._value;
     const valueName = c.name.slice(7);
-    const button = value === undefined ? (el.matches('button') ? el : el.querySelector('button')) : null;
+    if (act) value = undefined;
+    const button = value === undefined && !act ? (el.matches('button') ? el : el.querySelector('button')) : null;
     // A custom view (a pad, a canvas, an svg) has no input to type into: a user presses it (pairing 2026-09-28: a drum pad
     // whose value lagged one press behind, which only pressing it shows).
-    const pad = value === undefined && !button && !el.matches('input, select, textarea') && !el.querySelector('input, select, textarea') ? el : null;
-    if (value === undefined && !button && !pad) return { out: c.name + ' is not a button; pass `value`. Current value: ' + summary(el.value, 200), dead: false };
+    const pad = value === undefined && !button && !act && !el.matches('input, select, textarea') && !el.querySelector('input, select, textarea') ? el : null;
+    if (value === undefined && !button && !pad && !act) return { out: c.name + ' is not a button; pass `value`. Current value: ' + summary(el.value, 200), dead: false };
     const before = snapshotOf(mod);
     const t0 = performance.now();
     const raw = el.value;
@@ -8123,18 +8162,14 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     // coerces ("" -> 0 in Inputs.number), so the tool reported "empty -> 0" where a user sees the old result.
     const box = !button && (typeof value === 'string' || typeof value === 'number') ? typingBoxOf(el) : null;
     if (button) await ui_set(button);
+    else if (act && act.keys) await pressKeys(el, act.keys);
+    else if (act && act.drag) await drag(el, act.drag.from || [0.25, 0.5], act.drag.to || [0.75, 0.5]);
     else if (pad) {
-      const r = pad.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
-      const hit = typeof document !== 'undefined' && document.elementFromPoint(x, y);
-      const at = hit && pad.contains(hit) ? hit : pad;
-      const o = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
-      const P = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
-      at.dispatchEvent(new P('pointerdown', { ...o, buttons: 1 }));
-      at.dispatchEvent(new MouseEvent('mousedown', { ...o, buttons: 1 }));
+      const [x, y] = pointAt(pad, [0.5, 0.5]);
+      const at = pointerAt(pad, x, y, 'down', 1);
       await new Promise(r => setTimeout(r, 30));
-      at.dispatchEvent(new P('pointerup', o));
-      at.dispatchEvent(new MouseEvent('mouseup', o));
-      at.dispatchEvent(new MouseEvent('click', o));
+      pointerAt(pad, x, y, 'up', 0);
+      at.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0 }));
     }
     else if (box) { box.value = String(value); box.dispatchEvent(new Event('input', { bubbles: true })); box.dispatchEvent(new Event('change', { bubbles: true })); }
     else await ui_set(el, value);
@@ -8162,13 +8197,13 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const shown = box ? box.value : null;
     const refused = box && String(value) !== String(raw) && summary(el.value, 200) === was;
     const dead = !refused && !changed.some(l => !l.startsWith(valueName + ':'));
-    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (button ? ' by clicking' : pad ? ' by pressing it (pointer down, up, click at its centre)' : box ? '' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
+    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (act && act.keys ? ' by pressing keys ' + JSON.stringify(act.keys) : act && act.drag ? ' by dragging from ' + JSON.stringify(act.drag.from || [0.25, 0.5]) + ' to ' + JSON.stringify(act.drag.to || [0.75, 0.5]) + ' (fractions of its box)' : button ? ' by clicking' : pad ? ' by pressing it (pointer down, up, click at its centre)' : box ? '' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
     if (box && shown !== String(value)) out += 'The box shows ' + JSON.stringify(shown) + ' (a ' + (box.type || 'text') + ' box cannot hold ' + JSON.stringify(String(value)) + ').\n';
     if (refused) out += '⚠ NOT ACCEPTED: the box shows ' + JSON.stringify(shown) + ' but ' + valueName + ' stayed ' + was + ', so every output still shows the previous result and nothing tells the user their input was rejected. If this input is invalid, show a message that names the problem; if it is valid, the control is refusing it (e.g. outside its [min, max] extent).\n';
     out += changed.length ? 'Changed:\n  ' + changed.join('\n  ') : 'Nothing changed, not even ' + valueName + '.';
     if (dead) out += '\n⚠ NO VISIBLE EFFECT: no cell other than ' + valueName + ' changed, so a user using this control sees nothing happen. Look for where ' + valueName + ' should be used: a cell that lists "viewof ' + valueName + '" (the element) where it needs "' + valueName + '", or an output that interpolates a different cell.';
     if (bad.length) out += '\n⚠ NaN/undefined/[object …] appeared in: ' + bad.join(', ') + '.';
-    if (pad && summary(el.value, 200) !== was && !changed.some(l => l.startsWith(valueName + ':')))
+    if ((pad || act) && summary(el.value, 200) !== was && !changed.some(l => l.startsWith(valueName + ':')))
       out += '\n⚠ the element\'s .value is now ' + summary(el.value, 80) + ' but ' + valueName + ' still reads ' + was + ': the runtime reads .value when the `input` event fires, so this view dispatched it before setting .value and every press shows the previous one. Set el.value first, then dispatch.';
     const logged = id ? uncaughtLog.since(id, t0) : '';
     if (logged) out += '\n' + logged + '.';
@@ -8205,22 +8240,25 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   };
   const try_control = defineTool({
     id: 'try_control',
-    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button, or a custom pad/canvas/svg view, which is pressed with the pointer) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards), plus each slider\'s min and max and each select option, flagging a cell that throws or shows NaN at any of them: do this ' + 'first when asked whether a notebook works or what is wrong with it. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button or press a custom view. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
+    description: 'Use a module\'s controls (`viewof` cells: slider, text box, select, checkbox, button, or a custom pad/canvas/svg view, which is pressed with the pointer) the way a user ' + 'would, wait until the notebook has finished reacting, and report every cell and every rendered element ' + 'attribute/text that changed. Omit `control` to try EVERY control once (each is put back afterwards), plus each slider\'s min and max and each select option, flagging a cell that throws or shows NaN at any of them: do this ' + 'first when asked whether a notebook works or what is wrong with it. A control whose change reaches no other cell is flagged; a change can ' + 'still be the wrong one, so compare each with what the control\'s label promises. Values read in the same eval_js ' + 'snippet that dispatched an event are stale; this tool reads after the runtime settles. With `control`, omit ' + '`value` to click a button or press a custom view; pass `keys` to press keys on it or `drag` to drag across it. A string or number `value` is typed into the box as a user would (try "", "-1" or "abc" to see how bad input is handled); a value the control refuses is flagged. A value you set is put back afterwards, so the user finds the notebook as they left it; a button\'s effect stays.',
     parameters: {
       type: 'object',
       required: ['module'],
       properties: {
         module: { type: 'string', description: 'Module id, e.g. "@user/stats".' },
         control: { type: 'string', description: 'The viewof cell ("viewof rate" or "rate") or the text of its label ("Rate"). Omit to try every control.' },
-        value: { description: 'The new value (number, string, boolean, array for a multi-select). Omit to click a button, or to press a custom control (a pad, canvas or svg with no input) with the pointer.' }
+        value: { description: 'The new value (number, string, boolean, array for a multi-select). Omit to click a button, or to press a custom control (a pad, canvas or svg with no input) with the pointer.' },
+        keys: { type: 'string', description: 'Press keys on the control instead of setting a value, space-separated: "ArrowUp ArrowUp Enter", "a", "Space", "Shift+Tab", "Meta+k". keydown/keyup go to its focusable part and bubble to document/window listeners.' },
+        drag: { type: 'object', description: 'Drag across the control with the pointer instead: {from: [x, y], to: [x, y]} as fractions of its box (0..1), e.g. {from: [0.1, 0.5], to: [0.9, 0.5]}. Pointer down, 8 moves, up.', properties: { from: { type: 'array', items: { type: 'number' } }, to: { type: 'array', items: { type: 'number' } } } }
       },
       additionalProperties: false
     },
-    execute: async ({ module, control, value }) => {
+    execute: async ({ module, control, value, keys, drag }) => {
       const mod = resolveModule(module);
       if (!mod) return { title: 'try_control', output: 'Module not found: ' + module };
       const all = controlsOf(mod);
       const list = () => all.map(x => x.name + (x.label ? ' ("' + x.label + '")' : '')).join(', ') || '(none)';
+      if ((keys || drag) && (control == null || control === '')) return { title: 'try_control', output: 'keys and drag need `control`: which control to press keys on or drag across. Controls: ' + list() };
       if (control == null || control === '') {
         if (!all.length) return { title: 'try_control', output: module + ' has no viewof controls.' };
         const parts = [], dead = [];
@@ -8247,7 +8285,8 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       const want = String(control).trim().replace(/^viewof\s+/, '');
       const c = all.find(x => x.name === 'viewof ' + want) || all.find(x => x.label && x.label.toLowerCase() === want.toLowerCase()) || all.find(x => x.label && x.label.toLowerCase().includes(want.toLowerCase()));
       if (!c) return { title: 'try_control', output: 'No control "' + control + '" in ' + module + '. Controls: ' + list() };
-      const r = await tryOne(mod, c, value, module);
+      const act = keys ? { keys } : drag ? { drag } : null;
+      const r = await tryOne(mod, c, value, module, act);
       // rc5-train 20260928-0847-m7: a test term left in a search box kept the user's list filtered, unmentioned (2 of 2 runs)
       if (value !== undefined) { try { await ui_set(c.v._value, r.was); await ui_settle(); } catch (e) {} }
       return { title: 'try_control ' + module, output: r.out + (value !== undefined ? '\n(' + c.name + ' put back to ' + summary(r.was, 80) + ' afterwards.)' : '') };
