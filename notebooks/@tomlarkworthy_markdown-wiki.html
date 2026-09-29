@@ -8362,6 +8362,40 @@ A fixed list works as well. The corpus does this in `_barX` of module `d/d2dffac
 
 Leave out `domain` only when ascending order is what the user wants (years as strings, names).
 To order bars by value instead, use the mark's `sort` option: `Plot.barY(rows, {x: "name", y: "count", sort: {x: "-y"}})`.
+
+## A `stroke` or `fill` string that is not a colour is a field name
+
+Plot reads a constant `stroke` or `fill` string as a colour only when it parses as a CSS colour.
+Any other string is taken as the name of a field in the data. When no row has that field, the mark
+draws nothing and no error is raised. `Plot.line(pts, {stroke: "Alder"})` draws no line, although
+a legend built from the same names lists "Alder".
+
+Observed (run 20260929-0620-m57, eval-fixed): the agent drew five pump curves with
+`Plot.line(pts, {x: "q", y: "h", stroke: name})`, with `name` one of "Alder", "Birch", …. The write
+result said "✓ all cells compute", and the eval's plot check found 0 of 5 curves. The same module
+with `stroke: d => d.pump` drew all five.
+
+Measured 2026-09-29, Plot 0.6.17 in Playwright Chromium 151, one four-point `Plot.line`
+(`tools/scratch/rc5-train/20260929-0620/m57/merge/plot-stroke.mjs`):
+
+```
+stroke "Alder"           paths 0   no console error
+stroke "steelblue"       paths 1   <g stroke="steelblue">
+stroke "#1f77b4"         paths 1   <g stroke="#1f77b4">
+stroke d => "Alder"      paths 1   <path stroke="#4269d0">   (ordinal colour scale)
+```
+
+To colour one series per name, put the name in the rows and name that field, which also gives a
+legend that matches the lines:
+
+```js
+Plot.line(rows, {x: "q", y: "h", stroke: "pump"})   // rows: {pump: "Alder", q, h}
+```
+
+To give a series a fixed colour, pass a CSS colour. To label it, use a `Plot.text` mark or the
+colour scale's `domain`/`range`, not the `stroke` string. This is not gated by a write-trigger:
+`stroke: <field>` is the ordinary form (24 corpus files use `Plot.line(…, {stroke: <field>})`,
+count from m57's proposal, not re-measured).
 </script>
 <script id="@tomlarkworthy/markdown-wiki/reviewing-a-notebook-module.md" 
   type="text/plain"
@@ -9186,6 +9220,79 @@ $ npm install --offline ../units-1.0.0.tgz && node -e "import('@me/units')"
 - Which functions were left out and why (cells that use `md`, `html`, `Inputs`, `FileAttachment` …
   do not run outside the notebook).
 - Do not say the package was published: the page did not publish it.
+</script>
+<script id="@tomlarkworthy/markdown-wiki/reading-values-between-measured-points.md" 
+  type="text/plain"
+  data-mime="text/markdown"
+>
+---
+write-triggers:
+  - "[<>]=?\\s*[A-Za-z_$][\\w$]*\\[\\s*[A-Za-z_$][\\w$]*\\s*\\+\\s*1\\s*\\]\\s*\\.\\s*[A-Za-z_$]"
+---
+
+# Reading a value between measured points: device curves and calibration tables
+
+A pump curve, a fan curve, a battery discharge table or a sensor calibration is a list of measured
+points. Between two points, interpolate. Past the last point (or before the first) there is no
+data: the value is unknown. Returning the end point's value, or extending the last segment, reports
+a measurement nobody made, and every cell downstream computes without an error.
+
+Observed (run 20260929-0620-m57 eval-base, pump sizing from pumps.csv): the lookup returned the last
+point's head for any flow past it. The agent then chose a 1.5 kW pump tested only up to 36 m³/h for
+a 40 m³/h duty. At 80 m³/h it chose a pump tested only up to 72 m³/h, when a larger pump that was
+tested at 80 m³/h met the duty. The summary said it "interpolates each pump curve at the duty flow".
+
+## The lookup
+
+Return `null` outside the measured range:
+
+```js
+const _headAt = function headAt(){return(
+(pts, q) => {                       // pts sorted by q
+  if (q < pts[0].q || q > pts[pts.length - 1].q) return null;
+  for (let i = 1; i < pts.length; i++)
+    if (q <= pts[i].q) return pts[i - 1].h + (pts[i].h - pts[i - 1].h) * (q - pts[i - 1].q) / (pts[i].q - pts[i - 1].q);
+  return pts[0].h;
+}
+)};
+```
+
+Every consumer handles `null`:
+
+- **Selection** ("the smallest pump that meets the duty point"): a candidate with no data at the
+  duty point does not qualify. When no candidate qualifies, show that no candidate qualifies. Do not
+  fall back to the largest one.
+- **Display**: show "no data past <last measured x>" or leave the value blank. Do not show a
+  number.
+- **Plot**: draw each curve over its measured points only. A curve drawn past its data looks like
+  data.
+
+Convert units before the lookup. Convert the table's column to the unit the user works in, or the
+user's value to the table's unit, and not both.
+
+If the user asks for extrapolation, label every extrapolated value in the output as extrapolated.
+
+## Checking it
+
+`try_control` the input to just past the smallest candidate's last measured point. The candidate
+must drop out, and the output must name the next one or say that none qualifies.
+
+## Precedent and limits
+
+No notebook in the corpus does this lookup. On 2026-09-29, `lopecode/notebooks` and
+`lopebooks/notebooks` held no tabulated lookup with out-of-range handling. "extrapolat" occurs in
+24 files: a chart-scale comment ("Scales extrapolate happily past their domain") copied into all
+24, plus prose in `coded-landmark-tracking`. None of them is a lookup in a table of points. The `headAt` above was written for this page; it is not taken
+from existing code.
+
+The write-trigger matches a comparison against the next point's field (`q <= pts[i + 1].q`), the
+step of a hand-written piecewise-linear lookup. Measured 2026-09-29 against every `<script>` block
+of both repos (248 files, 23377 blocks): 0 matches. A lookup written with `d3.bisector`,
+`findIndex` or `.at(-1)` is not gated. Adding `bisector` would gate 16 corpus files, mostly chart
+hover code (m57's count, not re-measured).
+
+Evidence for the page is one model run per side (eval `rc5t-pump-sizing`, 0.40 before, 0.80
+after), which is an anecdote, not a rate.
 </script>
 <script id="@tomlarkworthy/markdown-wiki" 
   type="text/plain"
