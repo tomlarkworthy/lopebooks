@@ -5861,6 +5861,18 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
       'the runtime does not hold that code. Write it again, changed as the result said, and check the result ' +
       'says it applied. If you dropped it on purpose, tell the user it was not written and call task_complete again.';
   };
+  // A module with controls written this turn that try_control has not used since (srctools noteWrite fills the list;
+  // cleared at each turn's first step). rc5-train 20260929-0620-m69: 30 of 32 such turns ended without moving a control.
+  const untriedGate = info => {
+    const u = sessionState.untried;
+    if (!u || !u.size || !(info.toolNames || []).includes('try_control')) return null;
+    const miss = [...u].map(([id, names]) => id + ' (' + names.join(', ') + ')');
+    u.clear();
+    return 'REJECTED: this turn you wrote ' + miss.join(', ') + ' and no try_control has used ' + (miss.length > 1 ? 'those controls' : 'its controls') +
+      ' since. Cells that compute can still react wrongly to a control (a unit slip, an output that ignores it, NaN at one end). ' +
+      'Call try_control with the module and no `control` to move every control once, check each change against what its label promises, ' +
+      'fix what is wrong, then call task_complete again. Tell the user what a control does only as try_control showed it.';
+  };
   // Tools reach this session's bus through ctx, so a watch it sets reports to it and to no other agent.
   const bound = new WeakMap();
   const bind = t => {
@@ -5906,6 +5918,7 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
     // the loop is `await client.chat(...)`, tens of seconds of an otherwise idle browser, so the checks run
     // for free and a slow one simply reports a step later.
     noticesProvider: ctx => [
+      ...(ctx && ctx.step === 0 && sessionState.untried ? (sessionState.untried.clear(), []) : []),
       ...toolsNotice(),
       ...watchBus.drain(),
       ...rc5_monitorBus.drain(Array.isArray(monitorsView.value) ? monitorsView.value : [], ctx)
@@ -5934,7 +5947,7 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
     // A module write that was refused or not applied, with no later write to that path that landed: the
     // summary would describe a module that does not exist (run 20260928-0847-w9: one refused write_file,
     // then task_complete "I created /src/@user/project-timeline.js"). Fires once per path.
-    completeGuard: info => (extraGuard && extraGuard(info)) ?? specGateCheck(rc5_specGate.scorecard, info.summary) ?? unwrittenGate() ?? zeroToolCallGate(info),
+    completeGuard: info => (extraGuard && extraGuard(info)) ?? specGateCheck(rc5_specGate.scorecard, info.summary) ?? unwrittenGate() ?? untriedGate(info) ?? zeroToolCallGate(info),
     stallNudgeLimit: 2,
     maxStepsPerTurn: 40,
     // Reasoning models spend completion budget on reasoning; give headroom for reasoning + a full write_file.
@@ -8304,9 +8317,11 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       },
       additionalProperties: false
     },
-    execute: async ({ module, control, value, keys, drag }) => {
+    execute: async ({ module, control, value, keys, drag }, ctx) => {
       const mod = resolveModule(module);
       if (!mod) return { title: 'try_control', output: 'Module not found: ' + module };
+      const untried = ctx?.sessionState?.untried;
+      if (untried) for (const k of [...untried.keys()]) if (resolveModule(k) === mod) untried.delete(k);
       const all = controlsOf(mod);
       const list = () => all.map(x => x.name + (x.label ? ' ("' + x.label + '")' : '')).join(', ') || '(none)';
       if ((keys || drag) && (control == null || control === '')) return { title: 'try_control', output: 'keys and drag need `control`: which control to press keys on or drag across. Controls: ' + list() };
@@ -8429,6 +8444,12 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
     const u = st.unwritten ??= new Map();
     const miss = /^REFUSED|not applied|FAILED TO COMPILE/.exec(output);
     if (miss) u.set(path, miss[0]); else u.delete(path);
+    // rc5-train 20260929-0620-m69: a landed write of a module with controls is untried until try_control uses it;
+    // the engine's completion guard reads the list (m52, m55: summaries said what the sliders do, none was moved)
+    const m = !miss && /^\/src\/(.+)\.js$/.exec(path), mod = m && cellHelpers.resolveModule(m[1]);
+    const names = mod ? cellHelpers.varsOf(mod).map(v => v._name).filter(n => /^viewof /.test(n || '')) : [];
+    const t = st.untried ??= new Map();
+    if (names.length) t.set(m[1], names); else if (m) t.delete(m[1]);
     return output;
   };
   const read_file = defineTool({
