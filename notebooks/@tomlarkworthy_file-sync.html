@@ -2125,6 +2125,7 @@ const _qq3v7b = function _jbApply(importShim)
       const placed = [];
       // import plumbing tracked by name (loaders/bindings carry no pid)
       let changes = 0;
+      const resolvedBindings = [], touchedLoaders = new Set();
       for (const cell of cells) {
         // injected builtin — the runtime provides it; never (re)define
         if (cell.name === '@variable')
@@ -2151,6 +2152,7 @@ const _qq3v7b = function _jbApply(importShim)
             if (existing._jbKey !== undefined && existing._jbKey !== key) {
               existing.define(loaderName, [], make);
               existing._jbKey = key;
+              touchedLoaders.add(existing);
               changes++;
             }
             return;
@@ -2174,10 +2176,18 @@ const _qq3v7b = function _jbApply(importShim)
           const existingInputNames = (existing._inputs || []).map(iv => typeof iv === 'string' ? iv : iv._name);
           const inputsMatch = JSON.stringify(existingInputNames) === JSON.stringify(inputs);
           const defnMatch = existing._definition && existing._definition.toString() === (defn ? defn.toString() : '');
-          if (!(inputsMatch && defnMatch)) {
-            existing.define(name, inputs, defn);
-            changes++;
+          if (inputsMatch && defnMatch)
+            return;
+          // A binding that has run was redefined by v.import() to read the remote variable directly; the same file
+          // text then compared unequal and every import was rebound on every apply (rc5-train m67: "19 cells changed"
+          // for an edit that changed no cell). Settled after the loop, once every loader is final.
+          const remote = ((defn ? defn.toString() : '').match(/\.import\(\s*(["'])([^"']+)\1/) || [])[2];
+          if (remote && inputs.length === 2 && (existing._inputs || []).length === 1) {
+            resolvedBindings.push({ existing, name, inputs, defn, remote });
+            return;
           }
+          existing.define(name, inputs, defn);
+          changes++;
         };
         // explicit module.variable().import(remote, alias, from) form
         if (cell.type === 'import') {
@@ -2248,6 +2258,13 @@ const _qq3v7b = function _jbApply(importShim)
         existing.define(cell.name, cell.inputs, cell.definition).pid = pid;
         changes++;
       }
+      for (const {existing, name, inputs, defn, remote} of resolvedBindings) {
+        const loader = existingByName.get(inputs[0]), iv = existing._inputs[0];
+        if (loader && !touchedLoaders.has(loader) && iv && iv._name === remote && iv._module === loader._value)
+          continue;
+        existing.define(name, inputs, defn);
+        changes++;
+      }
       // F4: prune anything the file no longer contains — reload-proof, no cross-call state.
       //   user cells   → pid-bearing vars not seen this apply
       //   import plumbing → "module @x" loaders / import bindings whose name not seen
@@ -2262,6 +2279,9 @@ const _qq3v7b = function _jbApply(importShim)
           continue;
         const name = v._name;
         if (name === '@variable')
+          continue;
+        // an implicit variable (a builtin or undefined name the module reads) is the runtime's, re-created at once if deleted
+        if (v._type === 2)
           continue;
         if (name && seenNames.has(name))
           continue;
