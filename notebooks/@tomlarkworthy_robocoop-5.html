@@ -40713,6 +40713,11 @@ const _createAgentSession = function _createAgentSession(AbortController,truncat
       let batchVetoed = false;   // completion sent alongside other tool calls, refused once per turn
       const startLen = messages.length;
 
+      const dropImages = () => {
+        let n = 0;
+        for (const m of messages) if (Array.isArray(m.content)) m.content = m.content.map((p) => p && p.type === 'image_url' ? (n++, { type: 'text', text: '[image not shown: the model takes text only]' }) : p);
+        return n;
+      };
       for (step = 0; step < maxStepsPerTurn; step++) {
         if (abortController.signal.aborted) { finishReason = 'aborted'; break; }
         callbacks.onStep?.(step, messages);
@@ -40766,6 +40771,15 @@ const _createAgentSession = function _createAgentSession(AbortController,truncat
           stepAbort = null;
           if (abortController.signal.aborted) { finishReason = 'aborted'; break; }   // hard stop
           if (stepController.signal.aborted) { callbacks.onInterrupt?.(step); continue; }  // steer / model-switch → redo step
+          // A text-only model refuses the whole request once any message holds an image, and the image stays in
+          // the history, so every later call failed too (rc5-train 20260929-0620-m74: mimo-v2.5-pro, a screenshot
+          // tool's ctx.attachImage). Replace the images with a note, tell the model, redo the step.
+          if (/support image input/i.test(String(e?.message)) && dropImages()) {
+            messages.push({ role: 'system', content: 'The model ' + getModel() + ' takes text only (' + e.message + '). The image(s) sent since your last step were NOT shown to you and are removed. ' +
+              'You have not seen them: do not describe what they show. Check what you need another way (the element through eval_js or inspect_value), ' +
+              'and tell the user that seeing an image needs a vision model (one not marked "no vision" in the model menu).' });
+            continue;
+          }
           throw e;   // genuine network / provider error
         }
         abortController.signal.removeEventListener('abort', linkTurnAbort);
