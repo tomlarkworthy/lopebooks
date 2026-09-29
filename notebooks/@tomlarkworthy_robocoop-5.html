@@ -8154,6 +8154,20 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   const controlsOf = mod => varsOf(mod).filter(v => /^viewof /.test(v._name || '') && v._value instanceof Element).map(v => ({
     v, name: v._name, label: oneLine(v._value.querySelector?.('label')?.textContent || v._value.getAttribute?.('aria-label') || '')
   }));
+  // rc5-train 20260929-0620-m49: a Preview button inside a plain DOM cell (fileattachments.file_browser) was out of reach;
+  // the sweep skipped the module's 3 viewofs and the completion gate counted that as the controls tried.
+  const buttonsOf = mod => {
+    const out = [];
+    for (const v of varsOf(mod)) {
+      if (/^viewof /.test(v._name || '') || !(v._value instanceof Element) || isStructural(v)) continue;
+      for (const b of v._value.querySelectorAll('button, [role=button], input[type=button], input[type=submit]')) {
+        const text = oneLine(b.textContent || b.value || b.getAttribute('aria-label') || b.getAttribute('title') || '').trim();
+        if (text) out.push({ cell: v._name || v.pid, text, el: b });
+      }
+    }
+    return out;
+  };
+  const listButtons = bs => { const g = new Map(); for (const b of bs) { const k = b.cell + ': ' + JSON.stringify(b.text); g.set(k, (g.get(k) || 0) + 1); } return [...g].map(([k, n]) => k + (n > 1 ? ' \u00d7' + n : '')).join(', '); };
   // A pointer event at viewport point (x, y) of el, sent to the element drawn there when it is el's
   const pointerAt = (el, x, y, type, buttons) => {
     const hit = typeof document !== 'undefined' && document.elementFromPoint(x, y);
@@ -8197,7 +8211,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
   };
   const tryOne = async (mod, c, value, id, act = null) => {
     const el = c.v._value;
-    const valueName = c.name.slice(7);
+    const valueName = c.name.startsWith('viewof ') ? c.name.slice(7) : c.name;
     if (act) value = undefined;
     const button = value === undefined && !act ? (el.matches('button') ? el : el.querySelector('button')) : null;
     // A custom view (a pad, a canvas, an svg) has no input to type into: a user presses it (pairing 2026-09-28: a drum pad
@@ -8264,7 +8278,7 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
     const shown = box ? box.value : null;
     const refused = box && String(value) !== String(raw) && summary(el.value, 200) === was;
     const dead = !refused && !changed.some(l => !l.startsWith(valueName + ':'));
-    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (act && act.keys ? ' by pressing keys ' + JSON.stringify(act.keys) : act && act.drag ? ' by dragging from ' + JSON.stringify(act.drag.from || [0.25, 0.5]) + ' to ' + JSON.stringify(act.drag.to || [0.75, 0.5]) + ' (fractions of its box)' : button ? ' by clicking' : opt ? ' by picking the option ' + JSON.stringify(opt.textContent.trim()) : pad ? ' by pressing it (pointer down, up, click at its centre)' : box ? '' : ' to ' + JSON.stringify(value)) + ' (was ' + was + ').\n';
+    let out = (box ? 'Typed ' + JSON.stringify(String(value)) + ' into ' : 'Set ') + c.name + (c.label ? ' ("' + c.label + '")' : '') + (act && act.keys ? ' by pressing keys ' + JSON.stringify(act.keys) : act && act.drag ? ' by dragging from ' + JSON.stringify(act.drag.from || [0.25, 0.5]) + ' to ' + JSON.stringify(act.drag.to || [0.75, 0.5]) + ' (fractions of its box)' : button ? ' by clicking' : opt ? ' by picking the option ' + JSON.stringify(opt.textContent.trim()) : pad ? ' by pressing it (pointer down, up, click at its centre)' : box ? '' : ' to ' + JSON.stringify(value)) + (c.name.startsWith('viewof ') ? ' (was ' + was + ')' : '') + '.\n';
     if (box && shown !== String(value)) out += 'The box shows ' + JSON.stringify(shown) + ' (a ' + (box.type || 'text') + ' box cannot hold ' + JSON.stringify(String(value)) + ').\n';
     if (refused) out += '⚠ NOT ACCEPTED: the box shows ' + JSON.stringify(shown) + ' but ' + valueName + ' stayed ' + was + ', so every output still shows the previous result and nothing tells the user their input was rejected. If this input is invalid, show a message that names the problem; if it is valid, the control is refusing it (e.g. outside its [min, max] extent).\n';
     out += changed.length ? 'Changed:\n  ' + changed.join('\n  ') : 'Nothing changed, not even ' + valueName + '.';
@@ -8324,17 +8338,22 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
       const mod = resolveModule(module);
       if (!mod) return { title: 'try_control', output: 'Module not found: ' + module };
       const untried = ctx?.sessionState?.untried;
-      if (untried) for (const k of [...untried.keys()]) if (resolveModule(k) === mod) untried.delete(k);
+      // the module counts as tried only once a control was actually used, not when every one was skipped
+      const markTried = () => { if (untried) for (const k of [...untried.keys()]) if (resolveModule(k) === mod) untried.delete(k); };
       const all = controlsOf(mod);
+      const bs = buttonsOf(mod);
+      const unclicked = bs.length ? '\nButtons in rendered cells (not viewof controls, so the sweep does not click them; a click is not put back): ' + listButtons(bs) + '. Click one with `control` set to its text, e.g. ' + JSON.stringify(bs[0].text) + '.' : '';
       const list = () => all.map(x => x.name + (x.label ? ' ("' + x.label + '")' : '')).join(', ') || '(none)';
       if ((keys || drag) && (control == null || control === '')) return { title: 'try_control', output: 'keys and drag need `control`: which control to press keys on or drag across. Controls: ' + list() };
       if (control == null || control === '') {
-        if (!all.length) return { title: 'try_control', output: module + ' has no viewof controls.' };
+        if (!all.length) return { title: 'try_control', output: module + ' has no viewof controls.' + unclicked };
         const parts = [], dead = [];
+        let tried = 0;
         for (const c of all) {
           const v = probeValue(c.v._value);
           if (v === null) { parts.push(c.name + ': skipped (no value to pick automatically; call with control and value)'); continue; }
           const r = await tryOne(mod, c, v, module);
+          tried++;
           let part = r.out.length > 1500 ? r.out.slice(0, 1500) + ' …' : r.out;
           if (r.dead) dead.push(c.label || c.name);
           if (v !== undefined) { try { await ui_set(c.v._value, r.was); await ui_settle(); } catch (e) {} }
@@ -8349,13 +8368,28 @@ const _ual70b = function _valueTools(cellHelpers,observe,summarizeJS,defineTool,
           }
           parts.push(part);
         }
-        return { title: 'try_control ' + module, output: 'Tried ' + all.length + ' controls (each put back afterwards).' + (dead.length ? ' ⚠ NO VISIBLE EFFECT: ' + dead.join(', ') + '.' : '') + '\n\n' + parts.join('\n\n') };
+        if (tried) markTried();
+        const head = tried === all.length ? 'Tried ' + all.length + ' controls (each put back afterwards).'
+          : tried ? 'Tried ' + tried + ' of ' + all.length + ' controls (each put back afterwards); the rest were skipped.'
+          : '\u26a0 NOTHING WAS TRIED: all ' + all.length + ' controls were skipped, so this module\'s controls are still untested.';
+        return { title: 'try_control ' + module, output: head + unclicked + (dead.length ? ' ⚠ NO VISIBLE EFFECT: ' + dead.join(', ') + '.' : '') + '\n\n' + parts.join('\n\n') };
       }
       const want = String(control).trim().replace(/^viewof\s+/, '');
       const c = all.find(x => x.name === 'viewof ' + want) || all.find(x => x.label && x.label.toLowerCase() === want.toLowerCase()) || all.find(x => x.label && x.label.toLowerCase().includes(want.toLowerCase()));
-      if (!c) return { title: 'try_control', output: 'No control "' + control + '" in ' + module + '. Controls: ' + list() };
       const act = keys ? { keys } : drag ? { drag } : null;
+      if (!c) {
+        const w = want.toLowerCase(), exact = bs.filter(b => b.text.toLowerCase() === w);
+        const hit = exact.length ? exact : bs.filter(b => b.text.toLowerCase().includes(w));
+        if (hit.length && value === undefined) {
+          const b = hit[0];
+          const r = await tryOne(mod, { v: { _value: b.el }, name: 'the ' + JSON.stringify(b.text) + ' button in ' + b.cell, label: '' }, undefined, module, act);
+          markTried();
+          return { title: 'try_control ' + module, output: r.out + (hit.length > 1 ? '\n(Used the first of ' + hit.length + ' matching buttons: ' + listButtons(hit) + '.)' : '') };
+        }
+        return { title: 'try_control', output: 'No control "' + control + '" in ' + module + '. Controls: ' + list() + (hit.length ? '\nA button matches, but a button takes no `value`: omit it to click.' : unclicked) };
+      }
       const r = await tryOne(mod, c, value, module, act);
+      markTried();
       // rc5-train 20260928-0847-m7: a test term left in a search box kept the user's list filtered, unmentioned (2 of 2 runs)
       if (value !== undefined) { try { await ui_set(c.v._value, r.was); await ui_settle(); } catch (e) {} }
       return { title: 'try_control ' + module, output: r.out + (value !== undefined ? '\n(' + c.name + ' put back to ' + summary(r.was, 80) + ' afterwards.)' : '') };
@@ -33883,6 +33917,108 @@ hover code (m57's count, not re-measured).
 
 Evidence for the page is one model run per side (eval `rc5t-pump-sizing`, 0.40 before, 0.80
 after), which is an anecdote, not a rate.
+</script>
+<script id="@tomlarkworthy/markdown-wiki/reading-csv-and-delimited-text.md" 
+  type="text/plain"
+  data-mime="text/markdown"
+>
+---
+write-triggers:
+  - "split\\(\\s*(?:/\\\\r\\?\\\\n/|[\"'`](?:\\\\r)?\\\\n[\"'`]|/\\\\n/)\\s*\\)[\\s\\S]{0,300}?split\\(\\s*(?:[\"'`](?:,|;|\\\\t)[\"'`]|/,/)\\s*\\)"
+  - "([A-Za-z_$][\\w$]*)\\s*=[^;\\n]*split\\(\\s*(?:/\\\\r\\?\\\\n/|[\"'`](?:\\\\r)?\\\\n[\"'`]|/\\\\n/)\\s*\\)[\\s\\S]{0,2000}?[A-Za-z_$]*[Cc][Ss][Vv][\\w$]*\\(\\s*\\1\\b|split\\(\\s*(?:/\\\\r\\?\\\\n/|[\"'`](?:\\\\r)?\\\\n[\"'`]|/\\\\n/)\\s*\\)[^\\n]{0,120}?[Cc][Ss][Vv]"
+---
+
+# Reading CSV, TSV and other delimited text: parse it, do not split it
+
+A CSV field may hold the delimiter, a quote or a line break when the field is quoted:
+`"Thomas A. Garrett, Jr.",M,1972` is three fields, and `"Henry C. ""Hank"" Johnson, Jr."` is one
+field whose value contains `"Hank"`. `text.split("\n").map(line => line.split(","))` reads the
+first row as four fields and shifts every column after the name. The cells still compute, so no
+error shows the shift. Quoted fields are ordinary: 18 of the 887 rows of `us-congress-members.csv`
+are quoted like this, and 13 of the 23 distinct CSV attachments in the corpus have a field holding a
+comma, a quote or a line break (counted by the m49 worker on 2026-09-29, not re-counted since).
+
+A quoted field may also hold a line break, so splitting the text into lines first is wrong even when
+each line is then parsed with quotes in mind. A tweet export in
+`@tomlarkworthy/twitter-trending-notebook-bot-dataset-2022` has a tweet text of two paragraphs in one
+field; 2 of the 23 distinct CSV attachments have such fields. A quote-aware parser for one line does not fix
+this: the tweet still becomes two rows.
+
+Observed, "Make .csv file attachments show as a table preview in the file panel", in
+`@tomlarkworthy/fileattachments.file_browser`:
+
+- run 20260929-0620-m49-before: `text.trim().split("\n").map(l => l.split(","))`. The file it had
+  to look at had no quoted fields, and the agent reported the task done.
+- eval run eval-fixed: a 20-line quote-aware `parseCSVRow(line)` applied to
+  `text.split(/\r?\n/)`. Quoted commas were read correctly; the two-paragraph tweet became two rows.
+- eval run eval-base: `d3.csvParse(text)`, correct on both files.
+
+## Parse with the builtins
+
+A file attachment, from `d/d2dffac0e42406e8._events` (lopebooks
+`@tomlarkworthy_cloudevents-explorer.html`), which the same module shows with `Inputs.table(data)`:
+
+```js
+await FileAttachment("purchase_data.csv").csv({typed:true})
+```
+
+Text you already hold (fetched, pasted, read from another module), from
+`@tomlarkworthy/bitcoin-energy._hashrate` (lopebooks `@tomlarkworthy_bitcoin-energy.html`):
+
+```js
+d3.csvParse(await FileAttachment("hash-rate.csv").text())
+```
+
+- `FileAttachment(name).csv()` returns strings; `{typed: true}` converts numbers and dates. `.tsv()`
+  reads tab-separated files. `d3.csvParse`, `d3.tsvParse` and `d3.dsvFormat(";").parse` take text;
+  `d3.autoType` as the second argument types the values. Each returns an array of objects keyed by
+  the header row, with `.columns` in header order.
+- An attachment belongs to one module and is read with that module's `FileAttachment`. In
+  `@tomlarkworthy/fileattachments`, `getFileAttachment(name, module)` returns the same object, so
+  `.csv()` works on it.
+- `Inputs.table(rows)` renders the array; `{rows: 10}` limits the visible height. Typed numbers are
+  shown with thousands separators (1947 as 1,947).
+
+## Checking it
+
+Put a row with a quoted comma (`"Garrett, Jr."`) and a row with a quoted line break in the test
+data, and read the parsed row back: the name must be one field, and the row count must equal the
+number of records, not the number of lines. A file with no quoted fields passes every parser,
+which is how run `20260929-0620-m49-before` reported a split-based preview as done.
+
+## Precedent and limits
+
+Measured 2026-09-29 over the distinct JavaScript `<script>` blocks of `lopecode/notebooks` and
+`lopebooks/notebooks` (597 blocks after de-duplicating by content):
+
+```
+FileAttachment(...).csv({typed      15 files
+FileAttachment(...).csv(             9 files
+d3.csvParse                          3 files
+line split, then a comma split       0 files   (m49's counts; the last re-checked at merge)
+```
+
+The write-triggers match two hand-written parsers:
+
+1. A line split followed within 300 characters by a split on `,`, `;` or a tab. Corpus: 2 cells,
+   `@tomlarkworthy/sheet._sheet` and `@tomlarkworthy/spreadsheet._sheet`, which split pasted
+   clipboard text on `/\r?\n/` and then on `"\t"`. Spreadsheet applications quote a copied cell
+   that holds a tab or a line break (not tested here), so both are this defect, not false
+   positives. Unrelated splits within 300 characters (a line count next to a tag list) also
+   match; none was found in the corpus.
+2. A line split whose result is passed to a function named with `csv` (`parseCSVRow(lines[0])`,
+   up to 2000 characters later), or a line split with `csv` later on the same line
+   (`.map(parseCsvRow)`). Corpus: 0 cells. The m49 draft matched any `csv` within 40 lines of a
+   line split; that also refused a module with a `md` heading "Export as CSV" or a `"data.csv"`
+   download next to an unrelated line split, so it was narrowed at merge. A per-line parser that
+   has no `csv` in its name is not gated.
+
+Only a match the write adds counts, so editing `sheet` or `spreadsheet` without adding a split does
+not trip trigger 1.
+
+Not verified: no model run has used the page. The runs above predate it, so whether the agent
+reads it and switches to a parser, or rewrites its split until the trigger no longer matches, is
+unknown.
 </script>
 <script id="@tomlarkworthy/markdown-wiki" 
   type="text/plain"
