@@ -8826,6 +8826,46 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
     const id = m ? m[0].replace(/\.js$/, '').replace(/[*.]+$/, '') : '@user/name';
     return '\n/src and /content hold only the modules this page embeds. A notebook published on observablehq.com is not here until imported: write its two import lines ' + '(main.define("module ' + id + '", …import("/' + id + '.js?v=4")…) and a v.import binding per name; see /content/@tomlarkworthy/markdown-wiki/writing-cells-in-module-source.md "import") ' + 'and it is fetched when the write applies. /content/@tomlarkworthy/markdown-wiki/important-modules.md lists published modules (spreadsheet, editable document, slides, drawing, diagrams, saved state, file downloads) with their import lines. ' + 'To read another notebook\'s API first: fetch https://api.observablehq.com/' + id + '.js?v=4. Searching further will not find it.';
   };
+  // A search that finds nothing for a misspelled name ends the hunt (live session 2026-09-29: the agent searched a
+  // misspelling of annotate, then guessed api.observablehq.com URLs for 5 users; the page's own sources name it).
+  // Offer the names the page knows that are close: module ids and file paths, plus every @ns/name the searched
+  // files mention, matched on the last path segment by substring, a shared 4-letter prefix, or edit distance.
+  const editDistance = (a, b) => {
+    const d = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      let prev = d[0];
+      d[0] = i;
+      for (let j = 1; j <= b.length; j++) {
+        const t = d[j];
+        d[j] = Math.min(d[j] + 1, d[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+        prev = t;
+      }
+    }
+    return d[b.length];
+  };
+  const searchTerm = pattern => String(pattern).split('/').filter(Boolean).pop()?.replace(/\.js$/, '').replace(/[\\^$*+?.()|[\]{}]/g, '').toLowerCase() || '';
+  const nearNames = (pattern, paths, mentions = []) => {
+    const term = searchTerm(pattern);
+    if (term.length < 3)
+      return [];
+    const names = new Set(mentions);
+    for (const p of paths) {
+      const m = /^\/(?:src|notebook)\/(.+)\.js$/.exec(p);
+      names.add(m ? m[1] : /^\/content\/(@[\w-]+\/[\w.-]+)$/.test(p) ? p.slice(9) : p);
+    }
+    const scored = [];
+    for (const n of names) {
+      const seg = n.split('/').pop().replace(/\.[\w]+$/, '').toLowerCase();
+      if (!seg || seg === term)
+        continue;
+      const dist = seg.includes(term) || term.includes(seg) && seg.length >= 3 ? 0 : editDistance(term, seg);
+      const prefix = term.length >= 4 && seg.startsWith(term.slice(0, 4));
+      if (dist <= Math.max(1, Math.floor(term.length / 3)) || prefix)
+        scored.push([n, prefix ? Math.min(dist, 1) : dist]);
+    }
+    return scored.sort((a, b) => a[1] - b[1] || a[0].length - b[0].length).slice(0, 5).map(([n]) => n);
+  };
+  const didYouMean = (pattern, near) => near.length ? '\nDid you mean ' + near.join(', ') + '? (names this notebook knows that are close to "' + searchTerm(pattern) + '")' : '';
   const inEmbedded = p => p === '/' || /^\/(src|content)(\/|$)/.test(p) || p.startsWith('**');
   const globTool = defineTool({
     id: 'glob',
@@ -8850,9 +8890,13 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
       } catch (e) {
         return { output: 'ERROR: bad pattern: ' + (e && e.message || e) };
       }
-      const hits = (await listPathsAsync()).filter(p => re.test(p));
-      if (!hits.length)
-        return { output: '(no files match ' + pattern + ')' + (inEmbedded(pat) ? notEmbeddedHint(pat) : '') };
+      const all = await listPathsAsync();
+      const hits = all.filter(p => re.test(p));
+      if (!hits.length) {
+        const near = inEmbedded(pat) ? nearNames(pat, all) : [];
+        const mod = near.find(n => /^@[\w-]+\/[\w.-]+$/.test(n) && !all.includes('/src/' + n + '.js'));
+        return { output: '(no files match ' + pattern + ')' + didYouMean(pat, near) + (inEmbedded(pat) ? notEmbeddedHint(mod || pat) : '') };
+      }
       const shown = hits.slice(0, 200);
       return { output: shown.join('\n') + (hits.length > shown.length ? '\n[+' + (hits.length - shown.length) + ' more]' : '') };
     }
@@ -8921,6 +8965,7 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
       let matches = 0, total = 0;
       // past the cap, keep counting per file: a capped search must still say where the rest matched
       const hidden = new Map();
+      const mentions = new Set();
       for (const f of files) {
         let text;
         try {
@@ -8931,6 +8976,8 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
         if (text == null || text.length > 2000000)
           continue;
         // skip unreadable / huge binary-ish blobs
+        for (const m of text.match(/@[\w-]+\/[\w][\w.-]*/g) || [])
+          mentions.add(m.replace(/[.-]+$/, '').replace(/\.js$/, ''));
         const lines = text.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (!re.test(lines[i]))
@@ -8948,8 +8995,13 @@ const _6aumvx = function _fileTools(pathLib,applyLib,defineTool,rc5_store,cellHe
             out.push('--');
         }
       }
-      if (!matches)
-        return { output: '(no matches)' + (files.length > 1 && inEmbedded(base) && !/[\\()[\]{}]/.test(pattern) ? notEmbeddedHint(pattern) : '') };
+      if (!matches) {
+        if (!(files.length > 1 && inEmbedded(base) && !/[\\()[\]{}]/.test(pattern)))
+          return { output: '(no matches)' };
+        const near = nearNames(pattern, files, [...mentions]);
+        const mod = near.find(n => /^@[\w-]+\/[\w.-]+$/.test(n) && !files.includes('/src/' + n + '.js'));
+        return { output: '(no matches)' + didYouMean(pattern, near) + notEmbeddedHint(mod || pattern) };
+      }
       if (!hidden.size)
         return { output: out.join('\n') };
       const rest = [...hidden].sort((a, b) => b[1] - a[1]);
