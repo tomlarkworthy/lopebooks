@@ -7448,6 +7448,71 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         const lines = src.split('\n');
         return ' \xB7 ⚠ ' + gaps.length + ' $def line' + (gaps.length === 1 ? ' names a cell function' : 's name cell functions') + ' that no `const _x = function…` declares: ' + gaps.slice(0, 8).map(r => 'line ' + r.line + ' `' + lines[r.line - 1].trim().slice(0, 120) + '`').join(', ') + (gaps.length > 8 ? ', …' : '') + '. A cell is its declaration AND its $def line: to remove a cell delete both, to add one write both. Delete ' + (gaps.length === 1 ? 'this $def line, or write its declaration' : 'these $def lines, or write their declarations') + '; this draft is kept, so your next edit_file applies on top of it';
     };
+    // A module the written source imports that the page does not run yet joins runtime.mains under its own name, so it
+    // saves with the notebook and is a notebook module (live session 2026-09-29: an import of @tomlarkworthy/annotate
+    // loaded outside mains and was lost on save). createModule makes it a main before its first variable; a module
+    // added to mains later stays named "main" in module-map. The imported define runs into it through a runtime whose
+    // first module() returns it; every other call goes to the real runtime.
+    const frameworkModule = m => /^@tomlarkworthy\/(robocoop-5|lopepage|save-in-place$|inputs-reference$)/.test(m);
+    const joinImportedModules = async (id, src) => {
+        const loaders = new Map();
+        const walk = n => {
+            if (!n || typeof n.type !== 'string')
+                return;
+            if (n.type === 'CallExpression' && n.callee && n.callee.type === 'MemberExpression' && n.callee.property && n.callee.property.name === 'define') {
+                const a0 = n.arguments[0];
+                const spec = a0 && a0.type === 'Literal' && typeof a0.value === 'string' && /^module (@[\w.-]+\/[\w.-]+)$/.exec(a0.value);
+                if (spec && !loaders.has(spec[1])) {
+                    const m = /import(?:Shim)?\(\s*["'`]([^"'`]+)["'`]/.exec(src.slice(n.start, n.end));
+                    loaders.set(spec[1], m ? m[1] : '/' + spec[1] + '.js?v=4');
+                }
+            }
+            for (const k in n) {
+                const c = n[k];
+                if (Array.isArray(c))
+                    c.forEach(walk);
+                else if (c && typeof c.type === 'string')
+                    walk(c);
+            }
+        };
+        walk(acorn.parse(src, {
+            ecmaVersion: 'latest',
+            sourceType: 'module'
+        }));
+        const joined = [];
+        for (const [spec, path] of loaders) {
+            if (spec === id || frameworkModule(spec) || resolveModule(spec))
+                continue;
+            let define;
+            try {
+                define = (await import(path)).default;
+            } catch (e) {
+                continue;
+            }
+            if (typeof define !== 'function' || resolveModule(spec))
+                continue;
+            const m = createModule(spec, runtime);
+            let first = true;
+            const rt = new Proxy(runtime, {
+                get(t, k) {
+                    if (k === 'module')
+                        return (d, o) => d === undefined && first ? (first = false, m) : t.module(d, o);
+                    const v = Reflect.get(t, k);
+                    return typeof v === 'function' ? v.bind(t) : v;
+                }
+            });
+            try {
+                define(rt, () => ({}));
+                joined.push(spec);
+            } catch (e) {
+                for (const v of [...runtime._variables])
+                    if (v._module === m)
+                        v.delete();
+                runtime.mains.delete(spec);
+            }
+        }
+        return joined;
+    };
     const applyModuleSrc = async (id, src, { watchBus } = {}) => {
         const keepDraft = () => {
             const prev = rc5_store.srcFns.get(id);
@@ -7495,6 +7560,11 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                     ok: false,
                     msg: 'written, but no default export define() \u2014 not applied'
                 };
+            }
+            let joined = [];
+            try {
+                joined = await joinImportedModules(id, src);
+            } catch (e) {
             }
             let before = null, beforeCells = null;
             try {
@@ -7553,7 +7623,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             }
             return {
                 ok: true,
-                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + status + valueDiff + downstream + structure + spec
+                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + (joined.length ? ' \xB7 ' + joined.join(', ') + ' (imported) joined the notebook as ' + (joined.length === 1 ? 'a module' : 'modules') + ' of its own: it saves with the notebook, and its cells are at /src/' + joined[0] + '.js' : '') + status + valueDiff + downstream + structure + spec
             };
         } catch (e) {
             keepDraft();
