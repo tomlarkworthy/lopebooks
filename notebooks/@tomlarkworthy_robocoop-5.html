@@ -5482,12 +5482,12 @@ const _rc5sheets = function _rc5_pageSheets(){return(
   }
 }), ...document.adoptedStyleSheets]
 )};
-const _rc5cfg = function _rc5_settingsPanel(html,rc5_palette,keyView,modelView,promptView,contextToggle,reasoningToggle){return(
+const _rc5cfg = function _rc5_settingsPanel(html,rc5_palette,endpointView,keyView,modelView,promptView,contextToggle,reasoningToggle){return(
 // The key/model/prompt views are single DOM nodes, so only one chat on a page can host them.
 () => {
   const C = rc5_palette;
   const cfg = html`<details style="border-bottom:1px solid ${ C.border };padding:8px 10px">
-    <summary style="cursor:pointer;color:${ C.muted }">⚙ settings — key, model, system prompt</summary>
+    <summary style="cursor:pointer;color:${ C.muted }">⚙ settings — endpoint, key, model, system prompt</summary>
   </details>`;
   const cfgBody = html`<div class="rc5-settings" style="display:flex;flex-direction:column;gap:8px;margin-top:8px"></div>`;
   // Observable Inputs render with a light-theme palette (near-invisible on the dark UI). Force legible colors
@@ -5500,7 +5500,7 @@ const _rc5cfg = function _rc5_settingsPanel(html,rc5_palette,keyView,modelView,p
     .rc5-settings input::placeholder, .rc5-settings textarea::placeholder { color:${ C.muted } !important; opacity:.7; }
     .rc5-settings option { background:${ C.input }; color:${ C.fg }; }
   </style>`);
-  cfgBody.append(keyView, modelView, promptView, contextToggle, reasoningToggle);
+  cfgBody.append(endpointView, keyView, modelView, promptView, contextToggle, reasoningToggle);
   cfg.append(cfgBody);
   return cfg;
 }
@@ -5661,7 +5661,7 @@ export default function define(runtime, observer) {
   $def("_rc5pal", "rc5_palette", [], _rc5pal);
   $def("_rc5uns", "rc5_unsnapshotted", [], _rc5uns);
   $def("_rc5sheets", "rc5_pageSheets", [], _rc5sheets);
-  $def("_rc5cfg", "rc5_settingsPanel", ["html","rc5_palette","keyView","modelView","promptView","contextToggle","reasoningToggle"], _rc5cfg);
+  $def("_rc5cfg", "rc5_settingsPanel", ["html","rc5_palette","endpointView","keyView","modelView","promptView","contextToggle","reasoningToggle"], _rc5cfg);
   main.define("makeSession", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("makeSession", _));
   main.define("createSessionController", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("createSessionController", _));
   main.define("guardTools", ["module @tomlarkworthy/robocoop-5-sessions", "@variable"], (_, v) => v.import("guardTools", _));
@@ -5677,7 +5677,8 @@ export default function define(runtime, observer) {
   main.define("plugins", ["module @tomlarkworthy/plugin-registry", "@variable"], (_, v) => v.import("plugins", _));
   main.define("linkTo", ["module @tomlarkworthy/lopepage-urls", "@variable"], (_, v) => v.import("linkTo", _));
   main.define("contextToggle", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("contextToggle", _));
-  main.define("keyView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("keyView", _));  
+  main.define("keyView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("keyView", _));
+  main.define("endpointView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("endpointView", _));  
   main.define("modelView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("modelView", _));  
   main.define("promptView", ["module @tomlarkworthy/robocoop-5-engine", "@variable"], (_, v) => v.import("promptView", _));  
   main.define("summarizeTurn", ["module @tomlarkworthy/robocoop-5-core", "@variable"], (_, v) => v.import("summarizeTurn", _));  
@@ -5931,14 +5932,53 @@ Inputs.bind(Inputs.password({
 }), localStorageView('OPENROUTER_API_KEY'))
 )};
 const _e3skhu = (G, _) => G.input(_);
-const _1n2587c = function _demoMode(OPENROUTER_API_KEY){return(
-!String(OPENROUTER_API_KEY || '').trim()
+const _rc5endpoint = function _rc5_endpoint(Inputs,localStorageView){return(
+Inputs.bind(Inputs.text({
+  width: '100%',
+  label: 'endpoint',
+  placeholder: 'OpenRouter \u2014 or an OpenAI-compatible base URL, e.g. http://127.0.0.1:8765/v1'
+}), localStorageView('robocoop5_endpoint'))
+)};
+const _rc5endpointV = (G, _) => G.input(_);
+const _rc5pairedEndpoint = async function _pairedEndpoint()
+{
+  // A paired Claude Code channel started with LOPECODE_LLM_RUNNER=1 serves an LLM endpoint on the pairing
+  // port, keyed by the pairing token. Read once at boot: pairing after boot needs a reload.
+  let token = null;
+  try {
+    token = window.sessionStorage.getItem('lopecode_cc_token');
+  } catch (e) {
+  }
+  if (!token)
+    token = (String(window.location.hash).match(/[&#?]cc=([^&]+)/) || [])[1] || null;
+  const m = /^LOPE-(\d+)-/.exec(token || '');
+  if (!m)
+    return null;
+  const baseUrl = 'http://127.0.0.1:' + m[1] + '/v1';
+  const ok = await Promise.race([
+    window.fetch(baseUrl + '/models').then(r => r.ok, () => false),
+    new Promise(res => window.setTimeout(() => res(false), 2000))
+  ]);
+  return ok ? { baseUrl, apiKey: token } : null;
+};
+const _rc5endpointBase = function _endpointBase(rc5_endpoint,pairedEndpoint){return(
+// The endpoint setting wins; a paired channel's runner is used when the setting is empty.
+String(rc5_endpoint || '').trim().replace(/\/+$/, '') || (pairedEndpoint ? pairedEndpoint.baseUrl : '')
+)};
+const _rc5modelKey = function _modelStorageKey(endpointBase,pairedEndpoint){return(
+// Per endpoint, so switching does not overwrite the OpenRouter choice. The paired runner's port changes
+// every session, so it gets a fixed name.
+!endpointBase ? 'robocoop4_model' : pairedEndpoint && pairedEndpoint.baseUrl === endpointBase ? 'robocoop5_model@claude-code' : 'robocoop5_model@' + endpointBase
+)};
+const _1n2587c = function _demoMode(OPENROUTER_API_KEY,endpointBase){return(
+!endpointBase && !String(OPENROUTER_API_KEY || '').trim()
 )};
 const _gwbase = function _gatewayBase(){return(
 'https://openrouter-gateway.endpointservices.workers.dev/v1'
 )};
-const _1fgn2a4 = function _openrouter_catalog(demoMode,gatewayBase)
+const _1fgn2a4 = function _openrouter_catalog(demoMode,gatewayBase,endpointBase)
 {
+  // A custom endpoint advertises its own models at <base>/models, in the same shape.
   // Demo mode reads its catalog from the GATEWAY, whose /v1/models is the key's guardrail-filtered list —
   // so which models demo offers is an OpenRouter guardrail setting, never something baked in here.
   // Snapshot of openrouter.ai/api/v1/models (tool-capable models only, captured 2026-06-28) used as the
@@ -6028,7 +6068,7 @@ const _1fgn2a4 = function _openrouter_catalog(demoMode,gatewayBase)
   };
   const hasTools = m => Array.isArray(m.supported_parameters) && m.supported_parameters.includes('tools');
   const hasVision = m => Array.isArray(m.architecture && m.architecture.input_modalities) && m.architecture.input_modalities.includes('image');
-  const catalogUrl = demoMode ? gatewayBase + '/models' : 'https://openrouter.ai/api/v1/models';
+  const catalogUrl = endpointBase ? endpointBase + '/models' : demoMode ? gatewayBase + '/models' : 'https://openrouter.ai/api/v1/models';
   const fetched = window.fetch(catalogUrl).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))).then(j => {
     const models = (j.data || []).filter(m => m && m.id);
     const toolOnly = models.filter(hasTools);
@@ -6063,22 +6103,24 @@ const _12iwsf7 = function _openrouter_models(demoMode,openrouter_catalog)
 const _ycgtm0 = function _openrouter_vision(openrouter_catalog){return(
 openrouter_catalog.vision
 )};
-const _190jvha = function _model(localStorageView,demoMode,openrouter_models,Inputs,openrouter_vision)
+const _190jvha = function _model(localStorageView,demoMode,openrouter_models,Inputs,openrouter_vision,endpointBase,modelStorageKey)
 {
+  // A custom endpoint serves only its own models, like demo mode.
+  const restricted = demoMode || !!endpointBase;
   // Bind to the persisted choice, and ALWAYS keep that choice a selectable <option> — even when the live
   // catalog fetch timed out / returned the curated fallback that omits it. A model not in the option list
   // leaves the <select> value EMPTY, so chat() sends an empty model → OpenRouter 400 (the first-turn race).
-  const stored = localStorageView('robocoop4_model', { defaultValue: 'anthropic/claude-sonnet-4' });
+  const stored = localStorageView(modelStorageKey, { defaultValue: 'anthropic/claude-sonnet-4' });
   let sel = String(stored.value || 'anthropic/claude-sonnet-4');
   // Demo mode reaches only MiMo (gateway guardrail); coerce any other stored choice, and DON'T union it in
   // (a stale sonnet choice would 404 through the gateway).
-  if (demoMode && !openrouter_models.includes(sel))
+  if (restricted && !openrouter_models.includes(sel))
     sel = openrouter_models[0];
   // Write the coerced choice back BEFORE bind: Inputs.bind syncs stored.value into the <select>, and a stale
   // choice not in the demo option list resolves to null → empty model → gateway 400 on the first turn.
-  if (demoMode && stored.value !== sel)
+  if (restricted && stored.value !== sel)
     stored.value = sel;
-  const options = demoMode ? openrouter_models.slice() : Array.from(new Set([
+  const options = restricted ? openrouter_models.slice() : Array.from(new Set([
     sel,
     ...openrouter_models
   ]));
@@ -6116,9 +6158,18 @@ $0
 const _gdleyk = function _promptView($0){return(
 $0
 )};
-const _5agv7a = function _client(OPENROUTER_API_KEY,createOpenRouterClient,gatewayBase)
+const _rc5endpointView = function _endpointView($0){return(
+$0
+)};
+const _5agv7a = function _client(OPENROUTER_API_KEY,createOpenRouterClient,gatewayBase,endpointBase,pairedEndpoint)
 {
   const key = String(OPENROUTER_API_KEY || '').trim();
+  if (endpointBase)
+    return createOpenRouterClient({
+      baseUrl: endpointBase,
+      apiKey: pairedEndpoint && pairedEndpoint.baseUrl === endpointBase ? pairedEndpoint.apiKey : key,
+      title: 'robocoop-5'
+    });
   if (!key)
     return createOpenRouterClient({
       baseUrl: gatewayBase,
@@ -6386,19 +6437,25 @@ export default function define(runtime, observer) {
   $def("_yifgln", "systemPrompt", [], _yifgln);  
   $def("_1ba32tn", "viewof OPENROUTER_API_KEY", ["Inputs","localStorageView"], _1ba32tn);  
   $def("_e3skhu", "OPENROUTER_API_KEY", ["Generators","viewof OPENROUTER_API_KEY"], _e3skhu);  
-  $def("_1n2587c", "demoMode", ["OPENROUTER_API_KEY"], _1n2587c);  
+  $def("_rc5endpoint", "viewof rc5_endpoint", ["Inputs","localStorageView"], _rc5endpoint);
+  $def("_rc5endpointV", "rc5_endpoint", ["Generators","viewof rc5_endpoint"], _rc5endpointV);
+  $def("_rc5pairedEndpoint", "pairedEndpoint", [], _rc5pairedEndpoint);
+  $def("_rc5endpointBase", "endpointBase", ["rc5_endpoint","pairedEndpoint"], _rc5endpointBase);
+  $def("_rc5modelKey", "modelStorageKey", ["endpointBase","pairedEndpoint"], _rc5modelKey);
+  $def("_1n2587c", "demoMode", ["OPENROUTER_API_KEY","endpointBase"], _1n2587c);  
   $def("_gwbase", "gatewayBase", [], _gwbase);
-  $def("_1fgn2a4", "openrouter_catalog", ["demoMode","gatewayBase"], _1fgn2a4);  
+  $def("_1fgn2a4", "openrouter_catalog", ["demoMode","gatewayBase","endpointBase"], _1fgn2a4);  
   $def("_12iwsf7", "openrouter_models", ["demoMode","openrouter_catalog"], _12iwsf7);
   $def("_ycgtm0", "openrouter_vision", ["openrouter_catalog"], _ycgtm0);  
-  $def("_190jvha", "viewof model", ["localStorageView","demoMode","openrouter_models","Inputs","openrouter_vision"], _190jvha);  
+  $def("_190jvha", "viewof model", ["localStorageView","demoMode","openrouter_models","Inputs","openrouter_vision","endpointBase","modelStorageKey"], _190jvha);  
   $def("_1870whr", "model", ["Generators","viewof model"], _1870whr);  
   $def("_1vg55o6", "viewof rc5_systemPrompt", ["composeFooter","wiki_index","specLockOn","specLockPrompt","systemPrompt","Inputs"], _1vg55o6);
   $def("_kxiyos", "rc5_systemPrompt", ["Generators","viewof rc5_systemPrompt"], _kxiyos);  
   $def("_djvjqm", "keyView", ["viewof OPENROUTER_API_KEY"], _djvjqm);  
   $def("_17c024i", "modelView", ["viewof model"], _17c024i);  
   $def("_gdleyk", "promptView", ["viewof rc5_systemPrompt"], _gdleyk);  
-  $def("_5agv7a", "client", ["OPENROUTER_API_KEY","createOpenRouterClient","gatewayBase"], _5agv7a);
+  $def("_rc5endpointView", "endpointView", ["viewof rc5_endpoint"], _rc5endpointView);
+  $def("_5agv7a", "client", ["OPENROUTER_API_KEY","createOpenRouterClient","gatewayBase","endpointBase","pairedEndpoint"], _5agv7a);
   $def("_ctxtog", "contextToggle", ["Inputs"], _ctxtog);
   $def("_rc5makeSession", "makeSession", ["client","createAgentSession","reasoningToggle","toolsView","modelView","promptView","createWatchBus","createAskBus","rc5_monitorBus","monitorsView","contextToggle","composeContext","contextView","specGateCheck","rc5_specGate","zeroToolCallGate"], _rc5makeSession);
   $def("_zqho0j", "session", ["makeSession","rc5_watchBus"], _zqho0j);
