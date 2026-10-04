@@ -5694,6 +5694,15 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
+const _rc5e_title = function _title(md){return(
+md`# robocoop-5-engine
+
+The settings a chat reads and the factory that builds an agent from them.
+
+- \`makeSession(opts)\` returns one agent: the loop from robocoop-5-core, given this page's client, tools, prompt and rules. \`session\` is the default one.
+- Settings: \`OPENROUTER_API_KEY\`, \`rc5_endpoint\`, \`model\`, \`rc5_systemPrompt\`, \`contextToggle\`, \`reasoningToggle\`. \`keyView\`, \`modelView\`, \`promptView\` and \`endpointView\` are the same controls as elements, read at each step so that changing one does not rebuild a session.
+- \`client\` is the model client for the key and endpoint in force; \`pairedEndpoint\` and \`endpointBase\` say which endpoint that is.`
+)};
 const _yifgln = function _systemPrompt(){return(
 `You are a coding agent that builds and edits Observable notebook modules through Claude-Code-style file tools (read_file / write_file / edit_file), plus grep and glob for search.
 
@@ -6429,6 +6438,7 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/robocoop-5-tools", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-tools.js?v=4")).default));  
   main.define("module @tomlarkworthy/robocoop-5-core", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-core.js?v=4")).default));  
   main.define("module @tomlarkworthy/markdown-wiki", async () => runtime.module((await import("/@tomlarkworthy/markdown-wiki.js?v=4")).default));  
+  $def("_rc5e_title", null, ["md"], _rc5e_title);
   $def("_yifgln", "systemPrompt", [], _yifgln);  
   $def("_1ba32tn", "viewof OPENROUTER_API_KEY", ["Inputs","localStorageView"], _1ba32tn);  
   $def("_e3skhu", "OPENROUTER_API_KEY", ["Generators","viewof OPENROUTER_API_KEY"], _e3skhu);  
@@ -41246,6 +41256,122 @@ function createOpenRouterClient({
 
 // ── createAgentSession ──────────────────────────────────────────────────────
 
+// ── hooks ────────────────────────────────────────────────────────────────────
+
+const _doc_hooks = function _doc_hooks(md){return(
+md`## Hooks
+
+A hook is a named point in a step where rules run. A rule is \`{id, hook, order, check, evidence}\`;
+\`check(ctx)\` returns the hook's result type, or null to stay silent. \`runHook(hook, rules, ctx)\`
+runs the rules of one hook in ascending \`order\` and composes what they return. The loop below knows
+no rule: \`createAgentSession\` takes one function per hook it calls, in \`hooks\`, and the engine builds
+each from the registered rules.
+
+| compose | result |
+|---|---|
+| \`first\` | the first non-null result; later rules do not run |
+| \`list\` | every non-null result, arrays flattened |
+| \`join\` | the non-null results joined with the hook's \`sep\` |
+| \`chain\` | each rule receives the last result as \`ctx.result\`; the final one is returned |
+
+\`onThrow\` is \`skip\` (the rule is passed over and the rest run) or \`refuse\` (the hook returns a
+refusal naming the rule). \`prompt\` is declared in robocoop-5-engine and \`afterModuleWrite\` in
+robocoop-5-srctools, beside the code that calls them.`
+)};
+
+const _runHook = function _runHook(){return(
+  // Synchronous when every check is: beforeStep runs one statement before the model request and is not awaited.
+  function runHook(hook, rules, ctx = {}) {
+    const list = (Array.isArray(rules) ? rules : [])
+      .filter((r) => r && r.hook === hook.name && typeof r.check === 'function')
+      .map((r, i) => [r, i]).sort((a, b) => ((a[0].order ?? 50) - (b[0].order ?? 50)) || (a[1] - b[1])).map((x) => x[0]);
+    const out = [];
+    let cur = ctx, i = 0;
+    const refusal = (r, e) => 'REFUSED: rule ' + r.id + ' failed: ' + (e && e.message || e);
+    const done = () => hook.compose === 'first' ? null : hook.compose === 'chain' ? cur.result
+      : hook.compose === 'list' ? out : out.join(hook.sep ?? '');
+    // [value] stops the hook; undefined goes on to the next rule
+    const take = (res) => {
+      if (res == null || res === '') return;
+      if (hook.compose === 'first') return [res];
+      if (hook.compose === 'chain') cur = { ...cur, result: res };
+      else if (Array.isArray(res)) out.push(...res);
+      else out.push(res);
+    };
+    const step = () => {
+      while (i < list.length) {
+        const r = list[i++];
+        let res;
+        try { res = r.check(cur); } catch (e) { if (hook.onThrow === 'refuse') return refusal(r, e); continue; }
+        if (res && typeof res.then === 'function')
+          return res.then((v) => { const s = take(v); return s ? s[0] : step(); },
+            (e) => hook.onThrow === 'refuse' ? refusal(r, e) : step());
+        const s = take(res);
+        if (s) return s[0];
+      }
+      return done();
+    };
+    return step();
+  }
+)};
+
+const _doc_hook_context = function _doc_hook_context(md){return(
+md`### \`hook_context\`
+Runs when the context block is built: once per session (\`scope: 'session'\`) and at the start of every
+turn (\`scope: 'turn'\`). A rule is a section \`{id, label, scope, priority, budget, weak, render}\`;
+\`composeContext\` orders, bounds and assembles them. A section that throws or times out is dropped.`
+)};
+const _hook_context = function _hook_context(){return(
+{ name: 'context', compose: 'list', onThrow: 'skip' }
+)};
+const _doc_hook_beforeStep = function _doc_hook_beforeStep(md){return(
+md`### \`hook_beforeStep\`
+Runs before each model request. \`check({step, turn, sessionState, watchBus})\` returns a notice line, an
+array of lines, or null. The lines are sent as one system message. A rule with \`defer: true\` is a
+monitor: its check is started here and not awaited, its verdict is reported on the next step, and a
+verdict equal to its last one is not repeated.`
+)};
+const _hook_beforeStep = function _hook_beforeStep(){return(
+{ name: 'beforeStep', compose: 'list', onThrow: 'skip' }
+)};
+const _doc_hook_beforeTool = function _doc_hook_beforeTool(md){return(
+md`### \`hook_beforeTool\`
+Runs before a tool's \`execute\`. \`check({name, args, sessionState})\` returns a reason string to refuse
+the call; the model reads it as the tool result. The first reason wins. A rule that throws refuses the
+call: a guard that failed has not shown the call is allowed.`
+)};
+const _hook_beforeTool = function _hook_beforeTool(){return(
+{ name: 'beforeTool', compose: 'first', onThrow: 'refuse' }
+)};
+const _doc_hook_afterTool = function _doc_hook_afterTool(md){return(
+md`### \`hook_afterTool\`
+Runs after a tool's \`execute\`. \`check({name, args, result, sessionState})\` returns a replacement result
+or null. Rules are chained: each sees the result the one before it returned.`
+)};
+const _hook_afterTool = function _hook_afterTool(){return(
+{ name: 'afterTool', compose: 'chain', onThrow: 'skip' }
+)};
+const _doc_hook_turnEnd = function _doc_hook_turnEnd(md){return(
+md`### \`hook_turnEnd\`
+Runs when the model stopped, or replied with something the loop cannot run. \`ctx.kind\` says which:
+
+| kind | what happened | a rule may return |
+|---|---|---|
+| \`complete\` | the completion tool was called on its own | \`{continue: text}\`: the call is refused with that text |
+| \`batched\` | the completion tool was called beside other tools | \`{continue: text}\` |
+| \`stall\` | a reply with no tool call (\`finishReason\` is \`stop\` or \`length\`) | \`{continue: text}\` sent as a system message, or \`{end: true}\` |
+| \`truncated\` | a tool call whose arguments do not parse | \`{continue: text}\`, the tool result |
+| \`malformed\` | the provider rejected the model's own call and returned nothing | \`{retry: text}\` |
+| \`images_dropped\` | a text-only model refused a request holding images; they were removed | \`{retry: text}\` |
+
+The first non-null result wins; null lets the turn end. The loop, not the rule, bounds how often a turn
+can be continued: once per turn for \`complete\` and for \`batched\`, \`stallNudgeLimit\` consecutive
+stalls, \`malformedRetryLimit\` retries.`
+)};
+const _hook_turnEnd = function _hook_turnEnd(){return(
+{ name: 'turnEnd', compose: 'first', onThrow: 'skip' }
+)};
+
 const _doc_createAgentSession = function _doc_createAgentSession(md){return(
 md`### \`createAgentSession({client, toolsProvider, systemPromptProvider, modelProvider, …})\`
 The persistent, live-resolved conversation. \`messages\` persists across \`send()\` calls (one long
@@ -41912,6 +42038,18 @@ export default function define(runtime, observer) {
   $def("rc5c_defineTool", "defineTool", [], _defineTool);
   $def("rc5c_doc_createOpenRouterClient", null, ["md"], _doc_createOpenRouterClient);
   $def("rc5c_createOpenRouterClient", "createOpenRouterClient", ["globalThis"], _createOpenRouterClient);
+  $def("rc5c_doc_hooks", null, ["md"], _doc_hooks);
+  $def("rc5c_runHook", "runHook", [], _runHook);
+  $def("rc5c_doc_hook_context", null, ["md"], _doc_hook_context);
+  $def("rc5c_hook_context", "hook_context", [], _hook_context);
+  $def("rc5c_doc_hook_beforeStep", null, ["md"], _doc_hook_beforeStep);
+  $def("rc5c_hook_beforeStep", "hook_beforeStep", [], _hook_beforeStep);
+  $def("rc5c_doc_hook_beforeTool", null, ["md"], _doc_hook_beforeTool);
+  $def("rc5c_hook_beforeTool", "hook_beforeTool", [], _hook_beforeTool);
+  $def("rc5c_doc_hook_afterTool", null, ["md"], _doc_hook_afterTool);
+  $def("rc5c_hook_afterTool", "hook_afterTool", [], _hook_afterTool);
+  $def("rc5c_doc_hook_turnEnd", null, ["md"], _doc_hook_turnEnd);
+  $def("rc5c_hook_turnEnd", "hook_turnEnd", [], _hook_turnEnd);
   $def("rc5c_doc_createAgentSession", null, ["md"], _doc_createAgentSession);
   $def("rc5c_createAgentSession", "createAgentSession", ["AbortController","truncate"], _createAgentSession);
   $def("rc5c_doc_composeContext", null, ["md"], _doc_composeContext);
@@ -41944,31 +42082,67 @@ the current situation (what is on screen, recent edits, the document's own state
 mutable box the engine reads at each turn — like \`toolsView\`, deliberately not reactive so registering a
 provider mid-conversation cannot rebuild the session.`
 )};
-const _17jpbf2 = function _rc5_toolMgr(plugins)
-{
-  const handles = new Map();
-  // tool.id -> remove()
+const _rc5createRegistry = function _createRegistry(plugins){return(
+// One registry per plugin-registry set. register replaces by id; with `yields(next, prev)` true the new item
+// gives way and the old one stays. unregister(id, item) with `item` removes only that exact object, so a
+// re-registration by a recomputed cell is not undone by the old cell's cleanup.
+// list() is what this registry holds, read synchronously. view(invalidation) is a mutable box of the whole
+// set, including items another module added with plugins.add: written at once on register and unregister,
+// and from the set's stream after that. A box, not a reactive value, so a session reading it is not rebuilt.
+(set, { validate = null, yields = null } = {}) => {
+  const handles = new Map();  // id -> { item, remove }
+  const views = new Set();
+  const write = f => { for (const v of views) v.value = f(Array.isArray(v.value) ? v.value : []); };
+  const drop = id => {
+    const h = handles.get(id);
+    handles.delete(id);
+    h.remove();
+    write(list => list.filter(x => x !== h.item));
+  };
   return {
-    register(tool) {
-      if (!tool || !tool.id)
-        throw new Error('registerTool: tool needs an id');
-      const prev = handles.get(tool.id);
-      if (prev)
-        prev.remove();
-      // replace-by-id
-      handles.set(tool.id, { tool, remove: plugins.add('rc5-tools', tool) });
-      return tool;
-    },
-    // With `tool`, only removes it if that exact object is still the registered one (a re-registration wins).
-    unregister(id, tool) {
-      const h = handles.get(id);
-      if (h && (!tool || h.tool === tool)) {
-        h.remove();
-        handles.delete(id);
+    set,
+    register(item) {
+      if (!item || !item.id) throw new Error(set + ': an item needs an id');
+      if (validate) validate(item);
+      const prev = handles.get(item.id);
+      if (prev) {
+        if (yields && yields(item, prev.item)) return item;
+        drop(item.id);
       }
+      handles.set(item.id, { item, remove: plugins.add(set, item) });
+      write(list => [...list.filter(x => x !== item), item]);
+      return item;
+    },
+    unregister(id, item) {
+      const h = handles.get(id);
+      if (h && (!item || h.item === item)) drop(id);
+    },
+    list: () => [...handles.values()].map(h => h.item),
+    view(invalidation) {
+      const view = { value: [...handles.values()].map(h => h.item) };
+      views.add(view);
+      const gen = plugins.get(set);
+      let live = true;
+      (async () => {
+        while (live) {
+          const step = await gen.next();
+          if (step.done) break;
+          view.value = await step.value ?? [];
+        }
+      })();
+      Promise.resolve(invalidation).then(() => {
+        live = false;
+        views.delete(view);
+        try { gen.return && gen.return(); } catch (e) {}
+      });
+      return view;
     }
   };
-};
+}
+)};
+const _17jpbf2 = function _rc5_toolMgr(createRegistry){return(
+createRegistry('rc5-tools')
+)};
 const _2b4tt9 = function _registerTool(rc5_toolMgr){return(
 tool => rc5_toolMgr.register(tool)
 )};
@@ -42438,7 +42612,8 @@ export default function define(runtime, observer) {
 
   main.define("module @tomlarkworthy/plugin-registry", async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));  
   $def("_1iqd1vs", null, ["md"], _1iqd1vs);  
-  $def("_17jpbf2", "rc5_toolMgr", ["plugins"], _17jpbf2);  
+  $def("_rc5createRegistry", "createRegistry", ["plugins"], _rc5createRegistry);
+  $def("_17jpbf2", "rc5_toolMgr", ["createRegistry"], _17jpbf2);  
   $def("_2b4tt9", "registerTool", ["rc5_toolMgr"], _2b4tt9);  
   $def("_15um81e", "unregisterTool", ["rc5_toolMgr"], _15um81e);  
   $def("_1dzamy5", "rc5_tools", ["plugins"], _1dzamy5);  
