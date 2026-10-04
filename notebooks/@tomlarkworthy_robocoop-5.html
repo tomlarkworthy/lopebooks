@@ -42259,7 +42259,7 @@ const _runHook = function _runHook(){return(
   // Synchronous when every check is: beforeStep runs one statement before the model request and is not awaited.
   function runHook(hook, rules, ctx = {}) {
     const list = (Array.isArray(rules) ? rules : [])
-      .filter((r) => r && r.hook === hook.name && typeof r.check === 'function')
+      .filter((r) => r && r.hook === hook.name && typeof r.check === 'function' && !r.defer)
       .map((r, i) => [r, i]).sort((a, b) => ((a[0].order ?? 50) - (b[0].order ?? 50)) || (a[1] - b[1])).map((x) => x[0]);
     // Results are placed by order; a rule with a later `phase` is evaluated after the others.
     const seq = list.map((r, k) => k).sort((a, b) => ((list[a].phase ?? 0) - (list[b].phase ?? 0)) || (a - b));
@@ -43020,11 +43020,13 @@ Live registry over [\`@tomlarkworthy/plugin-registry\`](https://observablehq.com
 \`plugins.add("rc5-tools", tool)\` directly. No bash — the default surface is Claude-Code-style file tools +
 grep/glob, registered by robocoop-5-srctools.
 
-Situational context uses the same shape under set name \`"rc5-context"\`: \`registerContext({id, label,
-scope: 'session'|'turn', priority, budget, weak, render})\` from any cell/notebook teaches the agent about
-the current situation (what is on screen, recent edits, the document's own state). \`contextView\` is the
-mutable box the engine reads at each turn — like \`toolsView\`, deliberately not reactive so registering a
-provider mid-conversation cannot rebuild the session.`
+Rules, context providers and monitors are one set, \`"rc5-hooks"\`, keyed by hook and id. \`registerRule(rule)\`
+adds a rule on a hook. \`registerContext({id, label, scope: 'session'|'turn', priority, budget, weak, render})\`
+adds a provider on the context hook: what is on screen, recent edits, the document's own state.
+\`registerMonitor({id, check})\` adds a deferred rule on beforeStep. \`rulesView\`, \`contextView\` and
+\`monitorsView\` are boxes read at each use, like \`toolsView\`: not reactive, so registering mid-conversation
+does not rebuild the session. Until 2026-10-04 context and monitors were two more sets, \`"rc5-context"\` and
+\`"rc5-monitors"\`; an item added to those with \`plugins.add\` directly is no longer read.`
 )};
 const _rc5createRegistry = function _createRegistry(plugins){return(
 // One registry per plugin-registry set. register replaces by key (the id, unless `key` says otherwise); with `yields(next, prev)` true the new item
@@ -43091,7 +43093,8 @@ createRegistry('rc5-tools')
 const _rc5hooks = function _rc5_hooks(createRegistry){return(
 // Every rule on the page, on every hook, in one set. Two rules may share an id on different hooks.
 createRegistry('rc5-hooks', {
-  key: rule => rule.hook + ':' + rule.id,
+  // a monitor (a deferred rule) is keyed apart, so it may share an id with a rule on beforeStep
+  key: rule => (rule.defer ? 'monitor' : rule.hook) + ':' + rule.id,
   yields: (next, prev) => !!next.weak && !prev.weak,
   validate: rule => {
     if (typeof rule.hook !== 'string' || !rule.hook) throw new Error('registerRule: rule ' + rule.id + ' needs a hook');
@@ -43140,68 +43143,23 @@ const _1pxjzps = function _toolsView(plugins,invalidation)
   });
   return view;
 };
-const _ctxmgr1 = function _rc5_contextMgr(plugins)
-{
-  // Mirror of rc5_toolMgr for the 'rc5-context' set. id → {remove, weak}; re-register replaces,
-  // except a `weak` provider never displaces an existing one (so a tier-1 DOM fallback loses to a
-  // richer owner-registered provider regardless of boot order).
-  const handles = new Map();
-  return {
-    register(provider) {
-      if (!provider || !provider.id)
-        throw new Error('registerContext: provider needs an id');
-      const prev = handles.get(provider.id);
-      if (prev) {
-        if (provider.weak && !prev.weak)
-          return provider;
-        prev.remove();
-      }
-      handles.set(provider.id, {
-        remove: plugins.add('rc5-context', provider),
-        weak: !!provider.weak
-      });
-      return provider;
-    },
-    unregister(id) {
-      const h = handles.get(id);
-      if (h) {
-        h.remove();
-        handles.delete(id);
-      }
-    }
-  };
-};
-const _ctxmgr2 = function _registerContext(rc5_contextMgr){return(
-provider => rc5_contextMgr.register(provider)
+const _ctxmgr2 = function _registerContext(rc5_hooks){return(
+// A context provider {id, label, scope, priority, budget, weak, render} is an entry of rc5-hooks on the context
+// hook. A `weak` provider never displaces one already registered under its id, whatever the boot order.
+provider => {
+  if (!provider || !provider.id) throw new Error('registerContext: provider needs an id');
+  rc5_hooks.register({ ...provider, hook: 'context' });
+  return provider;
+}
 )};
-const _ctxmgr3 = function _unregisterContext(rc5_contextMgr){return(
-id => rc5_contextMgr.unregister(id)
+const _ctxmgr3 = function _unregisterContext(rc5_hooks){return(
+id => rc5_hooks.unregister('context:' + id)
 )};
-const _ctxmgr4 = function _contextView(plugins,invalidation)
-{
-  // Mutable box (NOT a reactive array) — same reason as toolsView: the session must not take a
-  // reactive dependency on the provider list, or registering a provider mid-conversation would
-  // rebuild the session and wipe the chat history.
-  const view = { value: [] };
-  const gen = plugins.get('rc5-context');
-  let live = true;
-  (async () => {
-    while (live) {
-      const step = await gen.next();
-      if (step.done)
-        break;
-      view.value = await step.value ?? [];
-    }
-  })();
-  invalidation.then(() => {
-    live = false;
-    try {
-      gen.return && gen.return();
-    } catch (e) {
-    }
-  });
-  return view;
-};
+const _ctxmgr4 = function _contextView(rulesView){return(
+// The context providers, read from the one registry at each use. A box with a getter, not a reactive value:
+// registering a provider mid-conversation must not rebuild the session.
+{ get value() { return (Array.isArray(rulesView.value) ? rulesView.value : []).filter(r => r && r.hook === 'context'); } }
+)};
 const _rc5wbf = function _createWatchBus(){return(
 // A watch bus carries live changes into an agent's next step (the engine's noticesProvider drains it).
 // Each session owns one, so two agents on a page never read each other's watches.
@@ -43357,67 +43315,23 @@ const _1yx9hra = function _9(html,rc5_tools){return(
 html`<div style="font:12px ui-monospace,Menlo,monospace;color:#8b949e">${ rc5_tools.length } tool(s): ${ rc5_tools.map(t => t.id).join(', ') || '(none yet \u2014 mount robocoop-5-srctools)' }</div>`
 )};
 
-const _rc5rc5monitorMgr = function _rc5_monitorMgr(plugins)
-{
-  // Mirror of rc5_toolMgr / rc5_contextMgr for the 'rc5-monitors' set. A monitor is
-  // {id, label?, budget?, check(ctx) -> string | null | Promise<string|null>}: a deterministic check that
-  // runs once per agent step and returns a NOTICE LINE, or null to stay silent. Silence is the default and
-  // the point \u2014 a monitor whose subject is absent must emit nothing at all, or it degrades every task it
-  // does not apply to.
-  const handles = new Map();
-  return {
-    register(monitor) {
-      if (!monitor || !monitor.id)
-        throw new Error('registerMonitor: monitor needs an id');
-      if (typeof monitor.check !== 'function')
-        throw new Error('registerMonitor: monitor needs a check(ctx) function');
-      const prev = handles.get(monitor.id);
-      if (prev)
-        prev();
-      // replace-by-id
-      handles.set(monitor.id, plugins.add('rc5-monitors', monitor));
-      return monitor;
-    },
-    unregister(id) {
-      const remove = handles.get(id);
-      if (remove) {
-        remove();
-        handles.delete(id);
-      }
-    }
-  };
-};
-const _rc5registerMonitor = function _registerMonitor(rc5_monitorMgr){return(
-monitor => rc5_monitorMgr.register(monitor)
+const _rc5registerMonitor = function _registerMonitor(rc5_hooks){return(
+// A monitor {id, label?, budget?, check(ctx) -> string | null | Promise} is an entry of rc5-hooks on beforeStep
+// with defer: true. The hook does not call a deferred rule: each session's monitor bus starts the check and
+// reports its line at a later step. Silence is the default: a monitor whose subject is absent returns null.
+monitor => {
+  if (!monitor || !monitor.id) throw new Error('registerMonitor: monitor needs an id');
+  if (typeof monitor.check !== 'function') throw new Error('registerMonitor: monitor needs a check(ctx) function');
+  rc5_hooks.register({ ...monitor, hook: 'beforeStep', defer: true });
+  return monitor;
+}
 )};
-const _rc5unregisterMonitor = function _unregisterMonitor(rc5_monitorMgr){return(
-id => rc5_monitorMgr.unregister(id)
+const _rc5unregisterMonitor = function _unregisterMonitor(rc5_hooks){return(
+id => rc5_hooks.unregister('monitor:' + id)
 )};
-const _rc5monitorsView = function _monitorsView(plugins,invalidation)
-{
-  // Mutable box (NOT a reactive array) \u2014 same reason as toolsView/contextView: the session must not take a
-  // reactive dependency on the monitor list, or registering a monitor mid-conversation would rebuild the
-  // session and wipe the chat history.
-  const view = { value: [] };
-  const gen = plugins.get('rc5-monitors');
-  let live = true;
-  (async () => {
-    while (live) {
-      const step = await gen.next();
-      if (step.done)
-        break;
-      view.value = await step.value ?? [];
-    }
-  })();
-  invalidation.then(() => {
-    live = false;
-    try {
-      gen.return && gen.return();
-    } catch (e) {
-    }
-  });
-  return view;
-};
+const _rc5monitorsView = function _monitorsView(rulesView){return(
+{ get value() { return (Array.isArray(rulesView.value) ? rulesView.value : []).filter(r => r && r.hook === 'beforeStep' && r.defer); } }
+)};
 const _rc5createMonitorBus = function _createMonitorBus(){return(
 // One per session (makeSession), as createWatchBus is: a shared bus gave a verdict to whichever agent drained first.
 () => {
@@ -43567,9 +43481,6 @@ const _rc5specGateCheck = function _specGateCheck(){return(
     return 'REJECTED: the spec scorecard reports ' + k + '/' + n + ' examples FAILING (' + names + '). ' + 'Fix /src/@user/solution.js, or if an example itself mis-transcribes the spec, correct ' + '/src/@user/spec.js. To knowingly complete anyway, include ' + '"SPEC-WAIVER: <example name> \u2014 <reason>" in your summary.';
   }
 )};
-const _rc5rc5monitors = function _rc5_monitors(plugins){return(
-plugins.get('rc5-monitors')
-)};
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -43588,23 +43499,21 @@ export default function define(runtime, observer) {
   $def("_15um81e", "unregisterTool", ["rc5_toolMgr"], _15um81e);  
   $def("_1dzamy5", "rc5_tools", ["plugins"], _1dzamy5);  
   $def("_1pxjzps", "toolsView", ["plugins","invalidation"], _1pxjzps);
-  $def("_ctxmgr1", "rc5_contextMgr", ["plugins"], _ctxmgr1);
-  $def("_ctxmgr2", "registerContext", ["rc5_contextMgr"], _ctxmgr2);
-  $def("_ctxmgr3", "unregisterContext", ["rc5_contextMgr"], _ctxmgr3);
-  $def("_ctxmgr4", "contextView", ["plugins","invalidation"], _ctxmgr4);
+  $def("_ctxmgr2", "registerContext", ["rc5_hooks"], _ctxmgr2);
+  $def("_ctxmgr3", "unregisterContext", ["rc5_hooks"], _ctxmgr3);
+  $def("_ctxmgr4", "contextView", ["rulesView"], _ctxmgr4);
   $def("_rc5wbf", "createWatchBus", [], _rc5wbf);
   $def("_rc5watchBuses", "rc5_watchBuses", [], _rc5watchBuses);
   $def("_16sx9jh", "rc5_watchBus", ["createWatchBus"], _16sx9jh);
   $def("_rc5askb", "createAskBus", [], _rc5askb);
   $def("_1yx9hra", null, ["html","rc5_tools"], _1yx9hra);  
-  $def("_rc5rc5monitorMgr", "rc5_monitorMgr", ["plugins"], _rc5rc5monitorMgr);
-  $def("_rc5registerMonitor", "registerMonitor", ["rc5_monitorMgr"], _rc5registerMonitor);
-  $def("_rc5unregisterMonitor", "unregisterMonitor", ["rc5_monitorMgr"], _rc5unregisterMonitor);
-  $def("_rc5monitorsView", "monitorsView", ["plugins","invalidation"], _rc5monitorsView);
+  $def("_rc5registerMonitor", "registerMonitor", ["rc5_hooks"], _rc5registerMonitor);
+  $def("_rc5unregisterMonitor", "unregisterMonitor", ["rc5_hooks"], _rc5unregisterMonitor);
+  $def("_rc5monitorsView", "monitorsView", ["rulesView"], _rc5monitorsView);
   $def("_rc5createMonitorBus", "createMonitorBus", [], _rc5createMonitorBus);
   $def("_rc5rc5specGate", "rc5_specGate", [], _rc5rc5specGate);
   $def("_rc5specGateCheck", "specGateCheck", [], _rc5specGateCheck);
-  $def("_rc5rc5monitors", "rc5_monitors", ["plugins"], _rc5rc5monitors);
+
   main.define("plugins", ["module @tomlarkworthy/plugin-registry", "@variable"], (_, v) => v.import("plugins", _));
   return main;
 }</script>
