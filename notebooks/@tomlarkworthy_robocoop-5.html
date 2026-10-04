@@ -7513,7 +7513,7 @@ const _rc5uncaught = function _uncaughtLog(invalidation,runtime)
         }
     };
 };
-const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,createModule,cellHelpers,summarizeJS,rc5_watchBus,observe,srcContext,descendants,location,navigate,rc5_store,specLib,uncaughtLog,acorn)
+const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,createModule,cellHelpers,summarizeJS,rc5_watchBus,observe,srcContext,descendants,location,navigate,rc5_store,specLib,uncaughtLog,acorn,rulesView,runHook,hook_afterModuleWrite)
 {
     const apply = jbApply({
         currentModules,
@@ -8380,41 +8380,16 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
             rc5_store.srcFns.set(id, mod.default);
             const n = r.changes || 0;
             const surfaced = wasNew && /\bviewof\s|\bmd`|\bhtml`/.test(src) && surfaceInView(id);
-            let status = '';
+            // What the write did, told by the afterModuleWrite rules (rule_afterModuleWrite_* below), in their order.
+            let report = '';
             try {
-                const probe = await probeAndWatch(id, watchBus);
-                // a rejection nobody awaits is reported a task after it happens; give the first compute's a moment
-                await new Promise(r => setTimeout(r, 50));
-                status = probeStatus(probe, id, src);
-            } catch (e) {
-            }
-            let downstream = '';
-            try {
-                downstream = await downstreamStatus(id);
-            } catch (e) {
-            }
-            let structure = '';
-            try {
-                structure = await structureStatus(id);
-            } catch (e) {
-            }
-            let spec = '';
-            try {
-                spec = await specLib.specStatus();
-            } catch (e) {
-            }
-            let valueDiff = '';
-            try {
-                valueDiff = valueDiffStatus(before, await snapshotValues(id));
-            } catch (e) {
-            }
-            try {
-                valueDiff = removedStatus(beforeCells, cellsByPid(id)) + valueDiff;
+                report = await runHook(hook_afterModuleWrite, Array.isArray(rulesView.value) ? rulesView.value : [],
+                    { id, src, wasNew, changes: n, before, beforeCells, watchBus });
             } catch (e) {
             }
             return {
                 ok: true,
-                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + (joined.length ? ' \xB7 ' + joined.join(', ') + ' (imported) joined the notebook as ' + (joined.length === 1 ? 'a module' : 'modules') + ' of its own: it saves with the notebook, and its cells are at /src/' + joined[0] + '.js' : '') + status + valueDiff + downstream + structure + spec
+                msg: 'applied live (' + n + ' cell' + (n === 1 ? '' : 's') + ' changed)' + (surfaced ? ' \xB7 opened in the shared view so the human can see it' : '') + (joined.length ? ' \xB7 ' + joined.join(', ') + ' (imported) joined the notebook as ' + (joined.length === 1 ? 'a module' : 'modules') + ' of its own: it saves with the notebook, and its cells are at /src/' + joined[0] + '.js' : '') + report
             };
         } catch (e) {
             keepDraft();
@@ -8456,7 +8431,12 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         applyModuleSrc: applyModuleSrcGated,
         probeAndWatch,
         probeStatus,
+        downstreamStatus,
         structureStatus,
+        snapshotValues,
+        cellsByPid,
+        removedStatus,
+        valueDiffStatus,
         moduleExists
     };
 };
@@ -10125,6 +10105,240 @@ const _qc0bl = function _rc5_host(rc5_store,applyLib,pathLib,exportModuleJS,moun
     mount
   };
 };
+const _rc5st_doc_afterModuleWrite = function _doc_hook_afterModuleWrite(md){return(
+md`## What a write reports: \`hook_afterModuleWrite\`
+
+\`applyModuleSrc(id, src)\` compiles the text and applies it to the live runtime. When it has applied, it runs the rules on this hook and appends what they return to \`applied live (N cells changed)\`. \`check({id, src, wasNew, changes, before, beforeCells, watchBus})\` returns text that starts with \` · \`, or nothing. \`before\` is the values of the module's cells and \`beforeCells\` its cells by pid, both taken before the apply. A rule that throws is skipped. The reporters themselves are functions of \`applyLib\`; a rule here says where one goes in the report.`
+)};
+const _rc5st_hook_afterModuleWrite = function _hook_afterModuleWrite(){return(
+{ name: 'afterModuleWrite', compose: 'join', sep: '', onThrow: 'skip' }
+)};
+const _rc5st_ruleFixture = function _rc5_ruleFixture(runtime){return(
+Object.assign(
+// Module source for the rule tests: cells as [name, inputs, function text]; imports as [module, name].
+(cells, imports = []) => cells.map(([n, , fn]) => 'const _' + n + ' = ' + fn + ';').join('\n') + `
+export default function define(runtime, observer) {
+  const main = runtime.module();
+` + [...new Set(imports.map(([m]) => m))].map(m => '  main.define("module ' + m + '", async () => runtime.module((await import("' + m + '")).default));').join('\n') + '\n' +
+  imports.map(([m, n]) => '  main.define("' + n + '", ["module ' + m + '", "@variable"], (_, v) => v.import("' + n + '", _));').join('\n') + '\n' +
+  cells.map(([n, deps]) => '  main.variable(observer("' + n + '")).define("' + n + '", ' + JSON.stringify(deps) + ', _' + n + ').pid = "_' + n + '";').join('\n') + `
+  return main;
+}
+`,
+{
+  // scratch(rule, tag, fn) runs fn(name), where name(x) is a module id for this run, then takes those modules off
+  // the page so a test's module is not saved with the notebook. A write recomputes applyLib and so every cell
+  // here: one run per (tag, check text) is kept, or a test that writes would rerun itself without end.
+  runs: new Map(),
+  queue: Promise.resolve(),  // one at a time: the page shows this module, so every test cell starts at once
+  // Off unless asked for: this module is shown on the page, so its cells run in every reader's notebook, and a
+  // test that writes modules there puts them in front of the model and in the saved file.
+  allow: false,
+  scratch(rule, tag, fn) {
+    if (!this.allow) return 'not run: this test applies modules to the page. tools/robocoop-5/rule-tests-browser.mjs runs it';
+    const key = tag + '|' + String(rule.check);
+    if (this.runs.has(key)) return this.runs.get(key);
+    const ids = new Map();
+    const stamp = Math.random().toString(36).slice(2, 8);
+    const name = x => ids.get(x) ?? (ids.set(x, '@rc5-test/' + x + '-' + stamp), ids.get(x));
+    const run = (this.queue = this.queue.then(() => {}, () => {})).then(async () => {
+      try { return await fn(name); }
+      finally {
+        for (const n of ids.values()) {
+          const m = runtime.mains.get(n);
+          if (!m) continue;
+          runtime.mains.delete(n);
+          for (const v of [...runtime._variables]) if (v._module === m && v._type === 1) v.delete();
+        }
+      }
+    });
+    this.queue = run;
+    this.runs.set(key, run);
+    return run;
+  }
+})
+)};
+const _rc5st_rule_afterModuleWrite_probe = function _rule_afterModuleWrite_probe(applyLib){return(
+{
+  id: 'probe', hook: 'afterModuleWrite', order: 10,
+  evidence: { run: '20260928-0847-m14', what: 'an anonymous chart errored while the write said "✓ all cells compute"' },
+  check: async ({ id, src, watchBus }) => {
+    const probe = await applyLib.probeAndWatch(id, watchBus);
+    // a rejection nobody awaits is reported a task after it happens; give the first compute's a moment
+    await new Promise(r => setTimeout(r, 50));
+    return applyLib.probeStatus(probe, id, src);
+  }
+}
+)};
+const _rc5st_doc_rule_afterModuleWrite_probe = function _doc_rule_afterModuleWrite_probe(md){return(
+md`**\`rule_afterModuleWrite_probe\`** (order 10). Computes every cell of the written module, starts watching them on the session's bus, and reports which compute, which error and why, and the first values. It also carries the notes read from the same probe: argument count against declared inputs, binding by position, declared functions no cell uses.`
+)};
+const _rc5st_test_probe_fires = async function _test_rule_probe_fires(rule_afterModuleWrite_probe,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_probe, 'probe-fires', async name => {
+    const id = name('probe-fires');
+    const r = await applyLib.applyModuleSrc(id, rc5_ruleFixture([['a', [], '() => 1'], ['b', ['a'], 'a => a.missing.deeper']]));
+    if (!r.ok || !/1 of 2 cells? |\u26A0|error/i.test(r.msg) || !/b/.test(r.msg)) throw new Error('got ' + r.msg);
+    const direct = await rule_afterModuleWrite_probe.check({ id, src: '' });
+    if (!direct || !r.msg.includes(direct.slice(0, 40))) throw new Error('the rule text is not in the write report: ' + direct);
+    return direct.slice(0, 80);
+  });
+};
+const _rc5st_test_probe_silent = async function _test_rule_probe_silent(rule_afterModuleWrite_probe,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_probe, 'probe-silent', async name => {
+    const off = await applyLib.applyModuleSrc(name('probe-silent'), 'const x = 1;');
+    if (off.ok || /compute/.test(off.msg)) throw new Error('reported on a write that did not apply: ' + off.msg);
+    return 'silent';
+  });
+};
+const _rc5st_rule_afterModuleWrite_removed_cells = function _rule_afterModuleWrite_removed_cells(applyLib){return(
+{
+  id: 'removed_cells', hook: 'afterModuleWrite', order: 20, phase: 2,
+  evidence: { run: '20260928-0847-m20', what: 'a tidy-up deleted test_breakpoints as "nothing depended on it" under "✓ values unchanged"' },
+  check: ({ id, beforeCells }) => applyLib.removedStatus(beforeCells, applyLib.cellsByPid(id))
+}
+)};
+const _rc5st_doc_rule_afterModuleWrite_removed_cells = function _doc_rule_afterModuleWrite_removed_cells(md){return(
+md`**\`rule_afterModuleWrite_removed_cells\`** (order 20). Names the cells a write removed, matched by pid so a rename is not a removal, and flags the two kinds that having no dependents does not make unused: a test cell and a cell that displays something. Evaluated last (\`phase: 2\`), as it was before it was a rule.`
+)};
+const _rc5st_test_removed_cells_fires = async function _test_rule_removed_cells_fires(rule_afterModuleWrite_removed_cells,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_removed_cells, 'removed_cells-fires', async name => {
+    const id = name('removed-fires');
+    await applyLib.applyModuleSrc(id, rc5_ruleFixture([['a', [], '() => 1'], ['test_a', ['a'], 'a => a']]));
+    // This applyLib holds the module list from before the first write, so its second write would take the
+    // module for new and pass no beforeCells. The rule is given them here; the whole path is in the oracle evals.
+    const beforeCells = applyLib.cellsByPid(id);
+    const r = await applyLib.applyModuleSrc(id, rc5_ruleFixture([['a', [], '() => 1']]));
+    const msg = r.ok ? rule_afterModuleWrite_removed_cells.check({ id, beforeCells }) : r.msg;
+    if (!msg || !msg.startsWith(' \xB7 removed 1 cell: test_a') || !msg.includes('TEST cell')) throw new Error('got ' + msg);
+    return 'removed 1 cell: test_a';
+  });
+};
+const _rc5st_test_removed_cells_silent = async function _test_rule_removed_cells_silent(rule_afterModuleWrite_removed_cells,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_removed_cells, 'removed_cells-silent', async name => {
+    const id = name('removed-silent');
+    await applyLib.applyModuleSrc(id, rc5_ruleFixture([['a', [], '() => 1']]));
+    const r = await applyLib.applyModuleSrc(id, rc5_ruleFixture([['a', [], '() => 2']]));
+    if (!r.ok || / removed \d+ cell/.test(r.msg)) throw new Error('got ' + r.msg);
+    if (rule_afterModuleWrite_removed_cells.check({ id, beforeCells: null })) throw new Error('fired on a new module');
+    return 'silent';
+  });
+};
+const _rc5st_rule_afterModuleWrite_value_diff = function _rule_afterModuleWrite_value_diff(applyLib){return(
+{
+  id: 'value_diff', hook: 'afterModuleWrite', order: 25, phase: 1,
+  evidence: { run: '20260928-0847-m12', what: 'a rename re-bound a chart\'s inputs and the report said "✓ values unchanged"' },
+  check: async ({ id, before }) => applyLib.valueDiffStatus(before, await applyLib.snapshotValues(id))
+}
+)};
+const _rc5st_doc_rule_afterModuleWrite_value_diff = function _doc_rule_afterModuleWrite_value_diff(md){return(
+md`**\`rule_afterModuleWrite_value_diff\`** (order 25). Compares what each kept cell shows before and after the write, at the current control settings, and says either that nothing changed or which cells did and where. It is evaluated after the other rules (\`phase: 1\`) so that cells have had time to compute, and placed second in the report.`
+)};
+const _rc5st_test_value_diff_fires = async function _test_rule_value_diff_fires(rule_afterModuleWrite_value_diff,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_value_diff, 'value_diff-fires', async name => {
+    const id = name('diff-fires');
+    await applyLib.applyModuleSrc(id, rc5_ruleFixture([['a', [], '() => 1'], ['b', ['a'], 'a => a + 1']]));
+    const r = await applyLib.applyModuleSrc(id, rc5_ruleFixture([['a', [], '() => 5'], ['b', ['a'], 'a => a + 1']]));
+    if (!r.ok || !/this write CHANGED what \d+ of \d+ kept cells/.test(r.msg)) throw new Error('got ' + r.msg);
+    return r.msg.match(/this write CHANGED[^:]*/)[0];
+  });
+};
+const _rc5st_test_value_diff_silent = async function _test_rule_value_diff_silent(rule_afterModuleWrite_value_diff,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_value_diff, 'value_diff-silent', async name => {
+    const id = name('diff-silent');
+    const first = await applyLib.applyModuleSrc(id, rc5_ruleFixture([['a', [], '() => 1']]));
+    if (!first.ok || /CHANGED what|values unchanged/.test(first.msg)) throw new Error('compared a module that did not exist before: ' + first.msg);
+    if (await rule_afterModuleWrite_value_diff.check({ id, before: null })) throw new Error('fired with no snapshot from before');
+    return 'silent';
+  });
+};
+const _rc5st_rule_afterModuleWrite_downstream = function _rule_afterModuleWrite_downstream(applyLib){return(
+{
+  id: 'downstream', hook: 'afterModuleWrite', order: 30,
+  evidence: { run: null, what: 'no run is cited in the source; write-feedback-check.mjs holds the case (cross-module-downstream)' },
+  check: ({ id }) => applyLib.downstreamStatus(id)
+}
+)};
+const _rc5st_doc_rule_afterModuleWrite_downstream = function _doc_rule_afterModuleWrite_downstream(md){return(
+md`**\`rule_afterModuleWrite_downstream\`** (order 30). Reports the cells in other modules that read the written module's cells: their value after the write, or their error. Up to 12 are listed.`
+)};
+const _rc5st_test_downstream_fires = async function _test_rule_downstream_fires(rule_afterModuleWrite_downstream,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_downstream, 'downstream-fires', async name => {
+    const up = name('down-up'), down = name('down-reader');
+    await applyLib.applyModuleSrc(up, rc5_ruleFixture([['a', [], '() => 1']]));
+    await applyLib.applyModuleSrc(down, rc5_ruleFixture([['twice', ['a'], 'a => a * 2']], [[up, 'a']]));
+    const r = await applyLib.applyModuleSrc(up, rc5_ruleFixture([['a', [], '() => 21']]));
+    if (!r.ok || !r.msg.includes(' \xB7 downstream recomputed: ') || !/twice=42/.test(r.msg)) throw new Error('got ' + r.msg);
+    return r.msg.match(/downstream recomputed: [^\xB7]*/)[0].trim();
+  });
+};
+const _rc5st_test_downstream_silent = async function _test_rule_downstream_silent(rule_afterModuleWrite_downstream,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_downstream, 'downstream-silent', async name => {
+    const r = await applyLib.applyModuleSrc(name('down-silent'), rc5_ruleFixture([['a', [], '() => 1']]));
+    if (!r.ok || /downstream recomputed/.test(r.msg)) throw new Error('got ' + r.msg);
+    return 'silent';
+  });
+};
+const _rc5st_rule_afterModuleWrite_structure = function _rule_afterModuleWrite_structure(applyLib){return(
+{
+  id: 'structure', hook: 'afterModuleWrite', order: 40,
+  evidence: { run: 'm16', what: 'a cell holding one literal (inline CSV) was told "SPLIT data" on every write; such cells are exempt' },
+  check: ({ id }) => applyLib.structureStatus(id)
+}
+)};
+const _rc5st_doc_rule_afterModuleWrite_structure = function _doc_rule_afterModuleWrite_structure(md){return(
+md`**\`rule_afterModuleWrite_structure\`** (order 40). Reports the module's cell count and its least maintainable cell (maintainability index, lines, cyclomatic complexity from \`@tomlarkworthy/code-metrics\`), and asks for a split when a cell falls below MI 65. The metrics module is fetched when first needed, so the rule is silent when it cannot be loaded, including offline.`
+)};
+const _rc5st_test_structure_fires = async function _test_rule_structure_fires(rule_afterModuleWrite_structure,applyLib,rc5_ruleFixture)
+{
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_structure, 'structure-fires', async name => {
+    const big = '() => { let n = 0; ' + Array.from({ length: 40 }, (_, i) => 'if (n % ' + (i + 2) + ' === 0) { n += ' + i + '; } else if (n > ' + i + ') { n -= 1; }').join(' ') + ' return n; }';
+    const r = await applyLib.applyModuleSrc(name('structure-fires'), rc5_ruleFixture([['big', [], big]]));
+    if (!r.ok) throw new Error('got ' + r.msg);
+    // the rule is silent without the metrics module (offline); only then is a missing line not a failure
+    const metrics = await applyLib.structureStatus(name('structure-fires'));
+    if (metrics === '') return 'metrics module not loadable here: the rule is silent, as it is offline';
+    if (!r.msg.includes(' \xB7 metrics: 1 cell, worst big MI=') || !/below MI 65/.test(r.msg)) throw new Error('got ' + r.msg);
+    return r.msg.match(/metrics: [^\xB7]*/)[0].trim();
+  });
+};
+const _rc5st_test_structure_silent = async function _test_rule_structure_silent(rule_afterModuleWrite_structure)
+{
+  if (await rule_afterModuleWrite_structure.check({ id: '@rc5-test/no-such-module' })) throw new Error('fired for a module that does not exist');
+  return 'silent';
+};
+const _rc5st_rule_afterModuleWrite_spec_scorecard = function _rule_afterModuleWrite_spec_scorecard(specLib){return(
+{
+  id: 'spec_scorecard', hook: 'afterModuleWrite', order: 50,
+  evidence: { run: '2026-08-18 polyglot', what: 'spec-lock arm: the scorecard of /src/@user/spec.js after each module write' },
+  check: () => specLib.specStatus()
+}
+)};
+const _rc5st_doc_rule_afterModuleWrite_spec_scorecard = function _doc_rule_afterModuleWrite_spec_scorecard(md){return(
+md`**\`rule_afterModuleWrite_spec_scorecard\`** (order 50). Appends the spec scorecard: which examples in \`/src/@user/spec.js\` pass against \`/src/@user/solution.js\`. Silent when there is no spec module. It belongs to spec-lock and leaves this module with it.`
+)};
+const _rc5st_test_spec_scorecard_fires = async function _test_rule_spec_scorecard_fires(rule_afterModuleWrite_spec_scorecard,specLib)
+{
+  const r = await rule_afterModuleWrite_spec_scorecard.check({});
+  const expected = await specLib.specStatus();
+  if (r !== expected) throw new Error('got ' + r);
+  if (expected === '') return 'no spec module on this page: nothing to fire on (spec-lock-check.mjs drives one)';
+  return r.slice(0, 80);
+};
+const _rc5st_test_spec_scorecard_silent = async function _test_rule_spec_scorecard_silent(rule_afterModuleWrite_spec_scorecard,specLib)
+{
+  if (await specLib.specStatus() !== '') return 'a spec module exists on this page: not the silent case';
+  const r = await rule_afterModuleWrite_spec_scorecard.check({});
+  if (r) throw new Error('fired with no spec module: ' + r);
+  return 'silent';
+};
 const _rc5st_rule_network_hint = function _rule_afterTool_network_hint(){return(
 (() => {
   // A network failure reaches the page as one message whatever the cause
@@ -10158,11 +10372,13 @@ const _rc5st_test_network_hint_silent = function _test_rule_network_hint_silent(
   if (rule_afterTool_network_hint.check({ name: 'eval_js', args: {}, result: null }) !== null) throw new Error('fired on no result');
   return 'silent';
 };
-const _rc5st_srctoolsRules = function _srctoolsRules(registerRule,unregisterRule,invalidation,rule_afterTool_network_hint)
+const _rc5st_srctoolsRules = function _srctoolsRules(registerRule,unregisterRule,invalidation,rule_afterTool_network_hint,rule_afterModuleWrite_probe,rule_afterModuleWrite_removed_cells,rule_afterModuleWrite_value_diff,rule_afterModuleWrite_downstream,rule_afterModuleWrite_structure,rule_afterModuleWrite_spec_scorecard)
 {
-  const rules = [rule_afterTool_network_hint];
+  const rules = [rule_afterTool_network_hint, rule_afterModuleWrite_probe, rule_afterModuleWrite_removed_cells, rule_afterModuleWrite_value_diff, rule_afterModuleWrite_downstream, rule_afterModuleWrite_structure, rule_afterModuleWrite_spec_scorecard].map(r => ({ ...r }));  // fresh objects per run: the late unregister below must not remove this run's successor
   rules.forEach(r => registerRule(r));
-  invalidation.then(() => rules.forEach(r => unregisterRule(r)));
+  // These cells recompute on every module write, and a write reads the rules just after it applies: the next
+  // run replaces by key, and only a rule nobody re-registered goes (as hostSetup does for tools).
+  invalidation.then(() => setTimeout(() => rules.forEach(r => unregisterRule(r)), 1000));
   return rules.map(r => r.hook + ':' + r.id);
 };
 const _1nb19yl = function _hostSetup(valueTools,fileTools,registerTool,invalidation,unregisterTool,srctoolsRules)
@@ -10533,17 +10749,44 @@ export default function define(runtime, observer) {
   $def("_o37ix1", "pathLib", ["currentModules","runtime","rc5_store","all_module_files","exportModuleJS","importShim","localDisk","cellHelpers"], _o37ix1);  
   $def("_1e7rc5x", "srcContext", ["rc5_store","cellHelpers"], _1e7rc5x);
   $def("_rc5uncaught", "uncaughtLog", ["invalidation","runtime"], _rc5uncaught);
-  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib","uncaughtLog","acorn"], _190yjiu);
+  $def("_190yjiu", "applyLib", ["jbApply","currentModules","runtime","probeDefine","createModule","cellHelpers","summarizeJS","rc5_watchBus","observe","srcContext","descendants","location","navigate","rc5_store","specLib","uncaughtLog","acorn","rulesView","runHook","hook_afterModuleWrite"], _190yjiu);
   $def("_ual70b", "valueTools", ["cellHelpers","observe","summarizeJS","defineTool","rc5_watchBus","srcContext","localDisk","ui_set","ui_settle","uncaughtLog"], _ual70b);
   $def("_rc5newTrigger", "newTriggerMatch", [], _rc5newTrigger);
   $def("_rc5punct", "punctuationMatch", [], _rc5punct);
   $def("_6aumvx", "fileTools", ["pathLib","applyLib","defineTool","rc5_store","cellHelpers","setFileAttachment","localDisk","wiki_triggers","newTriggerMatch","punctuationMatch","uncaughtLog"], _6aumvx);  
   $def("_qc0bl", "rc5_host", ["rc5_store","applyLib","pathLib","exportModuleJS","mountLocalDisk"], _qc0bl);  
+  $def("_rc5st_doc_afterModuleWrite", null, ["md"], _rc5st_doc_afterModuleWrite);
+  $def("_rc5st_hook_afterModuleWrite", "hook_afterModuleWrite", [], _rc5st_hook_afterModuleWrite);
+  $def("_rc5st_ruleFixture", "rc5_ruleFixture", ["runtime"], _rc5st_ruleFixture);
+  $def("_rc5st_rule_afterModuleWrite_probe", "rule_afterModuleWrite_probe", ["applyLib"], _rc5st_rule_afterModuleWrite_probe);
+  $def("_rc5st_doc_rule_afterModuleWrite_probe", null, ["md"], _rc5st_doc_rule_afterModuleWrite_probe);
+  $def("_rc5st_test_probe_fires", "test_rule_probe_fires", ["rule_afterModuleWrite_probe","applyLib","rc5_ruleFixture"], _rc5st_test_probe_fires);
+  $def("_rc5st_test_probe_silent", "test_rule_probe_silent", ["rule_afterModuleWrite_probe","applyLib","rc5_ruleFixture"], _rc5st_test_probe_silent);
+  $def("_rc5st_rule_afterModuleWrite_removed_cells", "rule_afterModuleWrite_removed_cells", ["applyLib"], _rc5st_rule_afterModuleWrite_removed_cells);
+  $def("_rc5st_doc_rule_afterModuleWrite_removed_cells", null, ["md"], _rc5st_doc_rule_afterModuleWrite_removed_cells);
+  $def("_rc5st_test_removed_cells_fires", "test_rule_removed_cells_fires", ["rule_afterModuleWrite_removed_cells","applyLib","rc5_ruleFixture"], _rc5st_test_removed_cells_fires);
+  $def("_rc5st_test_removed_cells_silent", "test_rule_removed_cells_silent", ["rule_afterModuleWrite_removed_cells","applyLib","rc5_ruleFixture"], _rc5st_test_removed_cells_silent);
+  $def("_rc5st_rule_afterModuleWrite_value_diff", "rule_afterModuleWrite_value_diff", ["applyLib"], _rc5st_rule_afterModuleWrite_value_diff);
+  $def("_rc5st_doc_rule_afterModuleWrite_value_diff", null, ["md"], _rc5st_doc_rule_afterModuleWrite_value_diff);
+  $def("_rc5st_test_value_diff_fires", "test_rule_value_diff_fires", ["rule_afterModuleWrite_value_diff","applyLib","rc5_ruleFixture"], _rc5st_test_value_diff_fires);
+  $def("_rc5st_test_value_diff_silent", "test_rule_value_diff_silent", ["rule_afterModuleWrite_value_diff","applyLib","rc5_ruleFixture"], _rc5st_test_value_diff_silent);
+  $def("_rc5st_rule_afterModuleWrite_downstream", "rule_afterModuleWrite_downstream", ["applyLib"], _rc5st_rule_afterModuleWrite_downstream);
+  $def("_rc5st_doc_rule_afterModuleWrite_downstream", null, ["md"], _rc5st_doc_rule_afterModuleWrite_downstream);
+  $def("_rc5st_test_downstream_fires", "test_rule_downstream_fires", ["rule_afterModuleWrite_downstream","applyLib","rc5_ruleFixture"], _rc5st_test_downstream_fires);
+  $def("_rc5st_test_downstream_silent", "test_rule_downstream_silent", ["rule_afterModuleWrite_downstream","applyLib","rc5_ruleFixture"], _rc5st_test_downstream_silent);
+  $def("_rc5st_rule_afterModuleWrite_structure", "rule_afterModuleWrite_structure", ["applyLib"], _rc5st_rule_afterModuleWrite_structure);
+  $def("_rc5st_doc_rule_afterModuleWrite_structure", null, ["md"], _rc5st_doc_rule_afterModuleWrite_structure);
+  $def("_rc5st_test_structure_fires", "test_rule_structure_fires", ["rule_afterModuleWrite_structure","applyLib","rc5_ruleFixture"], _rc5st_test_structure_fires);
+  $def("_rc5st_test_structure_silent", "test_rule_structure_silent", ["rule_afterModuleWrite_structure"], _rc5st_test_structure_silent);
+  $def("_rc5st_rule_afterModuleWrite_spec_scorecard", "rule_afterModuleWrite_spec_scorecard", ["specLib"], _rc5st_rule_afterModuleWrite_spec_scorecard);
+  $def("_rc5st_doc_rule_afterModuleWrite_spec_scorecard", null, ["md"], _rc5st_doc_rule_afterModuleWrite_spec_scorecard);
+  $def("_rc5st_test_spec_scorecard_fires", "test_rule_spec_scorecard_fires", ["rule_afterModuleWrite_spec_scorecard","specLib"], _rc5st_test_spec_scorecard_fires);
+  $def("_rc5st_test_spec_scorecard_silent", "test_rule_spec_scorecard_silent", ["rule_afterModuleWrite_spec_scorecard","specLib"], _rc5st_test_spec_scorecard_silent);
   $def("_rc5st_rule_network_hint", "rule_afterTool_network_hint", [], _rc5st_rule_network_hint);
   $def("_rc5st_doc_rule_network_hint", null, ["md"], _rc5st_doc_rule_network_hint);
   $def("_rc5st_test_network_hint_fires", "test_rule_network_hint_fires", ["rule_afterTool_network_hint"], _rc5st_test_network_hint_fires);
   $def("_rc5st_test_network_hint_silent", "test_rule_network_hint_silent", ["rule_afterTool_network_hint"], _rc5st_test_network_hint_silent);
-  $def("_rc5st_srctoolsRules", "srctoolsRules", ["registerRule","unregisterRule","invalidation","rule_afterTool_network_hint"], _rc5st_srctoolsRules);
+  $def("_rc5st_srctoolsRules", "srctoolsRules", ["registerRule","unregisterRule","invalidation","rule_afterTool_network_hint","rule_afterModuleWrite_probe","rule_afterModuleWrite_removed_cells","rule_afterModuleWrite_value_diff","rule_afterModuleWrite_downstream","rule_afterModuleWrite_structure","rule_afterModuleWrite_spec_scorecard"], _rc5st_srctoolsRules);
   $def("_1nb19yl", "hostSetup", ["valueTools","fileTools","registerTool","invalidation","unregisterTool","srctoolsRules"], _1nb19yl);  
   $def("_55ati1", "watchTable", ["html","rc5_watchBuses","invalidation"], _55ati1);  
   $def("_115mvzc", null, ["html","hostSetup","watchTable","viewof localDiskHandle"], _115mvzc);  
@@ -10572,6 +10815,8 @@ export default function define(runtime, observer) {
   main.define("viewof localDiskHandle", ["module @tomlarkworthy/local-disk", "@variable"], (_, v) => v.import("viewof localDiskHandle", _));
   main.define("rc5_watchBuses", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("rc5_watchBuses", _));
   main.define("rc5_specGate", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("rc5_specGate", _));
+  main.define("rulesView", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("rulesView", _));
+  main.define("runHook", ["module @tomlarkworthy/robocoop-5-core", "@variable"], (_, v) => v.import("runHook", _));
   main.define("registerRule", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("registerRule", _));
   main.define("unregisterRule", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("unregisterRule", _));
   main.define("registerMonitor", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("registerMonitor", _));
@@ -41706,6 +41951,9 @@ each from the registered rules.
 | \`join\` | the non-null results joined with the hook's \`sep\` |
 | \`chain\` | each rule receives the last result as \`ctx.result\`; the final one is returned |
 
+A rule with \`phase: 1\` is evaluated after every rule without one and still placed by its \`order\`: for a
+rule whose answer depends on the others having had their time (the value comparison after a write).
+
 \`onThrow\` is \`skip\` (the rule is passed over and the rest run) or \`refuse\` (the hook returns a
 refusal naming the rule). \`prompt\` is declared in robocoop-5-engine and \`afterModuleWrite\` in
 robocoop-5-srctools, beside the code that calls them.`
@@ -41717,28 +41965,33 @@ const _runHook = function _runHook(){return(
     const list = (Array.isArray(rules) ? rules : [])
       .filter((r) => r && r.hook === hook.name && typeof r.check === 'function')
       .map((r, i) => [r, i]).sort((a, b) => ((a[0].order ?? 50) - (b[0].order ?? 50)) || (a[1] - b[1])).map((x) => x[0]);
-    const out = [];
+    // Results are placed by order; a rule with a later `phase` is evaluated after the others.
+    const seq = list.map((r, k) => k).sort((a, b) => ((list[a].phase ?? 0) - (list[b].phase ?? 0)) || (a - b));
+    const slots = new Array(list.length);
     let cur = ctx, i = 0;
     const refusal = (r, e) => 'REFUSED: rule ' + r.id + ' failed: ' + (e && e.message || e);
-    const done = () => hook.compose === 'first' ? null : hook.compose === 'chain' ? cur.result
-      : hook.compose === 'list' ? out : out.join(hook.sep ?? '');
+    const done = () => {
+      if (hook.compose === 'first') return null;
+      if (hook.compose === 'chain') return cur.result;
+      const out = slots.flat().filter((x) => x != null);
+      return hook.compose === 'list' ? out : out.join(hook.sep ?? '');
+    };
     // [value] stops the hook; undefined goes on to the next rule
-    const take = (res) => {
+    const take = (res, k) => {
       if (res == null || res === '') return;
       if (hook.compose === 'first') return [res];
       if (hook.compose === 'chain') cur = { ...cur, result: res };
-      else if (Array.isArray(res)) out.push(...res);
-      else out.push(res);
+      else slots[k] = res;
     };
     const step = () => {
-      while (i < list.length) {
-        const r = list[i++];
+      while (i < seq.length) {
+        const k = seq[i++], r = list[k];
         let res;
         try { res = r.check(cur); } catch (e) { if (hook.onThrow === 'refuse') return refusal(r, e); continue; }
         if (res && typeof res.then === 'function')
-          return res.then((v) => { const s = take(v); return s ? s[0] : step(); },
+          return res.then((v) => { const s = take(v, k); return s ? s[0] : step(); },
             (e) => hook.onThrow === 'refuse' ? refusal(r, e) : step());
-        const s = take(res);
+        const s = take(res, k);
         if (s) return s[0];
       }
       return done();
