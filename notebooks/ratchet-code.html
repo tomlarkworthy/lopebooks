@@ -10097,10 +10097,25 @@ const _rc5st_tool_grep = function _tool_grep(fileLib,defineTool)
         head_limit: {
           type: 'number',
           description: 'Alias of max_results.'
+        },
+        max_line_chars: {
+          type: 'number',
+          description: 'Characters shown per line before it is cut (default 250).'
+        },
+        max_chars: {
+          type: 'number',
+          description: 'Size of the whole result before its middle is cut (default 8000).'
         }
       }
     },
-    execute: async ({pattern, path, glob, case_insensitive, context, max_results, head_limit}) => {
+    limits: [
+      { limit: '100 matching lines', override: 'max_results' },
+      { limit: '250 characters per line', override: 'max_line_chars' },
+      { limit: 'no context lines', override: 'context' },
+      { limit: '8000 characters per result (the loop\'s cap)', override: 'max_chars' },
+      { limit: 'a file over 2,000,000 characters is not searched', override: null, reason: 'a block that size is a vendored bundle or binary; read_file pages it' }
+    ],
+    execute: async ({pattern, path, glob, case_insensitive, context, max_results, head_limit, max_line_chars, max_chars}) => {
       let re;
       try {
         re = new RegExp(pattern, case_insensitive ? 'i' : '');
@@ -10121,8 +10136,12 @@ const _rc5st_tool_grep = function _tool_grep(fileLib,defineTool)
       }
       if (!files.length)
         return { output: '(no files to search under ' + base + (glob ? ' matching ' + glob : '') + ')' };
-      const cap = Math.max(1, Math.min(500, Number(max_results || head_limit) || 100));
-      const C = Math.max(0, Math.min(10, context || 0));
+      // defaults, not ceilings: the agent may ask for more of any of them (the loop's cap is lifted by max_chars)
+      const cap = Math.max(1, Number(max_results || head_limit) || 100);
+      const C = Math.max(0, Number(context) || 0);
+      const lineCap = Number(max_line_chars) > 0 ? Number(max_line_chars) : 250;
+      const cut = l => l.length > lineCap ? l.slice(0, lineCap) + '\u2026 [cut at ' + lineCap + ' of ' + l.length + ' chars; pass max_line_chars]' : l;
+      const lift = Number(max_chars) > 0 ? { outputLimit: Number(max_chars) } : {};
       const out = [];
       let matches = 0, total = 0;
       // past the cap, keep counting per file: a capped search must still say where the rest matched
@@ -10152,7 +10171,7 @@ const _rc5st_tool_grep = function _tool_grep(fileLib,defineTool)
           matches++;
           const s = Math.max(0, i - C), e = Math.min(lines.length - 1, i + C);
           for (let j = s; j <= e; j++)
-            out.push(f + ':' + (j + 1) + (j === i ? ':' : '-') + lines[j].slice(0, 250));
+            out.push(f + ':' + (j + 1) + (j === i ? ':' : '-') + cut(lines[j]));
           if (C)
             out.push('--');
         }
@@ -10165,9 +10184,9 @@ const _rc5st_tool_grep = function _tool_grep(fileLib,defineTool)
         return { output: '(no matches)' + didYouMean(pattern, near) + notEmbeddedHint(mod || pattern) };
       }
       if (!hidden.size)
-        return { output: out.join('\n') };
+        return { output: out.join('\n'), ...lift };
       const rest = [...hidden].sort((a, b) => b[1] - a[1]);
-      return { output: out.join('\n') + '\n[truncated: showing ' + matches + ' of ' + total + ' matches. Not shown: ' + rest.slice(0, 100).map(([f, n]) => f + ' (' + n + ')').join(', ') + (rest.length > 100 ? ', +' + (rest.length - 100) + ' more files' : '') + '. Narrow pattern, path or glob to see them.]' };
+      return { output: out.join('\n') + '\n[truncated: showing ' + matches + ' of ' + total + ' matches. Not shown: ' + rest.slice(0, 100).map(([f, n]) => f + ' (' + n + ')').join(', ') + (rest.length > 100 ? ', +' + (rest.length - 100) + ' more files' : '') + '. Narrow pattern, path or glob, or pass max_results, to see them.]', ...lift };
     }
   });
   return grepTool;
