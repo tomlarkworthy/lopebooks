@@ -56616,12 +56616,532 @@ export default function define(runtime, observer) {
 }</script>
 
 <!-- Bootloader -->
+<script id="@tomlarkworthy/robocoop-5-spec-lock" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _sl_title = function _title(md){return(
+md`# robocoop-5 spec-lock
+
+A plugin for robocoop-5, used in training runs and not shipped. It is hosted by the \`ratchet-code\` notebook, has no copy on observablehq.com, and no robocoop-5 module names it: everything here reaches the agent by registering on a hook.
+
+When a task supplies a written specification with literal examples, the agent transcribes them into \`/src/@user/spec.js\` before writing \`/src/@user/solution.js\`. This module runs those examples and reports:
+
+| registered as | what it does |
+|---|---|
+| \`rule_prompt_spec_lock\` | the instructions, as a section of the system prompt |
+| \`rule_afterModuleWrite_scorecard\` | the scorecard, appended to every write report |
+| \`specMonitor\` (\`registerMonitor\`) | a notice before a step when the scorecard changed |
+| \`rule_afterTool_spec_refresh\` | reruns the examples after a write that did not apply |
+| \`rule_turnEnd_spec_scorecard\` | refuses \`task_complete\` while an example fails |
+
+Measured 2026-08-18 on polyglot: pass@1 parity with the plain agent (10 v 8, P = 0.81) for +21% cost per task and +3 median steps. It is unproven, which is why it is not in the shipped notebook. With no \`/src/@user/spec.js\` on the page every rule here except the prompt section is silent.`
+)};
+const _rc5specLockPrompt = function _specLockPrompt(){return(
+`SPEC-LOCK — TRANSCRIBE THE EXAMPLES BEFORE YOU WRITE THE CODE
+When the task supplies a WRITTEN SPECIFICATION with literal examples (an instructions file, a stated test
+contract, a worked input/output table), build the solution as \`/src/@user/solution.js\` and FIRST create
+\`/src/@user/spec.js\`: one cell \`examples\` whose value is an array of \`{name, js, expected}\`. \`js\` is a JS
+EXPRESSION STRING evaluated with your solution module's cells in scope (e.g.
+\`"new List([1,2]).append(new List([3])).values"\`, \`"transpose(['AB','CD'])"\`); \`expected\` is the exact output
+COPIED VERBATIM from the specification. COPY it — never paraphrase, re-type from memory, or re-derive it: a
+paraphrased expectation only confirms your own reading of the spec, and the harness flags non-verbatim values
+as UNGROUNDED. Examples you derive from the specification's stated RULES (not from a printed example) are also
+valuable — include them; they are marked UNGROUNDED, which is informational, not an error. NEVER delete a
+correct example to improve the grounded count: more examples catch more bugs.
+Cover EVERY literal example the spec gives, plus each edge case it names.
+When the specification says an input must be REJECTED, write the row with \`throws\` instead of \`expected\`:
+\`{name, js, throws: true}\` asserts the expression throws at all, and \`{name, js, throws: "must be coprime"}\`
+asserts the thrown message CONTAINS that text — copy the message verbatim from the spec when it states one.
+A row that hangs instead of throwing counts as FAILING, not as a throw.
+The specification may not state the exact calling convention (argument order, array vs string, method vs
+function). Treat /stub.js's export shapes as part of the contract, and when official test output later reveals
+a different convention than you assumed, the TESTS outrank your reading — correct the spec examples first, then
+the solution.
+The harness re-runs all examples on EVERY AGENT STEP and after every module write, and appends the scorecard to
+that tool result, so you always see exactly which examples pass. \`task_complete\` is REJECTED while any example
+fails: fix \`/src/@user/solution.js\`, or — if you conclude an example itself mis-transcribes the spec — fix
+\`/src/@user/spec.js\`. Only when the specification is genuinely self-contradictory, put
+"SPEC-WAIVER: <example name> — <reason>" in your task_complete summary.
+Skip this protocol entirely when the task has no defined inputs and outputs (exploratory, visual or aesthetic
+work) — there is nothing to lock.`
+)};
+const _sl_rule_prompt = function _rule_prompt_spec_lock(specLockPrompt){return(
+{
+  id: 'spec_lock', hook: 'prompt', order: 70, always: true,
+  evidence: { run: '2026-08-18 polyglot', what: 'the spec-lock arm: transcribe the examples before writing the code' },
+  check: () => specLockPrompt
+}
+)};
+const _sl_doc_rule_prompt = function _doc_rule_prompt_spec_lock(md){return(
+md`**\`rule_prompt_spec_lock\`** (order 70, between the loop's own sections and the environment lines). The instructions above. Loading this module is what turns spec-lock on; until 2026-10-04 it was a \`localStorage\` key read by the engine.`
+)};
+const _sl_test_spec_lock_fires = function _test_rule_spec_lock_fires(rule_prompt_spec_lock)
+{
+  const t = rule_prompt_spec_lock.check({});
+  if (typeof t !== 'string' || !t.startsWith('SPEC-LOCK \u2014 TRANSCRIBE THE EXAMPLES')) throw new Error('got ' + String(t).slice(0, 60));
+  return t.length + ' chars';
+};
+const _rc5rc5specGate = function _rc5_specGate(){return(
+{ scorecard: null }
+)};
+const _rc5specGateCheck = function _specGateCheck(){return(
+(scorecard, summary) => {
+    if (!scorecard || !Array.isArray(scorecard.failing) || !scorecard.failing.length)
+      return null;
+    if (String(summary ?? '').includes('SPEC-WAIVER:'))
+      return null;
+    const k = scorecard.failing.length;
+    const n = scorecard.total ?? k;
+    const shown = scorecard.failing.slice(0, 6).map(f => f && f.name ? f.name : String(f));
+    const names = shown.join(', ') + (k > shown.length ? ', \u2026' : '');
+    return 'REJECTED: the spec scorecard reports ' + k + '/' + n + ' examples FAILING (' + names + '). ' + 'Fix /src/@user/solution.js, or if an example itself mis-transcribes the spec, correct ' + '/src/@user/spec.js. To knowingly complete anyway, include ' + '"SPEC-WAIVER: <example name> \u2014 <reason>" in your summary.';
+  }
+)};
+const _rc5specLib = function _specLib(cellHelpers,rc5_store,rc5_specGate)
+{
+    // spec-lock: /src/@user/spec.js declares one cell `examples` = [{name, js, expected}] or, for a rejection
+    // rule, [{name, js, throws}]. Each `js` is an expression evaluated with @user/solution's cells in scope;
+    // `expected` must be COPIED from the task spec. The MODEL proposes the rows; the RUNTIME disposes — the
+    // verdict comes from executing `js` and deepEqual-ing the result, never from a model judging itself.
+    //
+    // Absence is silence: no @user/spec module (or no `examples` cell) => computeScorecard() returns null,
+    // specStatus() returns '' and the gate holds null, so a task with no written spec sees nothing at all.
+    const {resolveModule, varsOf, isStructural} = cellHelpers;
+    const AsyncFunction = Object.getPrototypeOf(async function () {
+    }).constructor;
+    const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+    // A harness timeout is tagged so a `throws` row cannot be SATISFIED by a hang — "it threw" must mean the
+    // expression rejected the input, not that we gave up waiting for it.
+    const timed = (p, ms, tag) => Promise.race([
+        Promise.resolve(p),
+        new Promise((_, rej) => setTimeout(() => {
+            const e = new Error('timeout ' + ms + 'ms' + (tag ? ' (' + tag + ')' : ''));
+            e.specHarness = true;
+            rej(e);
+        }, ms))
+    ]);
+    const deepEqual = (a, b) => {
+        if (Object.is(a, b))
+            return true;
+        if (Array.isArray(a) || Array.isArray(b))
+            return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => deepEqual(x, b[i]));
+        if (a && b && typeof a === 'object' && typeof b === 'object') {
+            const ka = Object.keys(a), kb = Object.keys(b);
+            return ka.length === kb.length && ka.every(k => Object.prototype.hasOwnProperty.call(b, k) && deepEqual(a[k], b[k]));
+        }
+        return false;
+    };
+    const brief = v => {
+        try {
+            const s = JSON.stringify(v);
+            return (s === undefined ? String(v) : s).slice(0, 120);
+        } catch (e) {
+            return String(v).slice(0, 120);
+        }
+    };
+    const norm = s => String(s).replace(/\s+/g, ' ').trim();
+    const leaves = v => {
+        if (v === null || v === undefined)
+            return [];
+        if (Array.isArray(v))
+            return v.flatMap(leaves);
+        if (typeof v === 'object')
+            return Object.values(v).flatMap(leaves);
+        return typeof v === 'string' || typeof v === 'number' ? [v] : [];
+    };
+    // A short number (≤2 digits) is exempt: it matches almost any prose, so it cannot evidence a copy.
+    const leafGrounded = (hay, leaf) => typeof leaf === 'number' && String(leaf).replace(/\D/g, '').length <= 2 ? true : hay.includes(norm(leaf));
+    const cellNames = mod => [...new Set(varsOf(mod).filter(v => v._name && !isStructural(v) && IDENT.test(v._name)).map(v => v._name))];
+    const runExample = async (mod, names, js) => {
+        const used = names.filter(n => new RegExp('(^|[^A-Za-z0-9_$.])' + n + '($|[^A-Za-z0-9_$])').test(js));
+        const fn = new AsyncFunction(...used, 'return (' + js + ')');
+        const args = [];
+        for (const n of used)
+            args.push(await timed(mod.value(n), 2000, n));
+        return await timed(fn(...args), 2000, 'expression');
+    };
+    // The `throws` row type. 8 of the 31 attempt-1 polyglot failures are the expected-throw class, and the
+    // {name, js, expected} shape cannot express "this call must be REJECTED". Accepted matchers:
+    //   throws: true                     — any error from the expression
+    //   throws: "substring"              — String(err.message) must CONTAIN it
+    //   throws: {message: "substring"}   — same, explicit form
+    //   throws: {predicate: fn | "<js arrow source>"} / throws: fn — predicate over the error, truthy = pass
+    const throwSpecOf = ex => {
+        const t = ex && ex.throws;
+        return t === undefined || t === null || t === false ? null : t;
+    };
+    const matchThrow = async (t, err) => {
+        if (err && err.specHarness)
+            return {
+                ok: false,
+                why: 'did not throw within the time limit (' + String(err.message) + ')'
+            };
+        const msg = String(err && err.message != null ? err.message : err);
+        const predicate = async fn => {
+            try {
+                return {
+                    ok: !!await timed(fn(err), 2000, 'throws predicate')
+                };
+            } catch (e) {
+                return {
+                    ok: false,
+                    why: 'throws predicate itself threw: ' + String(e).slice(0, 120)
+                };
+            }
+        };
+        if (t === true)
+            return { ok: true };
+        if (typeof t === 'function')
+            return await predicate(t);
+        if (typeof t === 'string')
+            return {
+                ok: msg.includes(t),
+                why: 'threw ' + brief(msg) + ', expected a message containing ' + brief(t)
+            };
+        if (t && typeof t === 'object') {
+            if (typeof t.message === 'string')
+                return {
+                    ok: msg.includes(t.message),
+                    why: 'threw ' + brief(msg) + ', expected a message containing ' + brief(t.message)
+                };
+            if (typeof t.predicate === 'function')
+                return await predicate(t.predicate);
+            if (typeof t.predicate === 'string') {
+                let fn;
+                try {
+                    fn = new AsyncFunction('error', 'return (' + t.predicate + ')(error)');
+                } catch (e) {
+                    return {
+                        ok: false,
+                        why: 'throws predicate source does not compile: ' + String(e).slice(0, 120)
+                    };
+                }
+                return await predicate(fn);
+            }
+        }
+        return {
+            ok: false,
+            why: 'unsupported `throws` matcher ' + brief(t) + ' (use true, a message substring, or {predicate})'
+        };
+    };
+    const readExamples = async () => {
+        const mod = resolveModule('@user/spec');
+        if (!mod)
+            return null;
+        let examples;
+        try {
+            examples = await timed(mod.value('examples'), 4000, 'examples');
+        } catch (e) {
+            return null;
+        }
+        return Array.isArray(examples) && examples.length ? examples : null;
+    };
+    const gradeExample = async (sol, names, ex, name) => {
+        const want = throwSpecOf(ex);
+        let got, thrown = null;
+        try {
+            got = await runExample(sol, names, String(ex.js ?? ''));
+        } catch (e) {
+            thrown = e || new Error('threw a falsy value');
+        }
+        if (want !== null) {
+            if (!thrown)
+                return {
+                    pass: false,
+                    row: {
+                        name,
+                        err: 'did NOT throw, returned ' + brief(got)
+                    }
+                };
+            const m = await matchThrow(want, thrown);
+            return m.ok ? { pass: true } : {
+                pass: false,
+                row: {
+                    name,
+                    err: m.why
+                }
+            };
+        }
+        if (thrown)
+            return {
+                pass: false,
+                row: {
+                    name,
+                    err: String(thrown).slice(0, 200)
+                }
+            };
+        return deepEqual(got, ex.expected) ? { pass: true } : {
+            pass: false,
+            row: {
+                name,
+                got: brief(got)
+            }
+        };
+    };
+    // What a row claims to have COPIED from the spec: the expected value, or — for a throws row — the message
+    // substring it asserts. `throws: true` and predicate forms claim no literal, so they are never UNGROUNDED.
+    const groundTargetOf = ex => {
+        const want = throwSpecOf(ex);
+        if (want === null)
+            return { has: true, value: ex.expected };
+        if (typeof want === 'string')
+            return { has: true, value: want };
+        if (want && typeof want === 'object' && typeof want.message === 'string')
+            return { has: true, value: want.message };
+        return { has: false };
+    };
+    const computeScorecard = async () => {
+        const examples = await readExamples();
+        if (!examples)
+            return null;
+        const sol = resolveModule('@user/solution');
+        const names = sol ? cellNames(sol) : [];
+        const doc = rc5_store.scratch.get('/instructions.md');
+        const hay = typeof doc === 'string' ? norm(doc) : null;
+        const passing = [], failing = [], ungrounded = [];
+        for (let i = 0; i < examples.length; i++) {
+            const ex = examples[i] || {};
+            const name = String(ex.name || 'example ' + (i + 1));
+            if (!sol)
+                failing.push({
+                    name,
+                    err: 'no @user/solution module'
+                });
+            else {
+                const r = await gradeExample(sol, names, ex, name);
+                if (r.pass)
+                    passing.push(name);
+                else
+                    failing.push(r.row);
+            }
+            const g = groundTargetOf(ex);
+            if (hay !== null && g.has && !leaves(g.value).every(l => leafGrounded(hay, l)))
+                ungrounded.push(name);
+        }
+        return {
+            total: examples.length,
+            passing,
+            failing,
+            ungrounded: hay === null ? null : ungrounded
+        };
+    };
+    const greenMsg = sc => {
+        let msg = ' \xB7 ✓ spec scorecard ' + sc.total + '/' + sc.total + ' examples pass';
+        if (!sc.ungrounded)
+            return msg;
+        const k = sc.ungrounded.length;
+        msg += ' (' + (sc.total - k) + '/' + sc.total + ' grounded verbatim in /instructions.md)';
+        if (k)
+            msg += ' — WARNING ' + k + ' UNGROUNDED (paraphrased, not copied): ' + sc.ungrounded.join(', ') + ' (informational — fine if derived from stated rules; never delete examples to satisfy grounding)';
+        return msg;
+    };
+    const redMsg = sc => {
+        const det = sc.failing.slice(0, 6).map(f => f.name + (f.err ? ': ' + f.err : f.got !== undefined ? ' got ' + f.got : '')).join('; ');
+        return ' \xB7 spec scorecard ' + sc.failing.length + '/' + sc.total + ' FAILING (' + det + (sc.failing.length > 6 ? ', …' : '') + ') — fix before task_complete, or correct /src/@user/spec.js if an example mis-transcribes the spec';
+    };
+    // The ONE place the gate's verdict is written. v1's defect was that this ran only from a SUCCESSFUL module
+    // write, so completeGuard could veto (or wave through) on a verdict left behind by some earlier write —
+    // an eval_js that drove a viewof, or a write that failed to compile, left it stale. It is now called from
+    // the per-STEP monitor as well as from every write ATTEMPT, so the gate is never more than one step old.
+    const refreshGate = async () => {
+        let sc = null;
+        try {
+            sc = await computeScorecard();
+        } catch (e) {
+            sc = null;
+        }
+        rc5_specGate.scorecard = sc;
+        if (sc)
+            try {
+                rc5_store.scratch.set('/spec-scorecard.json', JSON.stringify(sc));
+            } catch (e) {
+            }
+        return sc;
+    };
+    const specStatus = async () => {
+        const sc = await refreshGate();
+        if (!sc)
+            return '';
+        return sc.failing.length ? redMsg(sc) : greenMsg(sc);
+    };
+    // The notice line the monitor streams. Facts and failing rows only — no exhortation: the veto text in
+    // specGateCheck already says what to do, and a nag on every step is what degrades the arm.
+    const noticeLine = sc => {
+        if (!sc || !sc.failing.length)
+            return null;
+        const det = sc.failing.slice(0, 6).map(f => f.name + (f.err ? ': ' + f.err : f.got !== undefined ? ' got ' + f.got : '')).join('; ');
+        return 'executable spec ' + sc.failing.length + '/' + sc.total + ' example(s) FAILING — ' + det + (sc.failing.length > 6 ? ', …' : '');
+    };
+    return {
+        computeScorecard,
+        refreshGate,
+        specStatus,
+        noticeLine,
+        deepEqual,
+        matchThrow
+    };
+};
+const _rc5st_rule_afterModuleWrite_scorecard = function _rule_afterModuleWrite_scorecard(specLib){return(
+{
+  id: 'scorecard', hook: 'afterModuleWrite', order: 50,
+  evidence: { run: '2026-08-18 polyglot', what: 'spec-lock arm: the scorecard of /src/@user/spec.js after each module write' },
+  check: () => specLib.specStatus()
+}
+)};
+const _rc5st_doc_rule_afterModuleWrite_scorecard = function _doc_rule_afterModuleWrite_scorecard(md){return(
+md`**\`rule_afterModuleWrite_scorecard\`** (order 50). Appends the spec scorecard: which examples in \`/src/@user/spec.js\` pass against \`/src/@user/solution.js\`. Silent when there is no spec module.`
+)};
+const _rc5st_test_spec_scorecard_fires = async function _test_rule_scorecard_fires(rule_afterModuleWrite_scorecard,specLib)
+{
+  const r = await rule_afterModuleWrite_scorecard.check({});
+  const expected = await specLib.specStatus();
+  if (r !== expected) throw new Error('got ' + r);
+  if (expected === '') return 'no spec module on this page: nothing to fire on (spec-lock-check.mjs drives one)';
+  return r.slice(0, 80);
+};
+const _rc5st_test_spec_scorecard_silent = async function _test_rule_scorecard_silent(rule_afterModuleWrite_scorecard,specLib)
+{
+  if (await specLib.specStatus() !== '') return 'a spec module exists on this page: not the silent case';
+  const r = await rule_afterModuleWrite_scorecard.check({});
+  if (r) throw new Error('fired with no spec module: ' + r);
+  return 'silent';
+};
+const _rc5specMonitor = function _specMonitor(specLib){return(
+{
+  id: 'spec-lock',
+  label: 'spec-lock',
+  // Runs once per agent step, inside the model-call window. Returns null — total silence — whenever there
+  // is no /src/@user/spec.js, which is every task that states no written specification.
+  check: async () => specLib.noticeLine(await specLib.refreshGate())
+}
+)};
+const _sl_rule_refresh = function _rule_afterTool_spec_refresh(specLib){return(
+{
+  id: 'spec_refresh', hook: 'afterTool', order: 20,
+  evidence: { run: '2026-08-17 spec-lock v1', what: 'defect (a): only a write that applied reran the examples, so the gate held the scorecard from before a refused write' },
+  // Says nothing and changes nothing in the result. Not awaited: the runtime is unchanged by a write that did
+  // not apply, and waiting would put the examples on the path of every compile error.
+  check: ({ name, result }) => {
+    if ((name === 'write_file' || name === 'edit_file') && !String(result?.output ?? '').includes('applied live'))
+      try { specLib.refreshGate(); } catch (e) {}
+    return null;
+  }
+}
+)};
+const _sl_doc_rule_refresh = function _doc_rule_afterTool_spec_refresh(md){return(
+md`**\`rule_afterTool_spec_refresh\`** (order 20). After a \`write_file\` or \`edit_file\` that did not apply, reruns the examples so the completion rule does not read a scorecard from before the attempt. Until 2026-10-04 this was a wrapper round \`applyModuleSrc\` inside robocoop-5-srctools.`
+)};
+const _sl_test_spec_refresh_fires = function _test_rule_spec_refresh_fires(rule_afterTool_spec_refresh,specLib)
+{
+  const real = specLib.refreshGate; let ran = 0;
+  specLib.refreshGate = () => { ran++; };
+  try {
+    const r = rule_afterTool_spec_refresh.check({ name: 'write_file', result: { output: 'REFUSED: does not compile' } });
+    if (r !== null || ran !== 1) throw new Error('ran ' + ran + ', returned ' + JSON.stringify(r));
+    return 'reran the examples once';
+  } finally { specLib.refreshGate = real; }
+};
+const _sl_test_spec_refresh_silent = function _test_rule_spec_refresh_silent(rule_afterTool_spec_refresh,specLib)
+{
+  const real = specLib.refreshGate; let ran = 0;
+  specLib.refreshGate = () => { ran++; };
+  try {
+    rule_afterTool_spec_refresh.check({ name: 'write_file', result: { output: 'applied live (1 cell changed)' } });
+    rule_afterTool_spec_refresh.check({ name: 'read_file', result: { output: 'REFUSED' } });
+    if (ran !== 0) throw new Error('reran the examples ' + ran + ' times');
+    return 'silent';
+  } finally { specLib.refreshGate = real; }
+};
+const _rc5e_rule_turnEnd_spec_scorecard = function _rule_turnEnd_spec_scorecard(specGateCheck,rc5_specGate){return(
+{
+  id: 'spec_scorecard', hook: 'turnEnd', order: 10,
+  evidence: { run: '2026-08-18 polyglot', what: 'spec-lock arm: completion while examples from /src/@user/spec.js still failed' },
+  check: ({ kind, summary }) => {
+    if (kind !== 'complete') return null;
+    const why = specGateCheck(rc5_specGate.scorecard, summary);
+    return why ? { continue: why } : null;
+  }
+}
+)};
+const _rc5e_doc_rule_turnEnd_spec_scorecard = function _doc_rule_turnEnd_spec_scorecard(md){return(
+md`**\`rule_turnEnd_spec_scorecard\`** (order 10). Refuses \`task_complete\` while the spec scorecard lists failing examples, and names them. A summary containing \`SPEC-WAIVER:\` is let through. With no spec module the scorecard is null and the rule is silent. It runs before the other completion rules: a red scorecard says more than a tool-call count. It belongs to spec-lock and leaves this module with it.`
+)};
+const _rc5e_test_spec_scorecard_fires = function _test_rule_spec_scorecard_fires(rule_turnEnd_spec_scorecard,rc5_specGate)
+{
+  const before = rc5_specGate.scorecard;
+  rc5_specGate.scorecard = { failing: [{ name: 'adds wrongly' }], total: 2 };
+  try {
+    const r = rule_turnEnd_spec_scorecard.check({ kind: 'complete', summary: 'done' });
+    if (!/^REJECTED: the spec scorecard reports 1\/2 examples FAILING \(adds wrongly\)/.test(r?.continue ?? '')) throw new Error('got ' + JSON.stringify(r));
+    return r.continue.slice(0, 60);
+  } finally { rc5_specGate.scorecard = before; }
+};
+const _rc5e_test_spec_scorecard_silent = function _test_rule_spec_scorecard_silent(rule_turnEnd_spec_scorecard,rc5_specGate)
+{
+  const before = rc5_specGate.scorecard;
+  try {
+    rc5_specGate.scorecard = null;
+    if (rule_turnEnd_spec_scorecard.check({ kind: 'complete', summary: 'done' }) !== null) throw new Error('fired with no scorecard');
+    rc5_specGate.scorecard = { failing: [{ name: 'x' }], total: 1 };
+    if (rule_turnEnd_spec_scorecard.check({ kind: 'complete', summary: 'SPEC-WAIVER: x — contradictory' }) !== null) throw new Error('fired on a waiver');
+    if (rule_turnEnd_spec_scorecard.check({ kind: 'stall' }) !== null) throw new Error('fired on a stall');
+    return 'silent';
+  } finally { rc5_specGate.scorecard = before; }
+};
+const _sl_setup = function _specLockSetup(registerRule,unregisterRule,registerMonitor,invalidation,rule_prompt_spec_lock,rule_afterModuleWrite_scorecard,rule_afterTool_spec_refresh,rule_turnEnd_spec_scorecard,specMonitor)
+{
+  // specLib reads the page's modules, so these cells recompute on every write, and a write reads the rules just
+  // after it applies: fresh objects per run, and the old run's leave late (as srctoolsRules does).
+  const rules = [rule_prompt_spec_lock, rule_afterModuleWrite_scorecard, rule_afterTool_spec_refresh, rule_turnEnd_spec_scorecard].map(r => ({ ...r }));
+  rules.forEach(r => registerRule(r));
+  registerMonitor(specMonitor);  // replaces the last run's by id
+  invalidation.then(() => setTimeout(() => rules.forEach(r => unregisterRule(r)), 1000));
+  return [...rules.map(r => r.hook + ':' + r.id), 'monitor:' + specMonitor.id];
+};
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  $def("_sl_title", null, ["md"], _sl_title);
+  $def("_rc5specLockPrompt", "specLockPrompt", [], _rc5specLockPrompt);
+  $def("_sl_rule_prompt", "rule_prompt_spec_lock", ["specLockPrompt"], _sl_rule_prompt);
+  $def("_sl_doc_rule_prompt", null, ["md"], _sl_doc_rule_prompt);
+  $def("_sl_test_spec_lock_fires", "test_rule_spec_lock_fires", ["rule_prompt_spec_lock"], _sl_test_spec_lock_fires);
+  $def("_rc5rc5specGate", "rc5_specGate", [], _rc5rc5specGate);
+  $def("_rc5specGateCheck", "specGateCheck", [], _rc5specGateCheck);
+  $def("_rc5specLib", "specLib", ["cellHelpers","rc5_store","rc5_specGate"], _rc5specLib);
+  $def("_rc5st_rule_afterModuleWrite_scorecard", "rule_afterModuleWrite_scorecard", ["specLib"], _rc5st_rule_afterModuleWrite_scorecard);
+  $def("_rc5st_doc_rule_afterModuleWrite_scorecard", null, ["md"], _rc5st_doc_rule_afterModuleWrite_scorecard);
+  $def("_rc5st_test_spec_scorecard_fires", "test_rule_scorecard_fires", ["rule_afterModuleWrite_scorecard","specLib"], _rc5st_test_spec_scorecard_fires);
+  $def("_rc5st_test_spec_scorecard_silent", "test_rule_scorecard_silent", ["rule_afterModuleWrite_scorecard","specLib"], _rc5st_test_spec_scorecard_silent);
+  $def("_rc5specMonitor", "specMonitor", ["specLib"], _rc5specMonitor);
+  $def("_sl_rule_refresh", "rule_afterTool_spec_refresh", ["specLib"], _sl_rule_refresh);
+  $def("_sl_doc_rule_refresh", null, ["md"], _sl_doc_rule_refresh);
+  $def("_sl_test_spec_refresh_fires", "test_rule_spec_refresh_fires", ["rule_afterTool_spec_refresh","specLib"], _sl_test_spec_refresh_fires);
+  $def("_sl_test_spec_refresh_silent", "test_rule_spec_refresh_silent", ["rule_afterTool_spec_refresh","specLib"], _sl_test_spec_refresh_silent);
+  $def("_rc5e_rule_turnEnd_spec_scorecard", "rule_turnEnd_spec_scorecard", ["specGateCheck","rc5_specGate"], _rc5e_rule_turnEnd_spec_scorecard);
+  $def("_rc5e_doc_rule_turnEnd_spec_scorecard", null, ["md"], _rc5e_doc_rule_turnEnd_spec_scorecard);
+  $def("_rc5e_test_spec_scorecard_fires", "test_rule_spec_scorecard_fires", ["rule_turnEnd_spec_scorecard","rc5_specGate"], _rc5e_test_spec_scorecard_fires);
+  $def("_rc5e_test_spec_scorecard_silent", "test_rule_spec_scorecard_silent", ["rule_turnEnd_spec_scorecard","rc5_specGate"], _rc5e_test_spec_scorecard_silent);
+  $def("_sl_setup", "specLockSetup", ["registerRule","unregisterRule","registerMonitor","invalidation","rule_prompt_spec_lock","rule_afterModuleWrite_scorecard","rule_afterTool_spec_refresh","rule_turnEnd_spec_scorecard","specMonitor"], _sl_setup);
+  main.define("module @tomlarkworthy/robocoop-5-tools", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-tools.js?v=4")).default));
+  main.define("registerRule", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("registerRule", _));
+  main.define("unregisterRule", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("unregisterRule", _));
+  main.define("registerMonitor", ["module @tomlarkworthy/robocoop-5-tools", "@variable"], (_, v) => v.import("registerMonitor", _));
+  main.define("module @tomlarkworthy/robocoop-5-srctools", async () => runtime.module((await import("/@tomlarkworthy/robocoop-5-srctools.js?v=4")).default));
+  main.define("cellHelpers", ["module @tomlarkworthy/robocoop-5-srctools", "@variable"], (_, v) => v.import("cellHelpers", _));
+  main.define("rc5_store", ["module @tomlarkworthy/robocoop-5-srctools", "@variable"], (_, v) => v.import("rc5_store", _));
+  return main;
+}
+</script>
 <script id="bootconf.json"
         type="text/plain"
         data-mime="application/json"
 >
 {
-  "mains": ["@tomlarkworthy/lopepage-2","@tomlarkworthy/robocoop-5","@tomlarkworthy/robocoop-5-engine","@tomlarkworthy/robocoop-5-srctools","@tomlarkworthy/switchboard","@tomlarkworthy/annotate","@tomlarkworthy/inputs-reference","@tomlarkworthy/save-in-place"],
+  "mains": ["@tomlarkworthy/lopepage-2","@tomlarkworthy/robocoop-5","@tomlarkworthy/robocoop-5-engine","@tomlarkworthy/robocoop-5-srctools","@tomlarkworthy/switchboard","@tomlarkworthy/annotate","@tomlarkworthy/inputs-reference","@tomlarkworthy/save-in-place","@tomlarkworthy/robocoop-5-spec-lock"],
   "hash": "#view=R100(S75(@tomlarkworthy/robocoop-5),S25(@tomlarkworthy/robocoop-5-srctools))",
   "headless": true
 }
