@@ -9797,10 +9797,23 @@ const _rc5st_tool_read_file = function _tool_read_file(fileLib,defineTool,localD
         limit: {
           type: 'number',
           description: 'Maximum lines to read (optional; default 2000).'
+        },
+        max_line_chars: {
+          type: 'number',
+          description: 'Characters shown per line before it is cut (optional; default 2000).'
+        },
+        max_chars: {
+          type: 'number',
+          description: 'Size of the whole result before its middle is cut (optional; default 8000).'
         }
       }
     },
-    execute: async ({file_path, offset, limit}, ctx) => {
+    limits: [
+      { limit: '2000 lines per call', override: 'limit' },
+      { limit: '2000 characters per line', override: 'max_line_chars' },
+      { limit: '8000 characters per result (the loop\'s cap)', override: 'max_chars' }
+    ],
+    execute: async ({file_path, offset, limit, max_line_chars, max_chars}, ctx) => {
       let text;
       try {
         text = await readPath(file_path);
@@ -9813,13 +9826,14 @@ const _rc5st_tool_read_file = function _tool_read_file(fileLib,defineTool,localD
       const lines = text.split('\n');
       const start = Math.max(0, offset ? offset - 1 : 0);
       const end = Math.min(lines.length, start + (limit || 2000));
-      const body = lines.slice(start, end).map((l, i) => String(start + i + 1).padStart(6) + '\t' + (l.length > 2000 ? l.slice(0, 2000) + '\u2026 [line truncated]' : l)).join('\n');
+      const lineCap = Number(max_line_chars) > 0 ? Number(max_line_chars) : 2000;
+      const body = lines.slice(start, end).map((l, i) => String(start + i + 1).padStart(6) + '\t' + (l.length > lineCap ? l.slice(0, lineCap) + '\u2026 [line truncated at ' + lineCap + ' of ' + l.length + ' chars; pass max_line_chars to read more]' : l)).join('\n');
       if (file_path.startsWith(WIKI) && ctx?.sessionState)
         (ctx.sessionState.wikiRead ??= new Set()).add(file_path);
       // rc5-train 20260928-0847-m33: what the module's code has logged is not in its source
       const mp = MODULE_PATH.exec(file_path);
       const logged = mp ? uncaughtLog.text(mp[1]) : '';
-      return { output: (body || '(empty file)') + (logged ? '\n\n' + logged : '') };
+      return { output: (body || '(empty file)') + (logged ? '\n\n' + logged : ''), ...(Number(max_chars) > 0 ? { outputLimit: Number(max_chars) } : {}) };
     }
   });
   return read_file;
@@ -41652,13 +41666,15 @@ prompt view.`
 )};
 
 const _doc_truncate = function _doc_truncate(md){return(
-md`### \`truncate(text, limit)\`
+md`### \`truncate(text, limit, how)\`
 Head+tail cap: keeps the first and last halves of \`limit\`, replacing the middle with a marker, so a
-1MB \`cat\` can't blow the model context. Returns \`text\` unchanged when within \`limit\`.`
+1MB \`cat\` can't blow the model context. Returns \`text\` unchanged when within \`limit\`. \`how\` is the
+marker's advice. The loop caps every tool result at \`toolOutputLimit\` (8000). A tool lifts the cap for one
+call by returning \`outputLimit\`; one whose parameters include \`max_chars\` gets a marker that names it.`
 )};
 
 const _truncate = function _truncate(){return(
-  function truncate(text, limit) {
+  function truncate(text, limit, how = 'use grep/sed to narrow') {
     const s = String(text ?? '');
     if (!limit || s.length <= limit) return s;
     const head = Math.ceil(limit / 2);
@@ -41666,7 +41682,7 @@ const _truncate = function _truncate(){return(
     const cut = s.length - head - tail;
     return (
       s.slice(0, head) +
-      '\n...[' + cut + ' bytes truncated — use grep/sed to narrow]...\n' +
+      '\n...[' + cut + ' bytes truncated — ' + how + ']...\n' +
       s.slice(s.length - tail)
     );
   }
@@ -41681,7 +41697,9 @@ errors into an \`Error: …\` output instead of rejecting. The loop calls \`tool
 )};
 
 const _defineTool = function _defineTool(){return(
-  function defineTool({ id, description, parameters, execute }) {
+  // `limits` is data for the reader and the limits test: [{limit, override}] with override the argument that
+  // lifts it, or null and a `reason`.
+  function defineTool({ id, description, parameters, execute, limits }) {
     if (!id || typeof id !== 'string') throw new Error('Tool must have a string id');
     if (!description || typeof description !== 'string')
       throw new Error('Tool must have a string description');
@@ -41693,6 +41711,7 @@ const _defineTool = function _defineTool(){return(
       id,
       description,
       parameters,
+      ...(limits ? { limits } : {}),
       execute: async (args, ctx) => {
         try {
           if (ctx?.abort?.aborted)
@@ -41702,6 +41721,7 @@ const _defineTool = function _defineTool(){return(
             title: result.title || id + ' completed',
             output: typeof result.output === 'string' ? result.output : JSON.stringify(result.output),
             metadata: { ...(ctx?.getMetadata?.() || {}), ...result.metadata },
+            ...(result.outputLimit ? { outputLimit: result.outputLimit } : {}),
           };
         } catch (error) {
           return {
@@ -42510,14 +42530,16 @@ const _createAgentSession = function _createAgentSession(AbortController,truncat
           }
           callbacks.onToolCall?.(callId, name, args);
           turnToolCalls++;
-          let output;
+          let output, cap = toolOutputLimit;
           try {
             const r = await tool.execute(args, { ...ctx, callId });
             output = String(r?.output ?? '');
+            if (Number(r?.outputLimit) > 0) cap = Number(r.outputLimit);
           } catch (e) {
             output = 'ERROR: ' + (e?.message ?? String(e));
           }
-          pushToolResult(callId, truncate(output, toolOutputLimit));
+          pushToolResult(callId, truncate(output, cap, tool.parameters?.properties?.max_chars
+            ? 'pass max_chars to get more, or offset and limit to page' : undefined));
         }
 
         // A tool fed image(s) in via ctx.attachImage — deliver them as a user image-message so the model
