@@ -8269,7 +8269,9 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         cm.redefine('allCells', [], () => cells);
         return await cm.value('metricsRows');
     };
-    const structureStatus = async id => {
+    // `changed`: the names of the cells this write changed, or null for all of them (a new module). A low-MI cell
+    // that was already there is counted and not complained about: the agent meets large cells it did not write.
+    const structureStatus = async (id, changed = null) => {
         let rows;
         try {
             rows = await metricsFor(id);
@@ -8290,10 +8292,13 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
                 return false;
             }
         };
-        const low = rows.filter(r => r.mi < 65 && !literal(r.name));
+        const lowAll = rows.filter(r => r.mi < 65 && !literal(r.name));
+        const low = changed ? lowAll.filter(r => changed.has(r.name)) : lowAll;
         const head = ' \xB7 metrics: ' + rows.length + ' cell' + (rows.length === 1 ? '' : 's') + ', worst ' + worst.name + ' MI=' + worst.mi + ' (loc ' + worst.loc + ', cc ' + worst.cyclomatic + ')';
-        if (!low.length)
+        if (!lowAll.length)
             return head + ' \xB7 all cells MI\u226565 \u2713 (well-decomposed)';
+        if (!low.length)
+            return head + ' \xB7 no cell this write changed is below MI 65 \u2713 (' + lowAll.length + ' already ' + (lowAll.length === 1 ? 'was' : 'were') + ': ' + lowAll.slice(0, 4).map(r => r.name + ' ' + r.mi).join(', ') + ')';
         return head + ' \xB7 \u26A0 ' + low.length + ' cell' + (low.length === 1 ? '' : 's') + ' below MI 65 (' + low.slice(0, 4).map(r => r.name + ' ' + r.mi).join(', ') + ') \u2014 SPLIT each low-MI cell into smaller ' + 'named per-concern cells (one panel/view/derivation each); do NOT consolidate cells into one big one ' + '(task-required/contractual cell names must stay: split helpers OUT of them, never rename them); split out pure functions and data, but keep an element and the addEventListener calls on it in ONE cell with invalidation cleanup: a cell that adds listeners to another cell\'s element adds another set each time it re-runs, and the old handlers keep firing with stale values)';
     };
     const moduleExists = id => {
@@ -8375,7 +8380,7 @@ const _190yjiu = function _applyLib(jbApply,currentModules,runtime,probeDefine,c
         if (mod)
             for (const v of varsOf(mod))
                 if (v._name ? !isStructural(v) && !/^(mutable|initial) /.test(v._name) : v.pid)
-                    m.set(v.pid || v._name, { label: v._name || v.pid, value: v._value, anon: !v._name });
+                    m.set(v.pid || v._name, { label: v._name || v.pid, value: v._value, anon: !v._name, def: String(v._definition) });
         return m;
     };
     const removedStatus = (before, after) => {
@@ -10661,11 +10666,17 @@ const _rc5st_rule_afterModuleWrite_structure = function _rule_afterModuleWrite_s
 {
   id: 'structure', hook: 'afterModuleWrite', order: 40,
   evidence: { run: 'm16', what: 'a cell holding one literal (inline CSV) was told "SPLIT data" on every write; such cells are exempt' },
-  check: ({ id }) => applyLib.structureStatus(id)
+  limits: [{ limit: 'a cell below maintainability index 65 is reported', override: 'advice, not a refusal; reported only for cells the write changed' }],
+  check: ({ id, beforeCells }) => {
+    if (!beforeCells) return applyLib.structureStatus(id);
+    const changed = new Set();
+    for (const [pid, c] of applyLib.cellsByPid(id)) if (beforeCells.get(pid)?.def !== c.def) changed.add(c.label);
+    return applyLib.structureStatus(id, changed);
+  }
 }
 )};
 const _rc5st_doc_rule_afterModuleWrite_structure = function _doc_rule_afterModuleWrite_structure(md){return(
-md`**\`rule_afterModuleWrite_structure\`** (order 40). Reports the module's cell count and its least maintainable cell (maintainability index, lines, cyclomatic complexity from \`@tomlarkworthy/code-metrics\`), and asks for a split when a cell falls below MI 65. The metrics module is fetched when first needed, so the rule is silent when it cannot be loaded, including offline.`
+md`**\`rule_afterModuleWrite_structure\`** (order 40). Reports the module's cell count and its least maintainable cell (maintainability index, lines, cyclomatic complexity from \`@tomlarkworthy/code-metrics\`), and asks for a split when a cell the write changed falls below MI 65. A low cell the write left alone is named and not complained about (since 2026-10-04; before, every write to a module holding one large cell was told to split it). The metrics module is fetched when first needed, so the rule is silent when it cannot be loaded, including offline.`
 )};
 const _rc5st_test_structure_fires = async function _test_rule_structure_fires(rule_afterModuleWrite_structure,applyLib,rc5_ruleFixture)
 {
@@ -10680,10 +10691,24 @@ const _rc5st_test_structure_fires = async function _test_rule_structure_fires(ru
     return r.msg.match(/metrics: [^\xB7]*/)[0].trim();
   });
 };
-const _rc5st_test_structure_silent = async function _test_rule_structure_silent(rule_afterModuleWrite_structure)
+const _rc5st_test_structure_silent = async function _test_rule_structure_silent(rule_afterModuleWrite_structure,applyLib,rc5_ruleFixture)
 {
   if (await rule_afterModuleWrite_structure.check({ id: '@rc5-test/no-such-module' })) throw new Error('fired for a module that does not exist');
-  return 'silent';
+  // a low-MI cell that was already there is not this write's business: only `small` changes in the second write
+  return rc5_ruleFixture.scratch(rule_afterModuleWrite_structure, 'structure-silent', async name => {
+    const big = '() => { let n = 0; ' + Array.from({ length: 40 }, (_, i) => 'if (n % ' + (i + 2) + ' === 0) { n += ' + i + '; } else if (n > ' + i + ') { n -= 1; }').join(' ') + ' return n; }';
+    const id = name('structure-silent');
+    const first = await applyLib.applyModuleSrc(id, rc5_ruleFixture([['big', [], big], ['small', [], '() => 1']]));
+    if (!first.ok) throw new Error('got ' + first.msg);
+    if ((await applyLib.structureStatus(id)) === '') return 'metrics module not loadable here: the rule is silent, as it is offline';
+    // as in the removed-cells test: this cell's applyLib predates the scratch module, so the rule is given the snapshot
+    const beforeCells = applyLib.cellsByPid(id);
+    const r = await applyLib.applyModuleSrc(id, rc5_ruleFixture([['big', [], big], ['small', [], '() => 2']]));
+    if (!r.ok) throw new Error('got ' + r.msg);
+    const msg = await rule_afterModuleWrite_structure.check({ id, beforeCells });
+    if (/SPLIT/.test(msg) || !/no cell this write changed is below MI 65 \u2713 \(1 already was: big/.test(msg)) throw new Error('got ' + msg.slice(0, 200));
+    return 'silent';
+  });
 };
 const _rc5st_rule_network_hint = function _rule_afterTool_network_hint(){return(
 (() => {
@@ -10841,7 +10866,7 @@ export default function define(runtime, observer) {
   $def("_rc5st_rule_afterModuleWrite_structure", "rule_afterModuleWrite_structure", ["applyLib"], _rc5st_rule_afterModuleWrite_structure);
   $def("_rc5st_doc_rule_afterModuleWrite_structure", null, ["md"], _rc5st_doc_rule_afterModuleWrite_structure);
   $def("_rc5st_test_structure_fires", "test_rule_structure_fires", ["rule_afterModuleWrite_structure","applyLib","rc5_ruleFixture"], _rc5st_test_structure_fires);
-  $def("_rc5st_test_structure_silent", "test_rule_structure_silent", ["rule_afterModuleWrite_structure"], _rc5st_test_structure_silent);
+  $def("_rc5st_test_structure_silent", "test_rule_structure_silent", ["rule_afterModuleWrite_structure","applyLib","rc5_ruleFixture"], _rc5st_test_structure_silent);
   $def("_rc5st_rule_network_hint", "rule_afterTool_network_hint", [], _rc5st_rule_network_hint);
   $def("_rc5st_doc_rule_network_hint", null, ["md"], _rc5st_doc_rule_network_hint);
   $def("_rc5st_test_network_hint_fires", "test_rule_network_hint_fires", ["rule_afterTool_network_hint"], _rc5st_test_network_hint_fires);
