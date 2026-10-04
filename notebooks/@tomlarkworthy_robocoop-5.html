@@ -6900,25 +6900,18 @@ const _rc5makeSession = function _makeSession(client,createAgentSession,reasonin
     reasoningProvider: () => reasoningToggle.value ? { enabled: false } : null,
     toolsProvider: offered,
     modelProvider: () => read(model) ?? modelView.value,
-    systemPromptProvider: () => read(system) ?? promptView.value,
-    // The only PER-STEP channel into the loop. Two producers, both synchronous and both change-suppressed:
-    // watched-variable changes, and the ambient monitors. The monitor drain harvests the checks that finished
-    // during the PREVIOUS model call and fires the next round without awaiting — the very next statement in
-    // the loop is `await client.chat(...)`, tens of seconds of an otherwise idle browser, so the checks run
-    // for free and a slow one simply reports a step later.
-    noticesProvider: ctx => runHook(hook_beforeStep, rules(), { ...ctx, stepCtx: ctx, sessionState, watchBus, monitorBus,
-      toolIds: toolIds(), monitors: Array.isArray(monitorsView.value) ? monitorsView.value : [] }),
-    // Situational context: whatever is registered under 'rc5-context' (see robocoop-5-context), composed
-    // per scope at send() time. Reads contextView (mutable box) and the toggle ELEMENT imperatively, so
-    // neither registering a provider nor flipping the toggle rebuilds the session.
-    contextProvider: ({scope, turn}) => contextToggle.value === false ? null : composeContext(Array.isArray(contextView.value) ? contextView.value : [], {
-      scope,
-      turn
-    }),
     // explicit-completion loop: end on task_complete, not on bare text. What the model is told when it
     // stops, and whether a completion is accepted, is the turnEnd rules' answer (rule_turnEnd_* above).
     completeToolName: 'task_complete',
     hooks: {
+      prompt: () => read(system) ?? promptView.value,
+      // The registered context providers (see robocoop-5-context), composed per scope at send() time. contextView
+      // is a box and the toggle is read from its element, so neither a new provider nor the toggle rebuilds the session.
+      context: ({scope, turn}) => contextToggle.value === false ? null : composeContext(Array.isArray(contextView.value) ? contextView.value : [], { scope, turn }),
+      // The only per-step channel into the loop, and synchronous: the monitor bus harvests the checks that finished
+      // during the previous model call and starts the next round without awaiting, so a slow one reports a step later.
+      beforeStep: ctx => runHook(hook_beforeStep, rules(), { ...ctx, stepCtx: ctx, sessionState, watchBus, monitorBus,
+        toolIds: toolIds(), monitors: Array.isArray(monitorsView.value) ? monitorsView.value : [] }),
       turnEnd: ctx => runHook(hook_turnEnd, rules(), { ...ctx, sessionState, watchBus })
     },
     stallNudgeLimit: 2,
@@ -42408,28 +42401,32 @@ const _createAgentSession = function _createAgentSession(AbortController,truncat
     toolChoice = 'auto',
     toolOutputLimit = 8000,
     completeToolName = null,
-    // One function per hook the loop calls; each is optional. `turnEnd(ctx)` is asked what to do when the
-    // model stopped or sent something the loop cannot run (see hook_turnEnd for the kinds and results). The
-    // loop holds no text of its own for those cases: without a turnEnd, a stalled turn ends and a completion
-    // is accepted. The engine builds turnEnd from the registered rules with runHook.
+    // One function per hook the loop calls; each is optional.
+    //   prompt()                -> the system prompt, read at each request
+    //   context({scope, turn})  -> string | null | Promise. scope 'session' once (spliced after the system
+    //                              prompt, so it stays in the cached prefix), scope 'turn' at each send()
+    //                              (a system message before the user's, so the user's words stay last)
+    //   beforeStep({step, turn}) -> string[] | null, called SYNCHRONOUSLY before each request and never
+    //                              awaited; each line becomes a system message
+    //   turnEnd(ctx)            -> what to do when the model stopped or sent something the loop cannot run
+    //                              (see hook_turnEnd). The loop holds no text of its own for those cases:
+    //                              without a turnEnd, a stalled turn ends and a completion is accepted.
+    // A throw or null from prompt, context or beforeStep injects nothing. The engine builds each from the
+    // registered rules with runHook. systemPromptProvider, contextProvider and noticesProvider are the
+    // names these had before 2026-10-04 and still work.
     hooks = {},
     stallNudgeLimit = 0,
     malformedRetryLimit = 4,
-    // Out-of-band per-STEP channel: noticesProvider({step, turn}) → string[] | null, called SYNCHRONOUSLY at
-    // the top of every step (never awaited — whatever it returns must already be computed). Each line is
-    // pushed as a system message before the model call. This is the seam ambient monitors ride on.
-    noticesProvider,
-    // Situational context (opt-in): contextProvider({scope, turn}) → string|null|Promise. Called with
-    // scope 'session' once (result spliced right after the system prompt, so it lives in the cached
-    // prefix) and scope 'turn' at the start of every send() (result pushed as a system message BEFORE
-    // the user message, so the user's words stay last). A throw or null injects nothing.
-    contextProvider = null,
+    noticesProvider: noticesOption,
+    contextProvider: contextOption = null,
   } = {}) {
     if (!client || typeof client.chat !== 'function')
       throw new Error('createAgentSession requires a client with a chat() method');
 
     const getTools = toolsProvider ?? (() => tools ?? []);
-    const getSystemPrompt = systemPromptProvider ?? (() => systemPrompt ?? null);
+    const getSystemPrompt = hooks.prompt ?? systemPromptProvider ?? (() => systemPrompt ?? null);
+    const noticesProvider = hooks.beforeStep ?? noticesOption;
+    const contextProvider = hooks.context ?? contextOption;
     // Resolve the model defensively: the picker can momentarily read EMPTY (its <select> options arrive from
     // an async catalog fetch, so a value not yet in the option list reads as ""), and sending an empty model
     // is OpenRouter 400 "No models provided". Remember the last non-empty model and reuse it rather than send
