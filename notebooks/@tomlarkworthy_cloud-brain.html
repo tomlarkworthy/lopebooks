@@ -22827,7 +22827,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braincore_anon_ea3ecc772b = function _anonymous(md) {return (md`# brain-core
+const _braincore_anon_0dd3d2b453 = function _anonymous(md) {return (md`# brain-core
 
 The Worker every other Worker is bound to. It routes a method or a path to the Worker of the service that declared it, and keeps what must last: the notebook-side rows, the route table and the rules the owner sets.
 
@@ -22881,7 +22881,7 @@ A rule that does not name \`origin\` lets the Worker act for anyone it answers. 
 **Prices and credits** (added 2026-10-08). A method or a path can have a price beside its rule: a CEL expression over the same \`caller\`, \`origin\` and \`request\`, which gives US dollars. The owner's price (\`price.put\`) stands in for the declared one. A call with no price, or a price of 0, reads the route table and the settings the core already holds and writes no row.
 
 \`\`\`js
-"com.lopecode.brain.browser.extend": { type: "procedure", who: "owner", price: "double(request.params.seconds) * 0.000025" }
+"com.lopecode.brain.shop.time": { type: "procedure", who: "owner", price: "double(request.params.seconds) * 0.000025" }
 \`\`\`
 
 The order is rule, price, charge, forward. The price is for the Worker's own work: a method it calls is charged by its own price when the call reaches the core. A price that throws, is not a number, or is less than 0 refuses the call with 403; one above \`perCall\` refuses it with 402. A price reads the query of the request and not its body, as a rule does.
@@ -22900,7 +22900,7 @@ A Worker that answers a call spends the credits of that call's origin, through a
 
 A priced call is charged when the core accepts it, before it is forwarded. The charge is not returned: not when the Worker answers an error, and not when it throws. A service whose call can fail after the charge gives its price to one method that does only the purchase. The answer to a priced call carries \`x-brain-price\`, what was charged.
 
-An account's day is one row, \`spend/DAY/ACCOUNT\`: a list that each charge is appended to in one statement. A charge counts when the charges that count before it, and it, are inside the allowance it was made under. The list alone decides that, so calls made at once do not spend past the allowance and no call holds a lock. A charge that lost to another made at the same time stays in the list and counts for nothing. A priced call is two statements (append, read). A day holds 2000 charges that count for one account; the next is refused. A core that read an account as spent refuses it for 5 s without a write. Days older than \`keepDays\` (30) are deleted at the first priced call of a UTC day; a Brain with no priced call keeps its rows until the next one.
+An account's day is one row, \`spend/DAY/ACCOUNT\`: a list that each charge is appended to in one statement. A charge counts when the charges that count before it, and it, are inside the allowance it was made under. The list alone decides that, so calls made at once do not spend past the allowance and no call holds a lock. A charge that lost to another made at the same time stays in the list and counts for nothing. A priced call is two statements (append, read). A day holds 2000 charges that count for one account; the next is refused. Spending only grows in a day, so a core that read an account as spent refuses it with no write until the day ends or the allowance grows. Days older than \`keepDays\` (30) are deleted at the first priced call of a UTC day; a Brain with no priced call keeps its rows until the next one.
 
 Limits. A cost known only after the call, such as the tokens of a model call, has no method yet: a price is fixed before the call and nothing brings it down afterwards (Tom, 2026-10-08: no refunds), so it needs a design of its own. The allowance of a member's calls for a day (429) is a separate count.
 
@@ -23321,7 +23321,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
   // request, which gives US dollars. The owner's price (price.put) stands in for the one a service declared. A call
   // with no price takes none of this. A priced call is charged to the account of its origin before it is forwarded,
   // and is refused when that leaves the account over its allowance for the UTC day.
-  // An account's day is one row: a list that charges and their corrections are appended to, in one statement each.
+  // An account's day is one row: a list that each charge is appended to, in one statement.
   // A charge counts when the charges that count before it, with it, are inside the allowance it was made under. That
   // is decided by the list alone, so calls made at once cannot spend past the allowance, and no call needs a lock.
   const PRICING = { owner: 1, member: 0.1, worker: 0.1, token: 0.1, perCall: 1, keepDays: 30 };
@@ -23358,15 +23358,15 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     return { spent, net, full: net.size >= CHARGES };
   };
   const spendKey = (day, account) => `spend/${day}/${account}`;
-  // What this instance last read for an account. It stops an account that is out of credits from growing its list.
+  // What this instance last read for an account. Spending only grows in a day, so an account read as spent is refused with no write.
   const known = new Map();
   const charge = async (account, u, allowance, about) => {
     const day = today(), key = spendKey(day, account), A = micro(allowance), k = known.get(account);
-    if (k && k.day === day && Date.now() - k.at < settings.ttl && (k.full || k.spent + u > A)) return { ok: false, spent: k.spent, full: k.full };
+    if (k && k.day === day && (k.full || k.spent + u > A)) return { ok: false, spent: k.spent, full: k.full };
     const i = crypto.randomUUID().slice(0, 13);
     await rows.append(key, { t: Date.now(), i, u, A, ...about }, KEEP);
     const { spent, net, full } = fold(await rows.get(key));
-    known.set(account, { day, spent, full, at: Date.now() });
+    known.set(account, { day, spent, full });
     return { ok: net.has(i), spent, full: full && !net.has(i) };
   };
   let pruned = "";
@@ -23374,10 +23374,10 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     if (pruned === today()) return;
     pruned = today();
     const dayAgo = (d) => new Date(clock() - d * 86400000);
-    // 31 days by name, then 12 whole months before them: a Brain with no priced call for a year still loses its old days.
+    // 31 days by name, then the month of the last of them and 12 before it: a Brain with no priced call for a year still loses its old days.
     for (let d = keepDays + 1; d <= keepDays + 31; d++) await rows.deletePrefix(`spend/${dayAgo(d).toISOString().slice(0, 10)}/`);
     const edge = dayAgo(keepDays + 31);
-    for (let m = 1; m <= 12; m++) await rows.deletePrefix(`spend/${new Date(Date.UTC(edge.getUTCFullYear(), edge.getUTCMonth() - m, 1)).toISOString().slice(0, 7)}-`);
+    for (let m = 0; m <= 12; m++) await rows.deletePrefix(`spend/${new Date(Date.UTC(edge.getUTCFullYear(), edge.getUTCMonth() - m, 1)).toISOString().slice(0, 7)}-`);
   };
   const midnight = () => new Date(today() + "T00:00:00Z").getTime() + 86400000;
   const money = (n) => "$" + String(Number(n.toFixed(6)));
@@ -23391,6 +23391,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     if (!u) return forward(route, c);
     const origin = c.get("origin"), account = accountOf(origin);
     if (!account) return fail(c, 402, "OutOfCredits", `${target} costs ${money(price.usd)} and ${callerOf(origin).id} has no credits`);
+    if (!workers.has(route.worker.replace(/^brain-(x-)?/, ""))) return forward(route, c);
     const allowance = await allowanceOf(account, p);
     const got = await charge(account, u, allowance, { m: target, c: c.get("who").caller, o: origin.caller, v: origin.via || "" });
     if (!got.ok)
@@ -23468,7 +23469,6 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     if (daily !== null && !(typeof daily === "number" && Number.isFinite(daily) && daily >= 0)) return fail(c, 400, "InvalidRequest", "daily is US dollars, 0 or more, or null for the default");
     if (daily === null) await settings.delete("quota/who/" + who);
     else await settings.put("quota/who/" + who, { daily, setAt: Date.now() });
-    known.delete(who);
     return c.json(await dayOf(who, await pricing()));
   });
   app.post(NS + "quota.setDefaults", session, async (c) => {
@@ -23480,7 +23480,6 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
       else return fail(c, 400, "InvalidRequest", `${k} is a number, 0 or more, or null for ${PRICING[k]}`);
     }
     await settings.put("quota/defaults", next);
-    known.clear();
     return c.json({ defaults: await pricing() });
   });
   app.get(NS + "quota.ledger", owner, async (c) => {
@@ -23978,6 +23977,7 @@ const _braincore_test_a_members_worker_calls_as_its_author_and_no_more = async f
   expect((await rig.as(B)("m.aaaaaaaaaa.list")).status).toBe(403);
   expect((await rig.owner("people.sync", { people: [] })).status).toBe(401);
   expect((await rig.as(B)("people.sync", { people: [] })).status).toBe(401);
+  return "the author's calls and no more";
 };
 const _braincore_test_a_members_method_is_open_by_its_rule_and_the_owner_has_a_switch = async function _test_a_members_method_is_open_by_its_rule_and_the_owner_has_a_switch(memberCoreRig,expect,sha256) {
   const rig = await memberCoreRig(), { A, B, W, ns } = rig;
@@ -24011,6 +24011,7 @@ const _braincore_test_a_members_method_is_open_by_its_rule_and_the_owner_has_a_s
   // Calls in and out are counted against the author's day.
   await rig.sync([{ did: A, methods: [], quota: { calls: 0 } }, { did: B, methods: [] }]);
   expect([(await rig.as(B)(list)).status, (await rig.todo(list)).status]).toEqual([429, 429]);
+  return "open by its rule, off by the owner's switch";
 };
 const _braincore_priceRig = function _priceRig(originRig,Response,sha256) {return (async (config = {}) => {
   const rig = await originRig(config);
@@ -24060,7 +24061,7 @@ const _braincore_test_a_priced_call_is_charged_to_the_day_of_its_origin = async 
   expect([ledger.total, ledger.byWho, ledger.byMethod.length]).toEqual([0.011, [{ who: "owner", cost: 0.011 }], 2]);
   return "$" + ledger.total;
 };
-const _braincore_test_a_price_that_cannot_be_decided_refuses_the_call = async function _test_a_price_that_cannot_be_decided_refuses_the_call(priceRig,expect) {
+const _braincore_test_a_price_that_cannot_be_decided_refuses_the_call = async function _test_a_price_that_cannot_be_decided_refuses_the_call(priceRig,expect,sha256) {
   const rig = await priceRig();
   const tried = [];
   for (const [m, status, error] of [["text", 403, "Forbidden"], ["less", 403, "Forbidden"], ["nan", 403, "Forbidden"], ["time", 403, "Forbidden"], ["time?seconds=soon", 403, "Forbidden"], ["dear", 402, "PriceOverCeiling"]]) {
@@ -24070,6 +24071,10 @@ const _braincore_test_a_price_that_cannot_be_decided_refuses_the_call = async fu
   }
   expect((await rig.owner("shop.less", {})).data.message).toBe("the price of com.lopecode.brain.shop.less could not be decided: it is less than 0");
   expect((await rig.owner("shop.dear", {})).data.message).toBe("com.lopecode.brain.shop.dear costs $2 for this call. The most one call may cost is $1");
+  // A priced method of a Worker that is not bound to the core: 502, and no charge.
+  await rig.deployer("service.register", { worker: "brain-x-gone", role: "recipe", paths: [], secrets: [], hash: "h", keyHash: await sha256("gone-key"), methods: { "com.lopecode.brain.gone.buy": { type: "procedure", allow: "true", price: "0.25" } } });
+  const gone = await rig.owner("gone.buy", {});
+  expect([gone.status, gone.data.error, gone.headers.get("x-brain-price")]).toEqual([502, "UpstreamUnavailable", null]);
   // Nothing reached the Worker and nothing was charged.
   expect([rig.shop, rig.spends()]).toEqual([[], []]);
   return tried.length + " refused";
@@ -24159,7 +24164,7 @@ const _braincore_test_a_new_day_starts_at_nothing_and_old_days_are_dropped = asy
   const config = {}, rig = await priceRig(config), DAY = 86400000;
   const at = (ms) => new Date(Date.now() + ms).toISOString().slice(0, 10), ago = (d) => at(-d * DAY);
   const full = [{ t: 1, i: "x", u: 1000000, A: 1000000, m: "m", c: "owner", o: "owner", v: "session" }];
-  for (const d of [1, 10, 30, 31, 37, 38, 61, 200, 420]) rig.sim.rows.set(`spend/${ago(d)}/owner`, full);
+  for (const d of [1, 10, 30, 31, 37, 38, 61, 62, 65, 68, 200, 390]) rig.sim.rows.set(`spend/${ago(d)}/owner`, full);
   expect((await rig.owner("quota.ledger?day=" + ago(1))).data.total).toBe(1);
   // Yesterday was spent to the last cent; today is new.
   expect(await rig.day()).toMatchObject({ day: rig.today, spent: 0, remaining: 1 });
@@ -24246,7 +24251,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braincore_anon_ea3ecc772b", null, ["md"], _braincore_anon_ea3ecc772b);
+  $def("_braincore_anon_0dd3d2b453", null, ["md"], _braincore_anon_0dd3d2b453);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
   $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","decide"], _braincore_coreApp);
@@ -24272,7 +24277,7 @@ export default function define(runtime, observer) {
   $def("_braincore_priceRig", "priceRig", ["originRig","Response","sha256"], _braincore_priceRig);
   $def("_braincore_test_a_call_with_no_price_writes_nothing", "test_a_call_with_no_price_writes_nothing", ["priceRig","expect"], _braincore_test_a_call_with_no_price_writes_nothing);
   $def("_braincore_test_a_priced_call_is_charged_to_the_day_of_its_origin", "test_a_priced_call_is_charged_to_the_day_of_its_origin", ["priceRig","expect"], _braincore_test_a_priced_call_is_charged_to_the_day_of_its_origin);
-  $def("_braincore_test_a_price_that_cannot_be_decided_refuses_the_call", "test_a_price_that_cannot_be_decided_refuses_the_call", ["priceRig","expect"], _braincore_test_a_price_that_cannot_be_decided_refuses_the_call);
+  $def("_braincore_test_a_price_that_cannot_be_decided_refuses_the_call", "test_a_price_that_cannot_be_decided_refuses_the_call", ["priceRig","expect","sha256"], _braincore_test_a_price_that_cannot_be_decided_refuses_the_call);
   $def("_braincore_test_the_origin_pays_through_one_worker_and_through_two", "test_the_origin_pays_through_one_worker_and_through_two", ["priceRig","expect","sha256"], _braincore_test_the_origin_pays_through_one_worker_and_through_two);
   $def("_braincore_test_out_of_credits_is_402_and_nothing_is_forwarded", "test_out_of_credits_is_402_and_nothing_is_forwarded", ["priceRig","expect"], _braincore_test_out_of_credits_is_402_and_nothing_is_forwarded);
   $def("_braincore_test_a_charge_is_not_returned", "test_a_charge_is_not_returned", ["priceRig","expect"], _braincore_test_a_charge_is_not_returned);
@@ -29915,13 +29920,13 @@ Addresses. \`open\`, \`goto\` and \`run\` refuse an address that is not \`http:\
 If a later build signs a page in to the Brain, \`eval\` and \`goto\` on that page must be for the owner's own session only: a caller that can run JavaScript in a signed-in page can do what the page can do.
 
 The assistant has no tool for this service. A page reads text from any address, and that text would come into the assistant's turn.`);};
-const _brainbrowser_anon_41b2163be5 = function _anonymous(md) {return (md`## Time and cost
+const _brainbrowser_anon_80a3124f15 = function _anonymous(md) {return (md`## Time and cost
 
 Cloudflare bills Browser Run by the browser-hour: $0.09 an hour, 10 hours a month in the Workers Paid plan, and the total of a month is rounded to the hour ([pricing](https://developers.cloudflare.com/browser-rendering/pricing/), read 2026-10-07). One second is $0.000025. The count is for the account and not for this service.
 
 Browser time is bought before it is used, by one method. \`extend?seconds=N\` adds N seconds to \`paidUntil\`, or to now when \`paidUntil\` has passed. Its price is N × 0.000025, and no other method has a price. The core charges that to the account of who started the call before the call reaches this service (see **Prices and credits** in \`@tomlarkworthy/brain-core\`), and refuses the call with 402 \`OutOfCredits\` when the account's day is spent.
 
-What is charged is what is added. The price is 0 for a \`seconds\` that this service refuses (absent, not digits, less than 10, more than 3600), and the service then answers 400. A purchase is one appended entry in the row \`paid\`, so purchases made at one time all count. The row keeps the last 1000 purchases.
+What is charged is what is added. The price is 0 for a \`seconds\` that this service refuses (absent, not digits, less than 10, more than 3600), and the service then answers 400. A purchase is one appended entry in the row \`paid\`, so purchases made at one time all count. The row keeps the last 1000 purchases. Each entry carries the time that was bought before it, so the oldest can go.
 
 Time that is bought is not given back: not when a page is closed, not on \`close { all: true }\`, and not when Browser Run fails to start the browser after an \`extend\`. In that last case the seconds stay bought and the next call that needs the browser starts it. The most one \`extend\` can cost is 3600 × $0.000025 = $0.09.
 
@@ -29982,7 +29987,7 @@ const _brainbrowser_browser_service = function _browser_service(cloudflare,brows
     "com.lopecode.brain.browser.text": { type: "query", who: "owner" },
     "com.lopecode.brain.browser.screenshot": { type: "query", who: "owner" },
     "com.lopecode.brain.browser.logs": { type: "query", who: "owner" },
-    // A Live View link gives the person who holds it the tab. The limits are the spend. Both for the owner's own session only.
+    // A Live View link gives the person who holds it the tab. settings is the tab limit. Both for the owner's own session only.
     "com.lopecode.brain.browser.liveView": { type: "query", who: "owner", allow: "caller.session", fixed: true },
     "com.lopecode.brain.browser.settings": { type: "procedure", who: "owner", allow: "caller.session", fixed: true }
   }
@@ -30106,8 +30111,12 @@ const _brainbrowser_browserOps = function _browserOps(browserLimits,rows,browser
   const browsers = async () => (await vals("browser/")).sort((a, b) => a.opened - b.opened || (a.sessionId < b.sessionId ? -1 : 1));
   const pages = () => vals("page/");
   // Each purchase adds its seconds to the time bought so far, or to the time it was made at when that had passed.
-  // A purchase is one appended entry, so two made at one moment both count.
-  const paidUntil = async () => ((await rows.get("paid")) || []).reduce((until, e) => Math.max(until, e.t) + e.n * 1000, 0);
+  // A purchase is one appended entry, so two made at one moment both count. Each carries the time bought before it (u),
+  // so the row can drop its oldest entries.
+  const paidUntil = async () => {
+    const list = (await rows.get("paid")) || [];
+    return list.reduce((until, e) => Math.max(until, e.t) + e.n * 1000, (list[0] && list[0].u) || 0);
+  };
   const noTime = (paid, left, need) => stop(409, "NoTime", `${left > 0 ? `the call needs ${Math.ceil(need / 1000)} s of browser time and ${Math.floor(left / 1000)} s are bought` : "no browser time is bought"}. browser.extend?seconds=N buys N seconds.`, { paidUntil: paid });
   // The sessions Browser Run reports for the account, or null when it does not answer. Other Workers' sessions are in the list.
   const sessions = async () => {
@@ -30400,8 +30409,8 @@ const _brainbrowser_browserOps = function _browserOps(browserLimits,rows,browser
     extend: async (q, by) => {
       const n = browserSeconds(q.seconds);
       if (n === null) throw stop(400, "InvalidRequest", `seconds: a whole number from ${L.minSeconds} to ${L.maxSeconds}, given one time in the query string`);
-      await expire(Date.now());
-      await rows.append("paid", { t: Date.now(), n }, 1000);
+      const u = await expire(Date.now());
+      await rows.append("paid", { t: Date.now(), n, u }, 1000);
       const paid = await paidUntil(), { cold } = await theBrowser(by);
       return { paidUntil: paid, added: n, costUsd: Number((n * L.dollarsPerSecond).toFixed(6)), cold };
     },
@@ -30454,6 +30463,7 @@ const _brainbrowser_browserOps = function _browserOps(browserLimits,rows,browser
     screenshot: async (q) => withPage(named(q.name), ({ cdp, sid }) => shot(cdp, sid, q)),
     logs: async (q) => withPage(named(q.name), async ({ cdp, sid }) => ({ logs: await readLogs(cdp, sid) })),
     liveView: async (q) => {
+      await timed();
       const p = await rows.get("page/" + named(q.name));
       if (!p || p.pending) throw await missing(q.name);
       const r = await http(`/v1/devtools/browser/${p.sessionId}/json/list`);
@@ -30754,6 +30764,7 @@ const _brainbrowser_browserFake = function _browserFake(Response) {return (({ si
         try {
           let v = evaluate(t, params.expression);
           if (params.awaitPromise) v = await v;
+          if (v instanceof Promise) v.catch(() => {});
           if (v === undefined) return { result: { type: "undefined" } };
           // An object is a handle unless the value is asked for. The handle is good on this connection.
           if (params.returnByValue || v === null || (typeof v !== "object" && typeof v !== "function")) return { result: { type: typeof v, value: v } };
@@ -30918,7 +30929,7 @@ const _brainbrowser_test_browser_time_is_bought_by_extend_alone = async function
     const r = await rig.owner.post(m, body);
     expect([m, r.status, r.data]).toEqual([m, 409, { error: "NoTime", message: "no browser time is bought. browser.extend?seconds=N buys N seconds.", paidUntil: 0 }]);
   }
-  for (const m of ["text", "screenshot", "logs"]) expect([m, (await rig.owner.get(m, { name: "a" })).data.error]).toEqual([m, "NoTime"]);
+  for (const m of ["text", "screenshot", "logs", "liveView"]) expect([m, (await rig.owner.get(m, { name: "a" })).data.error]).toEqual([m, "NoTime"]);
   expect([(await rig.owner.get("list")).data, (await rig.owner.get("status")).data.remaining, (await rig.owner.post("close", { all: true })).status, rig.fake.stats.acquired]).toEqual([{ pages: [] }, 0, 200, 0]);
   // extend adds its seconds from now and starts the browser.
   const first = (await rig.as("token:laptop", "did:plc:ada").post("extend", {}, { seconds: 100 })).data;
@@ -30965,7 +30976,11 @@ const _brainbrowser_test_browser_price_is_what_extend_adds = async function _tes
   rig.setPaid(0);
   const t0 = Date.now(), burst = await Promise.all(Array.from({ length: 12 }, () => rig.owner.post("extend", {}, { seconds: 50 })));
   expect([burst.filter((r) => r.status === 200).length, Math.round((Math.max(...burst.map((r) => r.data.paidUntil)) - t0) / 1000), rig.fake.sessions.size]).toEqual([12, 600, 1]);
-  return Object.keys(cases).length + " query strings: charged is added; 12 at once add 600 s";
+  // The row keeps 1000 purchases. One more, with all of them still bought, adds its seconds like the rest.
+  rig.sim.rows.set("paid", Array.from({ length: 1000 }, (_, i) => ({ t: t0, n: 10, u: i ? t0 + i * 10000 : 0 })));
+  const more = await rig.owner.post("extend", {}, { seconds: 10 });
+  expect([more.status, rig.rows.get("paid").length, Math.round((more.data.paidUntil - t0) / 1000)]).toEqual([200, 1000, 10010]);
+  return Object.keys(cases).length + " query strings: charged is added; 12 at once add 600 s; 1001 in a row all count";
 };
 const _brainbrowser_test_browser_gives_no_time_that_was_not_bought = async function _test_browser_gives_no_time_that_was_not_bought(browserRig,expect) {
   const rig = await browserRig({ paid: 0, sites: { "https://down.example/": { fail: "net::ERR_FAILED" } } });
@@ -31230,7 +31245,7 @@ export default function define(runtime, observer) {
   $def("_brainbrowser_anon_14b9e54654", null, ["md"], _brainbrowser_anon_14b9e54654);
   $def("_brainbrowser_anon_4752230c2e", null, ["md"], _brainbrowser_anon_4752230c2e);
   $def("_brainbrowser_anon_041bc6545d", null, ["md"], _brainbrowser_anon_041bc6545d);
-  $def("_brainbrowser_anon_41b2163be5", null, ["md"], _brainbrowser_anon_41b2163be5);
+  $def("_brainbrowser_anon_80a3124f15", null, ["md"], _brainbrowser_anon_80a3124f15);
   $def("_brainbrowser_anon_f2289bb56e", null, ["md"], _brainbrowser_anon_f2289bb56e);
   $def("_brainbrowser_anon_c0bd9f7964", null, ["md"], _brainbrowser_anon_c0bd9f7964);
   $def("_brainbrowser_browser_service", "browser_service", ["cloudflare","browserApp","browserOps","browserPrice"], _brainbrowser_browser_service);
