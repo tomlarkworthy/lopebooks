@@ -21723,6 +21723,9 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
   // version with the same code. A failure is logged and the tick tries again.
   const remint = async (logical, rec) => {
     try {
+      // A token left by a try that failed after it was bound: no Worker row names it, so it is ended here.
+      const left = await rows.get("token/" + logical);
+      if (left) (await rows.delete("token/" + logical), await dropToken(logical, left));
       const t = await mint(logical, rec.cloudflare), held = { id: t.id, groups: t.groups, expires: t.expires };
       try {
         const now = (await api("GET", script(logical) + "/settings")).bindings;
@@ -21735,9 +21738,12 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       }
       await rows.put("token/" + logical, held);
       await audit("mint", logical, held);
-      await rows.put("worker/" + logical, { ...rec, token: t.id, version: await currentVersion(logical) });
+      const next = { ...rec, token: t.id, version: await currentVersion(logical) };
+      await rows.put("worker/" + logical, next);
+      return next;
     } catch (e) {
       log({ at: "token.mint-failed", target: logical, reason: String((e && e.message) || e).slice(0, 300) });
+      return rec;
     }
   };
   const putBack = async (logical, rec, to, reason) => {
@@ -21790,13 +21796,11 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       await rows.put(key, next.state === "rolled-back" ? { ...next, hash: s.lastGoodHash, failedHash: s.hash, at: Date.now() } : next);
     }
     // Every other Worker: two failed checks in a row puts it back to the version before, when there is one.
-    for (const { value: rec } of await rows.list("worker/")) {
+    for (const row of await rows.list("worker/")) {
+      let rec = row.value;
       if (rec.state !== "deployed" || !rec.hash || onProbation.has(rec.worker)) continue;
-      // A Worker put back whose token could not be minted then.
-      if ((rec.cloudflare || []).length && !rec.token) {
-        await remint(rec.worker, rec);
-        continue;
-      }
+      // A Worker put back whose token could not be minted then. Its health is checked all the same.
+      if ((rec.cloudflare || []).length && !rec.token) rec = await remint(rec.worker, rec);
       const fails = (await healthy(rec.worker, rec.key)) ? 0 : (rec.fails || 0) + 1;
       if (fails >= 2 && rec.previous) await putBack(rec.worker, rec, rec.previous, "health check failed twice");
       else if (fails !== (rec.fails || 0)) {
@@ -22947,6 +22951,10 @@ const _braindeployer_test_redistil_after_a_deployer_update_and_source_follows_a_
   expect(same.results).toEqual([{ worker: "brain-x-probe", module: M, state: "same", hash: h1 }]);
   expect(uploads()).toBe(before);
   expect((await rig.state()).distiller.last.hash).toBe((await rig.state()).distiller.now);
+  // A script from before logs gets them from redistil, with nothing uploaded.
+  rig.fake.scripts.get("cb-x-probe").observability = null;
+  await redistil({ apply: true });
+  expect([rig.fake.scripts.get("cb-x-probe").observability, uploads()]).toEqual([{ enabled: true, logs: { enabled: true, invocation_logs: false } }, before]);
   // A record whose hash this deployer does not reproduce stands for a Worker distilled by an older deployer.
   const rec = rig.sim.rows.get("worker/brain-x-probe"), kept = rig.sim.rows.get("source/" + M);
   rig.sim.rows.set("worker/brain-x-probe", { ...rec, hash: "0".repeat(64) });
@@ -23107,7 +23115,7 @@ const _braindeployer_memberRig = function _memberRig(deployerRig,sha256) {return
   const deploy = async (name, salt, extra, author = A, quota = {}) => as("deploy", "member", { author, quota, request: await service(name, salt, extra) });
   return { ...rig, as, A, id, ns, service, deploy, key };
 });};
-const _braindeployer_test_a_member_deploys_with_no_approval_and_only_the_core_bound = async function _test_a_member_deploys_with_no_approval_and_only_the_core_bound(memberRig,expect,partsHash) {
+const _braindeployer_test_a_member_deploys_with_no_approval_and_only_the_core_bound = async function _test_a_member_deploys_with_no_approval_and_only_the_core_bound(memberRig,expect,logged,partsHash) {
   const rig = await memberRig(), { id, ns, A } = rig;
   expect((await rig.state()).approval).toBe(true);
   const out = await rig.deploy("todo", "a", { resources: ["sql", "xrpc"], access: { [ns + "add"]: { type: "procedure", who: "author" }, [ns + "list"]: { type: "query", who: "members" } } });
@@ -23122,11 +23130,12 @@ const _braindeployer_test_a_member_deploys_with_no_approval_and_only_the_core_bo
   expect((await rig.state()).pending).toEqual([]);
   // The same again is unchanged; a change goes live and keeps the key.
   expect((await rig.deploy("todo", "a", { resources: ["sql", "xrpc"], access: { [ns + "add"]: { type: "procedure", who: "author" }, [ns + "list"]: { type: "query", who: "members" } } })).state).toBe("unchanged");
-  expect((await rig.deploy("todo", "b")).state).toBe("deployed");
+  const at = (lines) => lines.filter((l) => l.target === `brain-m-${id}-todo`).map((l) => l.at);
+  expect(at(await logged(async () => expect((await rig.deploy("todo", "b")).state).toBe("deployed")))).toContain("deploy.deployed");
   // A version that does not answer is put back.
   const bad = await rig.service("todo", "c");
   rig.fake.unhealthy.add(await partsHash(bad.parts, { worker: `brain-m-${id}-todo`, role: "member", author: A, module: null, calls: [], crons: [], flags: [], methods: [], access: {}, paths: [], secrets: [], resources: [], bindings: [] }));
-  expect((await rig.as("deploy", "member", { author: A, request: bad })).state).toBe("put-back");
+  expect(at(await logged(async () => expect((await rig.as("deploy", "member", { author: A, request: bad })).state).toBe("put-back")))).toContain("deploy.put-back");
   expect((await rig.as("remove", "member", { author: "did:plc:bob", request: { name: "todo" } })).state).toBe("refused");
   expect((await rig.as("remove", "member", { author: A, request: { name: "todo" } })).state).toBe("removed");
   expect(rig.fake.scripts.has(script)).toBe(false);
@@ -23236,7 +23245,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_deployer_probe_service", "deployer_probe_service", ["cloudflare","Response"], _braindeployer_deployer_probe_service);
   $def("_braindeployer_anon_1f21a8bd4f", null, ["md"], _braindeployer_anon_1f21a8bd4f);
   $def("_braindeployer_memberRig", "memberRig", ["deployerRig","sha256"], _braindeployer_memberRig);
-  $def("_braindeployer_test_a_member_deploys_with_no_approval_and_only_the_core_bound", "test_a_member_deploys_with_no_approval_and_only_the_core_bound", ["memberRig","expect","partsHash"], _braindeployer_test_a_member_deploys_with_no_approval_and_only_the_core_bound);
+  $def("_braindeployer_test_a_member_deploys_with_no_approval_and_only_the_core_bound", "test_a_member_deploys_with_no_approval_and_only_the_core_bound", ["memberRig","expect","logged","partsHash"], _braindeployer_test_a_member_deploys_with_no_approval_and_only_the_core_bound);
   $def("_braindeployer_test_a_member_deploy_is_refused_outside_its_tier", "test_a_member_deploy_is_refused_outside_its_tier", ["memberRig","expect"], _braindeployer_test_a_member_deploy_is_refused_outside_its_tier);
   $def("_braindeployer_test_getModules_keeps_a_members_module_out_of_the_brains_list", "test_getModules_keeps_a_members_module_out_of_the_brains_list", ["memberRig","expect"], _braindeployer_test_getModules_keeps_a_members_module_out_of_the_brains_list);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
@@ -23439,9 +23448,24 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
   };
   // A method as it is counted and logged: the name after com.lopecode.brain., or the path a service declared.
   // Names nobody declared are counted as one, so a stranger cannot grow the table.
-  const nameOf = (c, status) => {
+  // Declared: a service's route matched (routeOf), or the core has a handler at this path. Not decided by the status.
+  const nameOf = (c) => {
     const url = new URL(c.req.url), nsid = url.pathname.startsWith(NS) ? url.pathname.slice(NS.length) : null;
-    return !c.get("target") && [404, 501].includes(status) ? "(unknown)" : nsid || c.get("path") || url.pathname;
+    const declared = c.get("target") || c.get("routed") || app.routes.some((r) => r.path === url.pathname);
+    return declared ? nsid || c.get("path") || url.pathname : "(unknown)";
+  };
+  const routeOf = async (c) => {
+    const url = new URL(c.req.url), nsid = url.pathname.startsWith("/xrpc/") ? url.pathname.slice("/xrpc/".length) : null;
+    // The route table and the owner's rules are read through a few seconds of memory, not from storage on every call.
+    for (const route of (await settings.list("route/")).map((r) => r.value).filter(routed)) {
+      const method = nsid && route.methods[nsid];
+      const path = !nsid && route.paths.find((p) => p.path === url.pathname || (p.path.endsWith("/*") && url.pathname.startsWith(p.path.slice(0, -1))));
+      if (!method && !path) continue;
+      if (path) c.set("path", path.path);
+      c.set("routed", route.worker);
+      return { route, method, path, nsid };
+    }
+    return { nsid };
   };
   // One line a call, in Workers Logs: Cloudflare keeps it 7 days and logs.query reads it. The keys are the ones written
   // here and no others: names and decisions. Never a header, a body, a parameter's value or a secret.
@@ -23461,13 +23485,13 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     const nsid = path.startsWith(NS) ? path.slice(NS.length) : null;
     console.log({
       at: "call", ray: (c.req.header("x-brain-ray") || "").slice(0, 64), caller: who.caller, via: who.via || "", origin: origin.caller,
-      method: nsid || c.get("path") ? nameOf(c, status).slice(0, 80) : "(unknown)", worker: c.get("target") || c.get("routed") || "brain-core", status, error: (await error) || null, ms: Date.now() - started,
+      method: nsid || c.get("path") ? nameOf(c).slice(0, 80) : "(unknown)", worker: c.get("target") || c.get("routed") || "brain-core", status, error: (await error) || null, ms: Date.now() - started,
       price: c.get("price") ?? null, rule: c.get("rule") || (status === 401 || status === 403 ? "deny" : status < 400 ? "allow" : ""), by: c.get("by") || "core"
     });
   };
   const observe = async (c, started) => {
     const target = c.get("target"), status = c.res.status, ms = Date.now() - started;
-    const method = nameOf(c, status);
+    const method = nameOf(c);
     if (method.startsWith("metrics.")) return;
     const who = c.get("who").caller, caller = /^(token|did):/.test(who) ? who.split(":")[0] : who;
     // The version that answered: the forwarded Worker's own header, or this core's.
@@ -23562,6 +23586,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     c.set("who", who);
     const no = who.member ? await asAuthor(c, who.member) : who.caller.startsWith("worker:") ? await asDeclared(c, who.caller.slice("worker:".length)) : null;
     if (no) {
+      await routeOf(c);
       c.set("rule", "deny");
       c.set("by", who.member ? "grant" : "calls");
       await say(c, started, no.status, c.get("error"));
@@ -23972,16 +23997,9 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     });
   app.all("*", async (c) => {
     const url = new URL(c.req.url), who = c.get("who");
-    // The route table and the owner's rules are read through a few seconds of memory, not from storage on every call.
-    const routes = (await settings.list("route/")).map((r) => r.value).filter(routed);
-    const nsid = url.pathname.startsWith("/xrpc/") ? url.pathname.slice("/xrpc/".length) : null;
-    for (const route of routes) {
-      const method = nsid && route.methods[nsid];
-      const path = !nsid && route.paths.find((p) => p.path === url.pathname || (p.path.endsWith("/*") && url.pathname.startsWith(p.path.slice(0, -1))));
+    const { route, method, path, nsid } = await routeOf(c);
+    if (route) {
       const rule = method || path;
-      if (!rule) continue;
-      if (path) c.set("path", path.path);
-      c.set("routed", route.worker);
       if (method && (method.type === "query") !== (c.req.method === "GET")) return fail(c, 405, "InvalidRequest", `${nsid} is a ${method.type}`);
       // A member's Worker answers while its author is a member and the owner has not switched it off.
       if (route.role === "member") {
@@ -24751,6 +24769,27 @@ const _braincore_test_one_log_line_a_call_with_these_keys_and_no_secret = async 
   expect(mine.every((l) => typeof l.ms === "number" && l.price === null)).toBe(true);
   return mine.length + " lines, " + KEYS.length + " keys each";
 };
+const _braincore_test_the_logged_method_is_named_by_what_is_declared_not_by_the_status = async function _test_the_logged_method_is_named_by_what_is_declared_not_by_the_status(coreRig,logged,expect) {
+  const rig = await coreRig();
+  await rig.owner("calls.setMode", { mode: "enforce" });
+  const lines = await logged(async () => {
+    // A method of the core that answers 404 keeps its name. A name nobody declared, refused before routing, does not.
+    await rig.owner("rule.put", { target: "com.lopecode.brain.nobody.x", allow: "true" }, { "x-brain-ray": "ray-name-1" });
+    await rig.worker("nobody.SEKRET-NSID", {}, { "x-brain-ray": "ray-name-2" });
+  });
+  const mine = lines.filter((l) => l.at === "call" && String(l.ray).startsWith("ray-name-")).sort((a, b) => (a.ray < b.ray ? -1 : 1));
+  expect(mine.map((l) => [l.method, l.status, l.by])).toEqual([["rule.put", 404, "core"], ["(unknown)", 403, "calls"]]);
+  return "rule.put 404 by name, an undeclared name 403 as (unknown)";
+};
+const _braincore_test_a_posted_body_reaches_the_service_whole = async function _test_a_posted_body_reaches_the_service_whole(coreRig,expect) {
+  const rig = await coreRig();
+  // With a content-length the core reads the body before it sends it on (bodyOf); without one it passes the stream.
+  const body = JSON.stringify({ text: "x".repeat(5000) });
+  expect((await rig.owner("echo.say", body, { "content-length": String(body.length) })).status).toBe(200);
+  expect((await rig.owner("echo.say", body)).status).toBe(200);
+  expect(rig.seen.slice(-2).map((s) => s.body)).toEqual([body, body]);
+  return "5013 characters in, 5013 out, both ways";
+};
 const _braincore_test_the_log_line_of_a_priced_call_has_its_price = async function _test_the_log_line_of_a_priced_call_has_its_price(coreRig,logged,expect) {
   const rig = await coreRig();
   await rig.owner("price.put", { target: "com.lopecode.brain.echo.say", price: "0.25" });
@@ -24804,6 +24843,8 @@ export default function define(runtime, observer) {
   $def("_braincore_test_the_owner_sets_prices_and_allowances_in_their_own_session", "test_the_owner_sets_prices_and_allowances_in_their_own_session", ["priceRig","expect"], _braincore_test_the_owner_sets_prices_and_allowances_in_their_own_session);
   $def("_braincore_test_a_members_worker_spends_its_authors_credits", "test_a_members_worker_spends_its_authors_credits", ["memberCoreRig","sha256","expect"], _braincore_test_a_members_worker_spends_its_authors_credits);
   $def("_braincore_test_one_log_line_a_call_with_these_keys_and_no_secret", "test_one_log_line_a_call_with_these_keys_and_no_secret", ["coreRig","logged","expect"], _braincore_test_one_log_line_a_call_with_these_keys_and_no_secret);
+  $def("_braincore_test_the_logged_method_is_named_by_what_is_declared_not_by_the_status", "test_the_logged_method_is_named_by_what_is_declared_not_by_the_status", ["coreRig","logged","expect"], _braincore_test_the_logged_method_is_named_by_what_is_declared_not_by_the_status);
+  $def("_braincore_test_a_posted_body_reaches_the_service_whole", "test_a_posted_body_reaches_the_service_whole", ["coreRig","expect"], _braincore_test_a_posted_body_reaches_the_service_whole);
   $def("_braincore_test_the_log_line_of_a_priced_call_has_its_price", "test_the_log_line_of_a_priced_call_has_its_price", ["coreRig","logged","expect"], _braincore_test_the_log_line_of_a_priced_call_has_its_price);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
@@ -25982,6 +26023,7 @@ const _brainkernel_test_a_member_reaches_their_own_services_and_the_deployer_hea
   expect(rig.toDeployer.at(-1).url).toBe("https://deployer.internal/xrpc/com.lopecode.brain.member.purge");
   expect(JSON.parse(rig.toDeployer.at(-1).body)).toEqual({ author: "did:plc:other" });
   expect((await rig.call("member.deploy", { session: rig.other, body })).status).toBe(403);
+  return "a member reaches their own services, and the deployer hears who";
 };
 const _brainkernel_test_a_member_reads_their_own_spending = async function _test_a_member_reads_their_own_spending(kernelRig,expect) {
   const rig = await kernelRig();
@@ -32371,7 +32413,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainlogs_anon_a48eac3ee2 = function _anonymous(md) {return (md`# brain-logs
+const _brainlogs_anon_c7cadce9d2 = function _anonymous(md) {return (md`# brain-logs
 
 A Cloud Brain recipe: the logs of this Brain's Workers, read from Cloudflare Workers Logs. It keeps nothing and has no query language of its own. A body is passed to Cloudflare's telemetry API and the answer is returned as Cloudflare gave it, its errors and limits included.
 
@@ -32396,7 +32438,7 @@ POST /xrpc/com.lopecode.brain.logs.query
 
 ## What is in the logs
 
-Cloudflare keeps what a Worker writes with \`console.log\`, 7 days on Workers Paid and 3 on Free, and gives every line \`$metadata.traceId\`, which is the same in each Worker one call passed through. The deployer turns Workers Logs on for every Worker and Cloudflare's own line per invocation off, because that line stores request headers and the whole URL. With it off, Cloudflare still stores, beside each line a Worker writes, the method and URL of that call with its query string (\`$workers.event.request\`: \`method\`, \`url\`, \`path\`, \`search\`), not its headers or body. So a parameter of a method is in the logs, and a long-lived secret must not be put in a path or a query string. A short-lived single-use code may be.
+Cloudflare keeps what a Worker writes with \`console.log\`, 7 days on Workers Paid and 3 on Free, and gives every line \`$metadata.traceId\`, which is the same in each Worker one call passed through. The deployer turns Workers Logs on for every Worker and Cloudflare's own line per invocation off, because that line stores request headers and the whole URL. With it off, Cloudflare still stores, beside each line a Worker writes, the method and URL of that call with its query string (\`$workers.event.request\`: \`method\`, \`url\`, \`path\`, \`search\`), not its headers or body. So a parameter of a method is in the logs, and a long-lived secret must not be put in a path or a query string. A short-lived single-use code may be. One exception is known: Meta sends the long-lived \`hub.verify_token\` in the query string of \`/hooks/whatsapp\`, and the core writes a line for that call. Cloudflare wrote \`REDACTED\` for that name on a scratch Worker (2026-10-08); that was not seen on a Brain.
 
 | Line | Written by | Fields |
 |---|---|---|
@@ -32529,7 +32571,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainlogs_anon_a48eac3ee2", null, ["md"], _brainlogs_anon_a48eac3ee2);
+  $def("_brainlogs_anon_c7cadce9d2", null, ["md"], _brainlogs_anon_c7cadce9d2);
   $def("_brainlogs_logsScript", "logsScript", [], _brainlogs_logsScript);
   $def("_brainlogs_logsScope", "logsScope", ["logsScript"], _brainlogs_logsScope);
   $def("_brainlogs_logs_service", "logs_service", ["cloudflare","Response","logsScript","config","cloudflareApi","logsScope"], _brainlogs_logs_service);
