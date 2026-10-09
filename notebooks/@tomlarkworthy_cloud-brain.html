@@ -19557,6 +19557,7 @@ const _cloudflareiac_deployer = function _deployer(platformTag,backend) {return 
 const _cloudflareiac_guard = function _guard(deployer) {return (deployer);};
 const _cloudflareiac_assets = function _assets(platformTag,backend) {return ({ [platformTag]: "assets", fetch: (request) => backend.forward("assets", request) });};
 const _cloudflareiac_browser = function _browser(platformTag,backend,Request) {return ({ [platformTag]: "browser", fetch: (path, init = {}) => backend.forward("browser", new Request("https://browser.internal" + path, init)) });};
+const _cloudflareiac_containers = function _containers(platformTag,backend) {return ({ [platformTag]: "containers", fetch: (image, id, request) => backend.forward("containers", request) });};
 const _cloudflareiac_log = function _log(platformTag) {return (Object.assign((entry) => console.log({ ...entry, worker: "notebook", ray: "" }), { [platformTag]: "log" }));};
 const _cloudflareiac_cloudflareApi = function _cloudflareApi(platformTag,backend,Request) {return ({ [platformTag]: "cloudflareApi", fetch: (path, init = {}) => backend.forward("cloudflareApi", new Request("https://api.cloudflare.com/client/v4/accounts/ACCOUNT" + path, init)) });};
 const _cloudflareiac_workers = function _workers(platformTag,backend) {return ({
@@ -20011,7 +20012,19 @@ const _cloudflareiac_asSource = function _asSource(globalThis) {return ((emitted
   }
   return { module: emitted.source.module, source: emitted.source.text, files };
 });};
-const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,notebookOnly,globalThis,acorn,acorn_walk,secretName,moduleSource,workerRuntime,quickjsWasmText,checkedRule,partsHash) {return (async (service) => {
+const _cloudflareiac_containerImages = function _containerImages() {return ((service, refuse = (cell, why) => { throw new Error(why); }) => {
+  const declared = service.options.containers || {};
+  const names = Object.keys(declared.images || {}).sort();
+  if (!names.length) refuse(service.name, "uses containers and declares no image: add containers: { images: { NAME: { image } }, object } to the service's options");
+  if (!declared.object || typeof declared.object.fetch !== "function" || typeof declared.object.alarm !== "function") refuse(service.name, "declares containers and no object with fetch and alarm");
+  return names.map((name) => {
+    const i = declared.images[name];
+    if (!/^[a-z][a-z0-9]{0,19}$/.test(name)) refuse(service.name, `names a container image "${name}": a lower case letter, then letters and digits, 20 at most`);
+    if (typeof i.image !== "string" || !/^docker\.io\/[a-z0-9._/-]+:[A-Za-z0-9._-]+$/.test(i.image)) refuse(service.name, `image "${name}" is not docker.io/NAME:TAG`);
+    return { name, class_name: "Box_" + name, image: i.image, instance_type: i.type || "lite", max_instances: i.max || 4, entrypoint: i.entrypoint || [], regions: i.regions || [] };
+  });
+});};
+const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,notebookOnly,globalThis,acorn,acorn_walk,secretName,moduleSource,workerRuntime,containerImages,quickjsWasmText,checkedRule,partsHash) {return (async (service) => {
   // An imported name is an alias variable whose one input lives in the exporting module.
   const follow = (v) => {
     while ((v._inputs || []).length === 1 && v._inputs[0]._module && v._inputs[0]._module !== v._module)
@@ -20051,6 +20064,9 @@ const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,noteboo
     } else if (kind === "cloudflareApi") {
       used.add(kind);
       ref = "__cloudflareApi";
+    } else if (kind === "containers") {
+      used.add(kind);
+      ref = "__containers";
     } else if (kind) {
       used.add(kind);
       ref = "__rt.platform." + kind;
@@ -20125,9 +20141,21 @@ const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,noteboo
   const groups = [...new Set(service.options.cloudflare || [])].sort();
   if (used.has("cloudflareApi") && !groups.length) refuse(service.name, "uses cloudflareApi and declares no Cloudflare permissions: add cloudflare: [\"GROUP\"] to the service's options");
   if (used.has("cloudflareApi")) lines.push(`const __cloudflareApi = { fetch: async (path, init = {}) => fetch("https://api.cloudflare.com/client/v4/accounts/" + __rt.platform.config.account + path, { ...init, headers: { "content-type": "application/json", ...(init.headers || {}), authorization: "Bearer " + (await __rt.platform.secrets.CF_TOKEN) } }) };`);
+  // Containers are written here and not in the wrapper, as the browser cell is. One Durable Object class for each image
+  // the service declares. The object does what the service's options.containers.object says, with its own ctx.
+  const boxes = used.has("containers") ? containerImages(service, refuse) : [];
+  if (boxes.length) lines.push(`import { DurableObject as __DO } from "cloudflare:workers";`, `let __env = null;`, `const __containers = { fetch: (image, id, request) => { const ns = __env && __env["BOX_" + String(image).toUpperCase()]; if (!ns) throw new Error("no container image " + image); return ns.get(ns.idFromName(id)).fetch(request); } };`);
   lines.push(`const __init = async () => {`);
   for (const c of cells) lines.push(`  const ${c.id} = await (${c.text})(${c.deps.join(", ")});`);
-  lines.push(`  return ${rootRef};`, `};`, `export default __rt.serve(__init, ${source ? "__source" : "null"});`);
+  if (!boxes.length) lines.push(`  return ${rootRef};`, `};`, `export default __rt.serve(__init, ${source ? "__source" : "null"});`);
+  else {
+    // One evaluation of the cells for the Worker and its objects. An object can be the first thing to run in an isolate:
+    // it asks the Worker for its health once, which gives the wrapper the bindings.
+    lines.push(`  return ${rootRef};`, `};`, `let __one = null;`, `const __once = () => (__one ??= __init().catch((e) => { __one = null; throw e; }));`, `const __served = __rt.serve(__once, ${source ? "__source" : "null"});`);
+    lines.push(`export default { fetch: (request, env, ctx) => ((__env = env), __served.fetch(request, env, ctx)), scheduled: (event, env, ctx) => ((__env = env), __served.scheduled(event, env, ctx)) };`);
+    lines.push(`const __box = async (o, what, image, request) => { if (!__env) { __env = o.env; await __served.fetch(new Request("https://box.internal/xrpc/_health"), o.env, { waitUntil: () => {} }); } return (await __once()).options.containers.object[what](o.ctx, { image }, request); };`);
+    for (const b of boxes) lines.push(`export class ${b.class_name} extends __DO { fetch(request) { return __box(this, "fetch", ${JSON.stringify(b.name)}, request); } alarm() { return __box(this, "alarm", ${JSON.stringify(b.name)}); } }`);
+  }
   if (used.has("rows") && (role === "deployer" || role === "guard")) lines.push(`export const Rows = __rt.Rows;`);
   // A cell value of the tab is never copied: every chased cell is evaluated again on the Worker from its source.
 
@@ -20156,6 +20184,8 @@ const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,noteboo
     resources,
     // Cloudflare permission groups. The deployer mints a token of exactly these and binds it to this Worker as CF_TOKEN.
     cloudflare: groups,
+    // Container applications the deployer makes for this Worker, one for each image. Absent for a Worker with none.
+    ...(boxes.length ? { containers: boxes } : {}),
     bindings: [
       // Only the kernel's and the core's named secrets are bound. A recipe reads its secrets through the core.
       ...(role === "kernel" || role === "core" || role === "deployer" ? [...secretNames].sort().map((name) => ({ type: "secret_text", name })) : []),
@@ -20165,7 +20195,8 @@ const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,noteboo
       ...(used.has("inbox") || used.has("xrpc") || used.has("sql") || used.has("core") || (secretNames.size && (role === "recipe" || role === "system")) ? [{ type: "service", name: "CORE", service: "brain-core" }] : []),
       ...(used.has("deployer") ? [{ type: "service", name: "DEPLOYER", service: "brain-deployer" }] : []),
       ...(used.has("assets") ? [{ type: "assets", name: "ASSETS" }] : []),
-      ...(used.has("browser") ? [{ type: "browser", name: "X_CF_BROWSER_RUN" }] : [])
+      ...(used.has("browser") ? [{ type: "browser", name: "X_CF_BROWSER_RUN" }] : []),
+      ...boxes.map((b) => ({ type: "durable_object_namespace", name: "BOX_" + b.name.toUpperCase(), class_name: b.class_name }))
     ]
   };
   const hash = await partsHash(parts, meta);
@@ -20184,7 +20215,7 @@ const _cloudflareiac_moduleSource = function _moduleSource(runtime,exportModuleJ
     return null;
   }
 });};
-const _cloudflareiac_simulate = function _simulate(Response,Request,simWaits) {return (async (service, { secrets = {}, stored = {}, fetch, config = {}, info = {}, core, deployer, guard, assets, workers = {}, rows, blobs, sql, browser } = {}) => {
+const _cloudflareiac_simulate = function _simulate(Response,Request,simWaits) {return (async (service, { secrets = {}, stored = {}, fetch, config = {}, info = {}, core, deployer, guard, assets, workers = {}, rows, blobs, sql, browser, containers } = {}) => {
   const emitted = await service.emit();
   const url = (text) => URL.createObjectURL(new Blob([text], { type: "text/javascript" }));
   let main = emitted.parts[0].text;
@@ -20195,6 +20226,8 @@ const _cloudflareiac_simulate = function _simulate(Response,Request,simWaits) {r
   }
   // A browser has no node:async_hooks. The wrapper then holds one call at a time (see workerRuntime).
   main = main.replace(/^import \{ AsyncLocalStorage as __als \} from "node:async_hooks";$/m, "const __als = null;");
+  // Nor cloudflare:workers. An object here is the emitted class over a plain base, with the ctx simulate gives it.
+  main = main.replace(/^import \{ DurableObject as __DO \} from "cloudflare:workers";$/m, "const __DO = class { constructor(ctx, env) { this.ctx = ctx; this.env = env; } };");
   const mod = await import(url(main));
   const sim = { emitted, inbox: [], rows: rows || new Map(), blobs: blobs || new Map(), requests: [], calls: [] };
   const reply = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
@@ -20260,6 +20293,40 @@ const _cloudflareiac_simulate = function _simulate(Response,Request,simWaits) {r
   };
   for (const [name, handler] of Object.entries(workers))
     env["X_" + name.toUpperCase().replace(/[^A-Z0-9]/g, "_")] = { fetch: async (request) => handler(request) };
+  // containers(image, id) gives the ctx.container of one object. sim.boxes has each object that was reached:
+  // "image/id" -> { object, ctx, stored (its storage), alarm (when its alarm is due, or null), sleep() }.
+  sim.boxes = new Map();
+  for (const b of emitted.meta.containers || [])
+    env["BOX_" + b.name.toUpperCase()] = {
+      idFromName: (name) => name,
+      get: (id) => ({
+        fetch: async (request) => {
+          const key = b.name + "/" + id;
+          if (!sim.boxes.has(key)) {
+            const box = { stored: new Map(), alarm: null, container: containers ? containers(b.name, id) : null };
+            // sleep(): the object as Cloudflare makes it again after it was put to sleep. Its storage, its alarm and
+            // its container stay; what it held in memory does not.
+            box.sleep = () => {
+              box.ctx = {
+                container: box.container,
+                storage: {
+                  get: async (k) => box.stored.get(k),
+                  put: async (k, v) => void box.stored.set(k, JSON.parse(JSON.stringify(v))),
+                  delete: async (k) => box.stored.delete(k),
+                  setAlarm: async (t) => void (box.alarm = +t),
+                  getAlarm: async () => box.alarm,
+                  deleteAlarm: async () => void (box.alarm = null)
+                }
+              };
+              box.object = new mod[b.class_name](box.ctx, env);
+            };
+            box.sleep();
+            sim.boxes.set(key, box);
+          }
+          return sim.boxes.get(key).object.fetch(request);
+        }
+      })
+    };
   // browser(request) answers as the Browser Run binding. For an upgrade it gives { status: 101, webSocket }.
   if (browser) env.X_CF_BROWSER_RUN = { fetch: async (request) => browser(request) };
   sim.env = env;
@@ -21208,6 +21275,7 @@ export default function define(runtime, observer) {
   $def("_cloudflareiac_guard", "guard", ["deployer"], _cloudflareiac_guard);
   $def("_cloudflareiac_assets", "assets", ["platformTag","backend"], _cloudflareiac_assets);
   $def("_cloudflareiac_browser", "browser", ["platformTag","backend","Request"], _cloudflareiac_browser);
+  $def("_cloudflareiac_containers", "containers", ["platformTag","backend"], _cloudflareiac_containers);
   $def("_cloudflareiac_log", "log", ["platformTag"], _cloudflareiac_log);
   $def("_cloudflareiac_cloudflareApi", "cloudflareApi", ["platformTag","backend","Request"], _cloudflareiac_cloudflareApi);
   $def("_cloudflareiac_workers", "workers", ["platformTag","backend"], _cloudflareiac_workers);
@@ -21222,7 +21290,8 @@ export default function define(runtime, observer) {
   $def("_cloudflareiac_sha256", "sha256", [], _cloudflareiac_sha256);
   $def("_cloudflareiac_partsHash", "partsHash", ["sha256"], _cloudflareiac_partsHash);
   $def("_cloudflareiac_asSource", "asSource", ["globalThis"], _cloudflareiac_asSource);
-  $def("_cloudflareiac_emit", "emit", ["runtime","platformTag","libraries","notebookOnly","globalThis","acorn","acorn_walk","secretName","moduleSource","workerRuntime","quickjsWasmText","checkedRule","partsHash"], _cloudflareiac_emit);
+  $def("_cloudflareiac_containerImages", "containerImages", [], _cloudflareiac_containerImages);
+  $def("_cloudflareiac_emit", "emit", ["runtime","platformTag","libraries","notebookOnly","globalThis","acorn","acorn_walk","secretName","moduleSource","workerRuntime","containerImages","quickjsWasmText","checkedRule","partsHash"], _cloudflareiac_emit);
   $def("_cloudflareiac_moduleSource", "moduleSource", ["runtime","exportModuleJS"], _cloudflareiac_moduleSource);
   $def("_cloudflareiac_simulate", "simulate", ["Response","Request","simWaits"], _cloudflareiac_simulate);
   $def("_cloudflareiac_simWaits", "simWaits", [], _cloudflareiac_simWaits);
@@ -21582,6 +21651,26 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     return id;
   };
 
+  // Container applications: one for each image a Worker declares, named <script>-<image>, bound to that Worker's
+  // Durable Object class. Made after the upload, because the class must exist. One that is no longer declared is
+  // deleted. A new application has no instance ready for about 4 minutes (seen 2026-10-09).
+  const TYPES = ["lite", "basic", "standard-1", "standard-2"];
+  const applications = async (logical, list) => {
+    const mine = ((await api("GET", "/containers/applications")) || []).filter((a) => a.name.startsWith(actual(logical) + "-"));
+    for (const b of list) {
+      const name = actual(logical) + "-" + b.name, found = mine.find((a) => a.name === name);
+      const configuration = { image: b.image, instance_type: b.instance_type, ...(b.entrypoint.length ? { entrypoint: b.entrypoint } : {}) };
+      const constraints = b.regions.length ? { constraints: { regions: b.regions } } : {};
+      if (!found) await api("POST", "/containers/applications", text({ name, scheduling_policy: "default", instances: 0, max_instances: b.max_instances, configuration, ...constraints, durable_objects: { script_name: actual(logical), class_name: b.class_name } }), jsonType);
+      else await api("PATCH", "/containers/applications/" + found.id, text({ max_instances: b.max_instances, configuration, ...constraints }), jsonType);
+      log({ at: found ? "deploy.application-set" : "deploy.application-made", target: logical, application: name, image: b.image, type: b.instance_type });
+    }
+    for (const a of mine.filter((a) => !list.some((b) => a.name === actual(logical) + "-" + b.name))) {
+      await api("DELETE", "/containers/applications/" + a.id);
+      log({ at: "deploy.application-removed", target: logical, application: a.name });
+    }
+  };
+
   // Bindings are built here from the resources a service declares. Nothing the tab sends is bound as given.
   const bindingsFor = async (w, key, existing, given, token = []) => {
     const m = w.meta, tier = m.role === "kernel" || m.role === "core";
@@ -21616,6 +21705,8 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     if (uses("assets")) out.push({ type: "assets", name: "ASSETS" });
     // Browser Run. The name is the one the wrapper's workers cell reads for "cf-browser-run" (see emit in cloudflare-iac).
     if (uses("browser")) out.push({ type: "browser", name: "X_CF_BROWSER_RUN" });
+    // The Worker's own Durable Object classes, one for each container image it declares.
+    for (const b of m.containers || []) out.push({ type: "durable_object_namespace", name: "BOX_" + b.name.toUpperCase(), class_name: b.class_name });
     for (const name of existing) if (name.startsWith("X_") && name !== "X_CF_BROWSER_RUN") out.push({ type: "inherit", name });
     out.push(...token);
     out.push({ type: "secret_text", name: "BRAIN_KEY", text: key });
@@ -21654,8 +21745,14 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       const clash = (m.methods || []).find((x) => (other.methods || []).includes(x)) || (m.paths || []).map((x) => x.path).find((x) => (other.paths || []).some((o) => o.path === x));
       if (clash) return `${clash} is already served by ${other.worker}`;
     }
-    const bad = m.resources.find((r) => !["rows", "blobs", "inbox", "xrpc", "assets", "sql", "browser", ...(logical === "brain-x-knowledge" ? ["database"] : [])].includes(r));
+    // Containers run as root with the open internet and are billed by the second: one service leases them to the rest.
+    const bad = m.resources.find((r) => !["rows", "blobs", "inbox", "xrpc", "assets", "sql", "browser", ...(logical === "brain-x-knowledge" ? ["database"] : []), ...(logical === "brain-x-container" ? ["containers"] : [])].includes(r));
     if (bad) return `a recipe may not use the platform cell "${bad}"`;
+    if ((m.containers || []).length && !m.resources.includes("containers")) return "container images without the platform cell containers";
+    const image = (m.containers || []).find((b) => !/^[a-z][a-z0-9]{0,19}$/.test(b.name) || b.class_name !== "Box_" + b.name || !/^docker\.io\/[a-z0-9._/-]+:[A-Za-z0-9._-]+$/.test(b.image) || !TYPES.includes(b.instance_type) || !(b.max_instances >= 1 && b.max_instances <= 20));
+    if (image) return `container image "${image.name}" is not one this deployer makes: docker.io/NAME:TAG, ${TYPES.join(", ")}, 1 to 20 instances`;
+    // Cloudflare takes a new Durable Object class only with the upload of a script, not of a version.
+    if (rec && rec.hash && text((rec.containers || []).map((b) => b.class_name)) !== text((m.containers || []).map((b) => b.class_name))) return "the container images of a Worker change only by removing it and deploying it again";
     return m.secrets.find((s) => s.startsWith("BRAIN_") || s.startsWith("CF_")) ? "a recipe may not name a BRAIN_ or CF_ secret" : null;
   };
 
@@ -21708,6 +21805,9 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     const m = w.meta, logical = m.worker;
     const bindings = await bindingsFor(w, key, existing, given, token.binding);
     const meta = { main_module: "worker.js", compatibility_date: "2026-10-01", compatibility_flags: [...new Set([...(m.flags || []), ...wrapperFlags])], observability: OBSERVABILITY, bindings };
+    const boxes = m.containers || [];
+    if (boxes.length) meta.containers = boxes.map((b) => ({ class_name: b.class_name }));
+    if (boxes.length && !live) meta.migrations = { new_tag: "v1", new_sqlite_classes: boxes.map((b) => b.class_name) };
     let assetHash = rec ? rec.assetHash : undefined;
     if (m.resources.includes("assets")) {
       if (typeof w.asset === "string") {
@@ -21754,13 +21854,15 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
         throw new Error("health check failed after go-live");
       }
     }
+    if (boxes.length || (rec && (rec.containers || []).length)) await applications(logical, boxes);
     // What is needed to put the version before back, routes included.
     await token.done();
     const before = rec && rec.hash ? { hash: rec.hash, version: previous, module: rec.module, methods: rec.methods, access: rec.access, paths: rec.paths, secrets: rec.secrets, resources: rec.resources, cloudflare: rec.cloudflare || [], token: rec.token || null } : null;
     const next = {
       worker: logical, role: m.role, module: m.module || null, hash: w.hash, version, key, state: "deployed", fails: 0, assetHash, distiller: typeof w.source === "string" ? self.hash : null,
       previous: before,
-      methods: m.methods, access: m.access || {}, paths: m.paths, secrets: m.secrets, resources: m.resources, cloudflare: m.cloudflare || [], token: token.id, deployedAt: Date.now()
+      methods: m.methods, access: m.access || {}, paths: m.paths, secrets: m.secrets, resources: m.resources, cloudflare: m.cloudflare || [], token: token.id, deployedAt: Date.now(),
+      ...(boxes.length ? { containers: boxes } : {})
     };
     await rows.put("worker/" + logical, next);
     await register(next, m.access);
@@ -21940,6 +22042,8 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
             await api("PATCH", script("brain-core") + "/settings", form);
           }
         }
+        // The applications first: one whose Worker is gone would keep its instances.
+        if (rec && (rec.containers || []).length) await applications(logical, []);
         if (rec && rec.hash) await api("DELETE", script(logical) + "?force=true");
         const token = await rows.get("token/" + logical);
         if (token) (await dropToken(logical, token), await rows.delete("token/" + logical));
@@ -22381,6 +22485,8 @@ const _braindeployer_deployerPage = function _deployerPage() {return ((s, messag
             (p.resources || []).some((r) => r === "rows" || r === "sql") ? "<p><b>Reaches the shared database.</b> A Worker with rows or sql is bound to the one database every Worker of this Brain shares.</p>" : ""
           }${
             (p.resources || []).includes("browser") ? "<p><b>Opens remote browsers.</b> Cloudflare bills browser time to this account.</p>" : ""
+          }${
+            (p.resources || []).includes("containers") ? "<p><b>Runs containers.</b> Cloudflare bills container time to this account. A container runs as root and reaches the internet.</p>" : ""
           }${(p.cloudflare || []).length ? `<p><b>Cloudflare permissions: ${esc(p.cloudflare.join(", "))}.</b> The deployer mints a Cloudflare API token with these and gives it to this Worker.</p>` : ""}`
     }</li>`;
   });
@@ -22525,7 +22631,7 @@ const _braindeployer_anon_34a5396163 = function _anonymous(md) {return (md`## Te
 
 The deployer runs under \`simulate\` against \`fakeCloudflare\`, a stand-in for the Cloudflare API and for the Workers it deploys. A hash added to \`fake.unhealthy\` makes that version fail its health check.`);};
 const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return (() => {
-  const scripts = new Map(), log = [], calls = [], unhealthy = new Set(), stored = {}, d1 = [], tokens = new Map();
+  const scripts = new Map(), log = [], calls = [], unhealthy = new Set(), stored = {}, d1 = [], tokens = new Map(), apps = [];
   const account = ["com.cloudflare.api.account"];
   const groups = [
     { id: "g-obs-user", name: "Workers Observability Read", scopes: ["com.cloudflare.api.user"] },
@@ -22600,6 +22706,12 @@ const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return
     if (t && !tokens.has(t[1])) return bad(404, "no token " + t[1]);
     if (t && request.method === "GET") return ok({ id: t[1], status: "active" });
     if (t && request.method === "DELETE") return tokens.delete(t[1]), ok({ id: t[1] });
+    // Container applications: made, changed and deleted by id.
+    if (path === "/containers/applications" && request.method === "GET") return ok(apps);
+    if (path === "/containers/applications") return apps.push({ id: "app-" + (apps.length + 1), ...JSON.parse(await request.text()) }), ok(apps.at(-1));
+    const app = /^\/containers\/applications\/([^/]+)$/.exec(path);
+    if (app && request.method === "PATCH") return Object.assign(apps.find((a) => a.id === app[1]), JSON.parse(await request.text())), ok({});
+    if (app && request.method === "DELETE") return apps.splice(apps.findIndex((a) => a.id === app[1]), 1), ok(null);
     const m = /^\/workers\/scripts\/([^/]+)(\/.*)?$/.exec(path);
     if (!m) return bad(404, "no route " + path);
     const name = m[1], rest = m[2] || "", s = scripts.get(name);
@@ -22644,7 +22756,7 @@ const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return
     const s = scripts.get(name);
     return s ? bindingOf(live(s), "BRAIN_INFO").json.hash : null;
   };
-  return { fetch, scripts, log, calls, unhealthy, stored, d1, tokens, running, live: (name) => live(scripts.get(name)) };
+  return { fetch, scripts, log, calls, unhealthy, stored, d1, tokens, apps, running, live: (name) => live(scripts.get(name)) };
 });};
 const _braindeployer_deployerRig = function _deployerRig(fakeCloudflare,simulate,deployer_service,partsHash,URLSearchParams) {return (async ({ acceptEmitted = true, config = {}, store } = {}) => {
   const fake = fakeCloudflare();
@@ -22762,6 +22874,34 @@ const _braindeployer_test_the_table_database_is_bound_to_brain_db_alone = async 
   const kb = Object.fromEntries(rig.fake.live("cb-x-knowledge").metadata.bindings.map((b) => [b.name, b]));
   expect([kb.DB.type, kb.DB.id, !!kb.SQL, rig.fake.d1.map((d) => d.name)]).toEqual(["d1", "d1-3", false, ["cb-sql", "cb-db", "cb-x-knowledge"]]);
   return db.DB.id;
+};
+const _braindeployer_test_container_images_are_applications_of_brain_x_container_alone = async function _test_container_images_are_applications_of_brain_x_container_alone(deployerRig,expect) {
+  const rig = await deployerRig();
+  await rig.recover({ workers: [await rig.made("brain-core", "core", "c1")] });
+  const node = { name: "node", class_name: "Box_node", image: "docker.io/library/node:22-alpine", instance_type: "lite", max_instances: 6, entrypoint: ["sh", "-c", "exec tail -f /dev/null"], regions: ["WEUR"] };
+  const box = (salt, containers = [node]) => rig.made("brain-x-container", "recipe", salt, { resources: ["containers", "rows"], containers });
+  // No other Worker runs containers, whatever it is named.
+  const no = await rig.recover({ workers: [await rig.made("brain-x-other", "recipe", "o1", { resources: ["containers"], containers: [node] }), await rig.made("brain-x-plain", "recipe", "p1", { containers: [node] })] });
+  expect(no.results.map((r) => [r.state, r.reason])).toEqual([["refused", 'a recipe may not use the platform cell "containers"'], ["refused", "container images without the platform cell containers"]]);
+  // An image that is not on Docker Hub, a type or a count this deployer does not make.
+  for (const wrong of [{ image: "registry.example/x:1" }, { image: "docker.io/library/node" }, { instance_type: "standard-4" }, { max_instances: 21 }, { class_name: "Rows" }])
+    expect((await rig.recover({ workers: [await box("w", [{ ...node, ...wrong }])] })).results[0].reason).toMatch(/^container image "node" is not one this deployer makes/);
+  expect(rig.fake.apps).toEqual([]);
+  // The first upload makes the class; the application is made after it, bound to that class of that script.
+  expect((await rig.recover({ workers: [await box("b1")] })).results[0].state).toBe("deployed");
+  const live = rig.fake.live("cb-x-container").metadata;
+  expect([live.migrations, live.containers, live.bindings.find((b) => b.name === "BOX_NODE")]).toEqual([{ new_tag: "v1", new_sqlite_classes: ["Box_node"] }, [{ class_name: "Box_node" }], { type: "durable_object_namespace", name: "BOX_NODE", class_name: "Box_node" }]);
+  expect(rig.fake.apps).toEqual([{ id: "app-1", name: "cb-x-container-node", scheduling_policy: "default", instances: 0, max_instances: 6, configuration: { image: node.image, instance_type: "lite", entrypoint: node.entrypoint }, constraints: { regions: ["WEUR"] }, durable_objects: { script_name: "cb-x-container", class_name: "Box_node" } }]);
+  // A later version sends no migration, and the application is set, not made again.
+  expect((await rig.recover({ workers: [await box("b2", [{ ...node, max_instances: 8 }])] })).results[0].state).toBe("deployed");
+  expect([rig.fake.live("cb-x-container").metadata.migrations, rig.fake.apps.length, rig.fake.apps[0].max_instances]).toEqual([undefined, 1, 8]);
+  // A different list of images is a different list of classes: refused on a Worker that runs.
+  const two = await rig.recover({ workers: [await box("b3", [node, { ...node, name: "py", class_name: "Box_py", image: "docker.io/library/python:3.13-alpine" }])] });
+  expect(two.results[0]).toMatchObject({ state: "refused", reason: "the container images of a Worker change only by removing it and deploying it again" });
+  // Removing the Worker deletes its applications.
+  expect((await rig.recover({ remove: ["brain-x-container"] })).results[0].state).toBe("removed");
+  expect([rig.fake.apps, rig.fake.scripts.has("cb-x-container")]).toEqual([[], false]);
+  return "1 application made, set and deleted";
 };
 const _braindeployer_test_a_browser_is_bound_shown_before_approval_and_not_for_a_member = async function _test_a_browser_is_bound_shown_before_approval_and_not_for_a_member(deployerRig,expect) {
   const rig = await deployerRig();
@@ -23669,6 +23809,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_test_only_the_deployer_names_the_cloudflare_token", "test_only_the_deployer_names_the_cloudflare_token", ["deployer_service","expect","deployerRig"], _braindeployer_test_only_the_deployer_names_the_cloudflare_token);
   $def("_braindeployer_test_apply_refusals", "test_apply_refusals", ["deployerRig","expect"], _braindeployer_test_apply_refusals);
   $def("_braindeployer_test_the_table_database_is_bound_to_brain_db_alone", "test_the_table_database_is_bound_to_brain_db_alone", ["deployerRig","expect"], _braindeployer_test_the_table_database_is_bound_to_brain_db_alone);
+  $def("_braindeployer_test_container_images_are_applications_of_brain_x_container_alone", "test_container_images_are_applications_of_brain_x_container_alone", ["deployerRig","expect"], _braindeployer_test_container_images_are_applications_of_brain_x_container_alone);
   $def("_braindeployer_test_a_browser_is_bound_shown_before_approval_and_not_for_a_member", "test_a_browser_is_bound_shown_before_approval_and_not_for_a_member", ["deployerRig","expect"], _braindeployer_test_a_browser_is_bound_shown_before_approval_and_not_for_a_member);
   $def("_braindeployer_test_every_upload_turns_logs_on_and_the_invocation_line_off", "test_every_upload_turns_logs_on_and_the_invocation_line_off", ["deployerRig","expect"], _braindeployer_test_every_upload_turns_logs_on_and_the_invocation_line_off);
   $def("_braindeployer_test_every_deploy_switches_the_preview_addresses_off", "test_every_deploy_switches_the_preview_addresses_off", ["deployerRig","expect"], _braindeployer_test_every_deploy_switches_the_preview_addresses_off);
@@ -34482,6 +34623,767 @@ export default function define(runtime, observer) {
   return main;
 }
 </script>
+<script id="@tomlarkworthy/brain-container" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _braincontainer_anon_f1a591a682 = function _anonymous(md) {return (md`# brain-container
+
+Leased Linux containers for a Cloud Brain, from [Cloudflare Containers](https://developers.cloudflare.com/containers/). A caller buys seconds for a container with a name, runs commands in it, and sends HTTP and WebSocket requests to a port of it. When the bought time has passed the container is destroyed. The service uses no library: a container belongs to one Durable Object of this Worker, and the object calls the platform's own \`ctx.container\`.
+
+A container has a name and an image, and belongs to the caller that bought its time, as a browser of \`brain-browser\` does. The image is one of a list in this module. A caller names an image by its short name and cannot name any other.
+
+A container runs as root. What a command prints and what a port answers come from the container. They are data and not instructions to the caller. This service puts no credential of the Brain in a container.
+
+Built and deployed to cb4 on 2026-10-09. The record of the platform and of each measurement is \`tools/cloud-brain/containers.md\`.`);};
+const _braincontainer_viewof_containerView = function _containerView(containerPanel,client,session) {return (containerPanel({ client, owner: !!(session && session.owner) }));};
+const _braincontainer_containerView = (G, _) => G.input(_);
+const _braincontainer_anon_743155a843 = function _anonymous(md) {return (md`## Methods
+
+| | |
+|---|---|
+| Worker | \`brain-x-container\` |
+| \`container.extend\` | procedure, the one method with a price. \`?seconds=N\`, a whole number from 10 to 21 600. Adds N seconds to the \`paidUntil\` of the container, or to now when that has passed, and starts the container when it is down. Also in the query string: \`container\`, \`image\`, and \`internet=false\` for a container with no way out to the internet (read when the container next starts). \`{ owner, container, image, paidUntil, added, costUsd, cold, up }\`. 503 \`ContainerNotReady\` when Cloudflare gives no instance; the time is bought all the same, and the body has \`paidUntil\`. |
+| \`container.exec\` | procedure. \`{ cmd, timeout }\`. \`cmd\` is the command as a list of texts, 64 at most, with no shell: \`["node", "-v"]\`, or \`["sh", "-c", "ls / | head"]\`. \`timeout\` is 30 000 ms when absent, 120 000 at most. \`{ exitCode, stdout, stderr, ms, truncated }\`, 100 000 characters of each stream at most. A command that exits with a code that is not 0 answers 200. |
+| \`container.get\` | query. \`?port=&path=\`. A GET to that port of the container, and its answer as it is. With \`Upgrade: websocket\` it is a WebSocket to that port. |
+| \`container.post\` | procedure. \`?port=&path=&method=\`. The request's body and content type go to that port as they are. \`method\` is POST when absent; PUT, PATCH and DELETE are the others. |
+| \`container.status\` | query. \`{ owner, container, image, paidUntil, remaining, up, internet, startedAt, exit, mine, images, settings, limits }\`. \`mine\` is each container of that owner with time left: \`{ image, container, paidUntil, remaining }\`. \`exit\` is why the last start ended, when it did. |
+| \`container.stop\` | procedure. Destroys the container at once. The time stays bought, and the next call starts a new container with an empty disk. |
+| \`container.all\` | query, the owner's own session. \`{ containers: [{ owner, image, container, paidUntil, remaining, up }] }\`: each container of each owner with time left. |
+| \`container.end\` | procedure, the owner's own session. \`{ owner, image, container }\`, as \`all\` gives them. Destroys that container and ends its time. |
+| \`container.settings\` | procedure, the owner's own session. \`{ maxContainers, maxPerOwner }\`. |
+| Storage | The object of a container keeps \`lease\`: \`{ owner, name, image, internet, paidUntil }\`, and an alarm at \`paidUntil\`. \`rows\`: \`c/<owner>/<image>/<name>\` \`{ paidUntil }\` for the lists, and \`settings\`. |
+
+Each method of the first seven takes \`container\` and \`image\` in the query string: \`container\` is a name of 1 to 40 letters, digits, \`-\` and \`_\` that starts with a letter or a digit, \`default\` when absent. \`image\` is \`node\` when absent.
+
+\`\`\`js
+await client.procedure("container.extend", {}, { params: { seconds: 60 } })
+// { owner: "owner", container: "default", image: "node", paidUntil: 1791570000000, added: 60, costUsd: 0.00012, cold: true, up: true }
+await client.procedure("container.exec", { cmd: ["node", "-v"] })
+// { exitCode: 0, stdout: "v22.…\\n", stderr: "", ms: 110, truncated: false }
+// A server in the container, then a request to its port:
+await client.procedure("container.exec", { cmd: ["sh", "-c", "nohup node -e 'require(\\"http\\").createServer((q,s)=>s.end(\\"hi\\")).listen(8080)' >/tmp/log 2>&1 &"] })
+await client.fetch("container.get", { params: { port: 8080, path: "/" } })
+\`\`\`
+
+\`exec\`, \`get\` and \`post\` need bought time. With none they answer 409 \`NoTime\` with \`paidUntil\`. With time and the container down, they start it. A port that nothing listens on answers 502 \`NoListener\`; in the first 15 s after a start the call is tried again until the port answers.
+
+\`seconds\`, \`container\` and \`image\` are in the query string and not in the body, because a price reads \`request.params\` and does not read the body, and because \`get\` and \`post\` pass the body on unread.`);};
+const _braincontainer_anon_ab25ebd94e = function _anonymous(md) {return (md`## The pass-through
+
+\`container.get\` and \`container.post\` are the container's own port. This Worker finds the object of the container from the caller's name and the two names in the query string, and hands it the request. The object holds \`paidUntil\` in its memory and gives the request to \`ctx.container.getTcpPort(port)\`. Neither reads the body or the answer, and neither reads a row. \`authorization\`, \`cookie\` and each \`x-brain-\` header are removed before the container sees the request. The core checks the rule and writes its one log line, as for each method.
+
+A WebSocket is one call to \`container.get\` with \`Upgrade: websocket\`. The rule is decided one time, at the upgrade. The socket closes when the container is destroyed.
+
+Use \`exec\` for one command with one answer. Use a port for a process that stays: a server in the container that the caller starts with \`exec\`.`);};
+const _braincontainer_anon_1b2e4fb60d = function _anonymous(md) {return (md`## Images
+
+| name | image | type | $ a second | where |
+|---|---|---|---|---|
+| \`node\` | \`docker.io/library/node:22-alpine\` | lite: 1/16 vCPU, 256 MiB, 2 GB | 0.000002 ($0.0072 an hour) | \`WEUR\` |
+
+Each image is one container application of the Cloudflare account, which the deployer makes when it deploys this Worker: \`<script>-<name>\`, scheduling policy \`default\`, 0 instances kept, \`max\` at most. An image is on Docker Hub. An application starts its image with the entrypoint in the list, which keeps the container up with nothing running in it.
+
+To add an image, add it to \`containerImageList\`, remove the Worker and deploy it again: Cloudflare takes a new Durable Object class only with the upload of a script, and the deployer refuses the change on a Worker that runs. Removing the Worker deletes its applications and ends each container.
+
+Not here: an image that runs a lopecode notebook. It has to be built and pushed with Docker, one time, to Docker Hub or to Cloudflare's registry.`);};
+const _braincontainer_anon_2ec170884d = function _anonymous(md) {return (md`## Who can call, and what it costs
+
+\`extend\`, \`exec\`, \`get\`, \`post\`, \`status\` and \`stop\` are \`who: "workers"\`: the owner, a token or an account the owner gave the method, and a Worker of this Brain that names the method in its \`calls\`. A member has none of them. \`all\`, \`end\` and \`settings\` are for the owner's own session, and the owner cannot put a different rule.
+
+A container is the triple of its owner, its image and its name. The owner is the caller the core names. A call made for a person that is not their own tab (a turn, a PDS call, a portal) owns containers as \`via:<caller>\`, as in \`brain-browser\`.
+
+The price of \`extend\` is \`seconds\` times the rate of the image, which is Cloudflare's price for the instance type at full use ([pricing](https://developers.cloudflare.com/containers/pricing/), read 2026-10-09: memory $0.0000025 a GiB-second, CPU $0.000020 a vCPU-second, disk $0.00000007 a GB-second). Time that is bought is not given back: not when the container is stopped, and not when it never started.
+
+| Setting | Default | |
+|---|---|---|
+| \`maxContainers\` | 6 | containers with time left, of all owners |
+| \`maxPerOwner\` | 3 | containers with time left that one caller owns |
+
+Over a limit, \`extend\` for a container that has no time left answers 429 \`TooManyContainers\`. The count is read and then the time is added, so two calls at one moment can pass the limit by one.`);};
+const _braincontainer_anon_789e591a61 = function _anonymous(md) {return (md`## Limits
+
+- **The disk is not kept.** A container that is destroyed, by the end of its time, by \`stop\` or by a deploy, starts again from its image.
+- **A container that exits is started again by the next call**, with an empty disk, while time is left. \`status\` gives \`exit\`.
+- **A new application gives no container at first.** 4 minutes in the spike, 27 s after the first deploy of this Worker (both 2026-10-09). \`extend\` in that time answers 503 and the time is bought all the same.
+- **Egress.** A container reaches the internet unless its time was bought with \`internet=false\`. Nothing counts or limits what it sends; Cloudflare bills egress over 1 TB a month to the account.
+- **\`exec\` gives the whole output when the command ends.** It does not stream. A command that is still running at \`timeout\` answers 504 \`ExecTimeout\`, and the command goes on in the container.
+- **No file is put in a container by this service.** A caller writes one with \`exec\` or sends it to a port.
+- **The container sees the caller's address.** \`cf-connecting-ip\`, \`cf-ipcountry\`, \`cf-ray\`, \`x-real-ip\` and the caller's own headers reach the port (seen 2026-10-09). \`authorization\`, \`cookie\` and \`x-brain-*\` do not.
+- **Cloudflare keeps \`max\` instances of an image ready**, each already running the entrypoint: the application reported \`instances: 6\` and 6 healthy with no container leased, and the first container had been up 34 s when its time was bought. Its pricing page says charges start "when a request is sent to the container or when it is manually started". Whether the ready ones are billed was not seen on a bill.
+- **A deploy of this Worker does not end a running container** (seen one time, 2026-10-09: a file in \`/tmp\` was still there and \`/proc/uptime\` went from 350 s to 415 s across an apply). The first try of that apply was put back after 60 s on a 504 from Cloudflare's version upload; the second deployed in 57 s. The cause of the 504 is not known.`);};
+const _braincontainer_anon_7b8977c2e9 = function _anonymous(md,containerMeasured) {return (md`## Measured
+
+On cb4, 2026-10-09, caller in Berlin. The record with each run is \`tools/cloud-brain/containers.md\`.
+
+${containerMeasured}`);};
+const _braincontainer_containerMeasured = function _containerMeasured() {return (`\`\`\`
+first deploy 20:29:44 CEST: application made about 20:30:10, 5 instances ready at 20:30:37 (27 s; the spike waited 4 minutes)
+extend, container down            0.62 s for the whole call; cold: true, up: true
+exec ["node","-v"]                 v22.23.3, 223 ms inside the object (the first), 52 to 119 ms after
+inside                             Linux 6.18.54-cloudflare-microvm, uid 0, 1 CPU, MemTotal 471032 kB, colo=DUB (regions: WEUR)
+
+one connection, 25 calls each, p50 / p90 / least, ms
+quota.get         (kernel, core)                  87 / 122 / 64
+container.status  (+ service, object, 2 row reads) 120 / 153 / 102
+container.get     (+ service, object, port 8080)  102 / 128 / 88
+container.post    1 KB to the same port           101 / 156 / 90
+container.exec    ["true"], 15 calls              127 / 176 / 118
+the same server asked from inside the container   node's own start on 1/16 vCPU is 1.4 s; no figure for one request
+
+WebSocket to port 8081 through container.get      open and first frame 435 ms after the client began
+idle 113 s with no call                           the same container: /proc/uptime 201 s, its files in /tmp
+time ended 20:33:50                               at 20:33:56 status up: false, exec and get 409 NoTime, container.all []
+application health at 20:34:06                    active 0, healthy 6
+a member / no caller                              403 no grant / 401
+\`\`\`
+
+\`container.get\` is 15 ms over a call the core answers itself. The spike, with the container in Istanbul and no region named, had 48 ms from the Worker to the port; with \`WEUR\` the container ran in Dublin.
+
+A server a caller starts with \`exec\` needs its own time before it listens: the first \`get\`, 0.5 s after \`nohup node …\`, answered 502 \`NoListener\`. Seen one time each; nothing here was run twice but the series.`);};
+const _braincontainer_container_service = function _container_service(cloudflare,containerApp,containerImageList,containerBox,containerPrice) {return (cloudflare.Service("container", containerApp, {
+  containers: { images: containerImageList, object: containerBox },
+  methods: {
+    // Time is bought by extend alone. The price is 0 for a number or an image the service refuses, so a refused call costs nothing.
+    // who: "workers" is the owner, a token or an account the owner gave the method, and a Worker of this Brain. A member has none.
+    "com.lopecode.brain.container.extend": { type: "procedure", who: "workers", price: containerPrice },
+    ...Object.fromEntries(["exec", "post", "stop"].map((m) => ["com.lopecode.brain.container." + m, { type: "procedure", who: "workers" }])),
+    ...Object.fromEntries(["get", "status"].map((m) => ["com.lopecode.brain.container." + m, { type: "query", who: "workers" }])),
+    // all and end reach the containers of each owner. settings is the limits. The owner's own session only.
+    "com.lopecode.brain.container.all": { type: "query", who: "owner", allow: "caller.session", fixed: true },
+    "com.lopecode.brain.container.end": { type: "procedure", who: "owner", allow: "caller.session", fixed: true },
+    "com.lopecode.brain.container.settings": { type: "procedure", who: "owner", allow: "caller.session", fixed: true }
+  }
+}));};
+const _braincontainer_container_announce = function _container_announce(plugins,container_service,invalidation) {
+  plugins.add("workers", container_service, { invalidation });
+  return "announced container_service";
+};
+const _braincontainer_containerImageList = function _containerImageList() {return ({
+  node: { image: "docker.io/library/node:22-alpine", type: "lite", max: 6, regions: ["WEUR"], entrypoint: ["sh", "-c", "exec tail -f /dev/null"], dollarsPerSecond: 0.000002 }
+});};
+const _braincontainer_containerLimits = function _containerLimits() {return ({
+  image: "node", // the image of a call that names none
+  maxContainers: 6, // containers with time left, of all owners. Not more than the max of the image.
+  maxPerOwner: 3,
+  minSeconds: 10, // the least and the most one extend buys. The price reads the same two numbers.
+  maxSeconds: 21600,
+  startWait: 10000, // ms a call waits for a container that is starting
+  listenGrace: 15000, // ms after a start in which a port that does not answer is tried again
+  execTimeout: 30000, // ms
+  maxTimeout: 120000, // ms
+  execArgs: 64,
+  execChars: 20000, // the command, all its texts together
+  outputChars: 100000, // each of stdout and stderr
+  keepRows: 86400 // seconds a row is kept after its time passed
+});};
+const _braincontainer_containerSeconds = function _containerSeconds(containerLimits) {return ((text) => (typeof text === "string" && /^[0-9]{2,5}$/.test(text) && +text >= containerLimits.minSeconds && +text <= containerLimits.maxSeconds ? +text : null));};
+const _braincontainer_containerPrice = function _containerPrice(containerLimits,containerImageList) {
+  const L = containerLimits, rate = (name) => containerImageList[name].dollarsPerSecond;
+  const byImage = Object.keys(containerImageList).sort().reduce((rest, name) => `(request.params.image == "${name}" ? ${rate(name)} : ${rest})`, "0.0");
+  return `has(request.params.seconds) && request.params.seconds.matches("^[0-9]{2,5}$") && int(request.params.seconds) >= ${L.minSeconds} && int(request.params.seconds) <= ${L.maxSeconds} ? double(request.params.seconds) * (has(request.params.image) ? ${byImage} : ${rate(L.image)}) : 0.0`;
+};
+const _braincontainer_containerBox = function _containerBox(containerLimits,Response,Request) {
+  const L = containerLimits;
+  const held = new WeakMap();
+  const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const text = (bytes) => new TextDecoder().decode(bytes || new Uint8Array());
+  const state = async (ctx) => {
+    if (!held.has(ctx)) held.set(ctx, { lease: (await ctx.storage.get("lease")) || null, up: false, exit: null, startedAt: 0 });
+    return held.get(ctx);
+  };
+  const paid = (s) => !!s.lease && Date.now() < s.lease.paidUntil;
+  // Starts the container when it is down, and waits until it runs a command. False when Cloudflare gives none in time.
+  const up = async (ctx, s) => {
+    const c = ctx.container;
+    let cold = false;
+    if (!c.running) {
+      cold = true;
+      Object.assign(s, { up: false, exit: null, ending: false, startedAt: Date.now() });
+      // Why the container ended, unless this object destroyed it.
+      const over = (why) => void Object.assign(s, { up: false, exit: s.ending ? null : String(why).slice(0, 300) });
+      try {
+        c.start({ enableInternet: s.lease.internet !== false });
+        c.monitor().then(() => over("exited"), (e) => over((e && e.message) || e));
+      } catch (e) {
+        over((e && e.message) || e);
+      }
+    }
+    const until = Date.now() + L.startWait;
+    while (!s.up && !s.exit && Date.now() < until) {
+      try {
+        await (await c.exec(["true"])).output();
+        s.up = true;
+      } catch (e) {
+        s.last = String((e && e.message) || e).slice(0, 300);
+        await sleep(100);
+      }
+    }
+    return { cold, up: s.up };
+  };
+  const down = (s) => ({ error: "ContainerNotReady", message: `the container did not start: ${s.exit || s.last || "no answer"}. A new application has no instance for about 4 minutes. Call again.`, paidUntil: s.lease.paidUntil });
+  const noTime = (s) => json({ error: "NoTime", message: "no time is bought for this container: container.extend?seconds=N", paidUntil: s.lease ? s.lease.paidUntil : 0 }, 409);
+  const destroy = async (ctx, s) => {
+    s.ending = true;
+    if (ctx.container.running) await ctx.container.destroy();
+    s.up = false;
+  };
+  const fetch = async (ctx, about, request) => {
+    const url = new URL(request.url), s = await state(ctx), c = ctx.container;
+    if (url.pathname === "/_status") return json({ paidUntil: s.lease ? s.lease.paidUntil : 0, remaining: s.lease ? Math.max(0, Math.round((s.lease.paidUntil - Date.now()) / 1000)) : 0, up: !!c.running, internet: s.lease ? s.lease.internet !== false : true, startedAt: c.running ? s.startedAt : 0, exit: s.exit });
+    if (url.pathname === "/_extend") {
+      const q = await request.json();
+      const internet = q.internet === undefined ? (s.lease ? s.lease.internet !== false : true) : !!q.internet;
+      s.lease = { owner: q.owner, name: q.name, image: about.image, internet, paidUntil: Math.max(Date.now(), s.lease ? s.lease.paidUntil : 0) + q.seconds * 1000 };
+      await ctx.storage.put("lease", s.lease);
+      await ctx.storage.setAlarm(s.lease.paidUntil);
+      const started = await up(ctx, s);
+      return started.up ? json({ paidUntil: s.lease.paidUntil, added: q.seconds, cold: started.cold, up: true }) : json(down(s), 503);
+    }
+    if (url.pathname === "/_stop" || url.pathname === "/_end") {
+      await destroy(ctx, s);
+      if (url.pathname === "/_end" && s.lease) {
+        s.lease = { ...s.lease, paidUntil: Date.now() };
+        await ctx.storage.put("lease", s.lease);
+        await ctx.storage.deleteAlarm();
+      }
+      return json({ stopped: true, paidUntil: s.lease ? s.lease.paidUntil : 0 });
+    }
+    if (!paid(s)) return noTime(s);
+    if (url.pathname === "/_exec") {
+      const q = await request.json(), t = Date.now();
+      if (!(await up(ctx, s)).up) return json(down(s), 503);
+      const done = await Promise.race([c.exec(q.cmd).then((p) => p.output()), sleep(q.timeout).then(() => null)]);
+      if (!done) return json({ error: "ExecTimeout", message: `the command did not end in ${q.timeout} ms. It goes on in the container.` }, 504);
+      const out = text(done.stdout), err = text(done.stderr);
+      return json({ exitCode: done.exitCode, stdout: out.slice(0, L.outputChars), stderr: err.slice(0, L.outputChars), ms: Date.now() - t, truncated: out.length > L.outputChars || err.length > L.outputChars });
+    }
+    // Everything else is a request to a port of the container.
+    if (!s.up || !c.running) if (!(await up(ctx, s)).up) return json(down(s), 503);
+    const port = +request.headers.get("x-box-port");
+    const send = (r) => c.getTcpPort(port).fetch(new Request("http://box" + url.pathname + url.search, r));
+    // Just after a start the process may not listen yet: the request is kept and tried again. After that it is passed once, unread.
+    const fresh = Date.now() - s.startedAt < L.listenGrace;
+    const kept = fresh && request.body ? await request.arrayBuffer() : null;
+    const again = () => (kept ? new Request(request, { body: kept }) : request);
+    for (;;) {
+      try {
+        return await send(fresh ? again() : request);
+      } catch (e) {
+        if (!fresh || Date.now() - s.startedAt >= L.listenGrace) return json({ error: "NoListener", message: `nothing answered on port ${port} of the container: ${String((e && e.message) || e).slice(0, 200)}` }, 502);
+        await sleep(200);
+      }
+    }
+  };
+  // The alarm is at paidUntil. extend moves paidUntil, so an alarm that comes early sets itself again.
+  const alarm = async (ctx) => {
+    const s = await state(ctx);
+    if (s.lease && Date.now() < s.lease.paidUntil) return void (await ctx.storage.setAlarm(s.lease.paidUntil));
+    await destroy(ctx, s);
+  };
+  return { fetch, alarm };
+};
+const _braincontainer_containerOps = function _containerOps(containerLimits,containerImageList,rows,containers,Request,containerSeconds) {
+  const L = containerLimits;
+  const stop = (status, error, message, more) => Object.assign(new Error(message), { status, error, more });
+  const named = (name, what) => {
+    if (typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(name)) throw stop(400, "InvalidRequest", what + ": 1 to 40 letters, digits, - and _");
+    return name;
+  };
+  const imaged = (image = L.image) => {
+    if (typeof image !== "string" || !Object.hasOwn(containerImageList, image)) throw stop(400, "InvalidRequest", "image: one of " + Object.keys(containerImageList).sort().join(", "));
+    return image;
+  };
+  const settings = async () => {
+    const set = (await rows.get("settings")) || {};
+    return { maxContainers: set.maxContainers || L.maxContainers, maxPerOwner: set.maxPerOwner || L.maxPerOwner };
+  };
+  // Each row with time left, as { owner, image, container, paidUntil, remaining }. A row a day past its time is deleted.
+  const live = async () => {
+    const now = Date.now(), out = [];
+    for (const r of await rows.list("c/")) {
+      const m = r.key.match(/^c\/([^/]+)\/([^/]+)\/([^/]+)$/);
+      if (!m) continue;
+      if (r.value.paidUntil > now) out.push({ owner: m[1], image: m[2], container: m[3], paidUntil: r.value.paidUntil, remaining: Math.round((r.value.paidUntil - now) / 1000) });
+      else if (r.value.paidUntil < now - L.keepRows * 1000) await rows.delete(r.key);
+    }
+    return out;
+  };
+  const one = (who, name = "default", image) => {
+    // A call with no caller has no owner: a rule that lets everyone in must not put them all in one container.
+    if (who === "anonymous") throw stop(401, "AuthRequired", "a container has an owner. This call has no caller.");
+    const owner = String(who).replace(/\//g, "_"), label = named(name, "container"), kind = imaged(image), key = `c/${owner}/${kind}/${label}`;
+    const box = (path, init) => containers.fetch(kind, owner + "/" + label, new Request("http://box.internal" + path, init));
+    const ask = async (path, body) => {
+      const r = await box(path, body === undefined ? {} : { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
+      const data = await r.json();
+      if (!r.ok) throw stop(r.status, data.error, data.message, { paidUntil: data.paidUntil });
+      return data;
+    };
+    return {
+      box,
+      extend: async ({ seconds, internet }) => {
+        const n = containerSeconds(seconds);
+        if (n == null) throw stop(400, "InvalidRequest", `seconds: a whole number from ${L.minSeconds} to ${L.maxSeconds}, in the query string`);
+        const up = await live(), limits = await settings();
+        if (!up.some((c) => c.owner === owner && c.image === kind && c.container === label)) {
+          if (up.length >= limits.maxContainers) throw stop(429, "TooManyContainers", `${up.length} containers have time left and maxContainers is ${limits.maxContainers}`);
+          if (up.filter((c) => c.owner === owner).length >= limits.maxPerOwner) throw stop(429, "TooManyContainers", `${owner} has ${limits.maxPerOwner} containers with time left, which is maxPerOwner`);
+        }
+        const r = await box("/_extend", { method: "POST", body: JSON.stringify({ owner, name: label, seconds: n, ...(internet === undefined ? {} : { internet }) }), headers: { "content-type": "application/json" } });
+        const data = await r.json();
+        // The time is bought when the container did not start, too.
+        if (data.paidUntil) await rows.put(key, { paidUntil: data.paidUntil });
+        if (!r.ok) throw stop(r.status, data.error, data.message, { paidUntil: data.paidUntil });
+        return { owner, container: label, image: kind, paidUntil: data.paidUntil, added: n, costUsd: +(n * containerImageList[kind].dollarsPerSecond).toFixed(8), cold: data.cold, up: data.up };
+      },
+      exec: async ({ cmd, timeout = L.execTimeout }) => {
+        if (!Array.isArray(cmd) || !cmd.length || cmd.length > L.execArgs || cmd.some((a) => typeof a !== "string") || cmd.join("").length > L.execChars) throw stop(400, "InvalidRequest", `cmd: a list of 1 to ${L.execArgs} texts, ${L.execChars} characters together`);
+        if (!Number.isInteger(timeout) || timeout < 1000 || timeout > L.maxTimeout) throw stop(400, "InvalidRequest", `timeout: 1000 to ${L.maxTimeout} ms`);
+        return ask("/_exec", { cmd, timeout });
+      },
+      status: async () => ({ owner, container: label, image: kind, ...(await ask("/_status")), mine: (await live()).filter((c) => c.owner === owner).map(({ owner: _, ...c }) => c), images: Object.entries(containerImageList).map(([name, i]) => ({ name, image: i.image, type: i.type, dollarsPerSecond: i.dollarsPerSecond })), settings: await settings(), limits: L }),
+      stop: () => ask("/_stop", {}),
+      end: async () => {
+        const out = await ask("/_end", {});
+        await rows.delete(key);
+        return { ended: true, owner, image: kind, container: label, paidUntil: out.paidUntil };
+      }
+    };
+  };
+  return {
+    one,
+    all: async () => ({ containers: await Promise.all((await live()).map(async (c) => ({ ...c, up: await one(c.owner, c.container, c.image).box("/_status").then((r) => r.json()).then((s) => !!s.up, () => null) }))) }),
+    settings: async (q) => {
+      const next = await settings();
+      for (const k of Object.keys(next)) {
+        if (q[k] === undefined) continue;
+        if (!Number.isInteger(q[k]) || q[k] < 1 || q[k] > 20) throw stop(400, "InvalidRequest", k + ": a whole number from 1 to 20");
+        next[k] = q[k];
+      }
+      await rows.put("settings", next);
+      return next;
+    }
+  };
+};
+const _braincontainer_containerApp = function _containerApp(hono,Response,containerOps) {
+  const app = new hono.Hono();
+  const NS = "/xrpc/com.lopecode.brain.container.";
+  // The core names the caller. This service records it and decides nothing.
+  const by = (c) => c.req.header("x-brain-caller") || "anonymous";
+  const body = async (c) => {
+    const b = await c.req.json().catch(() => null);
+    return b && typeof b === "object" ? b : {};
+  };
+  const fail = (c, e) => c.json({ error: e.error, message: e.message, ...e.more }, e.status);
+  const answer = (fn) => async (c) => {
+    try {
+      const out = await fn(c);
+      return out instanceof Response ? out : c.json(out);
+    } catch (e) {
+      if (e && e.status) return fail(c, e);
+      throw e;
+    }
+  };
+  // Who owns the container: the caller, or via:<caller> for a call that is not that person's own tab (see brain-browser).
+  const who = (c) => (by(c) !== "anonymous" && /^(turn:|portal:|jwt$)/.test(c.req.header("x-brain-via") || "") ? "via:" + by(c) : by(c));
+  const mine = (c) => containerOps.one(who(c), c.req.query("container") || "default", c.req.query("image"));
+  // seconds is in the query string, where the price reads it. Given two times, the last counts, for the core and here.
+  app.post(NS + "extend", answer((c) => ((q) => mine(c).extend({ seconds: q.getAll("seconds").pop(), ...(q.has("internet") ? { internet: q.get("internet") !== "false" } : {}) }))(new URL(c.req.url).searchParams)));
+  app.post(NS + "exec", answer(async (c) => mine(c).exec(await body(c))));
+  app.post(NS + "stop", answer((c) => mine(c).stop()));
+  app.get(NS + "status", answer((c) => mine(c).status()));
+  // The pass-through. The request goes to the object of the container with its body unread; the object gives it to the port.
+  const METHODS = ["POST", "PUT", "PATCH", "DELETE"];
+  const pass = (c, method) => {
+    const port = +c.req.query("port"), path = c.req.query("path") || "/";
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return c.json({ error: "InvalidRequest", message: "port: 1 to 65535, in the query string" }, 400);
+    if (!path.startsWith("/") || !METHODS.concat("GET").includes(method)) return c.json({ error: "InvalidRequest", message: "path starts with /; method is one of " + METHODS.join(", ") }, 400);
+    const headers = new Headers(c.req.raw.headers);
+    for (const name of [...headers.keys()]) if (name === "authorization" || name === "cookie" || name.startsWith("x-brain-")) headers.delete(name);
+    headers.set("x-box-port", String(port));
+    return mine(c).box(path, { method, headers, body: method === "GET" ? undefined : c.req.raw.body, ...(method === "GET" ? {} : { duplex: "half" }) });
+  };
+  app.get(NS + "get", answer((c) => pass(c, "GET")));
+  app.post(NS + "post", answer((c) => pass(c, (c.req.query("method") || "POST").toUpperCase())));
+  // For the owner's own session, by the rule of each.
+  app.get(NS + "all", answer(() => containerOps.all()));
+  app.post(NS + "end", answer(async (c) => {
+    const q = await body(c);
+    if (typeof q.owner !== "string" || !q.owner) return c.json({ error: "InvalidRequest", message: "owner, image and container, as container.all gives them" }, 400);
+    return containerOps.one(q.owner, q.container, q.image).end();
+  }));
+  app.post(NS + "settings", answer(async (c) => containerOps.settings(await body(c))));
+  return app;
+};
+const _braincontainer_containerPanel = function _containerPanel(htl,Inputs,containerImageList,containerLimits) {return (({ client, owner = false } = {}) => {
+  if (!client || !owner) return Object.assign(htl.html`<i style="color:var(--theme-foreground-muted)">Sign in to a Brain as the owner to see its containers.</i>`, { value: null });
+  const el = htl.html`<div></div>`, state = htl.html`<div style="margin:6px 0"></div>`, fleet = htl.html`<div style="margin:6px 0"></div>`;
+  const note = htl.html`<pre style="color:var(--theme-foreground-muted);margin-top:6px;white-space:pre-wrap;overflow-wrap:anywhere"></pre>`;
+  const say = (text) => void (note.textContent = text);
+  const which = Inputs.text({ label: "Container", value: "default", width: "12em" });
+  const image = Inputs.select(Object.keys(containerImageList), { label: "Image", value: containerLimits.image });
+  const seconds = Inputs.number({ label: "Seconds to add", value: 60, min: containerLimits.minSeconds, max: containerLimits.maxSeconds, step: 1, width: "8em" });
+  const cost = htl.html`<span style="align-self:center;color:var(--theme-foreground-muted)"></span>`;
+  const command = Inputs.text({ label: "Command (sh -c)", placeholder: "node -v", width: "30em" });
+  const limits = { maxContainers: Inputs.number({ label: "Containers with time", min: 1, max: 20, step: 1, width: "8em" }), maxPerOwner: Inputs.number({ label: "Containers of one caller", min: 1, max: 20, step: 1, width: "8em" }) };
+  const P = () => ({ container: which.value || "default", image: image.value });
+  // The price is on the page before the button is pressed. Time that is bought is not given back.
+  const priced = () => void (cost.textContent = `${seconds.value} s costs $${Number(((Number(seconds.value) || 0) * containerImageList[image.value].dollarsPerSecond).toFixed(6))}, charged to your day. It is not given back.`);
+  let fleetTable = null;
+  const draw = async () => {
+    const s = await client.query("container.status", P());
+    el.value = s;
+    state.replaceChildren(htl.html`${s.remaining ? `${s.remaining} s are bought for ${s.container} (${s.image}).` : `No time is bought for ${s.container} (${s.image}).`} The container is ${s.up ? "up" : "down"}.${s.exit ? " Its last start ended: " + s.exit : ""}`);
+    const every = (await client.query("container.all")).containers;
+    fleetTable = Inputs.table(every.map((c) => ({ owner: c.owner, image: c.image, container: c.container, up: c.up, remaining: c.remaining })), { multiple: false, required: false, layout: "auto" });
+    fleet.replaceChildren(every.length ? fleetTable : htl.html`<i style="color:var(--theme-foreground-muted)">No container has time.</i>`);
+    for (const k in limits) limits[k].value = s.settings[k];
+  };
+  const run = (what, fn) => async () => {
+    try {
+      say(what + "…");
+      say((await fn()) || "");
+      await draw();
+    } catch (e) {
+      say(`${what} failed: ${(e && e.message) || e}`);
+    }
+  };
+  const redraw = () => draw().catch((e) => say("container.status failed: " + ((e && e.message) || e)));
+  for (const input of [which, image]) input.addEventListener("input", () => (priced(), redraw()));
+  seconds.addEventListener("input", priced);
+  priced();
+  redraw();
+  const refresh = Inputs.button("Refresh", { reduce: run("Refresh", async () => "") });
+  const extend = Inputs.button("Add time", { reduce: run("Add time", async () => ((r) => `${r.added} s added, $${r.costUsd}${r.cold ? ", started" : ""}`)(await client.procedure("container.extend", {}, { params: { seconds: String(seconds.value), ...P() } }))) });
+  const exec = Inputs.button("Run", { reduce: run("Run", async () => ((r) => `exit ${r.exitCode}, ${r.ms} ms\n${r.stdout}${r.stderr}`.slice(0, 4000))(await client.procedure("container.exec", { cmd: ["sh", "-c", command.value] }, { params: P() }))) });
+  const stop = Inputs.button("Stop", { reduce: run("Stop", async () => void (await client.procedure("container.stop", {}, { params: P() }))) });
+  const endOne = Inputs.button("End chosen container", {
+    reduce: run("End", async () => {
+      const row = fleetTable && fleetTable.value;
+      if (!row) throw new Error("choose a container in the table");
+      await client.procedure("container.end", { owner: row.owner, image: row.image, container: row.container });
+    })
+  });
+  const save = Inputs.button("Save limits", { reduce: run("Save", async () => void (await client.procedure("container.settings", Object.fromEntries(Object.entries(limits).map(([k, i]) => [k, i.value]))))) });
+  const rowOf = (...items) => htl.html`<div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0">${items}</div>`;
+  el.append(which, image, state, rowOf(refresh, stop), seconds, rowOf(extend, cost), command, rowOf(exec), fleet, rowOf(endOne), ...Object.values(limits), rowOf(save), note);
+  return el;
+});};
+const _braincontainer_anon_83cbdb0376 = function _anonymous(md) {return (md`## Tests
+
+The service runs here as the emitted Worker with its emitted object class, over a fake of \`ctx.container\`. The fake starts, runs a command by echoing it, and answers on the ports a test gives it. It does not run Linux.`);};
+const _braincontainer_containerFake = function _containerFake() {return (() => {
+  const made = new Map(), bytes = (t) => new TextEncoder().encode(t);
+  const factory = (image, id) => {
+    const key = image + "/" + id;
+    if (made.has(key)) return made.get(key);
+    const c = {
+      running: false, starts: [], execs: [], destroyed: 0, refuse: null, ports: {}, over: null,
+      start(options = {}) {
+        if (c.refuse) return void (c.over = Promise.reject(new Error(c.refuse)));
+        c.running = true;
+        c.starts.push(options);
+        c.over = new Promise(() => {});
+      },
+      monitor: () => c.over,
+      destroy: async () => void ((c.running = false), c.destroyed++),
+      exec: async (cmd) => {
+        if (!c.running) throw new Error("the container is not running");
+        c.execs.push(cmd);
+        if (cmd[0] === "hang") return { output: () => new Promise(() => {}) };
+        return { output: async () => ({ stdout: bytes(cmd[0] === "big" ? "x".repeat(150000) : cmd.join(" ") + "\n"), stderr: bytes(""), exitCode: cmd[0] === "false" ? 1 : 0 }) };
+      },
+      getTcpPort: (port) => ({
+        fetch: async (request) => {
+          if (!c.running || !c.ports[port]) throw new Error("connection refused");
+          return c.ports[port](request);
+        }
+      })
+    };
+    made.set(key, c);
+    return c;
+  };
+  return { factory, made, of: (id = "owner/default", image = "node") => factory(image, id) };
+});};
+const _braincontainer_containerRig = function _containerRig(containerFake,simulate,container_service,URLSearchParams,callerOf,decide) {return (async () => {
+  const fake = containerFake();
+  const sim = await simulate(container_service, { containers: fake.factory });
+  const X = "https://brain.internal/xrpc/com.lopecode.brain.container.";
+  const as = (who, via) => {
+    const headers = { "content-type": "application/json", "x-brain-caller": who, "x-brain-context": "for " + who, "x-brain-origin": who, ...(via ? { "x-brain-via": via } : {}) };
+    const read = async (r) => ({ status: r.status, data: (r.headers.get("content-type") || "").includes("json") ? await r.json() : await r.text(), headers: r.headers });
+    const query = (params) => (Object.keys(params).length ? "?" + new URLSearchParams(params) : "");
+    return {
+      get: async (m, params = {}, more = {}) => read(await sim.fetch(X + m + query(params), { headers: { ...headers, ...more } })),
+      post: async (m, body = {}, params = {}, more = {}) => read(await sim.fetch(X + m + query(params), { method: "POST", body: typeof body === "string" ? body : JSON.stringify(body), headers: { ...headers, ...more } }))
+    };
+  };
+  const box = (id = "owner/default", image = "node") => sim.boxes.get(image + "/" + id);
+  return {
+    sim, fake, as, owner: as("owner"), box,
+    // The lease of an object as its storage has it, and a way to move its end: the object forgets what it held in memory,
+    // as one that Cloudflare put to sleep does, and reads the lease again.
+    lease: (id, image) => box(id, image).stored.get("lease"),
+    endsIn: (seconds, id, image) => {
+      const b = box(id, image);
+      b.stored.set("lease", { ...b.stored.get("lease"), paidUntil: Date.now() + seconds * 1000 });
+      b.sleep();
+    },
+    price: async (params = {}) => {
+      const rule = (await container_service.emit()).meta.access["com.lopecode.brain.container.extend"];
+      const context = { caller: callerOf({ caller: "owner" }), request: { params } };
+      // The price in millionths of a dollar, found by halving.
+      let low = 0, high = 1 << 20;
+      while (low < high) {
+        const mid = (low + high) >> 1;
+        if (decide({ allow: `(${rule.price}) < ${(mid + 0.5) / 1e6}` }, context).allow) high = mid;
+        else low = mid + 1;
+      }
+      return low / 1e6;
+    }
+  };
+});};
+const _braincontainer_test_container_declares_its_images_and_who_calls = async function _test_container_declares_its_images_and_who_calls(container_service,expect,decide,callerOf) {
+  const { meta, parts } = await container_service.emit();
+  expect(meta).toMatchObject({ worker: "brain-x-container", role: "recipe", module: "@tomlarkworthy/brain-container", resources: ["containers", "rows"], secrets: [], paths: [], calls: [], crons: [] });
+  // One application and one object class for each image, and the class is bound to the Worker.
+  expect(meta.containers).toEqual([{ name: "node", class_name: "Box_node", image: "docker.io/library/node:22-alpine", instance_type: "lite", max_instances: 6, entrypoint: ["sh", "-c", "exec tail -f /dev/null"], regions: ["WEUR"] }]);
+  expect(meta.bindings).toContainEqual({ type: "durable_object_namespace", name: "BOX_NODE", class_name: "Box_node" });
+  expect(parts[0].text).toContain("export class Box_node extends __DO");
+  const callers = { owner: { caller: "owner", via: "session" }, token: { caller: "token:laptop" }, granted: { caller: "did:plc:ada" }, worker: { caller: "worker:brain-x-reader" }, anyone: { caller: "anonymous" } };
+  const through = (rule) => Object.entries(callers).filter(([, w]) => decide(rule, { caller: callerOf(w), request: { method: "", path: "", verb: "POST", params: {} } }).allow).map(([n]) => n).join(" ");
+  const N = "com.lopecode.brain.container.";
+  for (const m of ["extend", "exec", "get", "post", "status", "stop"]) expect([m, through(meta.access[N + m])]).toEqual([m, "owner token granted worker"]);
+  for (const m of ["all", "end", "settings"]) expect([m, through(meta.access[N + m]), meta.access[N + m].fixed]).toEqual([m, "owner", true]);
+  expect(Object.keys(meta.access).filter((k) => meta.access[k].price).map((k) => k.slice(N.length))).toEqual(["extend"]);
+  return Object.keys(meta.access).length + " methods, " + meta.containers.length + " image";
+};
+const _braincontainer_test_container_time_is_bought_by_extend_and_starts_it = async function _test_container_time_is_bought_by_extend_and_starts_it(containerRig,expect) {
+  const rig = await containerRig();
+  // No time: nothing runs, and nothing starts.
+  expect((await rig.owner.post("exec", { cmd: ["node", "-v"] })).data).toMatchObject({ error: "NoTime", paidUntil: 0 });
+  expect((await rig.owner.get("get", { port: 8080 })).status).toBe(409);
+  expect(rig.fake.of().starts).toEqual([]);
+  const t = Date.now();
+  const first = await rig.owner.post("extend", {}, { seconds: 60 });
+  expect(first.data).toMatchObject({ owner: "owner", container: "default", image: "node", added: 60, costUsd: 0.00012, cold: true, up: true });
+  expect(first.data.paidUntil - t).toBeGreaterThanOrEqual(60000);
+  expect(rig.fake.of().starts).toEqual([{ enableInternet: true }]);
+  // The object keeps the lease and an alarm at its end; the row is for the lists.
+  expect(rig.lease()).toEqual({ owner: "owner", name: "default", image: "node", internet: true, paidUntil: first.data.paidUntil });
+  expect(rig.box().alarm).toBe(first.data.paidUntil);
+  expect(rig.sim.rows.get("c/owner/node/default")).toEqual({ paidUntil: first.data.paidUntil });
+  // More time is added to the end, and a container that is up is not started again.
+  const more = await rig.owner.post("extend", {}, { seconds: 30 });
+  expect([more.data.paidUntil - first.data.paidUntil, more.data.cold, rig.fake.of().starts.length, rig.box().alarm]).toEqual([30000, false, 1, more.data.paidUntil]);
+  // seconds is read from the query string alone, and a number outside the limits buys nothing.
+  for (const seconds of ["9", "21601", "1.5", "abc", ""]) expect([seconds, (await rig.owner.post("extend", { seconds: 60 }, seconds ? { seconds } : {})).status]).toEqual([seconds, 400]);
+  expect(rig.lease().paidUntil).toBe(more.data.paidUntil);
+  // The price is seconds times the rate of the image, and 0 for what is refused.
+  expect([await rig.price({ seconds: "60" }), await rig.price({ seconds: "3600", image: "node" }), await rig.price({ seconds: "9" }), await rig.price({ seconds: "60", image: "other" }), await rig.price({})]).toEqual([0.00012, 0.0072, 0, 0, 0]);
+  return "90 s bought, 1 start";
+};
+const _braincontainer_test_container_exec_runs_a_command_in_the_callers_container = async function _test_container_exec_runs_a_command_in_the_callers_container(containerRig,expect,containerLimits) {
+  const rig = await containerRig();
+  await rig.owner.post("extend", {}, { seconds: 60 });
+  const out = await rig.owner.post("exec", { cmd: ["node", "-v"] });
+  expect(out.data).toMatchObject({ exitCode: 0, stdout: "node -v\n", stderr: "", truncated: false });
+  // A command that fails is an answer, not an error.
+  expect((await rig.owner.post("exec", { cmd: ["false"] })).data).toMatchObject({ exitCode: 1 });
+  expect((await rig.owner.post("exec", { cmd: ["big"] })).data).toMatchObject({ truncated: true });
+  expect((await rig.owner.post("exec", { cmd: ["big"] })).data.stdout.length).toBe(containerLimits.outputChars);
+  // The command is a list of texts: no shell reads it here.
+  for (const cmd of ["node -v", [], [1], Array(65).fill("a"), ["x".repeat(20001)]]) expect((await rig.owner.post("exec", { cmd })).status).toBe(400);
+  expect((await rig.owner.post("exec", { cmd: ["true"], timeout: 500 })).status).toBe(400);
+  // A command that does not end answers at the timeout.
+  const slow = await rig.owner.post("exec", { cmd: ["hang"], timeout: 1000 });
+  expect([slow.status, slow.data.error]).toEqual([504, "ExecTimeout"]);
+  // A container that exited is started again by the next call while time is left.
+  rig.fake.of().running = false;
+  expect((await rig.owner.post("exec", { cmd: ["true"] })).status).toBe(200);
+  expect(rig.fake.of().starts.length).toBe(2);
+  return "exec, 2 starts";
+};
+const _braincontainer_test_container_get_and_post_are_the_port_with_nothing_read = async function _test_container_get_and_post_are_the_port_with_nothing_read(containerRig,Response,expect) {
+  const rig = await containerRig();
+  await rig.owner.post("extend", {}, { seconds: 60 });
+  const seen = [];
+  rig.fake.of().ports[8080] = async (request) => {
+    seen.push({ method: request.method, url: request.url, headers: Object.fromEntries(request.headers), body: request.method === "GET" ? null : await request.text() });
+    return new Response("hello from the box", { status: 201, headers: { "content-type": "text/plain", "x-from": "box" } });
+  };
+  // Each row call of the Worker from here on is counted.
+  let rowCalls = 0;
+  const sql = rig.sim.env.SQL.sim;
+  rig.sim.env.SQL = { sim: (...a) => (rowCalls++, sql(...a)) };
+  const got = await rig.owner.get("get", { port: 8080, path: "/a/b?q=1" }, { authorization: "Bearer secret", cookie: "c=1", "x-brain-session": "s", "x-mine": "kept" });
+  // The answer is the container's own: status, headers and body.
+  expect([got.status, got.data, got.headers.get("x-from")]).toEqual([201, "hello from the box", "box"]);
+  expect([seen[0].method, seen[0].url, seen[0].headers["x-mine"]]).toEqual(["GET", "http://box/a/b?q=1", "kept"]);
+  // No credential of the Brain and no header of the core reaches the container.
+  expect(Object.keys(seen[0].headers).filter((h) => h === "authorization" || h === "cookie" || h.startsWith("x-brain-"))).toEqual([]);
+  const sent = await rig.owner.post("post", "raw bytes, not JSON", { port: 8080, path: "/in" }, { "content-type": "text/plain" });
+  expect([sent.status, seen[1].method, seen[1].url, seen[1].body, seen[1].headers["content-type"]]).toEqual([201, "POST", "http://box/in", "raw bytes, not JSON", "text/plain"]);
+  expect((await rig.owner.post("post", "{}", { port: 8080, method: "put" })).status).toBe(201);
+  expect(seen[2].method).toBe("PUT");
+  // Three requests to the port read and wrote no row.
+  expect(rowCalls).toBe(0);
+  // A port, a path or a method the service refuses.
+  for (const params of [{}, { port: 0 }, { port: 70000 }, { port: "http" }, { port: 8080, path: "no-slash" }]) expect((await rig.owner.get("get", params)).status).toBe(400);
+  expect((await rig.owner.post("post", "", { port: 8080, method: "TRACE" })).status).toBe(400);
+  // Nothing listens: 502 once the start is not fresh.
+  rig.box().sleep();
+  const none = await rig.owner.get("get", { port: 9 });
+  expect([none.status, none.data.error]).toEqual([502, "NoListener"]);
+  return seen.length + " requests reached the port";
+};
+const _braincontainer_test_container_is_destroyed_when_its_time_ends = async function _test_container_is_destroyed_when_its_time_ends(containerRig,expect) {
+  const rig = await containerRig();
+  await rig.owner.post("extend", {}, { seconds: 60 });
+  const c = rig.fake.of();
+  // An alarm that comes while time is left destroys nothing and sets itself again.
+  rig.box().alarm = null;
+  await rig.box().object.alarm();
+  expect([c.running, c.destroyed, rig.box().alarm]).toEqual([true, 0, rig.lease().paidUntil]);
+  // The time ends. The object was asleep: it reads the lease from its storage.
+  rig.endsIn(-1);
+  await rig.box().object.alarm();
+  expect([c.running, c.destroyed]).toEqual([false, 1]);
+  // Nothing starts it again without time.
+  expect((await rig.owner.post("exec", { cmd: ["true"] })).data).toMatchObject({ error: "NoTime" });
+  expect((await rig.owner.get("get", { port: 8080 })).status).toBe(409);
+  expect(c.starts.length).toBe(1);
+  expect((await rig.owner.get("status")).data).toMatchObject({ remaining: 0, up: false });
+  // stop destroys at once and the time stays; end takes the time too.
+  await rig.owner.post("extend", {}, { seconds: 60 });
+  expect((await rig.owner.post("stop")).data).toMatchObject({ stopped: true });
+  expect([c.running, (await rig.owner.get("status")).data.remaining > 50]).toEqual([false, true]);
+  await rig.owner.post("exec", { cmd: ["true"] });
+  expect(c.running).toBe(true);
+  expect((await rig.owner.post("end", { owner: "owner", image: "node", container: "default" })).data).toMatchObject({ ended: true });
+  expect([c.running, rig.box().alarm, rig.sim.rows.has("c/owner/node/default"), (await rig.owner.post("exec", { cmd: ["true"] })).status]).toEqual([false, null, false, 409]);
+  return "destroyed " + c.destroyed + " times";
+};
+const _braincontainer_test_container_each_caller_has_its_own_and_a_caller_names_no_image = async function _test_container_each_caller_has_its_own_and_a_caller_names_no_image(containerRig,expect) {
+  const rig = await containerRig();
+  const reader = rig.as("worker:brain-x-reader"), turn = rig.as("owner", "turn:7");
+  await rig.owner.post("extend", {}, { seconds: 60 });
+  await reader.post("extend", {}, { seconds: 60 });
+  await turn.post("extend", {}, { seconds: 60, container: "job" });
+  expect([...rig.sim.boxes.keys()].sort()).toEqual(["node/owner/default", "node/via:owner/job", "node/worker:brain-x-reader/default"]);
+  // A caller reaches its own container by the same name, and no parameter names another owner's.
+  await reader.post("exec", { cmd: ["id"] });
+  expect([rig.fake.of("worker:brain-x-reader/default").execs.filter((e) => e[0] === "id").length, rig.fake.of().execs.filter((e) => e[0] === "id").length]).toEqual([1, 0]);
+  expect((await reader.get("status", { owner: "owner" })).data).toMatchObject({ owner: "worker:brain-x-reader", mine: [{ image: "node", container: "default" }] });
+  // A call with no caller has no container.
+  expect((await rig.as("anonymous").post("extend", {}, { seconds: 60 })).status).toBe(401);
+  // An image is a name of the list. Anything else is refused, and so is a name that is not a name.
+  for (const image of ["docker.io/library/alpine:3", "Node", "other"]) expect([image, (await rig.owner.post("extend", {}, { seconds: 60, image })).data.message]).toEqual([image, "image: one of node"]);
+  for (const container of ["a/b", "-a", "x".repeat(41)]) expect((await rig.owner.post("extend", {}, { seconds: 60, container })).status).toBe(400);
+  // The owner's own session sees each container, and ends any one.
+  expect((await rig.owner.get("all")).data.containers.map((c) => [c.owner, c.container, c.up])).toEqual([["owner", "default", true], ["via:owner", "job", true], ["worker:brain-x-reader", "default", true]]);
+  await rig.owner.post("end", { owner: "worker:brain-x-reader", image: "node", container: "default" });
+  expect(rig.fake.of("worker:brain-x-reader/default").running).toBe(false);
+  // The limits count containers with time left. One that has time is extended at the limit.
+  expect((await rig.owner.post("settings", { maxContainers: 2, maxPerOwner: 1 })).data).toEqual({ maxContainers: 2, maxPerOwner: 1 });
+  expect((await rig.owner.post("extend", {}, { seconds: 60, container: "second" })).data).toMatchObject({ error: "TooManyContainers" });
+  expect((await reader.post("extend", {}, { seconds: 60 })).data).toMatchObject({ error: "TooManyContainers" });
+  expect((await rig.owner.post("extend", {}, { seconds: 60 })).status).toBe(200);
+  expect((await rig.owner.post("settings", { maxContainers: 0 })).status).toBe(400);
+  return rig.sim.boxes.size + " containers of 3 owners";
+};
+const _braincontainer_test_container_that_cloudflare_does_not_give_answers_503_and_keeps_the_time = async function _test_container_that_cloudflare_does_not_give_answers_503_and_keeps_the_time(containerRig,expect) {
+  const rig = await containerRig();
+  rig.fake.of().refuse = "There is no container instance that can be provided to this Durable Object, try again later";
+  const out = await rig.owner.post("extend", {}, { seconds: 60 });
+  expect([out.status, out.data.error]).toEqual([503, "ContainerNotReady"]);
+  expect(out.data.message).toContain("There is no container instance");
+  // The time is bought: the lease, the row and the alarm are there, and the next call starts the container.
+  expect([out.data.paidUntil, rig.sim.rows.get("c/owner/node/default").paidUntil, rig.box().alarm]).toEqual([rig.lease().paidUntil, rig.lease().paidUntil, rig.lease().paidUntil]);
+  expect((await rig.owner.get("status")).data).toMatchObject({ up: false, exit: "There is no container instance that can be provided to this Durable Object, try again later" });
+  rig.fake.of().refuse = null;
+  expect((await rig.owner.post("exec", { cmd: ["true"] })).status).toBe(200);
+  // internet=false is read at the start.
+  await rig.owner.post("extend", {}, { seconds: 60, container: "shut", internet: "false" });
+  expect([rig.fake.of("owner/shut").starts, rig.lease("owner/shut").internet]).toEqual([[{ enableInternet: false }], false]);
+  return "503, then up";
+};
+const _braincontainer_test_container_panel_shows_the_price_and_names_the_container = async function _test_container_panel_shows_the_price_and_names_the_container(containerPanel,expect) {
+  const calls = [];
+  const status = { owner: "owner", container: "default", image: "node", remaining: 42, up: true, exit: null, settings: { maxContainers: 6, maxPerOwner: 3 } };
+  const fleet = { containers: [{ owner: "owner", image: "node", container: "default", up: true, remaining: 42 }, { owner: "worker:brain-x-reader", image: "node", container: "job", up: true, remaining: 9 }] };
+  const client = { query: async (name, params) => (calls.push([name, params]), name === "container.all" ? fleet : { ...status, container: params.container }), procedure: async (name, input, opts) => (calls.push([name, input, opts]), { added: 60, costUsd: 0.00012, cold: true, exitCode: 0, ms: 5, stdout: "v22\n", stderr: "" }) };
+  const el = containerPanel({ client, owner: true });
+  await new Promise((r) => setTimeout(r, 0));
+  expect([...el.querySelectorAll("button")].map((b) => b.textContent)).toEqual(["Refresh", "Stop", "Add time", "Run", "End chosen container", "Save limits"]);
+  expect(el.textContent).toContain("42 s are bought for default (node). The container is up.");
+  expect(el.textContent).toContain("60 s costs $0.00012, charged to your day. It is not given back.");
+  expect(el.textContent).toContain("worker:brain-x-reader");
+  [...el.querySelectorAll("button")].find((b) => b.textContent === "Add time").click();
+  await new Promise((r) => setTimeout(r, 0));
+  // The seconds and the two names go in the query string.
+  expect(calls.find((c) => c[0] === "container.extend")).toEqual(["container.extend", {}, { params: { seconds: "60", container: "default", image: "node" } }]);
+  expect(el.textContent).toContain("60 s added, $0.00012, started");
+  expect(containerPanel({ client, owner: false }).textContent).toMatch(/Sign in to a Brain as the owner/);
+  return "2 containers, 6 buttons";
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  $def("_braincontainer_anon_f1a591a682", null, ["md"], _braincontainer_anon_f1a591a682);
+  $def("_braincontainer_viewof_containerView", "viewof containerView", ["containerPanel","client","session"], _braincontainer_viewof_containerView);
+  $def("_braincontainer_containerView", "containerView", ["Generators","viewof containerView"], _braincontainer_containerView);
+  $def("_braincontainer_anon_743155a843", null, ["md"], _braincontainer_anon_743155a843);
+  $def("_braincontainer_anon_ab25ebd94e", null, ["md"], _braincontainer_anon_ab25ebd94e);
+  $def("_braincontainer_anon_1b2e4fb60d", null, ["md"], _braincontainer_anon_1b2e4fb60d);
+  $def("_braincontainer_anon_2ec170884d", null, ["md"], _braincontainer_anon_2ec170884d);
+  $def("_braincontainer_anon_789e591a61", null, ["md"], _braincontainer_anon_789e591a61);
+  $def("_braincontainer_anon_7b8977c2e9", null, ["md","containerMeasured"], _braincontainer_anon_7b8977c2e9);
+  $def("_braincontainer_containerMeasured", "containerMeasured", [], _braincontainer_containerMeasured);
+  $def("_braincontainer_container_service", "container_service", ["cloudflare","containerApp","containerImageList","containerBox","containerPrice"], _braincontainer_container_service);
+  $def("_braincontainer_container_announce", "container_announce", ["plugins","container_service","invalidation"], _braincontainer_container_announce);
+  $def("_braincontainer_containerImageList", "containerImageList", [], _braincontainer_containerImageList);
+  $def("_braincontainer_containerLimits", "containerLimits", [], _braincontainer_containerLimits);
+  $def("_braincontainer_containerSeconds", "containerSeconds", ["containerLimits"], _braincontainer_containerSeconds);
+  $def("_braincontainer_containerPrice", "containerPrice", ["containerLimits","containerImageList"], _braincontainer_containerPrice);
+  $def("_braincontainer_containerBox", "containerBox", ["containerLimits","Response","Request"], _braincontainer_containerBox);
+  $def("_braincontainer_containerOps", "containerOps", ["containerLimits","containerImageList","rows","containers","Request","containerSeconds"], _braincontainer_containerOps);
+  $def("_braincontainer_containerApp", "containerApp", ["hono","Response","containerOps"], _braincontainer_containerApp);
+  $def("_braincontainer_containerPanel", "containerPanel", ["htl","Inputs","containerImageList","containerLimits"], _braincontainer_containerPanel);
+  $def("_braincontainer_anon_83cbdb0376", null, ["md"], _braincontainer_anon_83cbdb0376);
+  $def("_braincontainer_containerFake", "containerFake", [], _braincontainer_containerFake);
+  $def("_braincontainer_containerRig", "containerRig", ["containerFake","simulate","container_service","URLSearchParams","callerOf","decide"], _braincontainer_containerRig);
+  $def("_braincontainer_test_container_declares_its_images_and_who_calls", "test_container_declares_its_images_and_who_calls", ["container_service","expect","decide","callerOf"], _braincontainer_test_container_declares_its_images_and_who_calls);
+  $def("_braincontainer_test_container_time_is_bought_by_extend_and_starts_it", "test_container_time_is_bought_by_extend_and_starts_it", ["containerRig","expect"], _braincontainer_test_container_time_is_bought_by_extend_and_starts_it);
+  $def("_braincontainer_test_container_exec_runs_a_command_in_the_callers_container", "test_container_exec_runs_a_command_in_the_callers_container", ["containerRig","expect","containerLimits"], _braincontainer_test_container_exec_runs_a_command_in_the_callers_container);
+  $def("_braincontainer_test_container_get_and_post_are_the_port_with_nothing_read", "test_container_get_and_post_are_the_port_with_nothing_read", ["containerRig","Response","expect"], _braincontainer_test_container_get_and_post_are_the_port_with_nothing_read);
+  $def("_braincontainer_test_container_is_destroyed_when_its_time_ends", "test_container_is_destroyed_when_its_time_ends", ["containerRig","expect"], _braincontainer_test_container_is_destroyed_when_its_time_ends);
+  $def("_braincontainer_test_container_each_caller_has_its_own_and_a_caller_names_no_image", "test_container_each_caller_has_its_own_and_a_caller_names_no_image", ["containerRig","expect"], _braincontainer_test_container_each_caller_has_its_own_and_a_caller_names_no_image);
+  $def("_braincontainer_test_container_that_cloudflare_does_not_give_answers_503_and_keeps_the_time", "test_container_that_cloudflare_does_not_give_answers_503_and_keeps_the_time", ["containerRig","expect"], _braincontainer_test_container_that_cloudflare_does_not_give_answers_503_and_keeps_the_time);
+  $def("_braincontainer_test_container_panel_shows_the_price_and_names_the_container", "test_container_panel_shows_the_price_and_names_the_container", ["containerPanel","expect"], _braincontainer_test_container_panel_shows_the_price_and_names_the_container);
+  main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
+  main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
+  main.define("rows", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("rows", _));
+  main.define("containers", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("containers", _));
+  main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
+  main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
+  main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
+  main.define("callerOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerOf", _));
+  main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
+  main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
+  main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone","@variable"], (_, v) => v.import("expect", _));
+  main.define("module @tomlarkworthy/cloud-brain", [], async () => runtime.module((await import("/@tomlarkworthy/cloud-brain.js?v=4")).default));
+  main.define("client", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("client", _));
+  main.define("session", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("session", _));
+  return main;
+}
+</script>
 <script id="@tomlarkworthy/cloud-brain" 
   type="text/plain"
   data-mime="application/javascript"
@@ -36082,7 +36984,7 @@ const _cloudbraindocs_anon_d0e09903ee = function _anonymous(md,mod) {return (md`
 The kernel serves a shell at \`/\`. The shell is this notebook without the modules that a Worker owns. ${mod("brain-shell")} asks the deployer for the list of those modules and loads each one from its Worker. A copy opened from a file loads nothing: the page is then the source, with no Brain.
 
 ${mod("cloud-brain")} is the page's own module. It is deployed as a service and is on probation after each deploy. This module, ${mod("cloud-brain-specs")} and ${mod("brain-shell")} are in the shell.`);};
-const _cloudbraindocs_anon_5d0da76103 = function _anonymous(md,mod) {return (md`## Services outside the core
+const _cloudbraindocs_anon_25680a2e41 = function _anonymous(md,mod) {return (md`## Services outside the core
 
 Each is an owner service. Its module documents it.
 
@@ -36093,6 +36995,7 @@ Each is an owner service. Its module documents it.
 | ${mod("brain-library")} | Notebooks that the Brain keeps and serves. |
 | ${mod("brain-feed")} | Lists of Bluesky posts, given as Bluesky feeds. |
 | ${mod("brain-browser")} | Remote browsers from Cloudflare Browser Run, for each process of the Brain: a caller has its own browsers by name, a page is a tab of one, and time is bought in seconds for one browser. |
+| ${mod("brain-container")} | Leased Linux containers from Cloudflare Containers. A caller buys seconds for a container of a declared image, runs commands in it and reaches its ports over HTTP and WebSocket. It is destroyed when its time ends. |
 | ${mod("brain-proxy")} | Outbound requests with a secret added. |
 | ${mod("brain-logs")} | The logs of this Brain's Workers, read from Cloudflare Workers Logs with Cloudflare's own query bodies. The core writes one line a call; the Logs panel of the page reads them. |`);};
 const _cloudbraindocs_mod = function _mod(htl,linkTo,navigate) {return ((name, label) => {
@@ -36122,7 +37025,7 @@ export default function define(runtime, observer) {
   $def("_cloudbraindocs_anon_866fa794d3", null, ["md","mod"], _cloudbraindocs_anon_866fa794d3);
   $def("_cloudbraindocs_anon_fe30eac93b", null, ["md"], _cloudbraindocs_anon_fe30eac93b);
   $def("_cloudbraindocs_anon_d0e09903ee", null, ["md","mod"], _cloudbraindocs_anon_d0e09903ee);
-  $def("_cloudbraindocs_anon_5d0da76103", null, ["md","mod"], _cloudbraindocs_anon_5d0da76103);
+  $def("_cloudbraindocs_anon_25680a2e41", null, ["md","mod"], _cloudbraindocs_anon_25680a2e41);
   $def("_cloudbraindocs_mod", "mod", ["htl","linkTo","navigate"], _cloudbraindocs_mod);
   main.define("module @tomlarkworthy/lopepage-urls", [], async () => runtime.module((await import("/@tomlarkworthy/lopepage-urls.js?v=4")).default));
   main.define("linkTo", ["module @tomlarkworthy/lopepage-urls","@variable"], (_, v) => v.import("linkTo", _));
@@ -38265,6 +39168,7 @@ One Brain, \`cb4\`, runs in one Cloudflare account. It has 17 Workers (counted 2
 | \`brain-x-knowledge\` | \`brain-knowledge\` | What the Brain knows: one entry per paper, page, post or finding, with where it was found, the path of its kept file, and who entered it and how. A D1 database of its own with a full-text index; no file bytes. The owner searches it; the snapshot and the digest tool enter into it. 68 entries on cb4, 2026-10-09. |
 | \`brain-x-snapshot\` | \`brain-snapshot\` | Once a day, at 06:00 UTC, fetches a list of public feeds (arXiv, Hugging Face papers, lab blogs, named writers, Hacker News, Reddit, Lobsters) and keeps each as a public JSON file under \`/static/snapshot/<day>/\`. It records only: no model call, no ranking, no summary. |
 | \`brain-x-browser\` | \`brain-browser\` | Remote browsers from Cloudflare Browser Run, for each process of the Brain. A browser has a name and belongs to the caller that bought its time; a page is a tab of one browser. Browser time is bought in seconds by \`browser.extend\`. |
+| \`brain-x-container\` | \`brain-container\` | Leased Linux containers from Cloudflare Containers (built 2026-10-09). A container belongs to the caller that bought its time, has a declared image (\`node\`) and a name, and is destroyed when the time ends. \`container.extend\` buys seconds; \`exec\` runs a command; \`get\` and \`post\` are its port. The owner and the Brain's Workers only. |
 
 A service is one notebook module. The module holds the prose, the code and the tests of the service.`
 )};
@@ -38336,6 +39240,7 @@ md`### What is not built
 - CPU limits and SQL metering for a member Worker.
 - The Brain's own page hosted in a remote browser. \`brain-x-browser\` opens pages that are not signed in.
 - A tool for the assistant to use the browser.
+- A container image that runs a lopecode notebook. \`brain-x-container\` runs images from Docker Hub; that image has to be built and pushed with Docker one time.
 - A cost known only after a call, such as model tokens. A charge is fixed before the call and is not returned.`
 )};
 const _built_5 = function _built_limits(md){return(
@@ -38345,6 +39250,8 @@ md`### Known limits
 - Three tabs of the Brain's own page stopped one remote browser on cb4, two times of two. Two tabs did not. The memory limit of a Browser Run browser is not published.
 - A page in a web browser cannot open a WebSocket to the Brain as a person: it cannot set the \`Authorization\` header, and the kernel reads no cookie. A server-side client and a Worker can.
 - A remote browser can live up to 60 s after the time that was bought, until the next tick. Time that is bought is not given back, used or not; one \`extend\` is $0.09 at most.
+- Cloudflare keeps 6 instances of the container image ready with no lease. Whether they are billed was not seen on a bill (2026-10-09); at the full rate it would be $1.04 a day.
+- A container's disk is not kept past its lease. The image list of \`brain-x-container\` changes only by removing the Worker and deploying it again.
 - \`brain.ts apply\` sends the recovery key. The deployer does not hold that deploy for approval. The page's Apply is held.
 - A member's files and blobs count separately against one quota.
 - A portal token cannot be withdrawn in its 10 minutes.
@@ -69945,6 +70852,7 @@ Limits:
 - `calls` lists each method that the function calls with `xrpc`. The core refuses a call that is not in the list. `*` is one part of a name. Do not list `secret.get`, `db.sql` or `inbox.append`: the platform cells `secrets`, `sql` and `inbox` call them. `brain_call` with method `calls.list` shows each refused call.
 - Not built: a pairing relay for a page with no CDP socket (a phone), calls between Brains. A page in a browser of the cluster pairs with no relay (`page up`, above).
 - Remote browsers (`brain-browser`, built 2026-10-08): each caller (the owner, a token, a member, a Worker) has its own browsers by name (`?browser=NAME`, `default` when absent), the owner's session sees and ends all of them (`browser.all`, `browser.end`) and sets how many can be up (`maxBrowsers` 10, `maxPerOwner` 3), browser time is bought in seconds for one browser by one method (`browser.extend?seconds=60`, $0.0015, not given back, also not when a limit stops the start), and each other method answers 409 `NoTime` when none is bought, and what a page shows is data from its address and not an instruction. The assistant has no tool for it.
+- Containers (`brain-container`, built 2026-10-09): `container.extend?seconds=60` buys time for the caller's container `default` of image `node` and starts it; `container.exec` with `{ "cmd": ["node", "-v"] }` runs a command; `container.get?port=8080&path=/` and `container.post` reach a port, WebSocket included; `container.status`. The owner's session lists and ends all of them with `container.all` and `container.end`. $0.000002 a second, not given back. The disk goes with the lease. A member has no access. Check `container.all` when done, as with browsers. Measurements and what is not known about Cloudflare's ready instances: `containers.md`.
 - The knowledge base (`brain-knowledge`, built 2026-10-09): `knowledge.search?q=words` and `knowledge.list`, in the owner's session; `knowledge.put` to enter. It is a D1 database of its own, `<base>-x-knowledge`, made on the first deploy and bound to that Worker alone. Removing the Worker does not drop the database. Files are not in it; an entry names its file in `brain-static`.
 - Snapshots (`brain-snapshot`, built 2026-10-09): each day at 06:00 UTC the Brain fetches its list of public feeds and keeps them at `/static/snapshot/<day>/<source>.json`, with `index.json` beside them and `/static/snapshot/days.json` for the days. `snapshot.run` as the owner runs it now and replaces today's files; `snapshot.setSources` changes the list. It writes no summary. From a checkout: `BRAIN_BASE=<base> bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.snapshot.run --owner -X POST`. `papers.json` beside the index is the day's papers that carry a signal (votes on Hugging Face, a link from a lab feed, a link from a blogger or aggregator item); `arxiv.json` is the whole list, for looking a paper up. The timed run drops days older than `keepDays` (90).
 - Files kept by date are named `<service>/<YYYY-MM-DD>/<name>`. `static.delete` with `{ prefix, before }` drops what is under a prefix that ends in `/` and was saved before a date; a Worker reaches only its own name, and nothing under `shell/` goes this way.
@@ -102835,6 +103743,7 @@ export default function define(runtime, observer) {
     "@tomlarkworthy/brain-logs",
     "@tomlarkworthy/brain-snapshot",
     "@tomlarkworthy/brain-knowledge",
+    "@tomlarkworthy/brain-container",
     "@tomlarkworthy/cloud-brain",
     "@tomlarkworthy/cloud-brain-docs",
     "@tomlarkworthy/brain-secrets",
