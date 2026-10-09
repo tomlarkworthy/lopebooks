@@ -19717,6 +19717,36 @@ const _cloudflareiac_workerRuntime = function _workerRuntime(Response,URLSearchP
   };
   const bindingName = (name) => "X_" + name.toUpperCase().replace(/[^A-Z0-9]/g, "_");
   const secretsHeld = new Map();
+  // Settings the owner stored for this Worker (config.set, rows of the core). The core sends them with each call it
+  // forwards, so a change is read with no deploy and no call of this Worker's own. A key the deployer bound in
+  // BRAIN_CONFIG (owner, host, base…) is never replaced. The kernel, the core and the deployer take none.
+  let stored = null, storedAt = 0;
+  const configRead = new Set();
+  const takesSettings = () => !["kernel", "core", "deployer", "guard"].includes(info().role);
+  const settingsFrom = (header) => {
+    try {
+      const v = JSON.parse(decodeURIComponent(header));
+      return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+    } catch {
+      return {};
+    }
+  };
+  // A Worker run by its clock has no call to read them from. It reads the core's row itself: one statement, when
+  // it has no copy or the copy is 5 minutes old. A Worker with no database binding (a member's) reads none.
+  const settingsForTick = async () => {
+    if (!takesSettings() || !ENV.SQL || Date.now() - storedAt < 300000) return;
+    try {
+      const key = "config/" + (info().name || "");
+      // Under simulate() the test's rows stand in for the core's.
+      const row = ENV.SQL.sim ? await ENV.SQL.sim("get", key) : await ENV.SQL.prepare("SELECT v FROM kv WHERE t = ?1 AND k = ?2").bind("brain-core", key).first().then((r) => (r ? JSON.parse(r.v) : null));
+      stored = row && typeof row === "object" ? row : {};
+      storedAt = Date.now();
+    } catch {}
+  };
+  const configOf = (k) => {
+    const bound = ENV.BRAIN_CONFIG || {};
+    return Object.hasOwn(bound, k) ? { value: bound[k], from: "deploy" } : stored && Object.hasOwn(stored, k) ? { value: stored[k], from: "stored" } : { value: undefined, from: "unset" };
+  };
   const platform = {
     cloudflare: ((Service) => ({ [tag]: "cloudflare", Service, Worker: Service }))((name, fn, options = {}) => ({ name, fn, options })),
     // A key the platform bound (this Worker's own key, the kernel's cookie key, the deployer's token) is read from the
@@ -19749,7 +19779,7 @@ const _cloudflareiac_workerRuntime = function _workerRuntime(Response,URLSearchP
         }
       }
     ),
-    config: new Proxy({}, { get: (_, k) => (typeof k === "string" && ENV ? (ENV.BRAIN_CONFIG || {})[k] : undefined) }),
+    config: new Proxy({}, { get: (_, k) => (typeof k === "string" && ENV ? (configRead.add(k), configOf(k).value) : undefined) }),
     rows: {
       get: (key) => rowsCall("get", key),
       put: (key, value) => rowsCall("put", key, value),
@@ -19843,10 +19873,14 @@ const _cloudflareiac_workerRuntime = function _workerRuntime(Response,URLSearchP
         // A Worker with a scheduled function is ticked by an alarm on its rows object as well as by its cron, once a
         // minute, starting from the first request to its own address. Measured 2026-10-05: cron triggers set through
         // the API had run 0 times after 30 minutes, and a rollback was missed.
+        if (inside && takesSettings() && request.headers.has("x-brain-settings")) (stored = settingsFrom(request.headers.get("x-brain-settings"))), (storedAt = Date.now());
+        // What this instance has read from config since it started, and where each value comes from. For the core's config.get.
+        if (inside && url.pathname === "/xrpc/_config") return json({ worker: info().name, read: [...configRead].sort().map((key) => ({ key, ...configOf(key) })) });
         if (keyed && url.pathname === "/__tick") {
           // GET: when the alarm is next due and how its last call went.
           if (request.method === "GET") return json(await rowsCall("armInfo"));
           const service = await load();
+          if (service.options.scheduled) await settingsForTick();
           if (service.options.scheduled) await during(null, async () => service.options.scheduled({ alarm: true }, ctx));
           return json({ ok: true });
         }
@@ -19892,6 +19926,7 @@ const _cloudflareiac_workerRuntime = function _workerRuntime(Response,URLSearchP
       async scheduled(event, env, ctx) {
         ENV = env;
         const service = await load();
+        if (service.options.scheduled) await settingsForTick();
         if (service.options.scheduled) await during(null, async () => service.options.scheduled(event, ctx));
       }
     };
@@ -20870,6 +20905,38 @@ const _cloudflareiac_test_the_wrapper_passes_the_origin_reference_on = async fun
   expect(took()).toEqual([["fx.who", "c-member"]]);
   return "passed on; none for a schedule; none when two overlap";
 };
+const _cloudflareiac_fx_conf = function _fx_conf(cloudflare,Response,config,rows) {return (cloudflare.Service(
+  "conf",
+  async () => Response.json({ pollMs: config.pollMs ?? 30000, owner: config.owner }),
+  { crons: ["* * * * *"], scheduled: async () => void (await rows.put("ticked", config.pollMs ?? 30000)) }
+));};
+const _cloudflareiac_test_stored_settings_show_through_config_and_never_replace_a_bound_key = async function _test_stored_settings_show_through_config_and_never_replace_a_bound_key(simulate,fx_conf,expect) {
+  const sim = await simulate(fx_conf, { config: { owner: "did:plc:owner" } });
+  const S = (o) => ({ "x-brain-settings": encodeURIComponent(JSON.stringify(o)) });
+  const ask = async (url, headers = {}) => (await sim.fetch(url, { headers })).json();
+  expect(await ask("https://conf.internal/")).toEqual({ pollMs: 30000, owner: "did:plc:owner" });
+  // The core's word with a call: read with no deploy. owner was bound at deploy and is not replaced.
+  expect(await ask("https://conf.internal/", S({ pollMs: 60000, owner: "did:plc:evil" }))).toEqual({ pollMs: 60000, owner: "did:plc:owner" });
+  // Kept by the instance for a call that carries none, and for its clock.
+  expect((await ask("https://conf.internal/")).pollMs).toBe(60000);
+  await sim.scheduled();
+  expect(sim.rows.get("ticked")).toBe(60000);
+  // What it has read, and where each value is from.
+  expect((await ask("https://conf.internal/xrpc/_config")).read).toEqual([{ key: "owner", value: "did:plc:owner", from: "deploy" }, { key: "pollMs", value: 60000, from: "stored" }]);
+  // Removed: the default again. Not a list, not text that is not JSON.
+  expect((await ask("https://conf.internal/", S({}))).pollMs).toBe(30000);
+  expect((await sim.fetch("https://conf.internal/", { headers: { "x-brain-settings": "%5B1%5D" } }).then((r) => r.json())).pollMs).toBe(30000);
+  // From the internet the header is removed before it is read, and _config is not answered.
+  expect((await sim.fetch("https://conf.example.workers.dev/", { headers: { ...S({ pollMs: 1 }), "x-brain-deployer": "k" } })).status).toBe(404);
+  // A Worker that only its clock has run reads the core's row itself, once.
+  const cold = await simulate(fx_conf, { rows: new Map([["config/brain-x-conf", { pollMs: 45000 }]]) });
+  await cold.scheduled();
+  expect(cold.rows.get("ticked")).toBe(45000);
+  cold.rows.set("config/brain-x-conf", { pollMs: 1 });
+  await cold.scheduled();
+  expect(cold.rows.get("ticked")).toBe(45000);
+  return "60000 from the core, owner kept, 45000 read by the clock";
+};
 const _cloudflareiac_fx_named_old = function _fx_named_old(cloudflare,Response) {return (cloudflare.Worker("named", () => new Response("x"), { methods: { "com.lopecode.brain.named.get": { type: "query", who: "anyone" } } }));};
 const _cloudflareiac_fx_named_new = function _fx_named_new(cloudflare,Response) {return (cloudflare.Service("named", () => new Response("x"), { methods: { "com.lopecode.brain.named.get": { type: "query", who: "anyone" } } }));};
 const _cloudflareiac_test_a_service_declared_with_the_old_name_emits_the_same = async function _test_a_service_declared_with_the_old_name_emits_the_same(fx_named_old,fx_named_new,expect) {
@@ -21191,6 +21258,8 @@ export default function define(runtime, observer) {
   $def("_cloudflareiac_test_refuses_computed_secret", "test_refuses_computed_secret", ["fx_refusal","fx_bad_secret","expect"], _cloudflareiac_test_refuses_computed_secret);
   $def("_cloudflareiac_fx_chain", "fx_chain", ["cloudflare","xrpc","secrets","sql","inbox","Response"], _cloudflareiac_fx_chain);
   $def("_cloudflareiac_test_the_wrapper_passes_the_origin_reference_on", "test_the_wrapper_passes_the_origin_reference_on", ["Response","simulate","fx_chain","expect"], _cloudflareiac_test_the_wrapper_passes_the_origin_reference_on);
+  $def("_cloudflareiac_fx_conf", "fx_conf", ["cloudflare","Response","config","rows"], _cloudflareiac_fx_conf);
+  $def("_cloudflareiac_test_stored_settings_show_through_config_and_never_replace_a_bound_key", "test_stored_settings_show_through_config_and_never_replace_a_bound_key", ["simulate","fx_conf","expect"], _cloudflareiac_test_stored_settings_show_through_config_and_never_replace_a_bound_key);
   $def("_cloudflareiac_fx_named_old", "fx_named_old", ["cloudflare","Response"], _cloudflareiac_fx_named_old);
   $def("_cloudflareiac_fx_named_new", "fx_named_new", ["cloudflare","Response"], _cloudflareiac_fx_named_new);
   $def("_cloudflareiac_test_a_service_declared_with_the_old_name_emits_the_same", "test_a_service_declared_with_the_old_name_emits_the_same", ["fx_named_old","fx_named_new","expect"], _cloudflareiac_test_a_service_declared_with_the_old_name_emits_the_same);
@@ -21284,7 +21353,7 @@ const _braindeployer_anon_17200b265d = function _anonymous(md) {return (md`## De
 \`deployerOps\` is everything the deployer does to Cloudflare. A Worker's name in an apply is its logical name (\`brain\`, \`brain-core\`, \`brain-x-NAME\`); the script name on Cloudflare replaces \`brain\` with this Brain's base name, so two Brains can share an account.
 
 Each Worker gets a key when it is first deployed. The deployer presents it to reach that Worker from the internet, and the Worker presents it to the core to say which Worker it is.`);};
-const _braindeployer_anon_ae422c5bba = function _anonymous(md) {return (md`## Logs and Cloudflare permissions
+const _braindeployer_anon_88f934237d = function _anonymous(md) {return (md`## Logs and Cloudflare permissions
 
 Added 2026-10-08. The deployer turns Workers Logs on for each script and Cloudflare's own line per invocation off (\`OBSERVABILITY\`, \`ensureLogs\`). The setting belongs to the script: Cloudflare took it from the upload of a new script and ignored it in the upload of a version, so 14 of the 17 scripts of cb4 kept no logs after the first deploy of this change. \`redistil\` sets it on each script the deployer has a row for, a member's Worker and one it keeps no source of included. A deploy of a member's Worker sets it too.
 
@@ -21294,7 +21363,7 @@ The deployer's own token needs the permission \`Account API Tokens Write\` to mi
 
 Every change names what it saw. Each Worker in \`infra.apply\` carries \`was\`: the hash the caller saw running, or \`null\` for no Worker. \`remove\` is \`[{ worker, was }]\`; \`member.deploy\` and \`member.remove\` take \`was\`; a roll back button carries it. When the Worker is no longer that, the answer is \`refused\` with \`NAME is A, you saw B\` and \`running\`, and nothing is deployed. There is no value that skips the check. A \`dry\` apply is not checked. An import of another module is not part of the check: a Worker is distilled against the kept source of its imports as they are at the deploy.
 
-One change to a Worker runs at a time, the tick's health check and a verdict's put-back among them: each takes the same row and leaves a Worker whose row is held. The deployer makes the row \`deploying/NAME\` (\`putIfAbsent\`) before it reads what is running, and deletes it when the change ends, deployed or not. A second caller in that time is refused with \`another change to NAME is running\`. A change that died leaves the row; after 5 minutes one caller takes it over, the one that makes \`deploying-over/NAME/ID\`. That row is kept, one for each change that died, and the take-over is logged as \`deploy.lease-taken-over\`. The rows have no compare-and-swap, so one case is open: a change over 5 minutes old that ends within one row read of the take-over. An approval is of one hash over one hash: the pending row keeps \`was\`, and an approval does not stand once the Worker has moved. Added 2026-10-09.
+One change to a Worker runs at a time, the tick's health check and a verdict's put-back among them: each takes the same row for its writes and leaves a Worker whose row is held. The tick's health check itself runs with no row held, and a caller waits up to a second for a row before it is refused. The deployer makes the row \`deploying/NAME\` (\`putIfAbsent\`) before it reads what is running, and deletes it when the change ends, deployed or not. A second caller in that time is refused with \`another change to NAME is running\`. A change that died leaves the row; after 5 minutes one caller takes it over, the one that makes \`deploying-over/NAME/ID/MINUTE\`, which is deleted when the take-over ends. A take-over that died leaves that row, and the next minute has a new one. The take-over is logged as \`deploy.lease-taken-over\`. The rows have no compare-and-swap, so one case is open: a change over 5 minutes old that ends within one row read of the take-over. An approval is of one hash over one hash: the pending row keeps \`was\`, and an approval does not stand once the Worker has moved. Added 2026-10-09.
 
 Every change says why. \`infra.apply\` (unless \`dry\`), \`infra.redistil\` with \`apply\`, a roll back on the page, \`member.deploy\` and \`member.remove\` take \`reason\`, 3 to 300 characters, and are refused without one (400 \`InvalidRequest\`, or \`refused\` for a member). The reason is logged before anything is done, as \`deploy.reason\` with \`reason\`, \`by\` (\`owner\`, \`recovery key\` or the member's DID) and \`targets\`. Added 2026-10-09.
 
@@ -21713,13 +21782,29 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     if (await rows.putIfAbsent(key, mine)) return mine;
     const held = await rows.get(key);
     if (!held) return (await rows.putIfAbsent(key, mine)) ? mine : null;
-    if (held.until > Date.now() || !(await rows.putIfAbsent(`deploying-over/${logical}/${held.id}`, { at: Date.now() }))) return null;
-    // Known limit, with no compare-and-swap on a row: the holder ends and another caller takes the row between
-    // the next two lines. That needs a change over 5 minutes old to end within one row read of this one.
-    if (((await rows.get(key)) || {}).id === held.id) await rows.delete(key);
-    if (!(await rows.putIfAbsent(key, mine))) return null;
-    log({ at: "deploy.lease-taken-over", target: logical });
-    return mine;
+    if (held.until > Date.now()) return null;
+    // One caller takes over an expired row: the one that makes the marker. The marker names the minute, so a
+    // take-over that died does not hold the Worker for good, and it is deleted when the take-over ends.
+    const over = `deploying-over/${logical}/${held.id}/${Math.floor(Date.now() / 60000)}`;
+    if (!(await rows.putIfAbsent(over, { at: Date.now() }))) return null;
+    try {
+      // Known limit, with no compare-and-swap on a row: the holder ends and another caller takes the row between
+      // the next two lines. That needs a change over 5 minutes old to end within one row read of this one.
+      if (((await rows.get(key)) || {}).id === held.id) await rows.delete(key);
+      if (!(await rows.putIfAbsent(key, mine))) return null;
+      log({ at: "deploy.lease-taken-over", target: logical });
+      return mine;
+    } finally {
+      await rows.deletePrefix(`deploying-over/${logical}/`);
+    }
+  };
+  // The tick holds a row for two row writes. A caller waits that out, a second, before it is told of another change.
+  const takeSoon = async (logical) => {
+    for (let i = 0; ; i++) {
+      const mine = await take(logical);
+      if (mine || i >= 4) return mine;
+      await new Promise((r) => setTimeout(r, 250));
+    }
   };
   const release = async (logical, mine) => {
     const held = await rows.get("deploying/" + logical);
@@ -21727,7 +21812,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
   };
   // The tick and a verdict change a Worker too. They take the same row, and leave a Worker that is being changed.
   const alone = async (logical, change) => {
-    const mine = await take(logical);
+    const mine = await takeSoon(logical);
     if (!mine) return null;
     try {
       return await change(await rows.get("worker/" + logical));
@@ -21738,7 +21823,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
   const guard = async (logical, was, change) => {
     // The whole hash: 12 characters of it are what a table shows, and are not a hash.
     if (was !== null && !/^[0-9a-f]{64}$/.test(String(was))) return { worker: logical, state: "refused", reason: SAW };
-    const mine = await take(logical);
+    const mine = await takeSoon(logical);
     if (!mine) return { worker: logical, state: "refused", reason: `another change to ${logical} is running` };
     try {
       const rec = await rows.get("worker/" + logical);
@@ -21817,7 +21902,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       }
       return { ...base, ...results[0] };
       };
-      results.push(dry ? await change(rec) : await guard(logical, w.was, change));
+      results.push(dry ? await change(rec) : { ...base, ...(await guard(logical, w.was, change)) });
     }
     // remove is [{ worker, was }].
     for (const item of remove) {
@@ -21928,27 +22013,34 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       if (s.state !== "probation") continue;
       const logical = key.slice("kernelstate/".length);
       onProbation.add(logical);
+      // The health check runs with no row held. The row is held for the writes, on a Worker that is still the one checked.
+      const seen = await rows.get("worker/" + logical);
+      if (!seen) continue;
+      const ok = await healthy(logical, seen.key);
       await alone(logical, async (rec) => {
         const s = await rows.get(key);
-        if (!rec || !s || s.state !== "probation") return;
-        const next = nextKernelState(s, { type: "tick", now: Date.now(), healthy: await healthy(logical, rec.key), probationMs: config.probationMs });
+        if (!rec || rec.hash !== seen.hash || !s || s.state !== "probation") return;
+        const next = nextKernelState(s, { type: "tick", now: Date.now(), healthy: ok, probationMs: config.probationMs });
         if (next.state === "rolled-back") await putBack(logical, rec, { version: s.lastGood, hash: s.lastGoodHash }, next.reason);
         await rows.put(key, next.state === "rolled-back" ? { ...next, hash: s.lastGoodHash, failedHash: s.hash, at: Date.now() } : next);
       });
     }
     // Every other Worker: two failed checks in a row puts it back to the version before, when there is one.
-    for (const row of await rows.list("worker/")) await alone(row.value.worker, async (rec) => {
-      // Read again under the row: a deploy may have ended since the list was read.
-      if (!rec || rec.state !== "deployed" || !rec.hash || onProbation.has(rec.worker) || ((await rows.get("kernelstate/" + rec.worker)) || {}).state === "probation") return;
-      // A Worker put back whose token could not be minted then. Its health is checked all the same.
+    for (const { value: seen } of await rows.list("worker/")) {
+      if (seen.state !== "deployed" || !seen.hash || onProbation.has(seen.worker)) continue;
+      const ok = await healthy(seen.worker, seen.key);
+      await alone(seen.worker, async (rec) => {
+      if (!rec || rec.hash !== seen.hash || rec.state !== "deployed" || ((await rows.get("kernelstate/" + rec.worker)) || {}).state === "probation") return;
+      // A Worker put back whose token could not be minted then. Its health is counted all the same.
       if ((rec.cloudflare || []).length && !rec.token) rec = await remint(rec.worker, rec);
-      const fails = (await healthy(rec.worker, rec.key)) ? 0 : (rec.fails || 0) + 1;
+      const fails = ok ? 0 : (rec.fails || 0) + 1;
       if (fails >= 2 && rec.previous) await putBack(rec.worker, rec, rec.previous, "health check failed twice");
       else if (fails !== (rec.fails || 0)) {
         await rows.put("worker/" + rec.worker, { ...rec, fails });
         if (fails === 2) (log({ at: "deploy.failing", target: rec.worker, hash: rec.hash, reason: "health check failed twice and there is no version before" }), await note(`failing/${rec.worker}/${rec.hash}`, { event: "failing", worker: rec.worker, hash: rec.hash }));
       }
-    });
+      });
+    }
   };
 
   const confirm = async (only = null) => {
@@ -22217,7 +22309,8 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
   // deployer, the key of each Worker included; importRows takes them into a deployer that holds none. tick and
   // distiller are this deployer's own notes and are not counted. rowsDigest is what both sides compare: per class of
   // row, how many and the SHA-256 of their keys and values.
-  const OWN = new Set(["tick", "distiller"]);
+  // Not moved and not compared: the tick's own rows, and the row of a change that is running.
+  const OWN = { has: (k) => k === "tick" || k === "distiller" || k.startsWith("deploying/") || k.startsWith("deploying-over/") };
   const exportRows = async () => ({ rows: (await rows.list("")).filter((r) => !OWN.has(r.key)) });
   const rowsDigest = async () => {
     const classes = {};
@@ -23099,15 +23192,34 @@ const _braindeployer_test_a_change_names_the_hash_it_saw_and_one_change_to_a_wor
   // A change that died holds the row until `until`. Then it is taken over, once.
   rig.sim.rows.set("deploying/" + W, { id: "other", until: Date.now() - 1 });
   expect(first(await rig.recover({ workers: [{ ...two, was: one.hash }] })).state).toBe("deployed");
-  expect([rig.sim.rows.has("deploying/" + W), rig.sim.rows.has(`deploying-over/${W}/other`), rig.fake.running("cb-x-saw")]).toEqual([false, true, two.hash]);
-  rig.sim.rows.set("deploying/" + W, { id: "other", until: Date.now() - 1 });
+  const overs = () => [...rig.sim.rows.keys()].filter((k) => k.startsWith("deploying-over/")).length;
+  expect([rig.sim.rows.has("deploying/" + W), overs(), rig.fake.running("cb-x-saw")]).toEqual([false, 0, two.hash]);
+  // Another caller is taking it over in this minute: refused. A take-over that died in an earlier minute holds nothing.
+  const minute = Math.floor(Date.now() / 60000);
+  rig.sim.rows.set("deploying/" + W, { id: "dead", until: Date.now() - 1 });
+  rig.sim.rows.set(`deploying-over/${W}/dead/${minute}`, { at: Date.now() });
+  rig.sim.rows.set(`deploying-over/${W}/dead/${minute + 1}`, { at: Date.now() });
   expect(first(await rig.recover({ workers: [{ ...three, was: two.hash }] })).reason).toBe(`another change to ${W} is running`);
-  rig.sim.rows.delete("deploying/" + W);
+  rig.sim.rows.delete(`deploying-over/${W}/dead/${minute}`);
+  rig.sim.rows.delete(`deploying-over/${W}/dead/${minute + 1}`);
+  rig.sim.rows.set(`deploying-over/${W}/dead/${minute - 3}`, { at: Date.now() - 180000 });
+  // The tick's writes and a verdict take the row too: while a change holds it, a failing Worker is not counted or put back.
+  rig.sim.rows.set("deploying/" + W, { id: "other", until: Date.now() + 60000 });
+  rig.fake.unhealthy.add(two.hash);
+  await rig.sim.scheduled();
+  await rig.sim.scheduled();
+  expect([rig.sim.rows.get("worker/" + W).fails || 0, rig.fake.running("cb-x-saw")]).toEqual([0, two.hash]);
+  const coreKey = rig.sim.rows.get("worker/brain-core").key;
+  const verdict = await (await rig.sim.fetch("https://deployer.internal/xrpc/com.lopecode.brain.infra.verdict", { method: "POST", headers: { "content-type": "application/json", "x-brain-key": coreKey }, body: JSON.stringify({ worker: W, hash: two.hash, ok: false, reason: "t" }) })).json();
+  expect([verdict.state, rig.fake.running("cb-x-saw")]).toEqual(["stale", two.hash]);
+  rig.fake.unhealthy.delete(two.hash);
+  rig.sim.rows.set("deploying/" + W, { id: "dead", until: Date.now() - 1 });
   // An approval is of a hash over a hash. The Worker moves after the owner approves: the approval does not stand.
   expect(first(await rig.asOwner("apply", { workers: [{ ...one, was: two.hash }] })).state).toBe("waiting");
   expect(rig.sim.rows.get("pending/" + one.hash).was).toBe(two.hash);
   expect((await rig.form({ key: "rk", action: "approve:" + one.hash })).status).toBe(200);
   expect(first(await rig.recover({ workers: [{ ...three, was: two.hash }] })).state).toBe("deployed");
+  expect([rig.sim.rows.has("deploying/" + W), overs()]).toEqual([false, 0]);
   expect(first(await rig.asOwner("apply", { workers: [{ ...one, was: three.hash }] })).state).toBe("waiting");
   expect((await rig.form({ key: "rk", action: "approve:" + one.hash })).status).toBe(200);
   expect(first(await rig.asOwner("apply", { workers: [{ ...one, was: three.hash }] })).state).toBe("deployed");
@@ -23527,7 +23639,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_anon_b9696821dc", null, ["md"], _braindeployer_anon_b9696821dc);
   $def("_braindeployer_nextKernelState", "nextKernelState", [], _braindeployer_nextKernelState);
   $def("_braindeployer_anon_17200b265d", null, ["md"], _braindeployer_anon_17200b265d);
-  $def("_braindeployer_anon_ae422c5bba", null, ["md"], _braindeployer_anon_ae422c5bba);
+  $def("_braindeployer_anon_88f934237d", null, ["md"], _braindeployer_anon_88f934237d);
   $def("_braindeployer_deployerOps", "deployerOps", ["config","secrets","log","rows","Response","URLSearchParams","sha256","FormData","partsHash","deployerAllows","wrapperFlags","deployerDistil","nextKernelState"], _braindeployer_deployerOps);
   $def("_braindeployer_anon_b5cfc17bdb", null, ["md"], _braindeployer_anon_b5cfc17bdb);
   $def("_braindeployer_deployerPage", "deployerPage", [], _braindeployer_deployerPage);
@@ -23607,7 +23719,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braincore_anon_0dd3d2b453 = function _anonymous(md) {return (md`# brain-core
+const _braincore_anon_6aa2d00c67 = function _anonymous(md) {return (md`# brain-core
 
 The Worker every other Worker is bound to. It routes a method or a path to the Worker of the service that declared it, and keeps what must last: the notebook-side rows, the route table and the rules the owner sets.
 
@@ -23630,6 +23742,9 @@ It answers bindings only. A caller is who the kernel says it is, and the kernel 
 | \`rule.put\`, \`rule.delete\` | procedure, the owner's own session. \`{ name, allow }\`: a CEL expression in place of the rule a service declared. A rule the service fixed is refused. |
 | \`calls.list\` | query, owner. \`{ mode, implicit, undeclared: [{ worker, method, n }] }\`. |
 | \`calls.setMode\` | procedure, the owner's own session. \`{ mode: "report" | "enforce" | null, clear }\`. |
+| \`config.list\` | query, the owner's own session. \`{ workers: [{ worker, values }], protected, ttl }\`: every stored setting. |
+| \`config.get\` | query, the owner's own session. \`?worker=\`. \`{ worker, values, changes, read }\`. \`changes\`: the last 100, each \`{ at, by, key, old, value }\`. \`read\`: the keys one running instance of the Worker has read from \`config\`, each with its value and \`from\`: \`deploy\`, \`stored\` or \`unset\`. |
+| \`config.set\` | procedure, the owner's own session. \`{ worker, key, value }\`. A number, a boolean or text of at most 500 characters; \`null\` removes the key. |
 | \`price.list\` | query, owner. \`{ prices: [{ target, worker, declared, set, setAt }], unit, defaults }\`. |
 | \`price.put\`, \`price.delete\` | procedure, the owner's own session. \`{ target, price }\`: a CEL expression in place of the price a service declared. |
 | \`quota.get\` | query, any account. \`{ who, day, spent, daily, remaining, resetsAt }\` for the caller's own account. The owner reads another with \`?who=\`. |
@@ -23657,6 +23772,14 @@ A rule that does not name \`origin\` lets the Worker act for anyone it answers. 
 | bluesky, whatsapp → \`lease.get\`, \`inbox.append\` | no | started by the Worker's own clock |
 | any → \`secret.get\`, \`db.sql\` | no | the Worker's own secrets and tables |
 | core → \`metrics.record\` | no | the core's own counts |
+
+**Settings** (added 2026-10-09). A value a service reads from \`config\` and gives a default (\`config.pollMs ?? 30000\`) can be stored here, per Worker, and is read with no deploy. A service does nothing to take part: the core sends a Worker's stored settings with each call it forwards (\`x-brain-settings\`), and the Worker wrapper shows them through \`config\`. The core reads the rows at most once in 60 s for one instance, so a change is followed within 60 s. A Worker run only by its clock reads the row itself, at most once in 5 minutes.
+
+\`\`\`
+brain.ts curl /xrpc/com.lopecode.brain.config.set --owner -X POST -d '{"worker":"brain-x-inbox","key":"pollMs","value":60000}'
+\`\`\`
+
+What a setting cannot do. A key the deployer bound at deploy (\`owner\`, \`host\`, \`base\`, \`subdomain\`, \`account\`, \`deployer\`) is never replaced by a stored value: the wrapper reads the bound one first. \`config.set\` refuses those names, and six more that the kernel, the core and the deployer read, with 400. The kernel, the core and the deployer take no stored settings. Access rules, prices, approval and keys are not settings. A setting is written to the log in clear: do not store a secret in one. Rows: \`config/<worker>\` (the values) and \`config-log/<worker>\` (the changes).
 
 **Prices and credits** (added 2026-10-08). A method or a path can have a price beside its rule: a CEL expression over the same \`caller\`, \`origin\` and \`request\`, which gives US dollars. The owner's price (\`price.put\`) stands in for the declared one. A call with no price, or a price of 0, reads the route table and the settings the core already holds and writes no row.
 
@@ -24101,6 +24224,45 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     return c.json({ deleted: !!(await settings.delete("rule/" + target)) });
   });
 
+  // Settings: values a service reads from config with a default, stored per Worker and sent with each call forwarded
+  // to it (see forward). Names the deployer binds, or that the kernel, the core or the deployer read, are refused.
+  const PROTECTED = ["owner", "host", "base", "subdomain", "account", "deployer", "self", "replacedBy", "acceptEmitted", "probationMs", "clockSkewMs", "contextMs"];
+  app.get(NS + "config.list", session, async (c) =>
+    c.json({ workers: (await rows.list("config/")).map(({ key, value }) => ({ worker: key.slice("config/".length), values: value })), protected: PROTECTED, ttl: config.settingsMs ?? 60000 })
+  );
+  app.get(NS + "config.get", session, async (c) => {
+    const worker = c.req.query("worker") || "", short = worker.replace(/^brain-(x-)?/, "");
+    const route = await rows.get("route/" + worker);
+    if (!route || !routed(route)) return fail(c, 404, "NotFound", `no Worker ${worker} takes settings`);
+    const values = (await rows.get("config/" + worker)) || {};
+    // One running instance says what it has read. Another instance may have read more.
+    const read = workers.has(short)
+      ? await workers.fetch(short, new Request(`https://${short}.internal/xrpc/_config`, { headers: { "x-brain-settings": encodeURIComponent(JSON.stringify(values)) } })).then((r) => (r.ok ? r.json() : null), () => null)
+      : null;
+    return c.json({ worker, values, changes: (await rows.get("config-log/" + worker)) || [], read: read && Array.isArray(read.read) ? read.read : null });
+  });
+  app.post(NS + "config.set", session, async (c) => {
+    const { worker, key, value = null } = await c.req.json().catch(() => ({}));
+    const route = typeof worker === "string" ? await rows.get("route/" + worker) : null;
+    if (!route || !routed(route)) return fail(c, 404, "NotFound", `no Worker ${worker} takes settings`);
+    if (typeof key !== "string" || !/^[A-Za-z][A-Za-z0-9]{0,63}$/.test(key)) return fail(c, 400, "InvalidRequest", "key is a name of letters and digits");
+    if (PROTECTED.includes(key)) return fail(c, 400, "InvalidRequest", `${key} is set at deploy and is not a setting`);
+    const plain = value === null || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value)) || (typeof value === "string" && value.length <= 500);
+    if (!plain) return fail(c, 400, "InvalidRequest", "value is a number, a boolean, text of at most 500 characters, or null to remove the key");
+    const values = (await rows.get("config/" + worker)) || {};
+    const old = Object.hasOwn(values, key) ? values[key] : null;
+    if (value === null) delete values[key];
+    else values[key] = value;
+    if (Object.keys(values).length > 50) return fail(c, 400, "InvalidRequest", "a Worker has at most 50 settings");
+    if (Object.keys(values).length) await rows.put("config/" + worker, values);
+    else await rows.delete("config/" + worker);
+    stored = null;
+    const change = { at: Date.now(), by: c.get("who").caller, key, old, value };
+    await rows.append("config-log/" + worker, change, 100);
+    console.log({ ...change, at: "config", worker });
+    return c.json({ worker, key, value, old });
+  });
+
   // The notebook side of the rows platform cell, one table per Worker name.
   const rowKey = (c, q) => "rows/" + (q.worker || "") + "/" + (q.key ?? q.prefix ?? "");
   app.get(NS + "rows.get", owner, async (c) => c.json({ value: await rows.get(rowKey(c, c.req.query())) }));
@@ -24117,6 +24279,15 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
   // getInfo for a named Worker, then everything a Worker declared.
   // A body of a known small size is read before it is sent on. A stream that the next Worker does not read to its end
   // throws "Can't read from request stream after response has been sent" here once the answer is out (cb4, 2026-10-08).
+  // Every Worker's stored settings, read at most once in 60 s for this instance. config.set drops this instance's copy.
+  let stored = null, storedAt = 0;
+  const settingsOf = async (worker) => {
+    if (!stored || Date.now() - storedAt >= (config.settingsMs ?? 60000)) {
+      stored = new Map((await rows.list("config/")).map(({ key, value }) => [key.slice("config/".length), value]));
+      storedAt = Date.now();
+    }
+    return stored.get(worker) || {};
+  };
   const bodyOf = async (c) => (+(c.req.header("content-length") || Infinity) <= 1e6 ? c.req.raw.arrayBuffer() : c.req.raw.body);
   const forward = async (route, c, path) => {
     const url = new URL(c.req.url), who = c.get("who");
@@ -24135,6 +24306,8 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     headers.set("x-brain-origin", origin.caller);
     if (origin.via) headers.set("x-brain-origin-via", origin.via);
     headers.set("x-brain-context", await contextFor(route.worker, origin));
+    // The Worker's stored settings. Always sent, so a removed key is seen as removed.
+    headers.set("x-brain-settings", encodeURIComponent(JSON.stringify(await settingsOf(route.worker))));
     // What a store needs to decide for a person: that they are a member, their file limit and the tags they were granted.
     if (person) {
       headers.set("x-brain-member", "1");
@@ -24413,6 +24586,53 @@ const _braincore_coreRig = function _coreRig(simulate,core_service,Response,sha2
   });
   return { sim, seen, toDeployer, deployer, as, worker, echo, heard, hear, send, owner: as("owner"), anonymous: as("anonymous", ""), nobody: send("https://core.internal", {}) };
 });};
+const _braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call = async function _test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call(Response,coreRig,expect) {
+  const got = [], logged = [];
+  const workers = {
+    conf: async (request) => {
+      if (new URL(request.url).pathname === "/xrpc/_config") return Response.json({ worker: "brain-x-conf", read: [{ key: "pollMs", value: 60000, from: "stored" }] });
+      got.push(JSON.parse(decodeURIComponent(request.headers.get("x-brain-settings"))));
+      return Response.json({ ok: true });
+    }
+  };
+  // settingsMs 0: this instance reads the rows on every call, as another instance does after 60 s.
+  const rig = await coreRig({ config: { settingsMs: 0 }, workers });
+  await rig.deployer("service.register", { worker: "brain-x-conf", role: "recipe", methods: { "com.lopecode.brain.conf.go": { type: "procedure", who: "owner" } }, paths: [], secrets: [], keyHash: "conf" });
+  const set = (who, body) => who("config.set", body);
+  const S = { worker: "brain-x-conf", key: "pollMs", value: 60000 };
+  // The owner's own session, and nobody else: a member, a token, a Worker, a caller with no account.
+  for (const who of [rig.as("did:plc:member"), rig.as("token:laptop", ""), rig.as("owner", "turn:1"), rig.worker, rig.anonymous]) expect((await set(who, S)).status).toBe(401);
+  expect((await rig.as("did:plc:member")("config.list")).status).toBe(401);
+  expect((await rig.anonymous("config.get?worker=brain-x-conf")).status).toBe(401);
+  await rig.owner("conf.go", {});
+  expect(got.pop()).toEqual({});
+  const log = console.log;
+  console.log = (line) => void (line && line.at === "config" ? logged.push(line) : null);
+  try {
+    expect((await set(rig.owner, S)).data).toEqual({ ...S, old: null });
+    expect((await set(rig.owner, { ...S, value: 45000 })).data).toEqual({ ...S, value: 45000, old: 60000 });
+  } finally {
+    console.log = log;
+  }
+  expect(logged.map((l) => [l.worker, l.key, l.old, l.value, l.by])).toEqual([["brain-x-conf", "pollMs", null, 60000, "owner"], ["brain-x-conf", "pollMs", 60000, 45000, "owner"]]);
+  await rig.owner("conf.go", {});
+  expect(got.pop()).toEqual({ pollMs: 45000 });
+  // A name set at deploy, a name that is not one, a value that is not plain, a Worker that takes none.
+  for (const key of ["owner", "host", "base", "subdomain", "account", "deployer", "self", "replacedBy", "acceptEmitted"]) expect((await set(rig.owner, { ...S, key })).status).toBe(400);
+  for (const body of [{ ...S, key: "a.b" }, { ...S, key: "__proto__" }, { ...S, value: { a: 1 } }, { ...S, value: "x".repeat(501) }, { ...S, value: [1] }]) expect((await set(rig.owner, body)).status).toBe(400);
+  for (const worker of ["brain", "brain-core", "brain-deployer", "brain-x-none"]) expect((await set(rig.owner, { ...S, worker })).status).toBe(404);
+  const seen = (await rig.owner("config.get?worker=brain-x-conf")).data;
+  expect(seen.values).toEqual({ pollMs: 45000 });
+  expect(seen.changes.map((c) => [c.by, c.key, c.old, c.value])).toEqual([["owner", "pollMs", null, 60000], ["owner", "pollMs", 60000, 45000]]);
+  expect(seen.read).toEqual([{ key: "pollMs", value: 60000, from: "stored" }]);
+  expect((await rig.owner("config.list")).data.workers).toEqual([{ worker: "brain-x-conf", values: { pollMs: 45000 } }]);
+  // null removes the key, and the Worker is sent none.
+  expect((await set(rig.owner, { ...S, value: null })).data).toEqual({ ...S, value: null, old: 45000 });
+  await rig.owner("conf.go", {});
+  expect(got.pop()).toEqual({});
+  expect((await rig.owner("config.list")).data.workers).toEqual([]);
+  return "set, sent, changed, removed; 5 callers and 18 requests refused";
+};
 const _braincore_test_calls_are_counted_and_handed_to_the_metrics_service = async function _test_calls_are_counted_and_handed_to_the_metrics_service(Response,coreRig,expect) {
   const batches = [];
   const workers = {
@@ -25141,12 +25361,13 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braincore_anon_0dd3d2b453", null, ["md"], _braincore_anon_0dd3d2b453);
+  $def("_braincore_anon_6aa2d00c67", null, ["md"], _braincore_anon_6aa2d00c67);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
   $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","decide"], _braincore_coreApp);
   $def("_braincore_anon_cf662cd9e9", null, ["md"], _braincore_anon_cf662cd9e9);
   $def("_braincore_coreRig", "coreRig", ["simulate","core_service","Response","sha256"], _braincore_coreRig);
+  $def("_braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call", "test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call", ["Response","coreRig","expect"], _braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call);
   $def("_braincore_test_calls_are_counted_and_handed_to_the_metrics_service", "test_calls_are_counted_and_handed_to_the_metrics_service", ["Response","coreRig","expect"], _braincore_test_calls_are_counted_and_handed_to_the_metrics_service);
   $def("_braincore_test_routes_by_method_and_path", "test_routes_by_method_and_path", ["coreRig","expect"], _braincore_test_routes_by_method_and_path);
   $def("_braincore_test_a_deploy_is_unverified_until_its_tests_are_reported", "test_a_deploy_is_unverified_until_its_tests_are_reported", ["coreRig","expect","sha256"], _braincore_test_a_deploy_is_unverified_until_its_tests_are_reported);
@@ -25215,7 +25436,7 @@ var Es=Object.defineProperty;var As=(e)=>e;function Ss(e,t){this[e]=As.bind(null
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainkernel_anon_9c52ce1263 = function _anonymous(md) {return (md`# brain-kernel
+const _brainkernel_anon_78f31ddacc = function _anonymous(md) {return (md`# brain-kernel
 
 The Worker at the Brain's address. It serves the notebook, signs people in with atproto, works out who is calling, and forwards everything else to the core with that answer attached.
 
@@ -25267,7 +25488,7 @@ A channel can narrow a turn with this and cannot widen one: the cap is taken ins
 
 **Members in the core.** After \`people.put\`, \`people.remove\`, \`grant.put\` and \`grant.delete\` the kernel sends the core every member with their grant, limits and tags (\`people.sync\`), because the core checks a member's Worker as its author.
 
-**Sessions.** No cookie is set or read. After atproto sign-in \`/auth/callback\` answers a page that writes a session token to this origin's \`localStorage\` (\`brain_session\`) and goes on; the Brain's page sends it as \`Authorization: Bearer\` with every call. \`/auth/login\` resolves a handle and calls a PDS for anyone, so it is counted: 60 starts in 10 minutes for all visitors together, then 429. Starts for the handle of the owner or of a member are counted apart, 600 in 10 minutes, so a flood of other handles does not keep them out. 600 starts that name the owner's own handle do keep the owner out, until the 10 minutes end. It is a signed \`{ did, exp, epoch }\`, lasts 30 days and is not renewed: after that the visitor signs in again. "Sign out" drops it from the page; "sign out everywhere" (\`/auth/logout?everywhere=true\`) raises the epoch, which ends every session, turn and portal token issued before. Because a caller is only ever who their token says, a page on another address has nothing of this Brain's to send, and \`Origin\` is not looked at. A link or an \`<img>\` cannot carry a token: a private file is fetched by the page and shown from the bytes. The secret that signs all three kinds of token is still named \`COOKIE_KEY\`.
+**Sessions.** No cookie is set or read. After atproto sign-in \`/auth/callback\` answers a page that writes a session token to this origin's \`localStorage\` (\`brain_session\`) and goes on; the Brain's page sends it as \`Authorization: Bearer\` with every call. \`/auth/login\` resolves a handle and calls a PDS for anyone, so it is counted: 60 starts in 10 minutes for all visitors together, then 429. Starts for the handle of the owner or of a member, once they have signed in here, are counted apart, 600 in 10 minutes, so a flood of other handles does not keep them out. 600 starts that name the owner's own handle do keep the owner out, until the 10 minutes end. It is a signed \`{ did, exp, epoch }\`, lasts 30 days and is not renewed: after that the visitor signs in again. "Sign out" drops it from the page; "sign out everywhere" (\`/auth/logout?everywhere=true\`) raises the epoch, which ends every session, turn and portal token issued before. Because a caller is only ever who their token says, a page on another address has nothing of this Brain's to send, and \`Origin\` is not looked at. A link or an \`<img>\` cannot carry a token: a private file is fetched by the page and shown from the bytes. The secret that signs all three kinds of token is still named \`COOKIE_KEY\`.
 
 Before 2026-10-07 13:40 the session was a \`SameSite=Lax\` cookie. \`NAME.SUBDOMAIN.workers.dev\` addresses are one site, so a page on another Worker's address sent it: on cb4 the owner's cookie with \`Origin: https://evil.endpointservices.workers.dev\` got 200 from \`GET library.list\` and \`POST token.revoke\`.
 
@@ -26505,7 +26726,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainkernel_anon_9c52ce1263", null, ["md"], _brainkernel_anon_9c52ce1263);
+  $def("_brainkernel_anon_78f31ddacc", null, ["md"], _brainkernel_anon_78f31ddacc);
   $def("_brainkernel_kernel_service", "kernel_service", ["cloudflare","kernelApp"], _brainkernel_kernel_service);
   $def("_brainkernel_kernel_announce", "kernel_announce", ["plugins","kernel_service","invalidation"], _brainkernel_kernel_announce);
   $def("_brainkernel_atcute", "atcute", ["library","FileAttachment"], _brainkernel_atcute);
@@ -27202,7 +27423,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainbluesky_anon_26e5a19b03 = function _anonymous(md) {return (md`# brain-bluesky
+const _brainbluesky_anon_c8aa3d1fb1 = function _anonymous(md) {return (md`# brain-bluesky
 
 A Cloud Brain channel: Bluesky messages to the Brain's own account arrive in the inbox, and answers go back with \`inbox.reply\`. A sender is their DID, so nobody links anything: the owner is answered from the first message, and anyone else once the owner has added their DID under People. In a group it answers the owner and people when they address it; see Groups.
 
@@ -27221,6 +27442,7 @@ A Cloud Brain channel: Bluesky messages to the Brain's own account arrive in the
 | \`bluesky.deleteRecord\` | procedure, the same callers. \`{ collection, rkey }\` deletes that record. \`{ did, handle, uri }\`. |
 | \`bluesky.status\` | query, owner. \`{ configured, handle, did, pds, signedIn, tick, lastPoll, lastError, backoffUntil, people, groups }\` |
 | Secrets | \`BLUESKY_HANDLE\`, \`BLUESKY_APP_PASSWORD\`. Read from the core at most once in 5 minutes for one instance (\`config.credsMs\`), so a changed secret is followed within 5 minutes. |
+| Settings | \`credsMs\` (300000): how long one instance keeps the two secrets. \`pollGapMs\` (3000): the least time between two reads of Bluesky. Changed with \`config.set\` on the core, no deploy. |
 | Storage | \`rows\`: \`session\`, \`refused\`, \`cursor\`, \`since\`, \`known/<did>\`, \`convo/<did>\`, \`direct/<convo>\`, \`group/<convo>\`, \`heard/<convo>\`, \`settings\`, \`declared\`, \`declareError\`, \`accepted/<convo>\`, \`asked/<did>\`, \`asks\`, \`quiet/<did>\`, \`polled\`, \`tick\`, \`busy\`, \`backoff\`, \`error\` |
 
 With either secret unset, a tick writes \`tick\` and stops: no request leaves the Worker, and \`bluesky.status\` answers \`{ configured: false }\`.`);};
@@ -28392,7 +28614,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainbluesky_anon_26e5a19b03", null, ["md"], _brainbluesky_anon_26e5a19b03);
+  $def("_brainbluesky_anon_c8aa3d1fb1", null, ["md"], _brainbluesky_anon_c8aa3d1fb1);
   $def("_brainbluesky_viewof_blueskyStatus", "viewof blueskyStatus", ["html","client","Inputs","session"], _brainbluesky_viewof_blueskyStatus);
   $def("_brainbluesky_blueskyStatus", "blueskyStatus", ["Generators","viewof blueskyStatus"], _brainbluesky_blueskyStatus);
   $def("_brainbluesky_bluesky_setup", "bluesky_setup", ["md"], _brainbluesky_bluesky_setup);
@@ -30026,6 +30248,9 @@ const _brainblob_test_blob_bytes_are_served_as_a_page_only_when_the_owner_set_th
   expect(await served(cid)).toEqual(page);
   expect((await rig.upload("owner", html, "text/plain")).status).toBe(200);
   expect([JSON.parse(rig.db.entries.get(cid).tags), await served(cid)]).toEqual([["by:owner", "by:" + A, "public"], text]);
+  // The owner by a turn is not the owner as an uploader: the same as a token's.
+  const turned = await (await rig.upload({ "x-brain-caller": "owner", "x-brain-via": "turn:7" }, "<p>four</p>", "text/html", "?public=true")).json();
+  expect([turned.tags, await served(turned.blob.ref.$link)]).toEqual([["by:owner:turn", "public"], page]);
   return "3 blobs: a person's, the owner's and a token's";
 };
 const _brainblob_test_blob_declares_what_it_needs = async function _test_blob_declares_what_it_needs(blob_service,expect) {
@@ -32878,7 +33103,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braininbox_anon_eb20726aa7 = function _anonymous(md) {return (md`# brain-inbox
+const _braininbox_anon_1f07439a48 = function _anonymous(md) {return (md`# brain-inbox
 
 What arrives from outside a Cloud Brain, kept in order until a tab has handled it.
 
@@ -32890,7 +33115,8 @@ What arrives from outside a Cloud Brain, kept in order until a tab has handled i
 | \`inbox.done\` | procedure, owner. \`{ id, failed }\`. \`failed\` is why it could not be handled; the entry is then finished as failed and is not handed out again. |
 | \`inbox.reply\` | procedure. \`{ id, text }\`. Sends \`text\` to the address entry \`id\` came from, through the channel it came from, and keeps it on the entry. An entry written in a room (\`body.room.id\`) is answered there: the channel is sent \`room\` beside \`to\`. The owner or a named token may answer any entry. A turn (\`x-brain-via: turn:<id>\`) may answer its own entry, and only while it is waiting. |
 | \`lease.take\` | procedure, owner. \`{ tab, release }\`. \`{ held, holder }\`. One tab holds it; unrenewed for 90 s it is free. |
-| \`inbox.poll\` | procedure, owner. \`{ tab }\`. \`{ held, holder, entries, waiting }\`: \`lease.take\` and the waiting entries in one call. |
+| \`inbox.poll\` | procedure, owner. \`{ tab }\`. \`{ held, holder, entries, waiting, wait }\`: \`lease.take\` and the waiting entries in one call. \`wait\`: the milliseconds the page waits before its next poll. |
+| Settings | \`pollMs\` (30000): what \`inbox.poll\` answers as \`wait\`. \`leaseMs\` (3 × \`pollMs\`): how long an unrenewed lease lasts. Changed with \`config.set\` on the core, no deploy. |
 | \`lease.get\` | query. A Worker or the owner. \`{ held }\` |
 | Storage | \`rows\`: \`inbox/<id>\` (waiting), \`inboxdone/<id>\`, \`inboxkey/<key>\`, \`inboxseq\`, \`lease\` |
 
@@ -32927,7 +33153,7 @@ const _braininbox_inbox_announce = function _inbox_announce(plugins,inbox_servic
   plugins.add("workers", inbox_service, { invalidation });
   return "announced inbox_service";
 };
-const _braininbox_inboxApp = function _inboxApp(hono,rows,xrpc) {
+const _braininbox_inboxApp = function _inboxApp(hono,rows,xrpc,config) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.";
   const pad = (n) => String(n).padStart(12, "0");
@@ -32984,11 +33210,13 @@ const _braininbox_inboxApp = function _inboxApp(hono,rows,xrpc) {
     await rows.put((waiting ? "inbox/" : "inboxdone/") + pad(id), { ...entry, replies: [...(entry.replies || []), { at: Date.now(), by: from, text: said }].slice(-20) });
     return c.json({ id, sent: true });
   });
-  // One tab answers at a time. The page polls every 30 s, so a tab that stops renewing loses the lease after 90 s: 3 polls.
-  const LEASE = 90000;
+  // One tab answers at a time. The page polls every pollMs (30 s), so a tab that stops renewing loses the lease after
+  // 3 polls (90 s). Both are settings, read on each call: the owner changes them with config.set and no deploy.
+  const pollMs = () => Math.max(2000, Number(config.pollMs ?? 30000) || 30000);
+  const leaseMs = () => Math.max(pollMs() + 5000, Number(config.leaseMs ?? 3 * pollMs()) || 3 * pollMs());
   const take = async (tab) => {
     const now = Date.now(), held = await rows.get("lease");
-    const free = !held || held.tab === tab || now - held.at > LEASE;
+    const free = !held || held.tab === tab || now - held.at > leaseMs();
     if (free) await rows.put("lease", { tab, at: now });
     return { held: free, holder: free ? tab : held.tab };
   };
@@ -33004,13 +33232,13 @@ const _braininbox_inboxApp = function _inboxApp(hono,rows,xrpc) {
     if (typeof tab !== "string" || !tab) return fail(c, 400, "InvalidRequest", "tab");
     const lease = await take(tab);
     const entries = lease.held ? (await rows.list("inbox/")).map((r) => r.value) : [];
-    return c.json({ ...lease, entries: entries.slice(0, 50), waiting: entries.length });
+    return c.json({ ...lease, entries: entries.slice(0, 50), waiting: entries.length, wait: pollMs() });
   });
   app.get(NS + "lease.get", async (c) => {
     const from = who(c);
     if (from !== "owner" && !/^(token|did|worker):/.test(from)) return fail(c, 401, "AuthRequired", "the owner or a Worker");
     const held = await rows.get("lease");
-    return c.json({ held: !!held && Date.now() - held.at <= LEASE });
+    return c.json({ held: !!held && Date.now() - held.at <= leaseMs() });
   });
   return app;
 };
@@ -33044,10 +33272,10 @@ const _braininbox_inboxRig = function _inboxRig(simulate,inbox_service,Response)
     }
   });
   const X = "/xrpc/com.lopecode.brain.";
-  const as = (who, via = "") => async (path, body) => {
+  const as = (who, via = "", more = {}) => async (path, body) => {
     const r = await sim.fetch("https://inbox.internal" + X + path, {
       method: body === undefined ? "GET" : "POST",
-      headers: { "x-brain-caller": who, "x-brain-via": via, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      headers: { "x-brain-caller": who, "x-brain-via": via, ...more, ...(body === undefined ? {} : { "content-type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body)
     });
     return { status: r.status, data: await r.json() };
@@ -33091,7 +33319,15 @@ const _braininbox_test_lease_one_tab_at_a_time = async function _test_lease_one_
   // poll is the lease and the waiting entries in one call. A tab without the lease is handed nothing.
   await rig.worker("inbox.append", { source: "t", key: "k1", body: 1 });
   expect((await rig.owner("inbox.poll", { tab: "a" })).data).toMatchObject({ held: true, holder: "a", waiting: 1 });
-  expect((await rig.owner("inbox.poll", { tab: "b" })).data).toEqual({ held: false, holder: "a", entries: [], waiting: 0 });
+  expect((await rig.owner("inbox.poll", { tab: "b" })).data).toEqual({ held: false, holder: "a", entries: [], waiting: 0, wait: 30000 });
+  // The owner stored pollMs 60000 (config.set): the page is told to wait that long, and the lease lasts 3 of them.
+  const slow = { "x-brain-settings": encodeURIComponent(JSON.stringify({ pollMs: 60000 })) };
+  expect((await rig.as("owner", "", slow)("inbox.poll", { tab: "a" })).data.wait).toBe(60000);
+  rig.sim.rows.set("lease", { tab: "a", at: Date.now() - 91000 });
+  expect((await rig.worker("lease.get")).data).toEqual({ held: true });
+  rig.sim.rows.set("lease", { tab: "a", at: Date.now() - 181000 });
+  expect((await rig.worker("lease.get")).data).toEqual({ held: false });
+  expect((await rig.as("owner", "", { "x-brain-settings": "%7B%7D" })("inbox.poll", { tab: "a" })).data.wait).toBe(30000);
   expect((await rig.worker("inbox.poll", { tab: "w" })).status).toBe(401);
   return "a, then b after 91 s, then released, then polled";
 };
@@ -33138,11 +33374,11 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braininbox_anon_eb20726aa7", null, ["md"], _braininbox_anon_eb20726aa7);
+  $def("_braininbox_anon_1f07439a48", null, ["md"], _braininbox_anon_1f07439a48);
   $def("_braininbox_inboxView", "inboxView", ["inboxPanel","client","session"], _braininbox_inboxView);
   $def("_braininbox_inbox_service", "inbox_service", ["cloudflare","inboxApp"], _braininbox_inbox_service);
   $def("_braininbox_inbox_announce", "inbox_announce", ["plugins","inbox_service","invalidation"], _braininbox_inbox_announce);
-  $def("_braininbox_inboxApp", "inboxApp", ["hono","rows","xrpc"], _braininbox_inboxApp);
+  $def("_braininbox_inboxApp", "inboxApp", ["hono","rows","xrpc","config"], _braininbox_inboxApp);
   $def("_braininbox_inboxPanel", "inboxPanel", ["htl","Inputs"], _braininbox_inboxPanel);
   $def("_braininbox_anon_be3d699220", null, ["md"], _braininbox_anon_be3d699220);
   $def("_braininbox_inboxRig", "inboxRig", ["simulate","inbox_service","Response"], _braininbox_inboxRig);
@@ -33154,6 +33390,7 @@ export default function define(runtime, observer) {
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("rows", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("rows", _));
   main.define("xrpc", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("xrpc", _));
+  main.define("config", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("config", _));
   main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("module @tomlarkworthy/cloud-brain", [], async () => runtime.module((await import("/@tomlarkworthy/cloud-brain.js?v=4")).default));
@@ -35179,7 +35416,7 @@ const _cloudbrain_inboxStarted = function _inboxStarted() {return (new Set());};
 const _cloudbrain_inboxPump = async function* _inboxPump(brain,invalidation,client,inboxHandlers,inboxStarted,conversationTurn) {
   if (!brain) return yield { answering: false, waiting: null, reason: "no owner session" };
   const tab = Math.random().toString(36).slice(2, 10);
-  let stopped = false, status = { answering: false, waiting: 0, tab }, readNext = 0;
+  let stopped = false, status = { answering: false, waiting: 0, tab }, readNext = 0, wait = 30000;
   invalidation.then(() => {
     stopped = true;
     client.procedure("lease.take", { tab, release: true }).catch(() => null);
@@ -35195,6 +35432,8 @@ const _cloudbrain_inboxPump = async function* _inboxPump(brain,invalidation,clie
           if (!read || read.configured === false) readNext = Date.now() + 300000;
         }
         const turn = await client.procedure("inbox.poll", { tab });
+        // The inbox says how long to wait: its setting pollMs, which the owner changes with config.set and no deploy.
+        if (turn.wait >= 2000) wait = turn.wait;
         let left = turn.waiting;
         for (const entry of turn.entries) {
           // From a channel: a Worker's entry that says which address wrote.
@@ -35223,8 +35462,8 @@ const _cloudbrain_inboxPump = async function* _inboxPump(brain,invalidation,clie
       if (status.error !== e.message) yield (status = { ...status, answering: false, error: e.message });
     }
     // One call a turn. The rows it reads are in D1, which bills nothing between calls.
-    // 30 s (Tom, 2026-10-09): a message waits up to that long. The lease lasts 3 of these.
-    await new Promise((r) => setTimeout(r, 30000));
+    // 30 s unless the inbox says another (Tom, 2026-10-09): a message waits up to that long. The lease lasts 3 of these.
+    await new Promise((r) => setTimeout(r, wait));
   }
 };
 const _cloudbrain_deployerInbox = function _deployerInbox(plugins,$0,invalidation) {
