@@ -23734,7 +23734,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braincore_anon_936102ae77 = function _anonymous(md) {return (md`# brain-core
+const _braincore_anon_507b67b9a2 = function _anonymous(md) {return (md`# brain-core
 
 The Worker every other Worker is bound to. It routes a method or a path to the Worker of the service that declared it, and keeps what must last: the notebook-side rows, the route table and the rules the owner sets.
 
@@ -23787,7 +23787,6 @@ A rule that does not name \`origin\` lets the Worker act for anyone it answers. 
 | whatsapp → \`static.put\` | no | a picture that arrived, with no caller |
 | bluesky, whatsapp → \`lease.get\`, \`inbox.append\` | no | started by the Worker's own clock |
 | any → \`secret.get\`, \`db.sql\` | no | the Worker's own secrets and tables |
-| core → \`metrics.record\` | no | the core's own counts |
 
 **Settings** (added 2026-10-09). A value a service reads from \`config\` and gives a default (\`config.pollMs ?? 30000\`) can be stored here, per Worker, and is read with no deploy. A service does nothing to take part: the core sends a Worker's stored settings with each call it forwards (\`x-brain-settings\`), and the Worker wrapper shows them through \`config\`. The core reads the rows at most once in 60 s for one instance, so a change is followed within 60 s. A Worker run only by its clock reads the row itself, at most once in 5 minutes.
 
@@ -23895,29 +23894,6 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
       return null;
     }
   };
-  // Every call the core answers or forwards is counted here. The counts are handed, in batches, to whichever
-  // Worker whose service declares metrics.record; with none they are dropped. A fault (500 and above, except 501) is sent at once, the rest every 10 s.
-  const RECORD = "com.lopecode.brain.metrics.record";
-  const tele = { from: 0, buckets: new Map(), errors: [], route: null, routeAt: 0 };
-  const flush = async () => {
-    const batch = {
-      from: tele.from,
-      to: Date.now(),
-      buckets: [...tele.buckets].map(([k, v]) => {
-        const [worker, version, method, caller, status] = k.split("|");
-        return { worker, version, method, caller, status: Number(status), ...v };
-      }),
-      errors: tele.errors
-    };
-    Object.assign(tele, { from: 0, buckets: new Map(), errors: [] });
-    if (Date.now() - tele.routeAt >= (config.metricsRouteMs ?? 60000)) {
-      tele.route = (await settings.list("route/")).map((r) => r.value).find((r) => r.methods && r.methods[RECORD]) || null;
-      tele.routeAt = Date.now();
-    }
-    const short = tele.route && tele.route.worker.replace(/^brain-(x-)?/, "");
-    if (!short || !workers.has(short)) return;
-    await workers.fetch(short, new Request(`https://${short}.internal/xrpc/${RECORD}`, { method: "POST", headers: { "content-type": "application/json", "x-brain-caller": "worker:brain-core" }, body: JSON.stringify(batch) }));
-  };
   // A method as it is counted and logged: the name after com.lopecode.brain., or the path a service declared.
   // Names nobody declared are counted as one, so a stranger cannot grow the table.
   // Declared: a service's route matched (routeOf), or the core has a handler at this path. Not decided by the status.
@@ -23960,22 +23936,6 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
       method: nsid || c.get("path") ? nameOf(c).slice(0, 80) : "(unknown)", worker: c.get("target") || c.get("routed") || "brain-core", status, error: (await error) || null, ms: Date.now() - started,
       price: c.get("price") ?? null, rule: c.get("rule") || (status === 401 || status === 403 ? "deny" : status < 400 ? "allow" : ""), by: c.get("by") || "core"
     });
-  };
-  const observe = async (c, started) => {
-    const target = c.get("target"), status = c.res.status, ms = Date.now() - started;
-    const method = nameOf(c);
-    if (method.startsWith("metrics.")) return;
-    const who = c.get("who").caller, caller = /^(token|did):/.test(who) ? who.split(":")[0] : who;
-    // The version that answered: the forwarded Worker's own header, or this core's.
-    const by = (c.res.headers.get("x-brain-served-by") || "").split(",")[0].trim();
-    const version = target ? (by.startsWith(target + "@") ? by.slice(target.length + 1) : "") : String((c.env && c.env.BRAIN_INFO && c.env.BRAIN_INFO.hash) || "").slice(0, 12);
-    const key = [target || "brain-core", version, method, caller, status].join("|");
-    const b = tele.buckets.get(key) || { n: 0, ms: 0, max: 0 };
-    tele.buckets.set(key, { n: b.n + 1, ms: b.ms + ms, max: Math.max(b.max, ms) });
-    // 501 is the answer to a name nobody declares: the caller's mistake, not a fault.
-    if (status >= 500 && status !== 501) tele.errors.push({ t: started, worker: target || "brain-core", version, method, caller, status, ms });
-    if (!tele.from) tele.from = started;
-    if (tele.errors.length || Date.now() - tele.from >= (config.metricsFlushMs ?? 10000)) await flush();
   };
   // Members. The kernel hands over who is a member and what each was granted (people.sync), because a Worker
   // cannot ask the kernel. A member's Worker has its author's permissions and no others: a call it makes is
@@ -24068,7 +24028,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     const now = c.get("who");
     c.set("origin", (who.keyed && (await originFrom(c.req.header("x-brain-context"), who.keyed))) || { caller: now.caller, via: now.via || "" });
     await next();
-    const done = Promise.all([say(c, started, c.res.status, errorOf(c, c.res)), observe(c, started)]).catch(() => null);
+    const done = say(c, started, c.res.status, errorOf(c, c.res)).catch(() => null);
     try {
       c.executionCtx.waitUntil(done);
     } catch {}
@@ -24743,40 +24703,6 @@ const _braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwar
   expect(got.pop()).toEqual({});
   expect((await rig.owner("config.list")).data.workers).toEqual([]);
   return "set, sent, changed, removed; 5 callers and 18 requests refused";
-};
-const _braincore_test_calls_are_counted_and_handed_to_the_metrics_service = async function _test_calls_are_counted_and_handed_to_the_metrics_service(Response,coreRig,expect) {
-  const batches = [];
-  const workers = {
-    metrics: async (request) => (batches.push({ caller: request.headers.get("x-brain-caller"), ...(await request.json()) }), Response.json({ stored: 1 })),
-    broken: async () => new Response("boom", { status: 500 })
-  };
-  const settle = () => new Promise((r) => setTimeout(r, 20));
-  // The counter is the Worker's own state and outlives a rig, so both waits are set to nothing here.
-  const rig = await coreRig({ config: { metricsFlushMs: 0, metricsRouteMs: 0 }, workers });
-  const reg = (worker, methods) => rig.deployer("service.register", { worker, role: "recipe", methods, paths: [], secrets: [], keyHash: worker });
-  await reg("brain-x-metrics", { "com.lopecode.brain.metrics.record": { type: "procedure", who: "worker:brain-core" }, "com.lopecode.brain.metrics.query": { type: "query", who: "owner" } });
-  await reg("brain-x-broken", { "com.lopecode.brain.broken.go": { type: "procedure", who: "owner" } });
-  await settle();
-  batches.length = 0;
-  await rig.owner("echo.say", { text: "hi" });
-  await rig.anonymous("/hooks/echo");
-  await rig.anonymous("made.up.name");
-  await rig.owner("broken.go", {});
-  // Its own traffic is not counted.
-  await rig.owner("metrics.query");
-  await settle();
-  expect(batches.every((b) => b.caller === "worker:brain-core")).toBe(true);
-  const got = batches.flatMap((b) => b.buckets).map((b) => [b.worker, b.method, b.caller, b.status, b.n]);
-  // The broken Worker here is a bare function with no wrapper, so it names no version; the core names its own.
-  expect(batches.flatMap((b) => b.buckets).map((b) => b.version)).toEqual(["", "", rig.sim.emitted.hash.slice(0, 12), ""]);
-  expect(got).toEqual([
-    ["brain-x-echo", "echo.say", "owner", 200, 1],
-    ["brain-x-echo", "/hooks/echo", "anonymous", 200, 1],
-    ["brain-core", "(unknown)", "anonymous", 501, 1],
-    ["brain-x-broken", "broken.go", "owner", 500, 1]
-  ]);
-  expect(batches.flatMap((b) => b.errors)).toMatchObject([{ worker: "brain-x-broken", method: "broken.go", status: 500 }]);
-  return got.length + " counted";
 };
 const _braincore_test_routes_by_method_and_path = async function _test_routes_by_method_and_path(coreRig,expect) {
   const rig = await coreRig();
@@ -25472,7 +25398,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braincore_anon_936102ae77", null, ["md"], _braincore_anon_936102ae77);
+  $def("_braincore_anon_507b67b9a2", null, ["md"], _braincore_anon_507b67b9a2);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
   $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","decide"], _braincore_coreApp);
@@ -25480,7 +25406,6 @@ export default function define(runtime, observer) {
   $def("_braincore_coreRig", "coreRig", ["simulate","core_service","Response","sha256"], _braincore_coreRig);
   $def("_braincore_test_llms_txt_is_written_from_the_host_and_the_route_table", "test_llms_txt_is_written_from_the_host_and_the_route_table", ["coreRig","expect"], _braincore_test_llms_txt_is_written_from_the_host_and_the_route_table);
   $def("_braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call", "test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call", ["Response","coreRig","expect"], _braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call);
-  $def("_braincore_test_calls_are_counted_and_handed_to_the_metrics_service", "test_calls_are_counted_and_handed_to_the_metrics_service", ["Response","coreRig","expect"], _braincore_test_calls_are_counted_and_handed_to_the_metrics_service);
   $def("_braincore_test_routes_by_method_and_path", "test_routes_by_method_and_path", ["coreRig","expect"], _braincore_test_routes_by_method_and_path);
   $def("_braincore_test_a_deploy_is_unverified_until_its_tests_are_reported", "test_a_deploy_is_unverified_until_its_tests_are_reported", ["coreRig","expect","sha256"], _braincore_test_a_deploy_is_unverified_until_its_tests_are_reported);
   $def("_braincore_test_a_worker_calls_a_method_not_a_worker", "test_a_worker_calls_a_method_not_a_worker", ["coreRig","sha256","expect"], _braincore_test_a_worker_calls_a_method_not_a_worker);
@@ -28790,378 +28715,6 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/cloud-brain", [], async () => runtime.module((await import("/@tomlarkworthy/cloud-brain.js?v=4")).default));
   main.define("client", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("client", _));
   main.define("session", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("session", _));
-  return main;
-}
-</script>
-<script id="@tomlarkworthy/brain-metrics" 
-  type="text/plain"
-  data-mime="application/javascript"
->
-const _brainmetrics_anon_1f15a5af52 = function _anonymous(md) {return (md`# brain-metrics
-
-Call counts, latency and errors for a Cloud Brain, and the charts that read them.
-
-| | |
-|---|---|
-| Worker | \`brain-x-metrics\` |
-| \`metrics.record\` | procedure, \`worker:brain-core\`. Stores one batch. |
-| \`metrics.query\` | query, anyone. \`since\`, \`until\` (ms), \`step\` (ms, at least 60000). At most 8 days. |
-| Storage | \`sql\`: two tables in the Brain's table database, reached through \`brain-db\`. \`metrics_calls(t, worker, version, method, caller, status, n, ms, max)\`, one row per minute and combination, and \`metrics_faults(t, worker, version, method, caller, status, ms)\`. Rows older than 14 days are deleted. |
-
-The core counts every call it answers or forwards and sends a batch every 10 s, or at once after a fault. A fault is a status of 500 or above, except 501, which is the answer to a name no service declares. A batch:
-
-\`\`\`js
-{ from, to,                                                   // ms
-  buckets: [{ worker, version, method, caller, status, n, ms, max }],  // ms is the sum over n calls
-  errors:  [{ t, worker, version, method, caller, status, ms }] }      // faults
-\`\`\`
-
-\`version\` is the first 12 characters of the hash of the Worker that answered, read from the \`x-brain-served-by\` header every Worker adds to its responses. \`caller\` is \`owner\`, \`anonymous\`, \`token\`, \`did\`, \`deployer\` or \`worker:NAME\`. \`method\` is the name after \`com.lopecode.brain.\`, a declared path, or \`(unknown)\` for a name no service declares. Calls to \`metrics.*\` are not counted.
-
-Not counted: calls that do not pass through the core (the deployer's health checks, a Worker's own \`fetch\` to the internet, sign-in on the kernel). Counts held by a core isolate that stops before its next call are lost, up to 10 s of them.`);};
-const _brainmetrics_metrics_service = function _metrics_service(cloudflare,metricsApp) {return (cloudflare.Service("metrics", metricsApp, {
-  methods: {
-    "com.lopecode.brain.metrics.record": { type: "procedure", who: "worker:brain-core" },
-    "com.lopecode.brain.metrics.query": { type: "query", who: "anyone" }
-  }
-}));};
-const _brainmetrics_metrics_announce = function _metrics_announce(plugins,metrics_service,invalidation) {
-  plugins.add("workers", metrics_service, { invalidation });
-  return "announced metrics_service";
-};
-const _brainmetrics_metricsApp = function _metricsApp(hono,metricsSchema,sql,metricsSql) {
-  const app = new hono.Hono();
-  const NS = "/xrpc/com.lopecode.brain.metrics.";
-  const fail = (c, status, error, message) => c.json({ error, message }, status);
-  const DAY = 86400000, MINUTE = 60000, KEEP = 14;
-  // Made by the first call an instance answers. A call is counted into the row of its minute.
-  let ready = null, pruned = 0;
-  // One call each: brain-db reads the plan of every statement of a batch before it runs any, and an index cannot
-  // be planned on a table the same batch makes.
-  const schema = () =>
-    (ready ??= (async () => {
-      for (const s of metricsSchema) await sql.exec(s);
-    })().catch((e) => {
-      ready = null;
-      throw e;
-    }));
-  app.post(NS + "record", async (c) => {
-    const b = await c.req.json().catch(() => null);
-    if (!b || !Array.isArray(b.buckets)) return fail(c, 400, "InvalidRequest", "buckets");
-    await schema();
-    const t = Math.floor((Number(b.from) || Date.now()) / MINUTE) * MINUTE;
-    const writes = [];
-    for (const x of b.buckets.slice(0, 500))
-      writes.push([metricsSql.count, t, String(x.worker), String(x.version || ""), String(x.method), String(x.caller), Number(x.status) || 0, Number(x.n) || 0, Number(x.ms) || 0, Number(x.max) || 0]);
-    for (const x of (b.errors || []).slice(0, 50))
-      writes.push([metricsSql.fault, Number(x.t) || t, String(x.worker), String(x.version || ""), String(x.method), String(x.caller), Number(x.status) || 0, Number(x.ms) || 0]);
-    if (writes.length) await sql.batch(writes);
-    return c.json({ stored: b.buckets.length });
-  });
-  app.get(NS + "query", async (c) => {
-    const until = Number(c.req.query("until")) || Date.now();
-    const since = Number(c.req.query("since")) || until - 3600000;
-    const step = Math.max(MINUTE, Math.floor((Number(c.req.query("step")) || MINUTE) / MINUTE) * MINUTE);
-    if (!(until > since) || until - since > 8 * DAY) return fail(c, 400, "InvalidRequest", "since and until, at most 8 days apart");
-    await schema();
-    // Once a day for each instance: delete what is past KEEP.
-    if (Date.now() - pruned > DAY) {
-      pruned = Date.now();
-      await sql.batch([[metricsSql.pruneCalls, pruned - KEEP * DAY], [metricsSql.pruneFaults, pruned - KEEP * DAY]]);
-    }
-    // A minute is in the range when any of it is.
-    const from = Math.floor(since / MINUTE) * MINUTE;
-    const [series, errors] = await sql.batch([[metricsSql.series, from, until, step], [metricsSql.faults, since, until]]);
-    return c.json({ since, until, step, series: series.rows, errors: errors.rows });
-  });
-  return app;
-};
-const _brainmetrics_metricsSchema = function _metricsSchema() {return ([
-  "CREATE TABLE IF NOT EXISTS metrics_calls (t INTEGER NOT NULL, worker TEXT NOT NULL, version TEXT NOT NULL, method TEXT NOT NULL, caller TEXT NOT NULL, status INTEGER NOT NULL, n INTEGER NOT NULL, ms REAL NOT NULL, max REAL NOT NULL, PRIMARY KEY (t, worker, version, method, caller, status)) WITHOUT ROWID",
-  "CREATE TABLE IF NOT EXISTS metrics_faults (t INTEGER NOT NULL, worker TEXT NOT NULL, version TEXT NOT NULL, method TEXT NOT NULL, caller TEXT NOT NULL, status INTEGER NOT NULL, ms REAL NOT NULL)",
-  "CREATE INDEX IF NOT EXISTS metrics_faults_t ON metrics_faults (t)"
-]);};
-const _brainmetrics_metricsSql = function _metricsSql() {return ({
-  count:
-    "INSERT INTO metrics_calls (t, worker, version, method, caller, status, n, ms, max) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (t, worker, version, method, caller, status) DO UPDATE SET n = n + excluded.n, ms = ms + excluded.ms, max = MAX(max, excluded.max)",
-  fault: "INSERT INTO metrics_faults (t, worker, version, method, caller, status, ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-  series:
-    // D1 binds a number as a float, and t / 300000.0 does not round down: the step is cast.
-    "SELECT (t / CAST(?3 AS INTEGER)) * CAST(?3 AS INTEGER) AS t, worker, version, method, caller, status, SUM(n) AS n, SUM(ms) AS ms, MAX(max) AS max FROM metrics_calls WHERE t >= ?1 AND t <= ?2 GROUP BY 1, worker, version, method, caller, status ORDER BY 1",
-  faults: "SELECT t, worker, version, method, caller, status, ms FROM metrics_faults WHERE t >= ?1 AND t <= ?2 ORDER BY t DESC LIMIT 500",
-  pruneCalls: "DELETE FROM metrics_calls WHERE t < ?1",
-  pruneFaults: "DELETE FROM metrics_faults WHERE t < ?1"
-});};
-const _brainmetrics_anon_ea6654a1bb = function _anonymous(md) {return (md`## Dashboard
-
-\`metricsData\` is the answer of \`metrics.query\` for the chosen range, in 60 steps. Without a Brain (a local copy of the notebook) it is \`sampleMetrics()\`, and the heading says so. Each chart is a function of that answer:
-
-| | |
-|---|---|
-| \`healthStrip(data)\` | one row per Worker, one cell per step, coloured by the share of calls that were faults |
-| \`requestsChart(data)\` | calls per step, stacked by Worker |
-| \`latencyChart(data)\` | mean (line) and slowest (dot) call per step, by Worker, in ms |
-| \`errorsChart(data)\` | calls per step that returned 400 or above, by status |
-| \`methodTable(data, { link })\` | one row per Worker, version and method: calls, refused (4xx and 501), faults, mean and max ms |
-| \`errorTable(data)\` | the faults, newest first, with a search box |
-| \`dashboard(panels)\` | lays out \`[{ title, body, wide }]\` in a grid |`);};
-const _brainmetrics_brainOrigin = function _brainOrigin(location) {return (location.protocol === "https:" && !/observableusercontent\.com$|^localhost$/.test(location.hostname) ? location.origin : null);};
-const _brainmetrics_metricsClient = function _metricsClient(brainOrigin,xrpcClient,globalThis) {return (brainOrigin
-  ? xrpcClient(brainOrigin, {
-      namespace: "com.lopecode.brain",
-      headers: () => {
-        try {
-          const token = globalThis.localStorage.getItem("brain_session");
-          return token ? { authorization: "Bearer " + token } : {};
-        } catch {
-          return {};
-        }
-      }
-    })
-  : null);};
-const _brainmetrics_viewof_metricsRange = function _metricsRange(Inputs) {return (Inputs.radio(new Map([["1 hour", 3600000], ["6 hours", 6 * 3600000], ["24 hours", 24 * 3600000], ["7 days", 7 * 24 * 3600000]]), { value: 3600000, label: "Range" }));};
-const _brainmetrics_metricsRange = (G, _) => G.input(_);
-const _brainmetrics_viewof_metricsRefresh = function _metricsRefresh(Inputs) {return (Inputs.button("Refresh"));};
-const _brainmetrics_metricsRefresh = (G, _) => G.input(_);
-const _brainmetrics_metricsData = async function _metricsData(metricsRefresh,metricsRange,metricsClient,sampleMetrics) {
-  metricsRefresh;
-  const until = Date.now(), since = until - metricsRange, step = Math.max(60000, Math.round(metricsRange / 60 / 60000) * 60000);
-  if (!metricsClient) return { ...sampleMetrics({ since, until, step }), sample: true };
-  try {
-    return await metricsClient.query("metrics.query", { since, until, step });
-  } catch (e) {
-    return { since, until, step, series: [], errors: [], error: String((e && e.message) || e) };
-  }
-};
-const _brainmetrics_metricsBoard = function _metricsBoard(dashboard,healthStrip,metricsData,width,requestsChart,latencyChart,errorsChart,methodTable,errorTable,d3) {return (dashboard([
-  { title: "Health", body: healthStrip(metricsData, { width }), wide: true },
-  { title: "Calls", body: requestsChart(metricsData, { width: width / 2 - 24 }) },
-  { title: "Latency, ms", body: latencyChart(metricsData, { width: width / 2 - 24 }) },
-  { title: "Calls that failed", body: errorsChart(metricsData, { width: width / 2 - 24 }) },
-  { title: "By method", body: methodTable(metricsData) },
-  { title: "Faults", body: errorTable(metricsData), wide: true }
-], { note: metricsData.sample ? "Sample data: this copy of the notebook is not served by a Brain." : metricsData.error ? "metrics.query failed: " + metricsData.error : `${metricsData.batches} batches, ${d3.sum(metricsData.series, (d) => d.n)} calls` }));};
-const _brainmetrics_rollup = function _rollup() {return ((series, keys) => {
-  const out = new Map();
-  for (const d of series) {
-    const k = keys.map((key) => d[key]).join("|");
-    const m = out.get(k) || { ...Object.fromEntries(keys.map((key) => [key, d[key]])), n: 0, ms: 0, max: 0, e4: 0, e5: 0 };
-    out.set(k, { ...m, n: m.n + d.n, ms: m.ms + d.ms, max: Math.max(m.max, d.max), e4: m.e4 + ((d.status >= 400 && d.status < 500) || d.status === 501 ? d.n : 0), e5: m.e5 + (d.status >= 500 && d.status !== 501 ? d.n : 0) });
-  }
-  return [...out.values()];
-});};
-const _brainmetrics_chartBase = function _chartBase() {return ((data, { width = 640, height = 200 } = {}) => ({
-  width,
-  height,
-  marginLeft: 44,
-  style: { background: "transparent", color: "var(--theme-foreground)", fontSize: "11px" },
-  x: { type: "time", domain: [new Date(data.since), new Date(data.until)], label: null }
-}));};
-const _brainmetrics_requestsChart = function _requestsChart(rollup,Plot,chartBase) {return ((data, options = {}) => {
-  const rows = rollup(data.series, ["t", "worker"]);
-  return Plot.plot({
-    ...chartBase(data, options),
-    y: { label: "calls", grid: true },
-    color: { legend: true },
-    marks: [
-      Plot.rectY(rows, Plot.stackY({ x1: (d) => new Date(d.t), x2: (d) => new Date(d.t + data.step), y: "n", fill: "worker", insetRight: 1, tip: true })),
-      Plot.ruleY([0])
-    ]
-  });
-});};
-const _brainmetrics_latencyChart = function _latencyChart(rollup,Plot,chartBase) {return ((data, options = {}) => {
-  const rows = rollup(data.series, ["t", "worker"]).map((d) => ({ ...d, at: new Date(d.t + data.step / 2), mean: d.ms / d.n }));
-  return Plot.plot({
-    ...chartBase(data, options),
-    y: { label: "ms", grid: true, type: rows.some((d) => d.max > 2000) ? "sqrt" : "linear" },
-    color: { legend: true },
-    marks: [
-      Plot.line(rows, { x: "at", y: "mean", z: "worker", stroke: "worker" }),
-      Plot.dot(rows, { x: "at", y: "max", stroke: "worker", r: 1.5, tip: true }),
-      Plot.ruleY([0])
-    ]
-  });
-});};
-const _brainmetrics_errorsChart = function _errorsChart(rollup,htl,Plot,chartBase) {return ((data, options = {}) => {
-  const rows = rollup(data.series.filter((d) => d.status >= 400), ["t", "status"]).map((d) => ({ ...d, status: String(d.status) }));
-  if (!rows.length) return htl.html`<div style="color:var(--theme-foreground-muted)">None in this range.</div>`;
-  return Plot.plot({
-    ...chartBase(data, options),
-    y: { label: "calls", grid: true },
-    color: { legend: true, type: "ordinal", scheme: "YlOrRd" },
-    marks: [
-      Plot.rectY(rows, Plot.stackY({ x1: (d) => new Date(d.t), x2: (d) => new Date(d.t + data.step), y: "n", fill: "status", insetRight: 1, tip: true })),
-      Plot.ruleY([0])
-    ]
-  });
-});};
-const _brainmetrics_healthStrip = function _healthStrip(rollup,Plot,chartBase) {return ((data, options = {}) => {
-  const rows = rollup(data.series, ["t", "worker"]).map((d) => ({ ...d, share: d.e5 / d.n }));
-  const names = [...new Set(rows.map((d) => d.worker))].sort();
-  return Plot.plot({
-    ...chartBase(data, { ...options, height: 40 + 22 * Math.max(1, names.length) }),
-    marginLeft: 130,
-    y: { domain: names, label: null },
-    color: { domain: [0, 1], range: ["#2e9e5b", "#e5484d"], legend: true, label: "share of calls that were faults", tickFormat: "%" },
-    marks: [Plot.barX(rows, { x1: (d) => new Date(d.t), x2: (d) => new Date(d.t + data.step), y: "worker", fill: "share", insetRight: 1, title: (d) => `${d.worker}\n${d.n} calls, ${d.e5} failed` })]
-  });
-});};
-const _brainmetrics_methodTable = function _methodTable(Inputs,rollup) {return ((data, { link = null } = {}) =>
-  Inputs.table(
-    rollup(data.series, ["worker", "version", "method"]).map((d) => ({ worker: d.worker, version: d.version, method: d.method, calls: d.n, refused: d.e4, faults: d.e5, "mean ms": Math.round(d.ms / d.n), "max ms": d.max })).sort((a, b) => b.calls - a.calls),
-    { select: false, rows: 12, layout: "auto", format: link ? { worker: (v) => link(v, v) || v } : {} }
-  ));};
-const _brainmetrics_errorTable = function _errorTable(htl,Inputs) {return ((data) => {
-  const rows = data.errors.map((e) => ({ at: new Date(e.t), worker: e.worker, version: e.version || "", method: e.method, caller: e.caller, status: e.status, ms: e.ms }));
-  if (!rows.length) return htl.html`<div style="color:var(--theme-foreground-muted)">None in this range.</div>`;
-  const search = Inputs.search(rows, { placeholder: "worker, method, caller, status" });
-  const box = htl.html`<div></div>`;
-  const draw = () => box.replaceChildren(Inputs.table(search.value, { select: false, rows: 12, layout: "auto", format: { at: (d) => d.toISOString().slice(0, 19).replace("T", " ") } }));
-  search.addEventListener("input", draw);
-  draw();
-  return htl.html`<div>${search}${box}</div>`;
-});};
-const _brainmetrics_dashboard = function _dashboard(htl) {return ((panels, { note = "" } = {}) => htl.html`<div style="font:13px/1.45 var(--sans-serif, system-ui, sans-serif);color:var(--theme-foreground)">
-  ${note ? htl.html`<div style="color:var(--theme-foreground-muted);margin-bottom:8px">${note}</div>` : ""}
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
-    ${panels.map((p) => htl.html`<div style=${`border:1px solid var(--theme-foreground-faintest);border-radius:6px;padding:10px 12px;min-width:0;overflow:auto;${p.wide ? "grid-column:1/-1;" : ""}`}>
-      <div style="font-weight:600;margin-bottom:6px">${p.title}</div>${p.body}</div>`)}
-  </div>
-</div>`);};
-const _brainmetrics_sampleMetrics = function _sampleMetrics() {return (({ since = 0, until = 3600000, step = 60000 } = {}) => {
-  const workers = [["brain-core", "inbox.list", 40, 0], ["brain-x-page", "/", 90, 0], ["brain-x-proxy", "proxy.fetch", 420, 0.06], ["brain-x-whatsapp", "/hooks/whatsapp", 120, 0]];
-  const series = [], errors = [];
-  let seed = 7;
-  const rnd = () => ((seed = (seed * 16807) % 2147483647) - 1) / 2147483646;
-  for (let t = Math.floor(since / step) * step; t < until; t += step)
-    for (const [worker, method, ms, bad] of workers) {
-      const n = Math.round(rnd() * 8);
-      if (!n) continue;
-      const failed = Math.min(n, Math.round(n * bad * 4 * rnd()));
-      if (n - failed) series.push({ t, worker, version: "0123456789ab", method, caller: "owner", status: 200, n: n - failed, ms: Math.round((n - failed) * ms * (0.6 + rnd())), max: Math.round(ms * (1.5 + rnd())) });
-      if (failed) {
-        series.push({ t, worker, version: "0123456789ab", method, caller: "owner", status: 502, n: failed, ms: failed * ms * 3, max: ms * 4 });
-        errors.push({ t, worker, method, caller: "owner", status: 502, ms: ms * 3 });
-      }
-    }
-  return { since, until, step, series, errors: errors.reverse() };
-});};
-const _brainmetrics_anon_be3d699220 = function _anonymous(md) {return (md`## Tests`);};
-const _brainmetrics_metricsFakeSql = function _metricsFakeSql(metricsSchema,metricsSql) {return (() => {
-  const calls = new Map(), faults = [], seen = [];
-  const run = (statement, a) => {
-    seen.push(statement);
-    if (metricsSchema.includes(statement)) return { rows: [], changes: 0 };
-    if (statement === metricsSql.count) {
-      const key = a.slice(0, 6).join("|"), had = calls.get(key);
-      calls.set(key, { t: a[0], worker: a[1], version: a[2], method: a[3], caller: a[4], status: a[5], n: (had ? had.n : 0) + a[6], ms: (had ? had.ms : 0) + a[7], max: Math.max(had ? had.max : 0, a[8]) });
-      return { rows: [], changes: 1 };
-    }
-    if (statement === metricsSql.fault) return faults.push({ t: a[0], worker: a[1], version: a[2], method: a[3], caller: a[4], status: a[5], ms: a[6] }), { rows: [], changes: 1 };
-    if (statement === metricsSql.series) {
-      const out = new Map();
-      for (const r of calls.values()) {
-        if (r.t < a[0] || r.t > a[1]) continue;
-        const t = Math.floor(r.t / a[2]) * a[2], key = [t, r.worker, r.version, r.method, r.caller, r.status].join("|"), had = out.get(key);
-        out.set(key, { ...r, t, n: (had ? had.n : 0) + r.n, ms: (had ? had.ms : 0) + r.ms, max: Math.max(had ? had.max : 0, r.max) });
-      }
-      return { rows: [...out.values()].sort((x, y) => x.t - y.t), changes: 0 };
-    }
-    if (statement === metricsSql.faults) return { rows: faults.filter((f) => f.t >= a[0] && f.t <= a[1]).sort((x, y) => y.t - x.t).slice(0, 500), changes: 0 };
-    if (statement === metricsSql.pruneCalls || statement === metricsSql.pruneFaults) return { rows: [], changes: 0 };
-    throw new Error("a statement metricsSql does not hold: " + statement);
-  };
-  return { run, calls, faults, seen };
-});};
-const _brainmetrics_test_metrics_record_and_query = async function _test_metrics_record_and_query(metricsFakeSql,simulate,metrics_service,expect,metricsSchema) {
-  const db = metricsFakeSql();
-  const sim = await simulate(metrics_service, { secrets: { BRAIN_KEY: "k" }, sql: db.run });
-  const X = "https://metrics.internal/xrpc/com.lopecode.brain.metrics.";
-  const post = (body) => sim.fetch(X + "record", { method: "POST", headers: { "content-type": "application/json", "x-brain-caller": "worker:brain-core" }, body: JSON.stringify(body) });
-  const T = Date.UTC(2026, 9, 6, 8, 0, 0);
-  const bucket = (status, n, ms) => ({ worker: "brain-x-a", method: "a.go", caller: "owner", status, n, ms, max: ms });
-  expect((await post({ nope: 1 })).status).toBe(400);
-  expect(db.seen).toEqual([]);
-  await post({ from: T + 1000, to: T + 9000, buckets: [bucket(200, 2, 30)], errors: [] });
-  // The tables are made once, by the first call that stores anything.
-  expect(db.seen.slice(0, 3)).toEqual(metricsSchema);
-  await post({ from: T + 20000, to: T + 29000, buckets: [bucket(200, 1, 10), bucket(500, 1, 70)], errors: [{ t: T + 21000, worker: "brain-x-a", method: "a.go", caller: "owner", status: 500, ms: 70 }] });
-  await post({ from: T + 400000, to: T + 409000, buckets: [bucket(200, 5, 50)], errors: [] });
-  expect(db.seen.filter((s) => metricsSchema.includes(s)).length).toBe(3);
-  // Two batches in one minute are one row for each status; nothing of the service is in rows.
-  expect([...db.calls.values()].map((r) => [r.t - T, r.status, r.n, r.ms, r.max])).toEqual([[0, 200, 3, 40, 30], [0, 500, 1, 70, 70], [360000, 200, 5, 50, 50]]);
-  expect([...sim.rows.keys()]).toEqual([]);
-  expect(sim.emitted.meta.resources).toEqual(["sql"]);
-  const q = await (await sim.fetch(`${X}query?since=${T}&until=${T + 600000}&step=300000`, { headers: { "x-brain-caller": "owner" } })).json();
-  expect(q.series.map((s) => [s.t - T, s.status, s.n, s.ms])).toEqual([[0, 200, 3, 40], [0, 500, 1, 70], [300000, 200, 5, 50]]);
-  expect(q.errors).toMatchObject([{ status: 500, ms: 70 }]);
-  // Outside the range, nothing; more than 8 days, refused.
-  expect((await (await sim.fetch(`${X}query?since=${T + 3600000}&until=${T + 7200000}`)).json()).series).toEqual([]);
-  expect((await sim.fetch(`${X}query?since=${T}&until=${T + 9 * 86400000}`)).status).toBe(400);
-  return q.series.length + " series rows";
-};
-const _brainmetrics_test_metrics_charts_draw = function _test_metrics_charts_draw(sampleMetrics,rollup,expect,d3,requestsChart,latencyChart,errorsChart,healthStrip,methodTable,dashboard) {
-  const data = sampleMetrics({ since: 0, until: 3600000, step: 60000 });
-  const totals = rollup(data.series, ["worker"]);
-  expect(totals.map((t) => t.worker).sort()).toEqual(["brain-core", "brain-x-page", "brain-x-proxy", "brain-x-whatsapp"]);
-  expect(d3.sum(totals, (t) => t.n)).toBe(d3.sum(data.series, (d) => d.n));
-  // A chart with a legend is a figure holding more than one svg.
-  const marks = (el, sel) => Math.max(...[el, ...el.querySelectorAll("svg")].map((n) => n.querySelectorAll(sel).length));
-  expect(marks(requestsChart(data), "rect")).toBeGreaterThan(50);
-  expect(marks(latencyChart(data), "path")).toBeGreaterThan(3);
-  expect(marks(errorsChart(data), "rect")).toBeGreaterThan(0);
-  expect(errorsChart({ ...data, series: [] }).textContent).toBe("None in this range.");
-  expect(marks(healthStrip(data), "rect")).toBeGreaterThan(50);
-  expect(methodTable(data).querySelectorAll("tbody tr").length).toBe(4);
-  expect(dashboard([{ title: "a", body: "x" }, { title: "b", body: "y", wide: true }]).querySelectorAll("div[style*=border]").length).toBe(2);
-  return "drawn";
-};
-
-export default function define(runtime, observer) {
-  const main = runtime.module();
-  const $def = (pid, name, deps, fn) => {
-    main.variable(observer(name)).define(name, deps, fn).pid = pid;
-  };
-  $def("_brainmetrics_anon_1f15a5af52", null, ["md"], _brainmetrics_anon_1f15a5af52);
-  $def("_brainmetrics_metrics_service", "metrics_service", ["cloudflare","metricsApp"], _brainmetrics_metrics_service);
-  $def("_brainmetrics_metrics_announce", "metrics_announce", ["plugins","metrics_service","invalidation"], _brainmetrics_metrics_announce);
-  $def("_brainmetrics_metricsApp", "metricsApp", ["hono","metricsSchema","sql","metricsSql"], _brainmetrics_metricsApp);
-  $def("_brainmetrics_metricsSchema", "metricsSchema", [], _brainmetrics_metricsSchema);
-  $def("_brainmetrics_metricsSql", "metricsSql", [], _brainmetrics_metricsSql);
-  $def("_brainmetrics_anon_ea6654a1bb", null, ["md"], _brainmetrics_anon_ea6654a1bb);
-  $def("_brainmetrics_brainOrigin", "brainOrigin", ["location"], _brainmetrics_brainOrigin);
-  $def("_brainmetrics_metricsClient", "metricsClient", ["brainOrigin","xrpcClient","globalThis"], _brainmetrics_metricsClient);
-  $def("_brainmetrics_viewof_metricsRange", "viewof metricsRange", ["Inputs"], _brainmetrics_viewof_metricsRange);
-  $def("_brainmetrics_metricsRange", "metricsRange", ["Generators","viewof metricsRange"], _brainmetrics_metricsRange);
-  $def("_brainmetrics_viewof_metricsRefresh", "viewof metricsRefresh", ["Inputs"], _brainmetrics_viewof_metricsRefresh);
-  $def("_brainmetrics_metricsRefresh", "metricsRefresh", ["Generators","viewof metricsRefresh"], _brainmetrics_metricsRefresh);
-  $def("_brainmetrics_metricsData", "metricsData", ["metricsRefresh","metricsRange","metricsClient","sampleMetrics"], _brainmetrics_metricsData);
-  $def("_brainmetrics_metricsBoard", "metricsBoard", ["dashboard","healthStrip","metricsData","width","requestsChart","latencyChart","errorsChart","methodTable","errorTable","d3"], _brainmetrics_metricsBoard);
-  $def("_brainmetrics_rollup", "rollup", [], _brainmetrics_rollup);
-  $def("_brainmetrics_chartBase", "chartBase", [], _brainmetrics_chartBase);
-  $def("_brainmetrics_requestsChart", "requestsChart", ["rollup","Plot","chartBase"], _brainmetrics_requestsChart);
-  $def("_brainmetrics_latencyChart", "latencyChart", ["rollup","Plot","chartBase"], _brainmetrics_latencyChart);
-  $def("_brainmetrics_errorsChart", "errorsChart", ["rollup","htl","Plot","chartBase"], _brainmetrics_errorsChart);
-  $def("_brainmetrics_healthStrip", "healthStrip", ["rollup","Plot","chartBase"], _brainmetrics_healthStrip);
-  $def("_brainmetrics_methodTable", "methodTable", ["Inputs","rollup"], _brainmetrics_methodTable);
-  $def("_brainmetrics_errorTable", "errorTable", ["htl","Inputs"], _brainmetrics_errorTable);
-  $def("_brainmetrics_dashboard", "dashboard", ["htl"], _brainmetrics_dashboard);
-  $def("_brainmetrics_sampleMetrics", "sampleMetrics", [], _brainmetrics_sampleMetrics);
-  $def("_brainmetrics_anon_be3d699220", null, ["md"], _brainmetrics_anon_be3d699220);
-  $def("_brainmetrics_metricsFakeSql", "metricsFakeSql", ["metricsSchema","metricsSql"], _brainmetrics_metricsFakeSql);
-  $def("_brainmetrics_test_metrics_record_and_query", "test_metrics_record_and_query", ["metricsFakeSql","simulate","metrics_service","expect","metricsSchema"], _brainmetrics_test_metrics_record_and_query);
-  $def("_brainmetrics_test_metrics_charts_draw", "test_metrics_charts_draw", ["sampleMetrics","rollup","expect","d3","requestsChart","latencyChart","errorsChart","healthStrip","methodTable","dashboard"], _brainmetrics_test_metrics_charts_draw);
-  main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
-  main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
-  main.define("sql", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sql", _));
-  main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
-  main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
-  main.define("module @tomlarkworthy/xrpc-client", [], async () => runtime.module((await import("/@tomlarkworthy/xrpc-client.js?v=4")).default));
-  main.define("xrpcClient", ["module @tomlarkworthy/xrpc-client","@variable"], (_, v) => v.import("xrpcClient", _));
-  main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
-  main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
-  main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
-  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone","@variable"], (_, v) => v.import("expect", _));
   return main;
 }
 </script>
@@ -34928,17 +34481,128 @@ const _cloudbrain_signIn = function _signIn(brainOrigin,htl,session,press,client
   return handle;
 };
 const _cloudbrain_anon_8a5035967f = function _anonymous(md) {return (md`## Health`);};
-const _cloudbrain_healthView = async function _healthView(assembled,client,session,sampleMetrics,dashboard,requestsChart,width,healthStrip,methodTable,moduleLink,brainModules,services) {
+const _cloudbrain_healthView = async function _healthView(assembled,client,session,htl,callsQuery,callsSeries,dashboard,requestsChart,width,healthStrip,methodTable,moduleLink,brainModules,services,d3) {
   assembled;
-  const until = Date.now(), ask = { since: until - 3600000, until, step: 60000 };
-  const data = !client || !session.owner
-    ? { ...sampleMetrics(ask), sample: true }
-    : await client.query("metrics.query", ask).catch((e) => ({ ...ask, series: [], errors: [], error: String((e && e.message) || e) }));
+  // The owner's own session only: logs.query is not a visitor's. A visitor is shown no chart, and no made-up one.
+  if (!client || !session.owner) return htl.html`<i style="color:var(--theme-foreground-muted)">Sign in as the owner to see the calls of the last hour.</i>`;
+  const until = Date.now(), ask = { since: until - 3600000, until };
+  const data = await client.procedure("logs.query", callsQuery(ask)).then((answer) => callsSeries(answer, ask), (e) => ({ ...ask, step: 60000, series: [], error: String((e && e.message) || e) }));
   return dashboard([
     { title: "Calls", body: requestsChart(data, { width: width - 40 }), wide: true },
     { title: "Health", body: healthStrip(data, { width: width - 40 }), wide: true },
     { title: "By method", body: methodTable(data, { link: (worker, label) => ((row) => (row && row.module ? moduleLink(row.module, label) : null))([...((brainModules && brainModules.modules) || []), ...(services || [])].find((r) => r.worker === worker)) }), wide: true }
-  ], { note: data.sample ? "Sample data: sign in to a Brain to see its own." : data.error ? "metrics.query failed: " + data.error : "" });
+  ], { note: data.error ? "logs.query failed: " + data.error : `The last hour, from the core's log lines: ${d3.sum(data.series, (d) => d.n)} calls in ${data.groups} groups.` });
+};
+const _cloudbrain_callsQuery = function _callsQuery() {return (({ since, until }) => ({
+  queryId: "brain-calls",
+  timeframe: { from: since, to: until },
+  view: "calculations",
+  parameters: {
+    calculations: [{ operator: "count" }, { operator: "sum", key: "ms", keyType: "number" }, { operator: "max", key: "ms", keyType: "number" }],
+    groupBys: [{ type: "string", value: "worker" }, { type: "string", value: "method" }, { type: "number", value: "status" }],
+    filters: [{ key: "method", operation: "exists", type: "string" }],
+    limit: 500
+  }
+}));};
+const _cloudbrain_callsSeries = function _callsSeries() {return ((answer, { since, until }) => {
+  const result = (answer || {}).result || {}, calcs = result.calculations || [];
+  const of = (name) => calcs.find((c) => String(c.calculation).toLowerCase().startsWith(name)) || { series: [], aggregates: [] };
+  const rows = new Map();
+  const field = (name, key) => {
+    for (const point of of(name).series || [])
+      for (const g of point.data || []) {
+        const t = Date.parse(String(point.time).replace(" ", "T") + "Z"), [worker, method, status] = ["worker", "method", "status"].map((k) => (g.groups.find((x) => x.key === k) || {}).value);
+        const id = t + "|" + g.groupKey;
+        rows.set(id, { ...(rows.get(id) || { t, worker: String(worker), method: String(method), status: Number(status), n: 0, ms: 0, max: 0 }), [key]: Number(g.value) || 0 });
+      }
+  };
+  field("count", "n");
+  field("sum", "ms");
+  field("max", "max");
+  return { since, until, step: (result.run || {}).granularity || 60000, series: [...rows.values()].filter((r) => r.n > 0).sort((a, b) => a.t - b.t), groups: (of("count").aggregates || []).length };
+});};
+const _cloudbrain_rollup = function _rollup() {return ((series, keys) => {
+  const out = new Map();
+  for (const d of series) {
+    const k = keys.map((key) => d[key]).join("|");
+    const m = out.get(k) || { ...Object.fromEntries(keys.map((key) => [key, d[key]])), n: 0, ms: 0, max: 0, e4: 0, e5: 0 };
+    out.set(k, { ...m, n: m.n + d.n, ms: m.ms + d.ms, max: Math.max(m.max, d.max), e4: m.e4 + ((d.status >= 400 && d.status < 500) || d.status === 501 ? d.n : 0), e5: m.e5 + (d.status >= 500 && d.status !== 501 ? d.n : 0) });
+  }
+  return [...out.values()];
+});};
+const _cloudbrain_chartBase = function _chartBase() {return ((data, { width = 640, height = 200 } = {}) => ({
+  width,
+  height,
+  marginLeft: 44,
+  style: { background: "transparent", color: "var(--theme-foreground)", fontSize: "11px" },
+  x: { type: "time", domain: [new Date(data.since), new Date(data.until)], label: null }
+}));};
+const _cloudbrain_requestsChart = function _requestsChart(rollup,Plot,chartBase) {return ((data, options = {}) => {
+  const rows = rollup(data.series, ["t", "worker"]);
+  return Plot.plot({
+    ...chartBase(data, options),
+    y: { label: "calls", grid: true },
+    color: { legend: true },
+    marks: [
+      Plot.rectY(rows, Plot.stackY({ x1: (d) => new Date(d.t), x2: (d) => new Date(d.t + data.step), y: "n", fill: "worker", insetRight: 1, tip: true })),
+      Plot.ruleY([0])
+    ]
+  });
+});};
+const _cloudbrain_healthStrip = function _healthStrip(rollup,Plot,chartBase) {return ((data, options = {}) => {
+  const rows = rollup(data.series, ["t", "worker"]).map((d) => ({ ...d, share: d.e5 / d.n }));
+  const names = [...new Set(rows.map((d) => d.worker))].sort();
+  return Plot.plot({
+    ...chartBase(data, { ...options, height: 40 + 22 * Math.max(1, names.length) }),
+    marginLeft: 130,
+    y: { domain: names, label: null },
+    color: { domain: [0, 1], range: ["#2e9e5b", "#e5484d"], legend: true, label: "share of calls that were faults", tickFormat: "%" },
+    marks: [Plot.barX(rows, { x1: (d) => new Date(d.t), x2: (d) => new Date(d.t + data.step), y: "worker", fill: "share", insetRight: 1, title: (d) => `${d.worker}\n${d.n} calls, ${d.e5} failed` })]
+  });
+});};
+const _cloudbrain_methodTable = function _methodTable(Inputs,rollup) {return ((data, { link = null } = {}) =>
+  Inputs.table(
+    rollup(data.series, ["worker", "method"]).map((d) => ({ worker: d.worker, method: d.method, calls: d.n, refused: d.e4, faults: d.e5, "mean ms": Math.round(d.ms / d.n), "max ms": d.max })).sort((a, b) => b.calls - a.calls),
+    { select: false, rows: 12, layout: "auto", format: link ? { worker: (v) => link(v, v) || v } : {} }
+  ));};
+const _cloudbrain_dashboard = function _dashboard(htl) {return ((panels, { note = "" } = {}) => htl.html`<div style="font:13px/1.45 var(--sans-serif, system-ui, sans-serif);color:var(--theme-foreground)">
+  ${note ? htl.html`<div style="color:var(--theme-foreground-muted);margin-bottom:8px">${note}</div>` : ""}
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
+    ${panels.map((p) => htl.html`<div style=${`border:1px solid var(--theme-foreground-faintest);border-radius:6px;padding:10px 12px;min-width:0;overflow:auto;${p.wide ? "grid-column:1/-1;" : ""}`}>
+      <div style="font-weight:600;margin-bottom:6px">${p.title}</div>${p.body}</div>`)}
+  </div>
+</div>`);};
+const _cloudbrain_test_calls_from_the_logs_become_chart_rows = function _test_calls_from_the_logs_become_chart_rows(callsQuery,expect,callsSeries,rollup,requestsChart,healthStrip,methodTable,dashboard) {
+  const ask = { since: Date.UTC(2026, 9, 9, 7, 0), until: Date.UTC(2026, 9, 9, 8, 0) };
+  const q = callsQuery(ask);
+  expect(q.timeframe).toEqual({ from: ask.since, to: ask.until });
+  expect([q.view, q.parameters.limit, q.parameters.groupBys.map((g) => g.value).join()]).toEqual(["calculations", 500, "worker,method,status"]);
+  // The answer in the shape Cloudflare gave on cb4, 2026-10-09: one list a calculation, each with a row a step and group.
+  const group = (worker, method, status, value) => ({ groups: [{ key: "worker", value: worker }, { key: "method", value: method }, { key: "status", value: status }], groupKey: [worker, method, status].join(" ⬤ "), value });
+  const calc = (calculation, at) => ({ calculation, aggregates: [group("brain-x-inbox", "inbox.poll", 200, 0), group("brain-core", "rule.list", 401, 0)], series: Object.entries(at).map(([time, data]) => ({ time, data })) });
+  const answer = { result: { run: { granularity: 60000 }, calculations: [
+    calc("count", { "2026-10-09 07:01:00": [group("brain-x-inbox", "inbox.poll", 200, 2), group("brain-core", "rule.list", 401, 1)], "2026-10-09 07:02:00": [group("brain-x-inbox", "inbox.poll", 502, 1)], "2026-10-09 07:03:00": [] }),
+    calc("sum(ms)", { "2026-10-09 07:01:00": [group("brain-x-inbox", "inbox.poll", 200, 80), group("brain-core", "rule.list", 401, 3)], "2026-10-09 07:02:00": [group("brain-x-inbox", "inbox.poll", 502, 900)] }),
+    calc("max(ms)", { "2026-10-09 07:01:00": [group("brain-x-inbox", "inbox.poll", 200, 50), group("brain-core", "rule.list", 401, 3)], "2026-10-09 07:02:00": [group("brain-x-inbox", "inbox.poll", 502, 900)] })
+  ] } };
+  const data = callsSeries(answer, ask);
+  expect(data).toMatchObject({ ...ask, step: 60000, groups: 2 });
+  expect(data.series).toEqual([
+    { t: Date.UTC(2026, 9, 9, 7, 1), worker: "brain-x-inbox", method: "inbox.poll", status: 200, n: 2, ms: 80, max: 50 },
+    { t: Date.UTC(2026, 9, 9, 7, 1), worker: "brain-core", method: "rule.list", status: 401, n: 1, ms: 3, max: 3 },
+    { t: Date.UTC(2026, 9, 9, 7, 2), worker: "brain-x-inbox", method: "inbox.poll", status: 502, n: 1, ms: 900, max: 900 }
+  ]);
+  // Refused and failed are told apart, and the charts draw from these rows.
+  expect(rollup(data.series, ["worker"]).map((r) => [r.worker, r.n, r.e4, r.e5])).toEqual([["brain-x-inbox", 3, 0, 1], ["brain-core", 1, 1, 0]]);
+  const marks = (el, sel) => Math.max(...[el, ...el.querySelectorAll("svg")].map((n) => n.querySelectorAll(sel).length));
+  expect(marks(requestsChart(data), "rect")).toBeGreaterThan(2);
+  expect(marks(healthStrip(data), "rect")).toBeGreaterThan(2);
+  expect(methodTable(data).querySelectorAll("tbody tr").length).toBe(2);
+  expect(dashboard([{ title: "a", body: "x" }, { title: "b", body: "y", wide: true }]).querySelectorAll("div[style*=border]").length).toBe(2);
+  // An answer with nothing in it, and one that is not an answer.
+  expect(callsSeries({ result: { calculations: [] } }, ask).series).toEqual([]);
+  expect(callsSeries(null, ask)).toMatchObject({ series: [], groups: 0, step: 60000 });
+  return "3 rows from 3 calculations";
 };
 const _cloudbrain_anon_a22ac4e664 = function _anonymous(md) {return (md`## Operator`);};
 const _cloudbrain_viewof_assistant = function _assistant(robocoop5,assistantPrompt,promptView,defaultWatches,assistantWatches,invalidation) {return (robocoop5({
@@ -35970,7 +35634,16 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_statusLine", "statusLine", ["htl","session","brainOrigin"], _cloudbrain_statusLine);
   $def("_cloudbrain_signIn", "signIn", ["brainOrigin","htl","session","press","client","brainSession","location","Inputs"], _cloudbrain_signIn);
   $def("_cloudbrain_anon_8a5035967f", null, ["md"], _cloudbrain_anon_8a5035967f);
-  $def("_cloudbrain_healthView", "healthView", ["assembled","client","session","sampleMetrics","dashboard","requestsChart","width","healthStrip","methodTable","moduleLink","brainModules","services"], _cloudbrain_healthView);
+  $def("_cloudbrain_healthView", "healthView", ["assembled","client","session","htl","callsQuery","callsSeries","dashboard","requestsChart","width","healthStrip","methodTable","moduleLink","brainModules","services","d3"], _cloudbrain_healthView);
+  $def("_cloudbrain_callsQuery", "callsQuery", [], _cloudbrain_callsQuery);
+  $def("_cloudbrain_callsSeries", "callsSeries", [], _cloudbrain_callsSeries);
+  $def("_cloudbrain_rollup", "rollup", [], _cloudbrain_rollup);
+  $def("_cloudbrain_chartBase", "chartBase", [], _cloudbrain_chartBase);
+  $def("_cloudbrain_requestsChart", "requestsChart", ["rollup","Plot","chartBase"], _cloudbrain_requestsChart);
+  $def("_cloudbrain_healthStrip", "healthStrip", ["rollup","Plot","chartBase"], _cloudbrain_healthStrip);
+  $def("_cloudbrain_methodTable", "methodTable", ["Inputs","rollup"], _cloudbrain_methodTable);
+  $def("_cloudbrain_dashboard", "dashboard", ["htl"], _cloudbrain_dashboard);
+  $def("_cloudbrain_test_calls_from_the_logs_become_chart_rows", "test_calls_from_the_logs_become_chart_rows", ["callsQuery","expect","callsSeries","rollup","requestsChart","healthStrip","methodTable","dashboard"], _cloudbrain_test_calls_from_the_logs_become_chart_rows);
   $def("_cloudbrain_anon_a22ac4e664", null, ["md"], _cloudbrain_anon_a22ac4e664);
   $def("_cloudbrain_viewof_assistant", "viewof assistant", ["robocoop5","assistantPrompt","promptView","defaultWatches","assistantWatches","invalidation"], _cloudbrain_viewof_assistant);
   $def("_cloudbrain_assistant", "assistant", ["Generators","viewof assistant"], _cloudbrain_assistant);
@@ -36099,12 +35772,6 @@ export default function define(runtime, observer) {
   main.define("createModule", ["module @tomlarkworthy/runtime-sdk","@variable"], (_, v) => v.import("createModule", _));
   main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
   main.define("expect", ["module @tomlarkworthy/jest-expect-standalone","@variable"], (_, v) => v.import("expect", _));
-  main.define("module @tomlarkworthy/brain-metrics", [], async () => runtime.module((await import("/@tomlarkworthy/brain-metrics.js?v=4")).default));
-  main.define("healthStrip", ["module @tomlarkworthy/brain-metrics","@variable"], (_, v) => v.import("healthStrip", _));
-  main.define("requestsChart", ["module @tomlarkworthy/brain-metrics","@variable"], (_, v) => v.import("requestsChart", _));
-  main.define("methodTable", ["module @tomlarkworthy/brain-metrics","@variable"], (_, v) => v.import("methodTable", _));
-  main.define("dashboard", ["module @tomlarkworthy/brain-metrics","@variable"], (_, v) => v.import("dashboard", _));
-  main.define("sampleMetrics", ["module @tomlarkworthy/brain-metrics","@variable"], (_, v) => v.import("sampleMetrics", _));
   main.define("module @tomlarkworthy/lopepage-urls", [], async () => runtime.module((await import("/@tomlarkworthy/lopepage-urls.js?v=4")).default));
   main.define("linkTo", ["module @tomlarkworthy/lopepage-urls","@variable"], (_, v) => v.import("linkTo", _));
   main.define("navigate", ["module @tomlarkworthy/lopepage-urls","@variable"], (_, v) => v.import("navigate", _));
@@ -36355,13 +36022,13 @@ A bad kernel, core, \`brain-db\` or page can lock the owner out. A new version o
 No Worker of the Brain can change the deployer: the deployer refuses an apply that names it. The deployer page is one HTML response with no script. With the recovery key, the deployer page rolls the kernel back and approves a deploy. With the recovery key, the deployer also answers \`infra.*\` to a caller that is not the kernel. That is the path when the kernel is broken. The installer makes the recovery key and shows it one time.
 
 A member deploy does not use approval or the recovery key. Fixed rules limit it. Reference: **A member's Worker** in ${mod("brain-deployer")}.`);};
-const _cloudbraindocs_anon_26e64afa21 = function _anonymous(md,mod) {return (md`## Data
+const _cloudbraindocs_anon_866fa794d3 = function _anonymous(md,mod) {return (md`## Data
 
 | store | reached by | access |
 |---|---|---|
 | a Worker's own \`rows\` | that Worker | No other Worker reads them. |
 | key-value tables | \`db.get/list/put/delete/increment\` | One rule per table, set with \`db.setRule\`. No rule: the owner only. |
-| SQL tables | \`db.sql\`, the \`sql\` cell | A Worker owns the tables that have its name's prefix (\`brain-x-metrics\` owns \`metrics_*\`). Another caller needs the table's rule, set with \`db.sqlGrant\`. |
+| SQL tables | \`db.sql\`, the \`sql\` cell | A Worker owns the tables that have its name's prefix (\`brain-x-knowledge\` owns \`knowledge_*\`). Another caller needs the table's rule, set with \`db.sqlGrant\`. |
 | secrets | \`secret.put\`, \`await secrets.NAME\` | One rule per secret. \`secret.get\` refuses a token, a granted account and an anonymous caller, whatever the rule says. |
 | files by path | \`static.*\`, \`GET /static/PATH\` | By tag. |
 | bytes by content address | \`blob.*\` | By tag. |
@@ -36369,13 +36036,15 @@ const _cloudbraindocs_anon_26e64afa21 = function _anonymous(md,mod) {return (md`
 ${mod("brain-db")} reads the query plan of each SQL statement that is not the owner's, before it runs the statement. It refuses a plan that has an opcode outside its list. There is no rule by column or by row. A removed Worker keeps its tables.
 
 **Tags** decide who reads or changes a file or a blob. The store writes \`by:DID\` and \`worker:NAME\`; a caller cannot set them. \`public\` opens a file to anyone. \`members\` opens it to each member. The owner grants a member \`read\` or \`write\` on any other tag. Reference: ${mod("brain-static")}, ${mod("brain-blob")}.`);};
-const _cloudbraindocs_anon_52be30752c = function _anonymous(md,mod) {return (md`## Metrics
+const _cloudbraindocs_anon_fe30eac93b = function _anonymous(md) {return (md`## Calls and faults
 
-The core counts each call that it answers or forwards. It sends a batch to ${mod("brain-metrics")} each 10 s, or immediately after a fault. One row is one minute of one Worker, version, method, kind of caller and status. \`metrics.query\` answers 8 days at most. The Worker deletes rows older than 14 days.
+The core writes one log line for each call that it answers or forwards: who called, the method, the Worker, the status, the time taken. Cloudflare keeps the lines 7 days. The Health section of the page counts the last hour of them with one \`logs.query\`, by Worker, method and status, for the owner. A visitor sees no chart.
 
 A fault is a status of 500 or above, except 501.
 
-Not counted: a call that does not go through the core (the deployer's health checks, a Worker's own \`fetch\`, sign-in on the kernel). A core instance that stops loses up to 10 s of counts.`);};
+Not in the lines: a call that does not go through the core (the deployer's health checks, a Worker's own \`fetch\`, sign-in on the kernel).
+
+Until 2026-10-09 the core also counted calls and sent the counts to a Worker, \`brain-x-metrics\`, each 10 s. That Worker is removed; the log lines hold the same counts and cost no call.`);};
 const _cloudbraindocs_anon_d0e09903ee = function _anonymous(md,mod) {return (md`## The page
 
 The kernel serves a shell at \`/\`. The shell is this notebook without the modules that a Worker owns. ${mod("brain-shell")} asks the deployer for the list of those modules and loads each one from its Worker. A copy opened from a file loads nothing: the page is then the source, with no Brain.
@@ -36418,8 +36087,8 @@ export default function define(runtime, observer) {
   $def("_cloudbraindocs_anon_79afaaa51f", null, ["md","mod"], _cloudbraindocs_anon_79afaaa51f);
   $def("_cloudbraindocs_anon_100d3dd592", null, ["md","mod"], _cloudbraindocs_anon_100d3dd592);
   $def("_cloudbraindocs_anon_86b982901e", null, ["md","mod"], _cloudbraindocs_anon_86b982901e);
-  $def("_cloudbraindocs_anon_26e64afa21", null, ["md","mod"], _cloudbraindocs_anon_26e64afa21);
-  $def("_cloudbraindocs_anon_52be30752c", null, ["md","mod"], _cloudbraindocs_anon_52be30752c);
+  $def("_cloudbraindocs_anon_866fa794d3", null, ["md","mod"], _cloudbraindocs_anon_866fa794d3);
+  $def("_cloudbraindocs_anon_fe30eac93b", null, ["md"], _cloudbraindocs_anon_fe30eac93b);
   $def("_cloudbraindocs_anon_d0e09903ee", null, ["md","mod"], _cloudbraindocs_anon_d0e09903ee);
   $def("_cloudbraindocs_anon_5d0da76103", null, ["md","mod"], _cloudbraindocs_anon_5d0da76103);
   $def("_cloudbraindocs_mod", "mod", ["htl","linkTo","navigate"], _cloudbraindocs_mod);
@@ -37738,7 +37407,7 @@ const _cloudbrainspecs_artboard_signed_out = function _artboard_signed_out(svgLe
   <rect x="380" y="264" width="236" height="32" rx="5" fill="var(--theme-foreground-focus)"/>
   <text x="498" y="285" font-size="12" fill="var(--theme-background)" text-anchor="middle">Clone into your Cloudflare account</text>
 </svg>`);};
-const _cloudbrainspecs_anon_372739460e = function _anonymous(md) {return (md`**signed out**: what a visitor sees. The page loads each Worker's module and shows sample metrics. Owner methods answer 401.`);};
+const _cloudbrainspecs_anon_3a00545b22 = function _anonymous(md) {return (md`**signed out**: what a visitor sees. The page loads each Worker's module. The Health section shows no chart. Owner methods answer 401.`);};
 const _cloudbrainspecs_artboard_plan = function _artboard_plan(svgLens) {return (svgLens({ keyboard: true })`<svg viewBox="0 0 640 290" width="100%" style="max-width:640px;background:var(--theme-background)" font-family="system-ui, sans-serif">
   <rect x="0" y="0" width="640" height="24" fill="var(--theme-background-alt)"/>
   <line x1="0" y1="24" x2="640" y2="24" stroke="var(--theme-foreground-fainter)"/>
@@ -37872,7 +37541,7 @@ const _cloudbrainspecs_requirements = function _requirements() {return ([
   { id: "R27", status: "part", text: "The kernel must accept a service JWT from a PDS as its iss, after it checks aud, exp, lxm and the signature.", check: "brain-kernel: test_service_jwt_claims_are_checked_first. An experiment of 2026-10-05 on a scratch Worker. Not verified: a real PDS signature against this kernel" },
   { id: "R28", status: "built", text: "A Worker's key-value rows are its own. brain-db must decide a SQL statement that is not the owner's from its query plan, per table, and must refuse a plan with an opcode that is not listed.", check: "brain-core: test_notebook_rows_per_worker. brain-db: test_db_sql_decides_by_table_from_the_plan, test_db_sql_refuses_everything_when_the_plans_read_differently, test_db_a_table_is_open_to_whom_its_rule_says" },
   { id: "R29", status: "built", text: "A file or a blob is read and changed by tag. Only the store writes a by: tag or a worker: tag. A blob's address is the CID of its bytes.", check: "brain-static: test_static_a_files_tags_decide_who_reads_and_who_changes_it, test_static_only_the_owner_writes_the_shell. brain-blob: test_blob_tags_decide_who_reads_and_who_changes_it, test_blob_cid_is_the_cid_a_pds_gives_the_bytes. cb4 2026-10-07 13:12: 95 rows, 0 bad" },
-  { id: "R30", status: "built", text: "The core must count each call that it answers or forwards and must send the counts to brain-metrics.", check: "brain-core: test_calls_are_counted_and_handed_to_the_metrics_service. brain-metrics: test_metrics_record_and_query" },
+  { id: "R30", status: "built", text: "The core must write one log line for each call that it answers or forwards, and the page must count them for the owner. Until 2026-10-09: the core counted calls and sent the counts to brain-metrics, which is removed.", check: "brain-core: test_one_log_line_a_call_with_these_keys_and_no_secret. cloud-brain: test_calls_from_the_logs_become_chart_rows. cb4: no db.sql by worker:brain-x-metrics in 10 minutes" },
   { id: "R31", status: "built", text: "Each event from outside reaches the page through the inbox: one entry per key, in order, kept until a tab marks it done.", check: "brain-inbox: test_inbox_once_per_key_in_order" },
   { id: "R32", status: "built", text: "One tab at a time holds the inbox lease. The lease ends 90 s after its last renewal.", check: "brain-inbox: test_lease_one_tab_at_a_time. Live: lease.get answers held: true" },
   { id: "R33", status: "built", text: "A turn must run as the sender of its entry, with a turn token. The turn must not reach more than the sender can call. The reply must go back on the entry's channel.", check: "brain-kernel: test_a_turn_is_made_as_its_sender, test_turn_token, test_poll_names_the_sender_and_hands_the_owner_turn_tokens. cloud-brain: test_turn_tool_calls_as_the_sender_or_not_at_all. brain-inbox: test_reply_goes_back_where_the_entry_came_from. cb4 2026-10-07 08:40 to 08:47" },
@@ -38558,7 +38227,7 @@ One Brain, \`cb4\`, runs in one Cloudflare account. It has 17 Workers (counted 2
 | \`brain-db\` | \`brain-db\` | SQL tables and secrets. |
 | \`brain-x-page\` | \`cloud-brain\` | The page as a service. |
 | \`brain-x-inbox\` | \`brain-inbox\` | The inbox and the lease. |
-| \`brain-x-metrics\`, \`brain-x-static\`, \`brain-x-blob\`, \`brain-x-library\`, \`brain-x-proxy\`, \`brain-x-feed\` | one module each | Metrics, files, blobs, saved notebooks, outbound fetch, Bluesky feeds. |
+| \`brain-x-static\`, \`brain-x-blob\`, \`brain-x-library\`, \`brain-x-proxy\`, \`brain-x-feed\` | one module each | Files, blobs, saved notebooks, outbound fetch, Bluesky feeds. \`brain-x-metrics\` was removed on 2026-10-09: calls are counted from the log lines. |
 | \`brain-x-whatsapp\`, \`brain-x-bluesky\` | one module each | Channels. |
 | \`brain-x-logs\` | \`brain-logs\` | The logs of this Brain's Workers, read from Cloudflare Workers Logs with Cloudflare's own query bodies. It holds a Cloudflare token with one permission, which the deployer minted for it. |
 | \`brain-x-knowledge\` | \`brain-knowledge\` | What the Brain knows: one entry per paper, page, post or finding, with where it was found, the path of its kept file, and who entered it and how. A D1 database of its own with a full-text index; no file bytes. The owner searches it; the snapshot and the digest tool enter into it. 68 entries on cb4, 2026-10-09. |
@@ -38680,7 +38349,7 @@ export default function define(runtime, observer) {
   $def("_cloudbrainspecs_artboard_default", "artboard_default", ["svgLens"], _cloudbrainspecs_artboard_default);
   $def("_cloudbrainspecs_anon_5d8b6d8199", null, ["md"], _cloudbrainspecs_anon_5d8b6d8199);
   $def("_cloudbrainspecs_artboard_signed_out", "artboard_signed_out", ["svgLens"], _cloudbrainspecs_artboard_signed_out);
-  $def("_cloudbrainspecs_anon_372739460e", null, ["md"], _cloudbrainspecs_anon_372739460e);
+  $def("_cloudbrainspecs_anon_3a00545b22", null, ["md"], _cloudbrainspecs_anon_3a00545b22);
   $def("_cloudbrainspecs_artboard_plan", "artboard_plan", ["svgLens"], _cloudbrainspecs_artboard_plan);
   $def("_cloudbrainspecs_anon_756920bd14", null, ["md"], _cloudbrainspecs_anon_756920bd14);
   $def("_cloudbrainspecs_artboard_probation", "artboard_probation", ["svgLens"], _cloudbrainspecs_artboard_probation);
@@ -70080,7 +69749,14 @@ Read this before changing, deploying or diagnosing a service of the Cloud Brain 
 
 ## Checking how it is running
 
-`brain_call` with method `metrics.query`, kind `query`, input `{ since, until, step }` (ms; default the last hour in 1-minute steps; at most 8 days). It returns `series`, rows of `{ t, worker, method, caller, status, n, ms, max }` where `ms` is the sum over `n` calls, and `errors`, the calls answered 500 or above except 501, newest first. Only calls that pass through the core are counted. The charts are in the module `@tomlarkworthy/brain-metrics`.
+The Health section of the page, for the owner: calls of the last hour by Worker, the share that were faults, and a table by method. It is one `logs.query` over the core's log lines (`callsQuery` and `callsSeries` in the module `@tomlarkworthy/cloud-brain`). The same counts from a terminal:
+
+```
+bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.logs.query --owner -X POST -H 'content-type: application/json' \
+  -d '{"queryId":"calls","timeframe":{"from":FROM_MS,"to":TO_MS},"view":"calculations","parameters":{"calculations":[{"operator":"count"}],"groupBys":[{"type":"string","value":"method"},{"type":"string","value":"caller"}],"filters":[{"key":"method","operation":"exists","type":"string"}],"limit":500}}'
+```
+
+Only calls that pass through the core have a line. Until 2026-10-09 this was `metrics.query` on `brain-x-metrics`, which is removed.
 
 ## Writing a recipe
 
@@ -103118,7 +102794,6 @@ export default function define(runtime, observer) {
     "@tomlarkworthy/brain-proxy",
     "@tomlarkworthy/brain-whatsapp",
     "@tomlarkworthy/brain-bluesky",
-    "@tomlarkworthy/brain-metrics",
     "@tomlarkworthy/brain-static",
     "@tomlarkworthy/brain-blob",
     "@tomlarkworthy/brain-library",
