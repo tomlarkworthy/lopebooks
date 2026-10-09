@@ -9484,11 +9484,15 @@ const _brainshell_brainBoot = async function _brainBoot(brainOrigin,md,brainModu
   if (brainPortal) {
     const note = htl.html`<span style="color:var(--theme-foreground-muted)"></span>`;
     const why = htl.html`<input placeholder="Reason for the change" maxlength="300" style="font:inherit;min-width:16em">`;
+    // What this page last knew to be running: from portal.modules, then from each answer of the deployer.
+    let seen = (brainModules.modules.find((m) => m.module === brainPortal.module) || {}).hash || null;
     const deploy = Inputs.button("Deploy", {
       reduce: async () => {
         note.textContent = " deploying…";
         try {
-          const made = await brainClient.procedure("member.deploy", { module: brainPortal.module, source: (await exportModuleJS(brainPortal.module)).source, reason: why.value });
+          const made = await brainClient.procedure("member.deploy", { module: brainPortal.module, source: (await exportModuleJS(brainPortal.module)).source, reason: why.value, was: seen });
+          if (made.state === "deployed" || made.state === "unchanged") seen = made.hash;
+          else if ("running" in made) seen = made.running;
           note.textContent = made.state === "refused" ? " refused: " + made.reason : ` ${made.worker || brainPortal.module} is ${String(made.hash || "").slice(0, 12)}`;
         } catch (e) {
           note.textContent = " refused: " + ((e && e.message) || e);
@@ -19273,7 +19277,7 @@ AGFzbQEAAAABvgZpYAJ/fwBgA39/fwF/YAR/fn9/AX5gAn9/AX9gAX8Bf2AFf35/f38BfmADf39/AGAC
   type="text/plain"
   data-mime="application/javascript"
 >
-const _cloudflareiac_anon_6af92562a2 = function _anonymous(md) {return (md`# Cloudflare from a notebook
+const _cloudflareiac_anon_1a51fb2aa3 = function _anonymous(md) {return (md`# Cloudflare from a notebook
 
 A service declared as a notebook value. \`cloudflare.Service(name, fn, options)\` returns a service: a name, a function that answers requests, and a manifest (methods, paths, rules, \`calls\`). Call it in the tab with \`service.fetch(request)\`, read the module it would upload with \`service.emit()\`, run that module in the tab with \`simulate(service)\`. \`cloudflare.Worker\` is the name of \`Service\` until 2026-10-07 and is the same function.
 
@@ -19283,7 +19287,7 @@ The module is the function plus every cell it depends on, across imports, writte
 
 Refused, naming the cell: a generator, a \`viewof\` or \`mutable\` cell, a cell that depends on a notebook builtin such as \`html\` or \`width\`, and a secret read by a computed name.
 
-\`service.deploy(reason)\` needs a Brain and a reason, which the deployer logs: with none configured it throws. \`serviceList\` shows each declared service against what the deployer runs. There is no \`service.status\`.`);};
+\`service.deploy(reason, was)\` needs a Brain, a reason, which the deployer logs, and the hash you saw running (\`null\` for no Worker): with none configured it throws. \`serviceList\` shows each declared service against what the deployer runs. There is no \`service.status\`.`);};
 const _cloudflareiac_anon_32581046c3 = function _anonymous(md) {return (md`## Services in this notebook
 
 A module announces a service with \`plugins.add("workers", service, { invalidation })\`, in a cell of its own. \`declaredWorkers\` is every service announced on the page, and \`serviceList\` shows them against what a deployer says is running, with one Apply.
@@ -19385,7 +19389,8 @@ const _cloudflareiac_serviceList = function _serviceList(htl,serviceRows,Inputs)
       busy = `applying ${r.worker}…`;
       draw();
       try {
-        const out = await brain.apply(emitted.find((e) => e.meta && e.meta.worker === r.worker), { reason });
+        // r.running is what this page last read from the deployer: the view the owner pressed Apply on.
+        const out = await brain.apply(emitted.find((e) => e.meta && e.meta.worker === r.worker), { reason, was: r.running });
         results.push(...out.results);
       } catch (e) {
         results.push({ worker: r.worker, state: "refused", reason: String((e && e.message) || e) });
@@ -19589,9 +19594,9 @@ const _cloudflareiac_cloudflare = function _cloudflare(Request,emit,backend,plat
         return typeof fn?.fetch === "function" ? fn.fetch(req, {}, {}) : fn(req, { caller, info: {} });
       },
       emit: () => emit(service),
-      deploy: async (reason) => {
+      deploy: async (reason, was) => {
         if (!backend.deploy) throw new Error("no Brain configured: deploy() needs a deployer");
-        return backend.deploy(await emit(service), reason);
+        return backend.deploy(await emit(service), reason, was);
       }
     };
     return service;
@@ -21096,7 +21101,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_cloudflareiac_anon_6af92562a2", null, ["md"], _cloudflareiac_anon_6af92562a2);
+  $def("_cloudflareiac_anon_1a51fb2aa3", null, ["md"], _cloudflareiac_anon_1a51fb2aa3);
   $def("_cloudflareiac_anon_32581046c3", null, ["md"], _cloudflareiac_anon_32581046c3);
   $def("_cloudflareiac_declaredWorkers", "declaredWorkers", ["plugins"], _cloudflareiac_declaredWorkers);
   $def("_cloudflareiac_serviceRows", "serviceRows", [], _cloudflareiac_serviceRows);
@@ -21279,13 +21284,17 @@ const _braindeployer_anon_17200b265d = function _anonymous(md) {return (md`## De
 \`deployerOps\` is everything the deployer does to Cloudflare. A Worker's name in an apply is its logical name (\`brain\`, \`brain-core\`, \`brain-x-NAME\`); the script name on Cloudflare replaces \`brain\` with this Brain's base name, so two Brains can share an account.
 
 Each Worker gets a key when it is first deployed. The deployer presents it to reach that Worker from the internet, and the Worker presents it to the core to say which Worker it is.`);};
-const _braindeployer_anon_32d58fce0d = function _anonymous(md) {return (md`## Logs and Cloudflare permissions
+const _braindeployer_anon_ae422c5bba = function _anonymous(md) {return (md`## Logs and Cloudflare permissions
 
 Added 2026-10-08. The deployer turns Workers Logs on for each script and Cloudflare's own line per invocation off (\`OBSERVABILITY\`, \`ensureLogs\`). The setting belongs to the script: Cloudflare took it from the upload of a new script and ignored it in the upload of a version, so 14 of the 17 scripts of cb4 kept no logs after the first deploy of this change. \`redistil\` sets it on each script the deployer has a row for, a member's Worker and one it keeps no source of included. A deploy of a member's Worker sets it too.
 
 A service that declares \`cloudflare: ["GROUP"]\` gets a Cloudflare API token (\`tokenFor\`, \`mint\`): held for the owner also when deploys need no approval, refused for a member and for a group that is not in \`GROUPS\`. The value is in the binding \`CF_TOKEN\` of that Worker and nowhere else. The rows \`token/WORKER\` hold the token's id, groups and end; \`audit/tokens\` holds each mint, roll and delete. A token is kept across deploys while its groups are the declared ones and it has more than 30 days left of its 90. A version that is put back gets a new token when the one it was deployed with was deleted (\`remint\`). The row of what is live is written first, with no token; when the mint or the bind fails, the line is \`token.mint-failed\` and each tick of the deployer tries again.
 
 The deployer's own token needs the permission \`Account API Tokens Write\` to mint, and each group it hands out.
+
+Every change names what it saw. Each Worker in \`infra.apply\` carries \`was\`: the hash the caller saw running, or \`null\` for no Worker. \`remove\` is \`[{ worker, was }]\`; \`member.deploy\` and \`member.remove\` take \`was\`; a roll back button carries it. When the Worker is no longer that, the answer is \`refused\` with \`NAME is A, you saw B\` and \`running\`, and nothing is deployed. There is no value that skips the check. A \`dry\` apply is not checked. An import of another module is not part of the check: a Worker is distilled against the kept source of its imports as they are at the deploy.
+
+One change to a Worker runs at a time, the tick's health check and a verdict's put-back among them: each takes the same row and leaves a Worker whose row is held. The deployer makes the row \`deploying/NAME\` (\`putIfAbsent\`) before it reads what is running, and deletes it when the change ends, deployed or not. A second caller in that time is refused with \`another change to NAME is running\`. A change that died leaves the row; after 5 minutes one caller takes it over, the one that makes \`deploying-over/NAME/ID\`. That row is kept, one for each change that died, and the take-over is logged as \`deploy.lease-taken-over\`. The rows have no compare-and-swap, so one case is open: a change over 5 minutes old that ends within one row read of the take-over. An approval is of one hash over one hash: the pending row keeps \`was\`, and an approval does not stand once the Worker has moved. Added 2026-10-09.
 
 Every change says why. \`infra.apply\` (unless \`dry\`), \`infra.redistil\` with \`apply\`, a roll back on the page, \`member.deploy\` and \`member.remove\` take \`reason\`, 3 to 300 characters, and are refused without one (400 \`InvalidRequest\`, or \`refused\` for a member). The reason is logged before anything is done, as \`deploy.reason\` with \`reason\`, \`by\` (\`owner\`, \`recovery key\` or the member's DID) and \`targets\`. Added 2026-10-09.
 
@@ -21693,9 +21702,58 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
   const WHY = "reason: say why this is changed, in 3 to 300 characters";
   const reasonOf = (r) => (typeof r === "string" && r.trim().length >= 3 && r.trim().length <= 300 ? r.trim() : null);
   const because = (reason, by, targets) => log({ at: "deploy.reason", reason, by, targets: targets.map((t) => String(t).slice(0, 80)).slice(0, 40) });
+  // A change to a Worker names the hash the caller saw running: `was`, or null for no Worker. One change to a Worker
+  // runs at a time, under the row deploying/NAME, which is deleted when the change ends. A change that died holds the
+  // row until `until`; then one caller takes it over, the one that makes deploying-over/NAME/ID. That row is kept.
+  const SAW = "was: the hash you saw running, all 64 characters, or null for no Worker";
+  const LEASE = 5 * 60 * 1000;
+  const h12 = (h) => (h ? String(h).slice(0, 12) : "no Worker");
+  const take = async (logical) => {
+    const key = "deploying/" + logical, mine = { id: crypto.randomUUID(), until: Date.now() + LEASE };
+    if (await rows.putIfAbsent(key, mine)) return mine;
+    const held = await rows.get(key);
+    if (!held) return (await rows.putIfAbsent(key, mine)) ? mine : null;
+    if (held.until > Date.now() || !(await rows.putIfAbsent(`deploying-over/${logical}/${held.id}`, { at: Date.now() }))) return null;
+    // Known limit, with no compare-and-swap on a row: the holder ends and another caller takes the row between
+    // the next two lines. That needs a change over 5 minutes old to end within one row read of this one.
+    if (((await rows.get(key)) || {}).id === held.id) await rows.delete(key);
+    if (!(await rows.putIfAbsent(key, mine))) return null;
+    log({ at: "deploy.lease-taken-over", target: logical });
+    return mine;
+  };
+  const release = async (logical, mine) => {
+    const held = await rows.get("deploying/" + logical);
+    if (held && held.id === mine.id) await rows.delete("deploying/" + logical);
+  };
+  // The tick and a verdict change a Worker too. They take the same row, and leave a Worker that is being changed.
+  const alone = async (logical, change) => {
+    const mine = await take(logical);
+    if (!mine) return null;
+    try {
+      return await change(await rows.get("worker/" + logical));
+    } finally {
+      await release(logical, mine);
+    }
+  };
+  const guard = async (logical, was, change) => {
+    // The whole hash: 12 characters of it are what a table shows, and are not a hash.
+    if (was !== null && !/^[0-9a-f]{64}$/.test(String(was))) return { worker: logical, state: "refused", reason: SAW };
+    const mine = await take(logical);
+    if (!mine) return { worker: logical, state: "refused", reason: `another change to ${logical} is running` };
+    try {
+      const rec = await rows.get("worker/" + logical);
+      const now = (rec && rec.hash) || null;
+      if (now !== was) return { worker: logical, state: "refused", reason: `${logical} is ${h12(now)}, you saw ${h12(was)}`, running: now };
+      return await change(rec);
+    } finally {
+      await release(logical, mine);
+    }
+  };
+  // An approval is of one hash over one hash: it does not stand once the Worker has moved.
+  const approvedOver = async (key, rec) => ((a) => !!a && (a.was ?? null) === ((rec && rec.hash) || null))(await rows.get("approved/" + key));
   const apply = async ({ workers = [], remove = [], dry = false, reason } = {}, { recovery = false } = {}) => {
     if (!dry && !reasonOf(reason)) return { error: "InvalidRequest", message: WHY };
-    if (!dry) because(reasonOf(reason), recovery ? "recovery key" : "owner", [...workers.map((w) => (w && (w.module || (w.meta && w.meta.worker))) || "?"), ...remove.map((n) => "remove " + n)]);
+    if (!dry) because(reasonOf(reason), recovery ? "recovery key" : "owner", [...workers.map((w) => (w && (w.module || (w.meta && w.meta.worker))) || "?"), ...remove.map((n) => "remove " + ((n && n.worker) || n))]);
     const approval = (await settings()).approval;
     const results = [];
     // A Worker given as source is distilled here, and what is deployed is what that gives. An import of another
@@ -21722,16 +21780,21 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       const rec = typeof logical === "string" ? await rows.get("worker/" + logical) : null;
       const base = { worker: logical, hash: w && w.hash };
       const reason = await refusal(w || {}, rec);
-      if (reason) results.push({ ...base, state: "refused", reason });
-      else if (rec && rec.hash === w.hash && rec.state === "deployed" && !w.force && !(typeof w.asset === "string" && (await sha256(w.asset)).slice(0, 32) !== rec.assetHash)) {
+      if (reason) {
+        results.push({ ...base, state: "refused", reason });
+        continue;
+      }
+      const change = async (rec) => {
+      const results = [];
+      if (rec && rec.hash === w.hash && rec.state === "deployed" && !w.force && !(typeof w.asset === "string" && (await sha256(w.asset)).slice(0, 32) !== rec.assetHash)) {
         // Deployed before the deployer kept source: keep it now, since it is the source of what is running.
         if (typeof w.source === "string" && !(await rows.get("source/" + w.module))) await rows.put("source/" + w.module, { text: w.source, files: w.files || {}, cell: w.cell || null, worker: logical, hash: w.hash, at: Date.now(), prev: null });
         results.push({ ...base, state: "unchanged" });
       }
       // A service that declares Cloudflare permissions is held for the owner also when deploys need no approval.
-      else if ((approval || (w.meta.cloudflare || []).length) && !recovery && !(await rows.get("approved/" + w.hash))) {
+      else if ((approval || (w.meta.cloudflare || []).length) && !recovery && !(await approvedOver(w.hash, rec))) {
         const m = w.meta;
-        await rows.put("pending/" + w.hash, { worker: logical, hash: w.hash, methods: m.methods, paths: m.paths, secrets: m.secrets, resources: m.resources, cloudflare: m.cloudflare || [], calls: m.calls || [], access: m.access || {}, at: Date.now() });
+        await rows.put("pending/" + w.hash, { worker: logical, hash: w.hash, was: (rec && rec.hash) || null, methods: m.methods, paths: m.paths, secrets: m.secrets, resources: m.resources, cloudflare: m.cloudflare || [], calls: m.calls || [], access: m.access || {}, at: Date.now() });
         results.push({ ...base, state: "waiting" });
       } else if (dry || !w.parts) results.push({ ...base, state: "ready" });
       else {
@@ -21752,13 +21815,19 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
           results.push({ ...base, state: "put-back", previous: kept.hash, reason });
         }
       }
+      return { ...base, ...results[0] };
+      };
+      results.push(dry ? await change(rec) : await guard(logical, w.was, change));
     }
-    for (const logical of remove) {
-      const rec = await rows.get("worker/" + logical);
+    // remove is [{ worker, was }].
+    for (const item of remove) {
+      const logical = String((item && item.worker) || item);
+      const change = async (rec) => {
+      const results = [];
       const reason = deployerAllows({ key: "worker/" + logical, op: "delete" });
       if (reason) results.push({ worker: logical, state: "refused", reason });
-      else if (approval && !recovery && !(await rows.get("approved/remove:" + logical))) {
-        await rows.put("pending/remove:" + logical, { worker: logical, hash: "remove:" + logical, remove: true, at: Date.now() });
+      else if (approval && !recovery && !(await approvedOver("remove:" + logical, rec))) {
+        await rows.put("pending/remove:" + logical, { worker: logical, hash: "remove:" + logical, was: (rec && rec.hash) || null, remove: true, at: Date.now() });
         results.push({ worker: logical, state: "waiting" });
       } else if (!dry) {
         await toCore("service.unregister", { worker: logical });
@@ -21780,6 +21849,9 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
         await rows.delete("approved/remove:" + logical);
         results.push({ worker: logical, state: "removed" });
       } else results.push({ worker: logical, state: "ready" });
+      return results[0];
+      };
+      results.push(dry ? await change(await rows.get("worker/" + logical)) : await guard(logical, item && item.was, change));
     }
     for (const r of results) if (r.state === "refused" || r.state === "waiting") log({ at: "deploy." + r.state, target: r.worker, hash: r.hash, reason: r.reason });
     return { results };
@@ -21856,15 +21928,18 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       if (s.state !== "probation") continue;
       const logical = key.slice("kernelstate/".length);
       onProbation.add(logical);
-      const rec = await rows.get("worker/" + logical);
-      const next = nextKernelState(s, { type: "tick", now: Date.now(), healthy: await healthy(logical, rec.key), probationMs: config.probationMs });
-      if (next.state === "rolled-back") await putBack(logical, rec, { version: s.lastGood, hash: s.lastGoodHash }, next.reason);
-      await rows.put(key, next.state === "rolled-back" ? { ...next, hash: s.lastGoodHash, failedHash: s.hash, at: Date.now() } : next);
+      await alone(logical, async (rec) => {
+        const s = await rows.get(key);
+        if (!rec || !s || s.state !== "probation") return;
+        const next = nextKernelState(s, { type: "tick", now: Date.now(), healthy: await healthy(logical, rec.key), probationMs: config.probationMs });
+        if (next.state === "rolled-back") await putBack(logical, rec, { version: s.lastGood, hash: s.lastGoodHash }, next.reason);
+        await rows.put(key, next.state === "rolled-back" ? { ...next, hash: s.lastGoodHash, failedHash: s.hash, at: Date.now() } : next);
+      });
     }
     // Every other Worker: two failed checks in a row puts it back to the version before, when there is one.
-    for (const row of await rows.list("worker/")) {
-      let rec = row.value;
-      if (rec.state !== "deployed" || !rec.hash || onProbation.has(rec.worker)) continue;
+    for (const row of await rows.list("worker/")) await alone(row.value.worker, async (rec) => {
+      // Read again under the row: a deploy may have ended since the list was read.
+      if (!rec || rec.state !== "deployed" || !rec.hash || onProbation.has(rec.worker) || ((await rows.get("kernelstate/" + rec.worker)) || {}).state === "probation") return;
       // A Worker put back whose token could not be minted then. Its health is checked all the same.
       if ((rec.cloudflare || []).length && !rec.token) rec = await remint(rec.worker, rec);
       const fails = (await healthy(rec.worker, rec.key)) ? 0 : (rec.fails || 0) + 1;
@@ -21873,7 +21948,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
         await rows.put("worker/" + rec.worker, { ...rec, fails });
         if (fails === 2) (log({ at: "deploy.failing", target: rec.worker, hash: rec.hash, reason: "health check failed twice and there is no version before" }), await note(`failing/${rec.worker}/${rec.hash}`, { event: "failing", worker: rec.worker, hash: rec.hash }));
       }
-    }
+    });
   };
 
   const confirm = async (only = null) => {
@@ -21891,17 +21966,19 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     return { confirmed };
   };
 
-  const rollback = async (logical, version) => {
+  const rollback = async (logical, version, was) => {
     const to = ((await rows.get("confirmed/" + logical)) || []).find((c) => c.version === version);
     if (!to) throw new Error(`${version} is not a confirmed version of ${logical}`);
-    const rec = await rows.get("worker/" + logical);
-    await putBack(logical, rec, to, "rolled back from the deployer page");
-    await rows.put("kernelstate/" + logical, { state: "rolled-back", version, lastGood: version, hash: to.hash, reason: "rolled back from the deployer page", at: Date.now() });
+    return guard(logical, was || null, async (rec) => {
+      await putBack(logical, rec, to, "rolled back from the deployer page");
+      await rows.put("kernelstate/" + logical, { state: "rolled-back", version, lastGood: version, hash: to.hash, reason: "rolled back from the deployer page", at: Date.now() });
+      return { worker: logical, state: "rolled-back" };
+    });
   };
 
   // The core passes on what the page found when it ran a deployed module's tests.
-  const verdict = async ({ worker: logical, hash, ok, reason = "" }) => {
-    const rec = await rows.get("worker/" + logical);
+  const verdict = async (v) => (await alone(v.worker, (rec) => verdictOf(v, rec))) || { state: "stale" };
+  const verdictOf = async ({ worker: logical, hash, ok, reason = "" }, rec) => {
     if (!rec || rec.hash !== hash) return { state: "stale" };
     const ks = await rows.get("kernelstate/" + logical);
     const probation = ks && ks.state === "probation";
@@ -21924,7 +22001,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
   const approve = async (hash) => {
     const pending = await rows.get("pending/" + hash);
     if (!pending) return false;
-    await rows.put("approved/" + hash, { at: Date.now(), worker: pending.worker });
+    await rows.put("approved/" + hash, { at: Date.now(), worker: pending.worker, was: pending.was ?? null });
     await rows.delete("pending/" + hash);
     return true;
   };
@@ -21945,7 +22022,8 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     pending: (await rows.list("pending/")).map((r) => r.value),
     // The deployer answering, and the deployer that last distilled everything. Different: redistil has not run since an update.
     distiller: { now: self.hash, last: await rows.get("distiller") },
-    approved: (await rows.list("approved/")).map((r) => r.key.slice("approved/".length))
+    // Only an approval that still stands: of that hash over what is running now.
+    approved: (await Promise.all((await rows.list("approved/")).map(async (r) => ((await approvedOver(r.key.slice("approved/".length), r.value.worker ? await rows.get("worker/" + r.value.worker) : null)) ? r.key.slice("approved/".length) : null)))).filter(Boolean)
   });
 
   const setApproval = async (on) => rows.put("settings", { ...(await settings()), approval: !!on });
@@ -21972,7 +22050,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
           if (rec.distiller !== self.hash) await rows.put("worker/" + s.worker, { ...rec, distiller: self.hash });
         } else {
           results.push({ ...base, state: "changes", from: rec.hash, hash: d.hash });
-          changed.push({ module: s.module, source: s.text, cell: s.cell || undefined, files: s.files });
+          changed.push({ module: s.module, source: s.text, cell: s.cell || undefined, files: s.files, was: rec.hash });
         }
       } catch (e) {
         results.push({ ...base, state: "cannot distil", reason: String((e && e.message) || e) });
@@ -22023,7 +22101,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     // Counted before the distil, which is the work: every call counts, one that is refused or unchanged too.
     const hourly = Number.isFinite(quota.deploys) ? quota.deploys : MEMBER.deploysAnHour;
     const asked = await rows.increment(`mdeploys/${author}/${new Date().toISOString().slice(0, 13)}`);
-    if (asked === 1) await rows.delete(`mdeploys/${author}/${new Date(Date.now() - 3600000).toISOString().slice(0, 13)}`);
+    if (asked === 1) for (const r of await rows.list(`mdeploys/${author}/`)) if (r.key !== `mdeploys/${author}/${new Date().toISOString().slice(0, 13)}`) await rows.delete(r.key);
     if (asked > hourly) return refuse(`${asked} deploys asked this hour, at most ${hourly}`);
     if (!reasonOf(request.reason)) return refuse(WHY);
     because(reasonOf(request.reason), author, [String(request.module || request.name || "?")]);
@@ -22058,7 +22136,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     if (!parts.length || parts.some((p) => typeof p.text !== "string" || !/^(worker\.js|source\.js|lib\/[A-Za-z0-9_-]+\.js)$/.test(p.path))) return refuse("the parts are worker.js, source.js and lib/NAME.js", logical);
     const size = parts.reduce((n, p) => n + p.text.length, 0);
     if (size > MEMBER.partBytes) return refuse(`${size} characters of code, at most ${MEMBER.partBytes}`, logical);
-    const rec = await rows.get("worker/" + logical);
+    return guard(logical, request.was, async (rec) => {
     // ID is 10 hex digits of a hash: two DIDs can share one. The name then belongs to whoever deployed it first.
     if (rec && rec.author !== author) return refuse("the name is held by a service of another member", logical);
     const mine = (await rows.list(`worker/brain-m-${id}-`)).filter((r) => r.value.author === author && r.value.hash).length;
@@ -22113,6 +22191,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       log({ at: "deploy.put-back", target: logical, hash, previous: (rec && rec.hash) || null, reason });
       return { worker: logical, hash, state: "put-back", previous: (rec && rec.hash) || null, reason };
     }
+    });
   };
   const memberRemove = async ({ author, request = {} } = {}) => {
     const logical = `brain-m-${await memberId(String(author))}-${String(request.name || "")}`;
@@ -22120,8 +22199,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
     if (!rec || rec.author !== author) return { worker: logical, state: "refused", reason: "not a service of this member" };
     if (!reasonOf(request.reason)) return { worker: logical, state: "refused", reason: WHY };
     because(reasonOf(request.reason), author, ["remove " + logical]);
-    await memberRemoveOne(logical);
-    return { worker: logical, state: "removed" };
+    return guard(logical, request.was, async () => (await memberRemoveOne(logical), { worker: logical, state: "removed" }));
   };
   // Every Worker of one member, when the owner removes them.
   const memberPurge = async ({ author } = {}) => {
@@ -22131,6 +22209,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,log,rows
       await memberRemoveOne(rec.worker);
       removed.push(rec.worker);
     }
+    await rows.deletePrefix(`mdeploys/${author}/`);
     return { removed };
   };
 
@@ -22199,7 +22278,7 @@ const _braindeployer_deployerPage = function _deployerPage() {return ((s, messag
     }</li>`;
   });
   const rollbacks = Object.entries(s.confirmed).flatMap(([name, list]) =>
-    list.map((c) => `<button name="action" value="rollback:${esc(name)}:${esc(c.version)}">Roll back ${esc(name)} to ${short(c.hash)} (${when(c.at)})</button>`)
+    list.map((c) => `<button name="action" value="rollback:${esc(name)}:${esc(c.version)}:${esc((s.workers.find((w) => w.worker === name) || {}).hash || "")}">Roll back ${esc(name)} to ${short(c.hash)} (${when(c.at)})</button>`)
   );
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Cloud Brain deployer</title><style>
 body{font:15px/1.5 system-ui,sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem;color:#111;background:#fff}
@@ -22299,14 +22378,15 @@ const _braindeployer_deployerFn = function _deployerFn(deployerOps,Response,depl
   if (config.replacedBy) return page("This deployer was replaced by " + config.replacedBy + ". Nothing was changed.", 409);
   const form = await request.formData();
   if (!recoveryKey || form.get("key") !== recoveryKey) return page("Wrong recovery key. Nothing was changed.", 401);
-  const [action, a, b] = String(form.get("action") || "").split(":");
+  const [action, a, b, saw] = String(form.get("action") || "").split(":");
   try {
     if (action === "approve") return page((await deployerOps.approve(a === "remove" ? "remove:" + b : a)) ? "Approved. Press Apply in the Brain again." : "Nothing with that hash is waiting.");
     if (action === "rollback") {
       const why = deployerOps.reasonOf(form.get("reason"));
       if (!why) return page("A roll back needs a reason, 3 to 300 characters. Nothing was changed.", 400);
       deployerOps.because(why, "recovery key", ["roll back " + a]);
-      return await deployerOps.rollback(a, b), page(`Rolled ${a} back.`);
+      const out = await deployerOps.rollback(a, b, saw);
+      return out.state === "refused" ? page(`Not rolled back: ${out.reason}. Nothing was changed; load this page again.`, 409) : page(`Rolled ${a} back.`);
     }
     if (action === "approval") return await deployerOps.setApproval(a === "on"), page(`Deploys need approval: ${a === "on" ? "on" : "off"}.`);
     return page("Unknown action.", 400);
@@ -22474,18 +22554,26 @@ const _braindeployer_deployerRig = function _deployerRig(fakeCloudflare,simulate
     const meta = { worker, role, crons: [], flags: [], methods: [], access: {}, paths: [], secrets: [], resources: [], bindings: [], ...extra };
     return { parts, meta, hash: await partsHash(parts, meta) };
   };
+  const running = (logical) => (sim.rows.get("worker/" + logical) || {}).hash || null;
+  const fresh = (body) => ({
+    ...body,
+    ...(body.workers ? { workers: body.workers.map((w) => (!w || "was" in w ? w : { ...w, was: running((w.meta && w.meta.worker) || (sim.rows.get("source/" + w.module) || {}).worker) })) } : {}),
+    ...(body.remove ? { remove: body.remove.map((n) => (typeof n === "string" ? { worker: n, was: running(n) } : n)) } : {})
+  });
   return {
     fake,
     sim,
     made,
-    // A reason goes with each apply; a test of the reason itself sends `reason: null`.
-    recover: async (body) => (await post(G + "/xrpc/com.lopecode.brain.infra.apply", { reason: "a test", ...body }, { authorization: "Bearer rk" })).json(),
+    fresh,
+    // A reason goes with each apply; a test of the reason itself sends `reason: null`. `was` is what the rig's rows
+    // hold at the call, as a caller with a fresh view would send; a test of `was` names its own.
+    recover: async (body) => (await post(G + "/xrpc/com.lopecode.brain.infra.apply", fresh({ reason: "a test", ...body }), { authorization: "Bearer rk" })).json(),
     asOwner: async (method, body) => {
       const key = (sim.rows.get("worker/brain") || {}).key;
       const headers = { "x-brain-key": key, "x-brain-caller": "owner" };
       const r = body === undefined
         ? await sim.fetch("https://deployer.internal/xrpc/com.lopecode.brain.infra." + method, { headers })
-        : await post("https://deployer.internal/xrpc/com.lopecode.brain.infra." + method, ["apply", "redistil"].includes(method) ? { reason: "a test", ...body } : body, headers);
+        : await post("https://deployer.internal/xrpc/com.lopecode.brain.infra." + method, ["apply", "redistil"].includes(method) ? fresh({ reason: "a test", ...body }) : body, headers);
       return r.json();
     },
     form: (fields) => sim.fetch(G + "/", { method: "POST", body: new URLSearchParams(fields) }),
@@ -22985,6 +23073,49 @@ const _braindeployer_test_a_change_says_why_and_the_reason_is_logged = async fun
   expect(lines.indexOf(why[0])).toBeLessThan(lines.findIndex((l) => l.at === "deploy.deployed" && l.target === "brain-x-why"));
   return why[0].reason;
 };
+const _braindeployer_test_a_change_names_the_hash_it_saw_and_one_change_to_a_worker_runs_at_a_time = async function _test_a_change_names_the_hash_it_saw_and_one_change_to_a_worker_runs_at_a_time(deployerRig,expect) {
+  const rig = await deployerRig(), W = "brain-x-saw", old = "f".repeat(64);
+  await rig.recover({ workers: [await rig.made("brain-core", "core", "c"), await rig.made("brain", "kernel", "k")] });
+  const one = await rig.made(W, "recipe", "one"), two = await rig.made(W, "recipe", "two"), three = await rig.made(W, "recipe", "three");
+  const uploads = () => rig.fake.log.filter((l) => l.startsWith("POST") && l.includes("/versions")).length;
+  const first = (out) => out.results[0];
+  // No `was`, and one that is not what is running: refused, nothing uploaded.
+  const none = uploads();
+  expect(first(await rig.recover({ workers: [{ ...one, was: undefined }] }))).toMatchObject({ state: "refused", reason: "was: the hash you saw running, all 64 characters, or null for no Worker" });
+  expect(first(await rig.recover({ workers: [{ ...one, was: "f".repeat(12) }] })).state).toBe("refused");
+  expect(first(await rig.recover({ workers: [{ ...one, was: old }] }))).toMatchObject({ state: "refused", reason: `${W} is no Worker, you saw ffffffffffff`, running: null });
+  expect(uploads()).toBe(none);
+  expect(first(await rig.recover({ workers: [{ ...one, was: null }] })).state).toBe("deployed");
+  // A view from before that deploy: it still says no Worker.
+  const once = uploads();
+  expect(first(await rig.recover({ workers: [{ ...two, was: null }] }))).toMatchObject({ state: "refused", reason: `${W} is ${one.hash.slice(0, 12)}, you saw no Worker`, running: one.hash });
+  expect([uploads(), rig.fake.running("cb-x-saw")]).toEqual([once, one.hash]);
+  // The row of a change is deleted when the change ends, a refused one too.
+  expect(rig.sim.rows.has("deploying/" + W)).toBe(false);
+  // While another change holds the row, a caller with the right hash is refused as well.
+  rig.sim.rows.set("deploying/" + W, { id: "other", until: Date.now() + 60000 });
+  expect(first(await rig.recover({ workers: [{ ...two, was: one.hash }] }))).toMatchObject({ state: "refused", reason: `another change to ${W} is running` });
+  expect([uploads(), rig.sim.rows.get("deploying/" + W).id]).toEqual([once, "other"]);
+  // A change that died holds the row until `until`. Then it is taken over, once.
+  rig.sim.rows.set("deploying/" + W, { id: "other", until: Date.now() - 1 });
+  expect(first(await rig.recover({ workers: [{ ...two, was: one.hash }] })).state).toBe("deployed");
+  expect([rig.sim.rows.has("deploying/" + W), rig.sim.rows.has(`deploying-over/${W}/other`), rig.fake.running("cb-x-saw")]).toEqual([false, true, two.hash]);
+  rig.sim.rows.set("deploying/" + W, { id: "other", until: Date.now() - 1 });
+  expect(first(await rig.recover({ workers: [{ ...three, was: two.hash }] })).reason).toBe(`another change to ${W} is running`);
+  rig.sim.rows.delete("deploying/" + W);
+  // An approval is of a hash over a hash. The Worker moves after the owner approves: the approval does not stand.
+  expect(first(await rig.asOwner("apply", { workers: [{ ...one, was: two.hash }] })).state).toBe("waiting");
+  expect(rig.sim.rows.get("pending/" + one.hash).was).toBe(two.hash);
+  expect((await rig.form({ key: "rk", action: "approve:" + one.hash })).status).toBe(200);
+  expect(first(await rig.recover({ workers: [{ ...three, was: two.hash }] })).state).toBe("deployed");
+  expect(first(await rig.asOwner("apply", { workers: [{ ...one, was: three.hash }] })).state).toBe("waiting");
+  expect((await rig.form({ key: "rk", action: "approve:" + one.hash })).status).toBe(200);
+  expect(first(await rig.asOwner("apply", { workers: [{ ...one, was: three.hash }] })).state).toBe("deployed");
+  // A removal names the hash too.
+  expect(first(await rig.recover({ remove: [{ worker: W, was: three.hash }] }))).toMatchObject({ state: "refused", reason: `${W} is ${one.hash.slice(0, 12)}, you saw ${three.hash.slice(0, 12)}` });
+  expect(first(await rig.recover({ remove: [W] })).state).toBe("removed");
+  return "refused 7 ways, deployed 4 times";
+};
 const _braindeployer_test_infra_needs_the_kernel_or_the_recovery_key = async function _test_infra_needs_the_kernel_or_the_recovery_key(deployerRig,expect) {
   const rig = await deployerRig();
   const G = "https://cb-deployer.sub.workers.dev/xrpc/com.lopecode.brain.infra.getState";
@@ -23014,9 +23145,13 @@ const _braindeployer_test_deployer_page_rolls_the_kernel_back = async function _
   expect((await rig.form({ key: "nope", action: `rollback:brain:${v1}` })).status).toBe(401);
   expect(rig.fake.running("cb")).toBe(k2.hash);
   // A roll back says why.
-  expect((await rig.form({ key: "rk", action: `rollback:brain:${v1}` })).status).toBe(400);
+  expect((await rig.form({ key: "rk", action: `rollback:brain:${v1}:${k2.hash}` })).status).toBe(400);
   expect(rig.fake.running("cb")).toBe(k2.hash);
-  expect((await rig.form({ key: "rk", action: `rollback:brain:${v1}`, reason: "k2 answers 500 on sign-in" })).status).toBe(200);
+  // A page drawn when another version was running does not roll back.
+  expect((await rig.form({ key: "rk", action: `rollback:brain:${v1}:${k1.hash}`, reason: "k2 answers 500 on sign-in" })).status).toBe(409);
+  expect((await rig.form({ key: "rk", action: `rollback:brain:${v1}`, reason: "k2 answers 500 on sign-in" })).status).toBe(409);
+  expect(rig.fake.running("cb")).toBe(k2.hash);
+  expect((await rig.form({ key: "rk", action: `rollback:brain:${v1}:${k2.hash}`, reason: "k2 answers 500 on sign-in" })).status).toBe(200);
   expect(rig.fake.running("cb")).toBe(k1.hash);
   return "rolled back to " + k1.hash.slice(0, 12);
 };
@@ -23254,7 +23389,15 @@ const _braindeployer_memberRig = function _memberRig(deployerRig,sha256) {return
   const rig = await deployerRig();
   await rig.recover({ workers: [await rig.made("brain-core", "core", "c"), await rig.made("brain", "kernel", "k")] });
   const key = rig.sim.rows.get("worker/brain").key;
-  const as = async (method, caller, body, k = key) => {
+  // `was` is what the rig's rows hold at the call, unless the test names one.
+  const seen = async (body) => {
+    const q = body && body.request;
+    if (!q || "was" in q || typeof body.author !== "string") return body;
+    const name = q.name || String((q.meta && q.meta.worker) || "").replace(/^brain-x-/, "");
+    return { ...body, request: { ...q, was: (rig.sim.rows.get(`worker/brain-m-${(await sha256(body.author)).slice(0, 10)}-${name}`) || {}).hash || null } };
+  };
+  const as = async (method, caller, raw, k = key) => {
+    const body = await seen(raw);
     const r = await rig.sim.fetch("https://deployer.internal/xrpc/com.lopecode.brain.member." + method, { method: "POST", headers: { "content-type": "application/json", "x-brain-key": k, "x-brain-caller": caller }, body: JSON.stringify(body) });
     return { status: r.status, ...(await r.json()) };
   };
@@ -23329,7 +23472,7 @@ const _braindeployer_test_a_member_deploy_is_refused_outside_its_tier = async fu
 const _braindeployer_test_a_member_cannot_deploy_over_another_members_worker = async function _test_a_member_cannot_deploy_over_another_members_worker(memberRig,expect) {
   const rig = await memberRig(), { id, A } = rig;
   // Two DIDs with one ID cannot be made here, so the row of the other member's Worker is written as a deploy leaves it.
-  const held = { worker: `brain-m-${id}-todo`, role: "member", author: "did:plc:carol", hash: "h-carol", version: "v-carol", key: "k-carol", state: "deployed", methods: [], access: {}, paths: [], secrets: [], resources: [] };
+  const held = { worker: `brain-m-${id}-todo`, role: "member", author: "did:plc:carol", hash: "c".repeat(64), version: "v-carol", key: "k-carol", state: "deployed", methods: [], access: {}, paths: [], secrets: [], resources: [] };
   rig.sim.rows.set("worker/" + held.worker, held);
   const uploads = rig.fake.log.length;
   expect(await rig.deploy("todo", "a")).toMatchObject({ worker: held.worker, state: "refused", reason: "the name is held by a service of another member" });
@@ -23344,12 +23487,15 @@ const _braindeployer_test_member_deploys_are_counted_per_member_and_hour = async
   const rig = await memberRig(), { A } = rig;
   const hour = new Date().toISOString().slice(0, 13);
   // Two an hour for this test; 60 when the kernel names no number.
+  rig.sim.rows.set(`mdeploys/${A}/2026-01-01T00`, 9);
   const go = (salt, author = A) => rig.deploy("todo", salt, {}, author, { deploys: 2 });
   expect([(await go("a")).state, (await go("a")).state]).toEqual(["deployed", "unchanged"]);
   const uploads = rig.fake.log.length;
   expect(await go("b")).toMatchObject({ worker: null, state: "refused", reason: "3 deploys asked this hour, at most 2" });
   expect(rig.fake.log.length).toBe(uploads);
   expect(rig.sim.rows.get(`mdeploys/${A}/${hour}`)).toBe(3);
+  // The count of an earlier hour is deleted by the first call of this one.
+  expect(rig.sim.rows.has(`mdeploys/${A}/2026-01-01T00`)).toBe(false);
   // Another member has their own count.
   expect((await go("a", "did:plc:bob")).state).toBe("deployed");
   rig.sim.rows.set(`mdeploys/${A}/${hour}`, 60);
@@ -23381,7 +23527,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_anon_b9696821dc", null, ["md"], _braindeployer_anon_b9696821dc);
   $def("_braindeployer_nextKernelState", "nextKernelState", [], _braindeployer_nextKernelState);
   $def("_braindeployer_anon_17200b265d", null, ["md"], _braindeployer_anon_17200b265d);
-  $def("_braindeployer_anon_32d58fce0d", null, ["md"], _braindeployer_anon_32d58fce0d);
+  $def("_braindeployer_anon_ae422c5bba", null, ["md"], _braindeployer_anon_ae422c5bba);
   $def("_braindeployer_deployerOps", "deployerOps", ["config","secrets","log","rows","Response","URLSearchParams","sha256","FormData","partsHash","deployerAllows","wrapperFlags","deployerDistil","nextKernelState"], _braindeployer_deployerOps);
   $def("_braindeployer_anon_b5cfc17bdb", null, ["md"], _braindeployer_anon_b5cfc17bdb);
   $def("_braindeployer_deployerPage", "deployerPage", [], _braindeployer_deployerPage);
@@ -23414,6 +23560,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_test_the_signing_key_is_not_made_anew_under_its_new_name", "test_the_signing_key_is_not_made_anew_under_its_new_name", ["deployerRig","expect"], _braindeployer_test_the_signing_key_is_not_made_anew_under_its_new_name);
   $def("_braindeployer_test_approval_holds_an_apply", "test_approval_holds_an_apply", ["deployerRig","expect"], _braindeployer_test_approval_holds_an_apply);
   $def("_braindeployer_test_a_change_says_why_and_the_reason_is_logged", "test_a_change_says_why_and_the_reason_is_logged", ["deployerRig","expect","logged"], _braindeployer_test_a_change_says_why_and_the_reason_is_logged);
+  $def("_braindeployer_test_a_change_names_the_hash_it_saw_and_one_change_to_a_worker_runs_at_a_time", "test_a_change_names_the_hash_it_saw_and_one_change_to_a_worker_runs_at_a_time", ["deployerRig","expect"], _braindeployer_test_a_change_names_the_hash_it_saw_and_one_change_to_a_worker_runs_at_a_time);
   $def("_braindeployer_test_infra_needs_the_kernel_or_the_recovery_key", "test_infra_needs_the_kernel_or_the_recovery_key", ["deployerRig","expect"], _braindeployer_test_infra_needs_the_kernel_or_the_recovery_key);
   $def("_braindeployer_test_deployer_page_rolls_the_kernel_back", "test_deployer_page_rolls_the_kernel_back", ["deployerRig","expect"], _braindeployer_test_deployer_page_rolls_the_kernel_back);
   $def("_braindeployer_test_a_path_or_method_belongs_to_one_worker", "test_a_path_or_method_belongs_to_one_worker", ["deployerRig","expect"], _braindeployer_test_a_path_or_method_belongs_to_one_worker);
@@ -25068,7 +25215,7 @@ var Es=Object.defineProperty;var As=(e)=>e;function Ss(e,t){this[e]=As.bind(null
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainkernel_anon_83308aecde = function _anonymous(md) {return (md`# brain-kernel
+const _brainkernel_anon_9c52ce1263 = function _anonymous(md) {return (md`# brain-kernel
 
 The Worker at the Brain's address. It serves the notebook, signs people in with atproto, works out who is calling, and forwards everything else to the core with that answer attached.
 
@@ -25092,10 +25239,10 @@ A person is an atproto account, named by its DID. There are two roles. The **own
 | \`people.list\` | query, owner. \`{ people }\`: each \`{ did, handle, role, name, addresses, methods }\`. \`role\` is \`owner\`, \`member\` or \`null\` (linked an address, not added). |
 | \`people.put\` | procedure, owner's session. \`{ did, name, services, quota, tags }\` makes that DID a member; a field left out keeps what it was. \`services: false\` stops their deploys. \`quota\` is \`{ workers, bytes, calls, deploys }\`; \`deploys\` is calls of \`member.deploy\` an hour. \`tags\` is \`[{ tag, access: "read" | "write" }]\`, the file tags they may read or change beside their own. |
 | \`people.remove\` | procedure, owner's session. \`{ did }\` removes the member, their grant and their addresses, and has the deployer delete their Workers. Their files stay, for the owner. |
-| \`member.deploy\`, \`member.remove\`, \`member.modules\` | procedure, a member. Passed to the deployer with the caller's DID as the author; the owner is refused and deploys with \`infra.apply\`. \`member.deploy\` takes \`{ module, source }\`. |
+| \`member.deploy\`, \`member.remove\`, \`member.modules\` | procedure, a member. Passed to the deployer with the caller's DID as the author; the owner is refused and deploys with \`infra.apply\`. \`member.deploy\` takes \`{ module, source, reason, was }\` and \`member.remove\` \`{ name, reason, was }\`: \`reason\` is 3 to 300 characters and is logged, \`was\` is the hash the caller saw running, \`null\` for no Worker. |
 | \`people.link\` | procedure, owner's session. \`{ channel, address, did }\` binds an address without the sign-in below. |
 | \`people.unlink\` | procedure, owner's session. \`{ channel, address }\` |
-| Storage | \`rows\`: \`member/<did>\`, \`address/<channel>/<address>\`, \`grant/<did>\`, \`handle/<did>\` |
+| Storage | \`rows\`: \`member/<did>\`, \`address/<channel>/<address>\`, \`grant/<did>\`, \`handle/<did>\`, \`logins/<10 minutes>\`, \`logins-known/<10 minutes>\` |
 
 **Addresses.** A channel is a Worker \`brain-x-NAME\` that appends what it receives to the inbox with \`body.address\`, the sender as that channel knows them (a phone number for \`whatsapp\`). The channel says nothing else about the sender. Which DID an address belongs to is decided here: \`address/NAME/<address>\`, where \`NAME\` comes from the Worker the core named as the entry's sender, not from anything in the entry. A channel can therefore speak only for addresses on its own channel.
 
@@ -25120,7 +25267,7 @@ A channel can narrow a turn with this and cannot widen one: the cap is taken ins
 
 **Members in the core.** After \`people.put\`, \`people.remove\`, \`grant.put\` and \`grant.delete\` the kernel sends the core every member with their grant, limits and tags (\`people.sync\`), because the core checks a member's Worker as its author.
 
-**Sessions.** No cookie is set or read. After atproto sign-in \`/auth/callback\` answers a page that writes a session token to this origin's \`localStorage\` (\`brain_session\`) and goes on; the Brain's page sends it as \`Authorization: Bearer\` with every call. \`/auth/login\` resolves a handle and calls a PDS for anyone, so it is counted: 60 starts in 10 minutes for all visitors together, then 429. A handle that signed in here before is not counted. It is a signed \`{ did, exp, epoch }\`, lasts 30 days and is not renewed: after that the visitor signs in again. "Sign out" drops it from the page; "sign out everywhere" (\`/auth/logout?everywhere=true\`) raises the epoch, which ends every session, turn and portal token issued before. Because a caller is only ever who their token says, a page on another address has nothing of this Brain's to send, and \`Origin\` is not looked at. A link or an \`<img>\` cannot carry a token: a private file is fetched by the page and shown from the bytes. The secret that signs all three kinds of token is still named \`COOKIE_KEY\`.
+**Sessions.** No cookie is set or read. After atproto sign-in \`/auth/callback\` answers a page that writes a session token to this origin's \`localStorage\` (\`brain_session\`) and goes on; the Brain's page sends it as \`Authorization: Bearer\` with every call. \`/auth/login\` resolves a handle and calls a PDS for anyone, so it is counted: 60 starts in 10 minutes for all visitors together, then 429. Starts for the handle of the owner or of a member are counted apart, 600 in 10 minutes, so a flood of other handles does not keep them out. 600 starts that name the owner's own handle do keep the owner out, until the 10 minutes end. It is a signed \`{ did, exp, epoch }\`, lasts 30 days and is not renewed: after that the visitor signs in again. "Sign out" drops it from the page; "sign out everywhere" (\`/auth/logout?everywhere=true\`) raises the epoch, which ends every session, turn and portal token issued before. Because a caller is only ever who their token says, a page on another address has nothing of this Brain's to send, and \`Origin\` is not looked at. A link or an \`<img>\` cannot carry a token: a private file is fetched by the page and shown from the bytes. The secret that signs all three kinds of token is still named \`COOKIE_KEY\`.
 
 Before 2026-10-07 13:40 the session was a \`SameSite=Lax\` cookie. \`NAME.SUBDOMAIN.workers.dev\` addresses are one site, so a page on another Worker's address sent it: on cb4 the owner's cookie with \`Origin: https://evil.endpointservices.workers.dev\` got 200 from \`GET library.list\` and \`POST token.revoke\`.
 
@@ -25384,11 +25531,14 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
     const handle = (c.req.query("handle") || "").trim().replace(/^@/, "");
     if (!handle) return c.text("handle", 400);
     // A sign-in start resolves a handle, calls a PDS and keeps a row, for anyone. LOGINS in 10 minutes, for all visitors together.
-    // A handle that signed in before is not counted, so the count cannot keep the owner or a member out.
     const bucket = Math.floor(Date.now() / 600000);
-    const before = (await rows.list("handle/")).some((r) => typeof r.value === "string" && r.value.toLowerCase() === handle.toLowerCase());
-    if (!before && (await rows.increment("logins/" + bucket)) > LOGINS) return c.text("too many sign-ins were started. Try again in 10 minutes.", 429);
-    await rows.delete("logins/" + (bucket - 2));
+    // The owner's handle and a member's are counted apart, 600 a bucket: a flood of unknown handles does not lock them out,
+    // and a flood of theirs is still bounded.
+    let ours = false;
+    for (const r of await rows.list("handle/")) if (typeof r.value === "string" && r.value.toLowerCase() === handle.toLowerCase() && (await roleOf(r.key.slice("handle/".length)))) ours = true;
+    const count = (ours ? "logins-known/" : "logins/") + bucket;
+    if ((await rows.increment(count)) > (ours ? LOGINS * 10 : LOGINS)) return c.text("too many sign-ins were started. Try again in 10 minutes.", 429);
+    for (const prefix of ["logins/", "logins-known/"]) for (const r of await rows.list(prefix)) if (r.key !== prefix + bucket) await rows.delete(r.key);
     // After sign-in a visitor goes back to the link page they came from, and nowhere else.
     const next = c.req.query("next") || "";
     const { url } = await (await oauth()).authorize({ target: { type: "account", identifier: handle }, state: { at: Date.now(), next: /^\/link\?[A-Za-z0-9=&_.-]*$/.test(next) ? next : null } });
@@ -25507,7 +25657,7 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
     if (!DID.test(did || "")) return fail(c, 400, "InvalidRequest", "did");
     if (did === config.owner) return fail(c, 400, "InvalidRequest", "the owner is not a member");
     const was = (await rows.get("member/" + did)) || {};
-    // quota: { workers, bytes, calls }, each a whole number; a name left out keeps the Brain's default.
+    // quota: { workers, bytes, calls, deploys }, each a whole number; a name left out keeps the Brain's default.
     const limits = quota === undefined ? was.quota || null : quota && Object.fromEntries(["workers", "bytes", "calls", "deploys"].filter((k) => Number.isInteger(quota[k]) && quota[k] >= 0).map((k) => [k, quota[k]]));
     // tags: [{ tag, access: "read" | "write" }], the labels on files this member may read or change beside their own.
     if (tags !== undefined && !(Array.isArray(tags) && tags.length <= 20 && tags.every((g) => g && typeof g.tag === "string" && /^[a-z0-9-]{1,40}$|^(by|worker):[A-Za-z0-9.:%-]{1,120}$/.test(g.tag) && ["read", "write"].includes(g.access)))) return fail(c, 400, "InvalidRequest", "tags: [{ tag, access: read | write }]");
@@ -26180,6 +26330,17 @@ const _brainkernel_test_a_strangers_jwt_makes_no_request_and_sign_in_starts_are_
   // A sign-in start past the count for 10 minutes is refused before anything is resolved.
   rig.sim.rows.set("logins/" + Math.floor(Date.now() / 600000), 60);
   expect((await rig.call("/auth/login?handle=someone.example")).status).toBe(429);
+  // A member's handle is counted apart: not refused by that count, and refused by its own at 600.
+  rig.sim.rows.set("member/did:plc:ada", { did: "did:plc:ada", added: 1 });
+  rig.sim.rows.set("handle/did:plc:ada", "Ada.example");
+  const known = "logins-known/" + Math.floor(Date.now() / 600000);
+  expect((await rig.call("/auth/login?handle=ada.example").catch(() => ({ status: 0 }))).status).not.toBe(429);
+  expect(rig.sim.rows.get(known)).toBe(1);
+  // One who signed in once and is no member is counted with everyone.
+  rig.sim.rows.set("handle/did:plc:gone", "gone.example");
+  expect((await rig.call("/auth/login?handle=gone.example")).status).toBe(429);
+  rig.sim.rows.set(known, 600);
+  expect((await rig.call("/auth/login?handle=ada.example")).status).toBe(429);
   return "401 AuthRequired; 429";
 };
 const _brainkernel_test_a_method_of_another_lexicon_is_passed_on_as_anonymous = async function _test_a_method_of_another_lexicon_is_passed_on_as_anonymous(kernelRig,expect) {
@@ -26344,7 +26505,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainkernel_anon_83308aecde", null, ["md"], _brainkernel_anon_83308aecde);
+  $def("_brainkernel_anon_9c52ce1263", null, ["md"], _brainkernel_anon_9c52ce1263);
   $def("_brainkernel_kernel_service", "kernel_service", ["cloudflare","kernelApp"], _brainkernel_kernel_service);
   $def("_brainkernel_kernel_announce", "kernel_announce", ["plugins","kernel_service","invalidation"], _brainkernel_kernel_announce);
   $def("_brainkernel_atcute", "atcute", ["library","FileAttachment"], _brainkernel_atcute);
@@ -27041,7 +27202,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainbluesky_anon_6780fac6a7 = function _anonymous(md) {return (md`# brain-bluesky
+const _brainbluesky_anon_26e5a19b03 = function _anonymous(md) {return (md`# brain-bluesky
 
 A Cloud Brain channel: Bluesky messages to the Brain's own account arrive in the inbox, and answers go back with \`inbox.reply\`. A sender is their DID, so nobody links anything: the owner is answered from the first message, and anyone else once the owner has added their DID under People. In a group it answers the owner and people when they address it; see Groups.
 
@@ -27049,7 +27210,7 @@ A Cloud Brain channel: Bluesky messages to the Brain's own account arrive in the
 |---|---|
 | Worker | \`brain-x-bluesky\`, ticked once a minute |
 | \`bluesky.send\` | procedure. The owner, a named token, or \`brain-x-inbox\` answering an entry; never a member. \`{ to, text }\` or \`{ to, image, text }\`; \`to\` is the owner's DID or a person's. With \`room\`, a group's conversation id, the text goes to that group, and \`to\` must be in it. |
-| \`bluesky.poll\` | procedure, owner. Reads what is new now. The page calls it every 5 s while its tab answers. |
+| \`bluesky.poll\` | procedure, owner. Reads what is new now. The page calls it every 30 s while its tab answers. |
 | \`bluesky.know\` | procedure, the kernel. \`{ address, forget }\` adds or drops one DID; \`{ all: [did] }\` replaces the set. |
 | \`bluesky.room\` | procedure, the kernel. \`{ id }\` answers \`{ known, name, members, complete, served }\` for a group this Worker has seen, read from the chat service when what is kept is over 2 minutes old. |
 | \`bluesky.start\` | procedure, owner. \`{ members, name, text }\`: makes a group of the owner and people already added (2 to 20 DIDs) and says \`text\` in it. \`{ id }\`. |
@@ -27059,7 +27220,7 @@ A Cloud Brain channel: Bluesky messages to the Brain's own account arrive in the
 | \`bluesky.putRecord\` | procedure. The owner in their tab, or \`brain-x-feed\` when the chain was started by the owner, in their tab or in a turn run for them (\`origin.kind == "owner"\`; *Origin* in \`@tomlarkworthy/brain-core\`). A token, or a member the owner gave \`feed.publish\`, does not write a record. Until 2026-10-08 the rule read \`origin.trusted\`, which let both through. \`{ collection, rkey, record }\` writes one record in the account's repo. \`collection\` must be \`app.bsky.feed.generator\`. \`{ did, handle, uri, cid }\`. |
 | \`bluesky.deleteRecord\` | procedure, the same callers. \`{ collection, rkey }\` deletes that record. \`{ did, handle, uri }\`. |
 | \`bluesky.status\` | query, owner. \`{ configured, handle, did, pds, signedIn, tick, lastPoll, lastError, backoffUntil, people, groups }\` |
-| Secrets | \`BLUESKY_HANDLE\`, \`BLUESKY_APP_PASSWORD\` |
+| Secrets | \`BLUESKY_HANDLE\`, \`BLUESKY_APP_PASSWORD\`. Read from the core at most once in 5 minutes for one instance (\`config.credsMs\`), so a changed secret is followed within 5 minutes. |
 | Storage | \`rows\`: \`session\`, \`refused\`, \`cursor\`, \`since\`, \`known/<did>\`, \`convo/<did>\`, \`direct/<convo>\`, \`group/<convo>\`, \`heard/<convo>\`, \`settings\`, \`declared\`, \`declareError\`, \`accepted/<convo>\`, \`asked/<did>\`, \`asks\`, \`quiet/<did>\`, \`polled\`, \`tick\`, \`busy\`, \`backoff\`, \`error\` |
 
 With either secret unset, a tick writes \`tick\` and stops: no request leaves the Worker, and \`bluesky.status\` answers \`{ configured: false }\`.`);};
@@ -27189,7 +27350,7 @@ const _brainbluesky_blueskyFacets = function _blueskyFacets() {return ((text) =>
     return { index: { byteStart, byteEnd: byteStart + encoder.encode(uri).length }, features: [{ $type: "app.bsky.richtext.facet#link", uri }] };
   });
 });};
-const _brainbluesky_blueskyOps = function _blueskyOps(secrets,sha256,rows,URLSearchParams,blueskySplit,blueskyFacets,config,inbox,xrpc) {
+const _brainbluesky_blueskyOps = function _blueskyOps(config,secrets,sha256,rows,URLSearchParams,blueskySplit,blueskyFacets,inbox,xrpc) {
   const HOUR = 3600000, CHAT = "did:web:api.bsky.chat#bsky_chat", NS = "chat.bsky.convo.";
   const stop = (code, message) => Object.assign(new Error(message), { code });
   const expiry = (jwt) => {
@@ -27199,12 +27360,19 @@ const _brainbluesky_blueskyOps = function _blueskyOps(secrets,sha256,rows,URLSea
       return 0;
     }
   };
+  // The two secrets are kept in this instance for credsMs: each read is a call to the core, and a poll made two.
+  // A changed secret is followed within that time. A missing one is not kept.
+  let kept = null;
   const creds = async () => {
+    const ms = config.credsMs ?? 300000;
+    if (ms > 0 && kept && Date.now() - kept.at < ms) return kept.c;
     const handle = await secrets.BLUESKY_HANDLE, password = await secrets.BLUESKY_APP_PASSWORD;
-    if (!handle || !password) return null;
+    if (!handle || !password) return (kept = null);
     const c = { handle: String(handle).trim().replace(/^@/, ""), password: String(password).trim() };
     // Says whether the secrets are the ones a session or a refusal was made with.
-    return { ...c, mark: (await sha256(c.handle + "\n" + c.password)).slice(0, 16) };
+    const out = { ...c, mark: (await sha256(c.handle + "\n" + c.password)).slice(0, 16) };
+    if (ms > 0) kept = { at: Date.now(), c: out };
+    return out;
   };
   const call = async (url, init) => {
     const r = await fetch(url, init);
@@ -27632,7 +27800,7 @@ const _brainbluesky_bluesky_announce = function _bluesky_announce(plugins,bluesk
 const _brainbluesky_anon_3e0092ed75 = function _anonymous(md) {return (md`## Tests
 
 The emitted Worker under \`simulate\`, against a stand-in for the directory, the account's PDS and the chat service. No test reaches Bluesky.`);};
-const _brainbluesky_blueskyRig = function _blueskyRig(Response,simulate,bluesky_service) {return (async ({ held = true, known = [], configured = true, owner = "did:plc:owner", pageSize = 50, allow = "following" } = {}) => {
+const _brainbluesky_blueskyRig = function _blueskyRig(Response,simulate,bluesky_service) {return (async ({ held = true, known = [], configured = true, owner = "did:plc:owner", pageSize = 50, allow = "following", credsMs = 0 } = {}) => {
   const jwt = (kind, n, exp) => `h.${btoa(JSON.stringify({ kind, n, exp: Math.floor(exp / 1000) }))}.s`;
   const net = { asked: [], sent: [], events: [], read: [], accepted: [], sessions: 0, refreshes: 0, live: 0, limit: 0, reset: null, password: "app-pass", declaration: allow === null ? null : { $type: "chat.bsky.actor.declaration", allowIncoming: allow }, groups: new Map(), past: new Set(), memberPage: 100, ttl: 7200000 };
   const state = { held };
@@ -27693,11 +27861,13 @@ const _brainbluesky_blueskyRig = function _blueskyRig(Response,simulate,bluesky_
   const sim = await simulate(bluesky_service, {
     rows: new Map(known.map((d) => ["known/" + d, { at: 1 }])),
     secrets: { BRAIN_KEY: "k" },
-    config: { host: "brain.example", owner, pollGapMs: 0 },
+    // credsMs 0: a test changes a secret and reads it on the next poll.
+    config: { host: "brain.example", owner, pollGapMs: 0, credsMs },
     fetch,
     core: async (request) => {
       const u = new URL(request.url), nsid = u.pathname.replace("/xrpc/com.lopecode.brain.", "");
       if (nsid === "secret.get") {
+        state.reads = (state.reads || 0) + 1;
         const name = u.searchParams.get("name"), value = sim.stored[name];
         return value === undefined ? Response.json({ error: "NotFound" }, { status: 404 }) : Response.json({ name, value });
       }
@@ -28190,6 +28360,19 @@ const _brainbluesky_test_bluesky_writes_only_a_feed_generator_record = async fun
   }
   return "1 written, 1 deleted, 8 refused by collection";
 };
+const _brainbluesky_test_bluesky_reads_its_secrets_once_in_the_window = async function _test_bluesky_reads_its_secrets_once_in_the_window(blueskyRig,expect) {
+  const rig = await blueskyRig({ credsMs: 150 });
+  const reads = () => rig.state.reads || 0;
+  await rig.poll();
+  const first = reads();
+  await rig.poll();
+  const second = reads();
+  await new Promise((r) => setTimeout(r, 200));
+  await rig.poll();
+  // One pair for two polls inside the window, and a second pair after it.
+  expect([first, second, reads()]).toEqual([2, 2, 4]);
+  return "2 reads for 2 polls, 4 after the window";
+};
 const _brainbluesky_test_bluesky_declares_what_it_needs = async function _test_bluesky_declares_what_it_needs(bluesky_service,expect,decide,callerOf) {
   const { meta } = await bluesky_service.emit();
   expect(meta.worker).toBe("brain-x-bluesky");
@@ -28209,7 +28392,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainbluesky_anon_6780fac6a7", null, ["md"], _brainbluesky_anon_6780fac6a7);
+  $def("_brainbluesky_anon_26e5a19b03", null, ["md"], _brainbluesky_anon_26e5a19b03);
   $def("_brainbluesky_viewof_blueskyStatus", "viewof blueskyStatus", ["html","client","Inputs","session"], _brainbluesky_viewof_blueskyStatus);
   $def("_brainbluesky_blueskyStatus", "blueskyStatus", ["Generators","viewof blueskyStatus"], _brainbluesky_blueskyStatus);
   $def("_brainbluesky_bluesky_setup", "bluesky_setup", ["md"], _brainbluesky_bluesky_setup);
@@ -28219,7 +28402,7 @@ export default function define(runtime, observer) {
   $def("_brainbluesky_blueskyGroups", "blueskyGroups", ["Generators","viewof blueskyGroups"], _brainbluesky_blueskyGroups);
   $def("_brainbluesky_blueskySplit", "blueskySplit", [], _brainbluesky_blueskySplit);
   $def("_brainbluesky_blueskyFacets", "blueskyFacets", [], _brainbluesky_blueskyFacets);
-  $def("_brainbluesky_blueskyOps", "blueskyOps", ["secrets","sha256","rows","URLSearchParams","blueskySplit","blueskyFacets","config","inbox","xrpc"], _brainbluesky_blueskyOps);
+  $def("_brainbluesky_blueskyOps", "blueskyOps", ["config","secrets","sha256","rows","URLSearchParams","blueskySplit","blueskyFacets","inbox","xrpc"], _brainbluesky_blueskyOps);
   $def("_brainbluesky_blueskyApp", "blueskyApp", ["hono","blueskyOps"], _brainbluesky_blueskyApp);
   $def("_brainbluesky_bluesky_service", "bluesky_service", ["cloudflare","blueskyApp","blueskyOps"], _brainbluesky_bluesky_service);
   $def("_brainbluesky_bluesky_announce", "bluesky_announce", ["plugins","bluesky_service","invalidation"], _brainbluesky_bluesky_announce);
@@ -28244,6 +28427,7 @@ export default function define(runtime, observer) {
   $def("_brainbluesky_test_bluesky_group_members_are_read_again", "test_bluesky_group_members_are_read_again", ["blueskyRig","expect"], _brainbluesky_test_bluesky_group_members_are_read_again);
   $def("_brainbluesky_test_bluesky_what_someone_said_before_leaving_a_group_is_not_sent_with_an_entry", "test_bluesky_what_someone_said_before_leaving_a_group_is_not_sent_with_an_entry", ["blueskyRig","expect"], _brainbluesky_test_bluesky_what_someone_said_before_leaving_a_group_is_not_sent_with_an_entry);
   $def("_brainbluesky_test_bluesky_writes_only_a_feed_generator_record", "test_bluesky_writes_only_a_feed_generator_record", ["blueskyRig","expect","bluesky_service","decide","callerOf"], _brainbluesky_test_bluesky_writes_only_a_feed_generator_record);
+  $def("_brainbluesky_test_bluesky_reads_its_secrets_once_in_the_window", "test_bluesky_reads_its_secrets_once_in_the_window", ["blueskyRig","expect"], _brainbluesky_test_bluesky_reads_its_secrets_once_in_the_window);
   $def("_brainbluesky_test_bluesky_declares_what_it_needs", "test_bluesky_declares_what_it_needs", ["bluesky_service","expect","decide","callerOf"], _brainbluesky_test_bluesky_declares_what_it_needs);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
@@ -28643,7 +28827,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainstatic_anon_6fbbdfac41 = function _anonymous(md) {return (md`# brain-static
+const _brainstatic_anon_10bc324b59 = function _anonymous(md) {return (md`# brain-static
 
 Files kept by a Cloud Brain and served from its address.
 
@@ -28687,7 +28871,7 @@ A recipe is the owner's code and is not checked by tag: it reads and changes wha
 
 The core sends, with each call by a person, whether they are a member, their tag grants and their limit in bytes. The limit counts every file under \`u/ID/\`, default 20 MB.
 
-Each put records its caller as the file's \`writer\`. A file is served with \`Content-Security-Policy: sandbox\`, so a browser gives it no script and no origin, unless its writer is the owner, the deployer or a recipe. A token's file and a member's are sandboxed, and so is the owner's file once either has written it, until the owner puts it again. A file kept before \`writer\` (2026-10-09) is sandboxed unless it is under \`shell/\`.
+Each put records its caller as the file's \`writer\`. A file is served with \`Content-Security-Policy: sandbox\`, so a browser gives it no script and no origin, unless its writer is the owner in their own session, the deployer or a recipe. The owner by a turn, a portal or a PDS call is the writer \`owner by turn\` (\`portal\`, \`jwt\`): its file is sandboxed, its \`type\` is not taken, and it does not write under \`shell/\` or \`library/\`. A token's file and a member's are sandboxed, and so is the owner's file once either has written it, until the owner puts it again. A file kept before \`writer\` (2026-10-09) is sandboxed unless it is under \`shell/\`.
 
 ## Where a file goes
 
@@ -28798,7 +28982,7 @@ const _brainstatic_staticApp = function _staticApp(hono,config,sha256,rows,Respo
   const writable = async (c, path) => {
     if (!okPath(path)) return { no: fail(c, 400, "InvalidRequest", "path") };
     const dir = kept(c, path);
-    if (dir) return { no: fail(c, 403, "Forbidden", `only the owner writes under ${dir}`) };
+    if (dir) return { no: fail(c, 403, "Forbidden", `only the owner, in their own session, writes under ${dir}`) };
     const m = await me(c), before = await rows.get("f/" + path);
     const ok = before ? can(m, before, path, "write") : !!m && typeof m.home === "string" && path.startsWith(m.home);
     return ok ? { m, before } : { no: fail(c, 403, "Forbidden", before ? `${path} is not this caller's to change` : `${path} is outside ${m && typeof m.home === "string" ? m.home : "what this caller may reach"}`) };
@@ -28931,7 +29115,8 @@ const _brainstatic_staticApp = function _staticApp(hono,config,sha256,rows,Respo
 const _brainstatic_anon_be3d699220 = function _anonymous(md) {return (md`## Tests`);};
 const _brainstatic_staticRig = function _staticRig(simulate,static_service) {return (async () => {
   const sim = await simulate(static_service, {});
-  const call = (who, path, init = {}) => sim.fetch("https://static.internal" + path, { ...init, headers: { ...(init.headers || {}), "x-brain-caller": who } });
+  // who is a caller, or "owner by turn:7": the owner as the core names them for a turn, a portal or a PDS call.
+  const call = (who, path, init = {}) => sim.fetch("https://static.internal" + path, { ...init, headers: { ...(init.headers || {}), "x-brain-caller": who.split(" by ")[0], ...(who.includes(" by ") ? { "x-brain-via": who.split(" by ")[1] } : {}) } });
   const X = "/xrpc/com.lopecode.brain.static.";
   const put = (who, path, body, extra = "") => call(who, X + "put?path=" + encodeURIComponent(path) + extra, { method: "POST", body });
   const post = (who, name, input) => call(who, X + name, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
@@ -29127,6 +29312,22 @@ const _brainstatic_test_static_a_members_worker_writes_as_its_author_within_thei
   expect((await rig.get({ "x-brain-caller": "worker:brain-x-library" }, file)).status).toBe(403);
   return "a member's Worker, within the limit";
 };
+const _brainstatic_test_the_owner_by_a_turn_is_not_the_owner_as_a_writer = async function _test_the_owner_by_a_turn_is_not_the_owner_as_a_writer(staticRig,expect) {
+  const rig = await staticRig();
+  const page = "<script>1<\/script>";
+  const got = async (path) => ((r) => [r.headers.get("content-type"), (r.headers.get("content-security-policy") || "").startsWith("sandbox")])(await rig.call("owner", "/static/" + path));
+  // A turn, a portal and a PDS call of the owner: stored, sandboxed, and the type each names is not taken.
+  for (const via of ["turn:7", "portal:did:plc:ada", "jwt"]) {
+    expect((await rig.put("owner by " + via, "site/t.txt", page, "&type=text/html")).status).toBe(200);
+    expect(await got("site/t.txt")).toEqual(["text/plain; charset=utf-8", true]);
+    expect((await rig.put("owner by " + via, "shell/index.html", page)).status).toBe(403);
+    expect((await rig.put("owner by " + via, "library/n/1.html", page)).status).toBe(403);
+  }
+  // The owner in their own session puts it again: a page.
+  expect((await rig.put("owner", "site/t.txt", page, "&type=text/html")).status).toBe(200);
+  expect(await got("site/t.txt")).toEqual(["text/html", false]);
+  return "3 ways refused under shell/ and library/";
+};
 const _brainstatic_test_static_only_bytes_the_owner_last_wrote_are_served_as_a_page = async function _test_static_only_bytes_the_owner_last_wrote_are_served_as_a_page(tagRig,expect) {
   const rig = await tagRig(), { A, a } = rig, token = "token:laptop", html = "text/html; charset=utf-8";
   const served = async (path) => {
@@ -29207,7 +29408,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainstatic_anon_6fbbdfac41", null, ["md"], _brainstatic_anon_6fbbdfac41);
+  $def("_brainstatic_anon_10bc324b59", null, ["md"], _brainstatic_anon_10bc324b59);
   $def("_brainstatic_static_service", "static_service", ["cloudflare","staticApp"], _brainstatic_static_service);
   $def("_brainstatic_static_announce", "static_announce", ["plugins","static_service","invalidation"], _brainstatic_static_announce);
   $def("_brainstatic_staticTypes", "staticTypes", [], _brainstatic_staticTypes);
@@ -29223,6 +29424,7 @@ export default function define(runtime, observer) {
   $def("_brainstatic_tagRig", "tagRig", ["staticRig","sha256"], _brainstatic_tagRig);
   $def("_brainstatic_test_static_a_files_tags_decide_who_reads_and_who_changes_it", "test_static_a_files_tags_decide_who_reads_and_who_changes_it", ["tagRig","expect"], _brainstatic_test_static_a_files_tags_decide_who_reads_and_who_changes_it);
   $def("_brainstatic_test_static_a_members_worker_writes_as_its_author_within_their_limit", "test_static_a_members_worker_writes_as_its_author_within_their_limit", ["tagRig","expect"], _brainstatic_test_static_a_members_worker_writes_as_its_author_within_their_limit);
+  $def("_brainstatic_test_the_owner_by_a_turn_is_not_the_owner_as_a_writer", "test_the_owner_by_a_turn_is_not_the_owner_as_a_writer", ["staticRig","expect"], _brainstatic_test_the_owner_by_a_turn_is_not_the_owner_as_a_writer);
   $def("_brainstatic_test_static_only_bytes_the_owner_last_wrote_are_served_as_a_page", "test_static_only_bytes_the_owner_last_wrote_are_served_as_a_page", ["tagRig","expect"], _brainstatic_test_static_only_bytes_the_owner_last_wrote_are_served_as_a_page);
   $def("_brainstatic_test_static_a_member_who_overwrites_the_owners_file_gets_no_page", "test_static_a_member_who_overwrites_the_owners_file_gets_no_page", ["tagRig","expect"], _brainstatic_test_static_a_member_who_overwrites_the_owners_file_gets_no_page);
   $def("_brainstatic_test_static_a_listing_does_not_show_a_person_what_is_only_public", "test_static_a_listing_does_not_show_a_person_what_is_only_public", ["tagRig","expect"], _brainstatic_test_static_a_listing_does_not_show_a_person_what_is_only_public);
@@ -29245,7 +29447,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainblob_anon_63bb1f0ef1 = function _anonymous(md) {return (md`# brain-blob
+const _brainblob_anon_43384eb3ef = function _anonymous(md) {return (md`# brain-blob
 
 Bytes kept by a Cloud Brain under the address of their content, in the shapes an atproto PDS uses for blobs. There are no paths: \`brain-static\` keeps files by path and is a separate store.
 
@@ -29280,7 +29482,7 @@ Who may read or change a blob is decided from its tags, by the rules of \`brain-
 
 | tag | set by | meaning |
 |---|---|---|
-| \`by:<did>\` | this Worker, from the caller | an uploader. Their bytes count against their limit. The owner's uploads, and a recipe's, carry the owner's; a token's carry \`by:token:<name>\`. The first one in the list set the type. |
+| \`by:<did>\` | this Worker, from the caller | an uploader. Their bytes count against their limit. The owner's uploads, and a recipe's, carry the owner's; a token's carry \`by:token:<name>\`, and the owner's by a turn, a portal or a PDS call \`by:owner:turn\` (\`portal\`, \`jwt\`), which does not set a type that is served as a page. The first one in the list set the type. |
 | \`worker:<name>\` | this Worker, when a Worker uploaded | a member's Worker calls as its author, so its blob carries both. |
 | \`public\` | whoever may change the blob | anyone reads it. |
 | \`members\` | whoever may change the blob | any current member reads it. |
@@ -29838,7 +30040,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainblob_anon_63bb1f0ef1", null, ["md"], _brainblob_anon_63bb1f0ef1);
+  $def("_brainblob_anon_43384eb3ef", null, ["md"], _brainblob_anon_43384eb3ef);
   $def("_brainblob_blob_service", "blob_service", ["cloudflare","blobApp"], _brainblob_blob_service);
   $def("_brainblob_blob_announce", "blob_announce", ["plugins","blob_service","invalidation"], _brainblob_blob_announce);
   $def("_brainblob_blobCid", "blobCid", [], _brainblob_blobCid);
@@ -29909,7 +30111,8 @@ A notebook served from \`/library\` runs on the Brain's own address, so its cell
 const _brainlibrary_library_service = function _library_service(cloudflare,libraryApp) {return (cloudflare.Service("library", libraryApp, {
   methods: {
     // A saved notebook is served as a page that runs as whoever opens it: only the owner's own tab saves one, not a token or a turn.
-    "com.lopecode.brain.library.put": { type: "procedure", who: "owner", allow: "caller.session" },
+    // Fixed: this Worker is a writer brain-static trusts, so what reaches put is served as a page.
+    "com.lopecode.brain.library.put": { type: "procedure", who: "owner", allow: "caller.session", fixed: true },
     "com.lopecode.brain.library.list": { type: "query", who: "anyone" },
     "com.lopecode.brain.library.versions": { type: "query", who: "owner" },
     "com.lopecode.brain.library.setPublic": { type: "procedure", who: "owner" },
@@ -30145,6 +30348,7 @@ const _brainlibrary_test_library_declares_what_it_needs = async function _test_l
     calls: ["com.lopecode.brain.static.delete", "com.lopecode.brain.static.get", "com.lopecode.brain.static.put"],
     paths: [{ path: "/library/*", who: "anyone" }]
   });
+  expect(meta.access["com.lopecode.brain.library.put"]).toMatchObject({ allow: "caller.session", fixed: true });
   return meta.calls.join(", ");
 };
 const _brainlibrary_test_library_panel_lists_notebooks = async function _test_library_panel_lists_notebooks(libraryPanel,expect) {
@@ -32674,7 +32878,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braininbox_anon_61bcb1dcaa = function _anonymous(md) {return (md`# brain-inbox
+const _braininbox_anon_eb20726aa7 = function _anonymous(md) {return (md`# brain-inbox
 
 What arrives from outside a Cloud Brain, kept in order until a tab has handled it.
 
@@ -32685,7 +32889,7 @@ What arrives from outside a Cloud Brain, kept in order until a tab has handled i
 | \`inbox.list\` | query, owner. \`?after=<id>&limit=50&all=true\`. \`{ entries, waiting }\`; without \`all\`, only entries not done. |
 | \`inbox.done\` | procedure, owner. \`{ id, failed }\`. \`failed\` is why it could not be handled; the entry is then finished as failed and is not handed out again. |
 | \`inbox.reply\` | procedure. \`{ id, text }\`. Sends \`text\` to the address entry \`id\` came from, through the channel it came from, and keeps it on the entry. An entry written in a room (\`body.room.id\`) is answered there: the channel is sent \`room\` beside \`to\`. The owner or a named token may answer any entry. A turn (\`x-brain-via: turn:<id>\`) may answer its own entry, and only while it is waiting. |
-| \`lease.take\` | procedure, owner. \`{ tab, release }\`. \`{ held, holder }\`. One tab holds it; unrenewed for 30 s it is free. |
+| \`lease.take\` | procedure, owner. \`{ tab, release }\`. \`{ held, holder }\`. One tab holds it; unrenewed for 90 s it is free. |
 | \`inbox.poll\` | procedure, owner. \`{ tab }\`. \`{ held, holder, entries, waiting }\`: \`lease.take\` and the waiting entries in one call. |
 | \`lease.get\` | query. A Worker or the owner. \`{ held }\` |
 | Storage | \`rows\`: \`inbox/<id>\` (waiting), \`inboxdone/<id>\`, \`inboxkey/<key>\`, \`inboxseq\`, \`lease\` |
@@ -32780,8 +32984,8 @@ const _braininbox_inboxApp = function _inboxApp(hono,rows,xrpc) {
     await rows.put((waiting ? "inbox/" : "inboxdone/") + pad(id), { ...entry, replies: [...(entry.replies || []), { at: Date.now(), by: from, text: said }].slice(-20) });
     return c.json({ id, sent: true });
   });
-  // One tab answers at a time. A tab that stops renewing loses the lease after 30 s.
-  const LEASE = 30000;
+  // One tab answers at a time. The page polls every 30 s, so a tab that stops renewing loses the lease after 90 s: 3 polls.
+  const LEASE = 90000;
   const take = async (tab) => {
     const now = Date.now(), held = await rows.get("lease");
     const free = !held || held.tab === tab || now - held.at > LEASE;
@@ -32880,7 +33084,7 @@ const _braininbox_test_lease_one_tab_at_a_time = async function _test_lease_one_
   expect((await rig.anonymous("lease.get")).status).toBe(401);
   expect((await rig.worker("lease.take", { tab: "w" })).status).toBe(401);
   // A tab that stopped renewing 31 s ago has lost it.
-  rig.sim.rows.set("lease", { tab: "a", at: Date.now() - 31000 });
+  rig.sim.rows.set("lease", { tab: "a", at: Date.now() - 91000 });
   expect((await rig.worker("lease.get")).data).toEqual({ held: false });
   expect((await rig.owner("lease.take", { tab: "b" })).data).toEqual({ held: true, holder: "b" });
   expect((await rig.owner("lease.take", { tab: "b", release: true })).data).toEqual({ held: false, holder: null });
@@ -32889,7 +33093,7 @@ const _braininbox_test_lease_one_tab_at_a_time = async function _test_lease_one_
   expect((await rig.owner("inbox.poll", { tab: "a" })).data).toMatchObject({ held: true, holder: "a", waiting: 1 });
   expect((await rig.owner("inbox.poll", { tab: "b" })).data).toEqual({ held: false, holder: "a", entries: [], waiting: 0 });
   expect((await rig.worker("inbox.poll", { tab: "w" })).status).toBe(401);
-  return "a, then b after 31 s, then released, then polled";
+  return "a, then b after 91 s, then released, then polled";
 };
 const _braininbox_test_reply_goes_back_where_the_entry_came_from = async function _test_reply_goes_back_where_the_entry_came_from(inboxRig,expect) {
   const rig = await inboxRig();
@@ -32934,7 +33138,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braininbox_anon_61bcb1dcaa", null, ["md"], _braininbox_anon_61bcb1dcaa);
+  $def("_braininbox_anon_eb20726aa7", null, ["md"], _braininbox_anon_eb20726aa7);
   $def("_braininbox_inboxView", "inboxView", ["inboxPanel","client","session"], _braininbox_inboxView);
   $def("_braininbox_inbox_service", "inbox_service", ["cloudflare","inboxApp"], _braininbox_inbox_service);
   $def("_braininbox_inbox_announce", "inbox_announce", ["plugins","inbox_service","invalidation"], _braininbox_inbox_announce);
@@ -33847,7 +34051,7 @@ What a Cloud Brain knows: one entry for each thing found, with where it was foun
 An entry holds text to search, not a file. A paper's PDF or a page's HTML stays in \`brain-static\`; the entry has its path and its SHA-256.`);};
 const _brainknowledge_viewof_knowledgeView = function _knowledgeView(knowledgePanel,client,session) {return (knowledgePanel({ client, owner: !!(session && session.owner) }));};
 const _brainknowledge_knowledgeView = (G, _) => G.input(_);
-const _brainknowledge_anon_876e5bc16b = function _anonymous(md,knowledgeLimits,knowledgeKinds) {return (md`## Methods
+const _brainknowledge_anon_dc9b1eb371 = function _anonymous(md,knowledgeLimits,knowledgeKinds) {return (md`## Methods
 
 | | |
 |---|---|
@@ -33855,10 +34059,10 @@ const _brainknowledge_anon_876e5bc16b = function _anonymous(md,knowledgeLimits,k
 | \`knowledge.put\` | procedure. One entry, or \`{ entries: [...] }\`, ${knowledgeLimits.batch} at most. \`{ entered, changed, ids }\`. |
 | \`knowledge.get\` | query. \`?id=\`. The entry, or 404 \`EntryNotFound\`. |
 | \`knowledge.search\` | query. \`?q=\` and the filters below, \`limit\` 1 to ${knowledgeLimits.page} (20). \`{ entries }\`, best match first, each with a \`snippet\`. |
-| \`knowledge.list\` | query. The filters below, \`limit\`, \`cursor\`. \`{ entries, cursor }\`, last entered first. |
+| \`knowledge.list\` | query. The filters below, \`limit\` 1 to ${knowledgeLimits.page} (50), \`cursor\`. \`{ entries, cursor }\`, last entered first. |
 | \`knowledge.delete\` | procedure. \`{ id }\` or \`{ ids }\`. \`{ deleted }\`. |
-| \`knowledge.stats\` | query. \`{ entries, kinds, sources, by }\`: counts, the last two of the 100 largest. |
-| Filters | \`source\`, \`kind\`, \`by\`, \`tag\`, and \`since\` (milliseconds or an ISO date, compared with \`at\`) |
+| \`knowledge.stats\` | query. \`{ entries, kinds, sources, by, limits }\`: counts, \`sources\` and \`by\` of the 100 largest, and \`knowledgeLimits\`. |
+| Filters | \`source\`, \`kind\`, \`by\`, \`tag\`, and \`since\`, compared with \`at\`: milliseconds, or a date from \`YYYY-MM\` on. Four digits alone are refused, since they could be either. |
 | Storage | \`database\`: \`entries\` and its full-text index \`entries_fts\` |
 
 ## An entry
@@ -33869,17 +34073,17 @@ const _brainknowledge_anon_876e5bc16b = function _anonymous(md,knowledgeLimits,k
 | \`kind\` | ${knowledgeKinds.map((k) => "\`" + k + "\`").join(", ")} |
 | \`title\` | 1 to ${knowledgeLimits.title} characters |
 | \`text\` | the abstract, the summary or the finding, ${knowledgeLimits.text} characters at most. This and the title are what a search reads. |
-| \`url\` | where it was found |
-| \`source\` | the service it came from, \`a-z 0-9 -\`: \`arxiv\`, \`hn\`, \`simon-willison\` |
-| \`published\` | the date the source gives, as text |
-| \`file\`, \`sha256\` | the path of the kept copy in \`brain-static\` and the SHA-256 of its bytes |
+| \`url\` | where it was found: an \`http\` or \`https\` address that parses |
+| \`source\` | the service it came from, \`a-z 0-9 -\`, ${knowledgeLimits.source} characters at most: \`arxiv\`, \`hn\`, \`simon-willison\` |
+| \`published\` | the date the source gives, as text, ${knowledgeLimits.published} characters at most |
+| \`file\`, \`sha256\` | the path of the kept copy in \`brain-static\`, ${knowledgeLimits.file} characters at most, and the SHA-256 of its bytes |
 | \`method\` | how it was entered, ${knowledgeLimits.method} characters at most: \`snapshot\`, \`digest:research-2026-10-09\`, \`manual\` |
 | \`cites\` | ids of the entries this one is drawn from, ${knowledgeLimits.cites} at most. A finding cites its sources. |
-| \`tags\` | \`a-z 0-9 -\`, ${knowledgeLimits.tags} at most |
+| \`tags\` | \`a-z 0-9 -\`, ${knowledgeLimits.source} characters each, ${knowledgeLimits.tags} at most |
 | \`by\`, \`at\` | who entered it and when. Set here from the caller the core names (\`owner\`, \`token:NAME\`, \`worker:brain-x-NAME\`, a DID); a value in the body is not read. |
-| \`changed\` | \`null\`, or \`{ by, method, at }\` of the last put after the first |
+| \`changed\` | \`null\`, or \`{ by, method, at }\` of the last put after the first. Its \`method\` is the one that put gave, \`null\` when it gave none. |
 
-A put of an id that is kept changes the entry. \`by\`, \`method\` and \`at\` stay as first entered. A field left out keeps its value; \`tags\` and \`cites\` are joined with those kept.
+A put of an id that is kept changes the entry. \`by\`, \`method\` and \`at\` stay as first entered. A field left out, or \`null\`, keeps its value. An empty text clears \`text\`, \`url\`, \`source\`, \`published\`, \`file\` or \`sha256\`; \`title\` and \`method\` cannot be cleared. \`tags\` and \`cites\` are only added to: those given are joined with those kept, and the way to remove one is to delete the entry and put it again.
 
 \`\`\`js
 await client.procedure("knowledge.put", { id: "arxiv:2610.08077", kind: "paper", title: "Self-Retrospection Distillation", text: "…", url: "https://arxiv.org/abs/2610.08077", source: "arxiv", method: "manual" })
@@ -33914,7 +34118,8 @@ const _brainknowledge_knowledge_announce = function _knowledge_announce(plugins,
   return "announced knowledge_service";
 };
 const _brainknowledge_knowledgeKinds = function _knowledgeKinds() {return (["paper", "article", "post", "finding", "note", "other"]);};
-const _brainknowledge_knowledgeLimits = function _knowledgeLimits() {return ({ batch: 100, page: 100, id: 100, title: 500, text: 16000, url: 2000, method: 100, cites: 50, tags: 16 });};
+const _brainknowledge_knowledgeLimits = function _knowledgeLimits() {return ({ batch: 100, page: 100, id: 100, title: 500, text: 16000, url: 2000, source: 40, published: 40, file: 200, method: 100, cites: 50, tags: 16 });};
+const _brainknowledge_knowledgePatterns = function _knowledgePatterns() {return ({ id: /^[a-z0-9][a-z0-9._:-]*$/, name: /^[a-z0-9-]+$/ });};
 const _brainknowledge_knowledgeSchema = function _knowledgeSchema() {return ([
   "CREATE TABLE IF NOT EXISTS entries (n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, url TEXT, source TEXT, published TEXT, file TEXT, sha256 TEXT, entered_by TEXT NOT NULL, method TEXT NOT NULL, at INTEGER NOT NULL, upd_by TEXT, upd_method TEXT, upd_at INTEGER, cites TEXT NOT NULL, tags TEXT NOT NULL)",
   "CREATE INDEX IF NOT EXISTS entries_newest ON entries (at, id)",
@@ -33926,8 +34131,8 @@ const _brainknowledge_knowledgeSql = function _knowledgeSql() {
   const FILTER = "(?1 = '' OR e.source = ?1) AND (?2 = '' OR e.kind = ?2) AND (?3 = '' OR e.entered_by = ?3) AND e.at >= ?4 AND (?5 = '' OR e.tags LIKE ?5)";
   return {
     get: `SELECT ${COLS} FROM entries e WHERE e.id = ?1`,
-    // A put of a kept id leaves entered_by, method and at as they were.
-    put: "INSERT INTO entries (id, kind, title, text, url, source, published, file, sha256, entered_by, method, at, cites, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, title = excluded.title, text = excluded.text, url = excluded.url, source = excluded.source, published = excluded.published, file = excluded.file, sha256 = excluded.sha256, cites = excluded.cites, tags = excluded.tags, upd_by = excluded.entered_by, upd_method = excluded.method, upd_at = excluded.at",
+    // A put of a kept id leaves entered_by, method and at as they were. ?15 is the method this put gave, null when none.
+    put: "INSERT INTO entries (id, kind, title, text, url, source, published, file, sha256, entered_by, method, at, cites, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, title = excluded.title, text = excluded.text, url = excluded.url, source = excluded.source, published = excluded.published, file = excluded.file, sha256 = excluded.sha256, cites = excluded.cites, tags = excluded.tags, upd_by = excluded.entered_by, upd_method = ?15, upd_at = excluded.at",
     ftsDrop: "DELETE FROM entries_fts WHERE rowid = (SELECT n FROM entries WHERE id = ?1)",
     ftsAdd: "INSERT INTO entries_fts (rowid, title, text, tags) SELECT n, title, text, tags FROM entries WHERE id = ?1",
     drop: "DELETE FROM entries WHERE id = ?1",
@@ -33948,7 +34153,7 @@ const _brainknowledge_knowledgeMatch = function _knowledgeMatch() {return ((q) =
     .slice(0, 20)
     .map(([w, start]) => `"${w}"` + (start ? "*" : ""))
     .join(" "));};
-const _brainknowledge_knowledgeEntry = function _knowledgeEntry(knowledgeLimits,knowledgeKinds,sha256) {return (async (given, kept = null) => {
+const _brainknowledge_knowledgeEntry = function _knowledgeEntry(knowledgeLimits,knowledgePatterns,knowledgeKinds,sha256) {return (async (given, kept = null) => {
   const L = knowledgeLimits, e = given;
   if (!e || typeof e !== "object" || Array.isArray(e)) return { error: "an entry is an object" };
   const text = (k, max, { need = false, pattern = null } = {}) => {
@@ -33957,22 +34162,23 @@ const _brainknowledge_knowledgeEntry = function _knowledgeEntry(knowledgeLimits,
     if (typeof v !== "string" || v.length > max || (pattern && !pattern.test(v))) return { error: `${k}: text of ${max} characters at most${pattern ? ", " + pattern.source : ""}` };
     return { value: v };
   };
-  const NAME = /^[a-z0-9-]{1,40}$/, ID = /^[a-z0-9][a-z0-9._:-]*$/;
+  const NAME = knowledgePatterns.name, ID = knowledgePatterns.id;
+  const parses = (u) => { try { return !!new URL(u); } catch { return false; } };
   const list = (k, max, pattern) => {
     const v = e[k] === undefined || e[k] === null ? [] : e[k];
-    if (!Array.isArray(v) || !v.every((t) => typeof t === "string" && pattern.test(t) && t.length <= L.id)) return { error: `${k}: a list of ${pattern.source}` };
+    if (!Array.isArray(v) || !v.every((t) => typeof t === "string" && pattern.test(t) && t.length <= (pattern === NAME ? L.source : L.id))) return { error: `${k}: a list of ${pattern.source}` };
     const all = [...new Set([...((kept && kept[k]) || []), ...v])];
     return all.length > max ? { error: `${k}: ${max} at most` } : { value: all };
   };
   const out = {};
   const fields = [
-    ["kind", () => (knowledgeKinds.includes(e.kind === undefined && kept ? kept.kind : e.kind) ? { value: e.kind === undefined && kept ? kept.kind : e.kind } : { error: "kind: one of " + knowledgeKinds.join(", ") })],
+    ["kind", () => ((k) => (knowledgeKinds.includes(k) ? { value: k } : { error: "kind: one of " + knowledgeKinds.join(", ") }))(e.kind == null && kept ? kept.kind : e.kind)],
     ["title", () => text("title", L.title, { need: true })],
     ["text", () => ((r) => (r.error ? r : { value: r.value || "" }))(text("text", L.text))],
-    ["url", () => text("url", L.url, { pattern: /^https?:\/\/\S+$/ })],
-    ["source", () => text("source", 40, { pattern: NAME })],
-    ["published", () => text("published", 40)],
-    ["file", () => text("file", 200, { pattern: /^[A-Za-z0-9@._-]+(\/[A-Za-z0-9@._-]+)*$/ })],
+    ["url", () => ((r) => (r.error || !r.value || parses(r.value) ? r : { error: "url: not an address that parses" }))(text("url", L.url, { pattern: /^https?:\/\/\S+$/ }))],
+    ["source", () => text("source", L.source, { pattern: NAME })],
+    ["published", () => text("published", L.published)],
+    ["file", () => text("file", L.file, { pattern: /^[A-Za-z0-9@._-]+(\/[A-Za-z0-9@._-]+)*$/ })],
     ["sha256", () => text("sha256", 64, { pattern: /^[0-9a-f]{64}$/ })],
     ["method", () => text("method", L.method, { need: true, pattern: /^[A-Za-z0-9._:/ -]+$/ })],
     ["cites", () => list("cites", L.cites, ID)],
@@ -33983,11 +34189,11 @@ const _brainknowledge_knowledgeEntry = function _knowledgeEntry(knowledgeLimits,
     if (r.error) return { error: r.error };
     out[k] = r.value;
   }
-  if (e.id !== undefined && !(typeof e.id === "string" && e.id.length <= L.id && ID.test(e.id))) return { error: `id: ${ID.source}, ${L.id} characters at most` };
-  out.id = e.id !== undefined ? e.id : await sha256([out.kind, out.url || "", out.title].join("\n"));
+  if (e.id != null && !(typeof e.id === "string" && e.id.length <= L.id && ID.test(e.id))) return { error: `id: ${ID.source}, ${L.id} characters at most` };
+  out.id = e.id != null ? e.id : await sha256([out.kind, out.url || "", out.title].join("\n"));
   return { entry: out };
 });};
-const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits,knowledgeSql,database,knowledgeSchema,knowledgeKinds,knowledgeEntry,knowledgeMatch) {
+const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits,knowledgeSql,database,knowledgeSchema,knowledgePatterns,knowledgeKinds,knowledgeEntry,knowledgeMatch) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.knowledge.", L = knowledgeLimits, S = knowledgeSql;
   const fail = (c, status, error, message) => c.json({ error, message }, status);
@@ -34007,9 +34213,10 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
   // The filters of search and list, as the five arguments of FILTER.
   const filters = (c) => {
     const q = (k) => c.req.query(k) || "", since = q("since");
-    const at = since === "" ? 0 : /^\d{1,16}$/.test(since) ? Number(since) : Date.parse(since);
-    if (!Number.isFinite(at)) return { error: "since: milliseconds or a date" };
-    for (const k of ["source", "tag"]) if (q(k) && !/^[a-z0-9-]{1,40}$/.test(q(k))) return { error: k + ": a-z 0-9 -" };
+    // Four digits could be a year or 2026 ms, so they are neither.
+    const at = since === "" ? 0 : /^\d{4}$/.test(since) ? NaN : /^\d{1,16}$/.test(since) ? Number(since) : /^\d{4}-\d{2}/.test(since) ? Date.parse(since) : NaN;
+    if (!Number.isFinite(at)) return { error: "since: milliseconds, or a date from YYYY-MM on" };
+    for (const k of ["source", "tag"]) if (q(k) && !(knowledgePatterns.name.test(q(k)) && q(k).length <= L.source)) return { error: k + ": a-z 0-9 -" };
     if (q("kind") && !knowledgeKinds.includes(q("kind"))) return { error: "kind: one of " + knowledgeKinds.join(", ") };
     if (q("by").length > 300) return { error: "by" };
     return { args: [q("source"), q("kind"), q("by"), at, q("tag") ? `%"${q("tag")}"%` : ""] };
@@ -34030,7 +34237,7 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
     for (const [i, e] of given.entries()) {
       const r = await knowledgeEntry(e);
       // A changed entry may leave out what a new one needs; it is checked again below against what is kept.
-      first.push(r.entry ? r.entry.id : e && typeof e.id === "string" && /^[a-z0-9][a-z0-9._:-]{0,99}$/.test(e.id) ? e.id : null);
+      first.push(r.entry ? r.entry.id : e && typeof e.id === "string" && e.id.length <= L.id && knowledgePatterns.id.test(e.id) ? e.id : null);
       if (!first[i]) return fail(c, 400, "InvalidRequest", `entry ${i + 1}: ${r.error}`);
     }
     const was = new Map();
@@ -34043,9 +34250,10 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
       const r = await knowledgeEntry({ ...e, id: first[i] }, kept);
       if (r.error) return fail(c, 400, "InvalidRequest", `entry ${i + 1}: ${r.error}`);
       seen.set(first[i], r.entry);
-      entries.push(r.entry);
+      // said: the method this put gave. A change that gives none is recorded with none, not with the first enterer's.
+      entries.push({ ...r.entry, said: e.method == null || e.method === "" ? null : r.entry.method });
     }
-    const row = (e) => [S.put, e.id, e.kind, e.title, e.text, e.url, e.source, e.published, e.file, e.sha256, by, e.method, now, JSON.stringify(e.cites), JSON.stringify(e.tags)];
+    const row = (e) => [S.put, e.id, e.kind, e.title, e.text, e.url, e.source, e.published, e.file, e.sha256, by, e.method, now, JSON.stringify(e.cites), JSON.stringify(e.tags), e.said];
     // One transaction for each 20 entries: the full-text row goes, the entry is written, its full-text row is made again.
     for (let i = 0; i < entries.length; i += 20) await run(entries.slice(i, i + 20).flatMap((e) => [[S.ftsDrop, e.id], row(e), [S.ftsAdd, e.id]]));
     const ids = [...new Set(first)], changed = ids.filter((id) => was.has(id)).length;
@@ -34084,14 +34292,14 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
   });
   return app;
 };
-const _brainknowledge_knowledgePanel = function _knowledgePanel(htl,Inputs,knowledgeKinds) {return (({ client, owner = false } = {}) => {
+const _brainknowledge_knowledgePanel = function _knowledgePanel(htl,Inputs,knowledgeKinds,Event) {return (({ client, owner = false } = {}) => {
   const muted = "color:var(--theme-foreground-muted)";
   if (!client || !owner) return Object.assign(htl.html`<i style=${muted}>Sign in to a Brain as the owner to search what it knows.</i>`, { value: null });
   const box = htl.html`<div></div>`, note = htl.html`<div style="${muted};margin:6px 0"></div>`;
   const q = Inputs.text({ label: "Find", placeholder: "words", width: "24em", submit: "Search" });
   const kind = Inputs.select(["", ...knowledgeKinds], { label: "Kind", format: (k) => k || "any" });
   const el = Object.assign(htl.html`<div>${q}${kind}${note}${box}</div>`, { value: [] });
-  const link = (u) => (u ? htl.html`<a href=${u} target="_blank" rel="noopener">${new URL(u).hostname}</a>` : "");
+  const link = (u) => (u ? htl.html`<a href=${u} target="_blank" rel="noopener">${((x) => { try { return new URL(x).hostname; } catch { return x; } })(u)}</a>` : "");
   const draw = async () => {
     const params = { ...(kind.value ? { kind: kind.value } : {}) };
     const [found, stats] = await Promise.all([q.value ? client.query("knowledge.search", { ...params, q: q.value }) : client.query("knowledge.list", { ...params, limit: 50 }), client.query("knowledge.stats")]);
@@ -34102,6 +34310,8 @@ const _brainknowledge_knowledgePanel = function _knowledgePanel(htl,Inputs,knowl
         ? Inputs.table(found.entries.map((e) => ({ kind: e.kind, title: e.title, found: e.snippet || e.text.slice(0, 160), source: e.source || "", url: e.url, file: e.file || "", by: e.by, method: e.method, entered: new Date(e.at) })), { layout: "auto", format: { url: link, entered: (d) => d.toISOString().slice(0, 16).replace("T", " ") } })
         : htl.html`<i style=${muted}>Nothing.</i>`
     );
+    // The value cell reads el on its own input event. load listens on q and kind, not on el, so this starts no second draw.
+    el.dispatchEvent(new Event("input"));
   };
   el.load = () => draw().catch((e) => void (note.textContent = "knowledge failed: " + ((e && e.message) || e)));
   q.addEventListener("input", el.load);
@@ -34124,8 +34334,8 @@ const _brainknowledge_knowledgeFakeSql = function _knowledgeFakeSql(knowledgeSql
     if (knowledgeSchema.includes(statement)) return { rows: [], changes: 0 };
     if (statement === S.get) return { rows: entries.has(a[0]) ? [cols(entries.get(a[0]))] : [], changes: 0 };
     if (statement === S.put) {
-      const [id, kind, title, text, url, source, published, file, sha256, by, method, at, cites, tags] = a, was = entries.get(id);
-      entries.set(id, was ? { ...was, kind, title, text, url, source, published, file, sha256, cites, tags, upd_by: by, upd_method: method, upd_at: at } : { n: ++n, id, kind, title, text, url, source, published, file, sha256, entered_by: by, method, at, upd_by: null, upd_method: null, upd_at: null, cites, tags });
+      const [id, kind, title, text, url, source, published, file, sha256, by, method, at, cites, tags, said] = a, was = entries.get(id);
+      entries.set(id, was ? { ...was, kind, title, text, url, source, published, file, sha256, cites, tags, upd_by: by, upd_method: said, upd_at: at } : { n: ++n, id, kind, title, text, url, source, published, file, sha256, entered_by: by, method, at, upd_by: null, upd_method: null, upd_at: null, cites, tags });
       return { rows: [], changes: 1 };
     }
     if (statement === S.ftsDrop) return { rows: [], changes: entries.has(a[0]) && fts.delete(entries.get(a[0]).n) ? 3 : 0 };
@@ -34170,6 +34380,12 @@ const _brainknowledge_test_knowledge_records_who_entered_it_and_how = async func
   expect(first.at).toBeGreaterThan(1e12);
   // A second put changes the entry and not how it entered. A field left out keeps its value; tags are joined.
   await rig.snapshot.post("put", { id: "arxiv:1", tags: ["votes-hf-papers"] });
+  // A change that gives no method is recorded with none: not with the method of whoever entered it first.
+  await rig.owner.post("put", { id: "arxiv:1", kind: null, published: "2026-10-07" });
+  expect((await rig.owner.get("get", { id: "arxiv:1" })).data).toMatchObject({ kind: "paper", method: "snapshot", published: "2026-10-07", changed: { by: "owner", method: null } });
+  // An empty text clears a field that may be empty.
+  await rig.owner.post("put", { id: "arxiv:1", published: "" });
+  expect((await rig.owner.get("get", { id: "arxiv:1" })).data.published).toBe(null);
   expect((await rig.owner.post("put", { id: "arxiv:1", file: "corpus/2026-10-09/hf-papers/1.pdf", sha256: "a".repeat(64), method: "digest:research-2026-10-09", tags: ["agents"] })).data).toEqual({ entered: 0, changed: 1, ids: ["arxiv:1"] });
   const second = (await rig.owner.get("get", { id: "arxiv:1" })).data;
   expect(second).toMatchObject({ by: "worker:brain-x-snapshot", method: "snapshot", at: first.at, title: "Paper 1", url: "https://arxiv.org/abs/1", file: "corpus/2026-10-09/hf-papers/1.pdf", tags: ["votes-hf-papers", "agents"] });
@@ -34195,16 +34411,17 @@ const _brainknowledge_test_knowledge_search_finds_by_word_and_filter = async fun
   expect(await found({ q: "agents hindsight" })).toEqual(["arxiv:1"]);
   expect(await found({ q: "hind*" })).toEqual(["arxiv:1"]);
   expect(await found({ q: "speech", since: String(Date.now() + 60000) })).toEqual([]);
+  expect([await found({ q: "speech", since: "2026-01" }), await found({ q: "speech", since: "2999-01-01" })]).toEqual([["arxiv:2", "hn:3"], []]);
   expect((await o.get("search", { q: "speech" })).data.entries[0].snippet).toBeTruthy();
   // What is typed is words, never syntax of the index.
   expect([knowledgeMatch('agents AND ("hind* OR'), knowledgeMatch("  "), knowledgeMatch("a*b c*")]).toEqual(['"agents" "AND" "(hind"* "OR"', "", '"ab" "c"*']);
-  for (const params of [{}, { q: '"' }, { q: "a", limit: "0" }, { q: "a", limit: "101" }, { q: "a", kind: "book" }, { q: "a", source: "A B" }, { q: "a", since: "soon" }]) expect((await o.get("search", params)).status).toBe(400);
+  for (const params of [{}, { q: '"' }, { q: "a", limit: "0" }, { q: "a", limit: "101" }, { q: "a", kind: "book" }, { q: "a", source: "A B" }, { q: "a", since: "soon" }, { q: "a", since: "2026" }]) expect((await o.get("search", params)).status).toBe(400);
   // A changed entry is found by its new words only, and a deleted one not at all.
   await o.post("put", { id: "hn:3", text: "a tiny audio model" });
   expect([await found({ q: "speech" }), await found({ q: "audio" })]).toEqual([["arxiv:2"], ["hn:3"]]);
   expect((await o.post("delete", { ids: ["hn:3", "hn:4"] })).data).toEqual({ deleted: 1 });
   expect([await found({ q: "audio" }), rig.db.fts.size, rig.db.entries.size]).toEqual([[], 2, 2]);
-  return "8 searches, 7 refused";
+  return "10 searches, 8 refused";
 };
 const _brainknowledge_test_knowledge_list_pages_and_stats_count = async function _test_knowledge_list_pages_and_stats_count(knowledgeRig,expect) {
   const rig = await knowledgeRig(), o = rig.owner;
@@ -34223,7 +34440,7 @@ const _brainknowledge_test_knowledge_refuses_an_entry_it_cannot_keep = async fun
   const rig = await knowledgeRig(), o = rig.owner, ok = rig.paper(1);
   const bad = [
     [{ ...ok, kind: "book" }, "kind"], [{ ...ok, title: "" }, "title"], [{ ...ok, title: "x".repeat(501) }, "title"], [{ ...ok, text: "x".repeat(16001) }, "text"],
-    [{ ...ok, url: "ftp://x" }, "url"], [{ ...ok, source: "Hacker News" }, "source"], [{ ...ok, method: undefined }, "method"], [{ ...ok, id: "A b" }, "id"],
+    [{ ...ok, url: "ftp://x" }, "url"], [{ ...ok, url: "https://[" }, "url"], [{ ...ok, source: "Hacker News" }, "source"], [{ ...ok, method: undefined }, "method"], [{ ...ok, id: "A b" }, "id"],
     [{ ...ok, file: "a b" }, "file"], [{ ...ok, sha256: "abc" }, "sha256"], [{ ...ok, tags: ["a:b"] }, "tags"], [{ ...ok, tags: Array.from({ length: 17 }, (_, i) => "t" + i) }, "tags"], [{ ...ok, cites: "arxiv:2" }, "cites"]
   ];
   for (const [entry, field] of bad) expect([field, (await o.post("put", entry)).data.message.startsWith("entry 1: " + field)]).toEqual([field, true]);
@@ -34256,12 +34473,20 @@ const _brainknowledge_test_knowledge_panel_searches_and_lists = async function _
   const client = { query: async (name, params) => (asked.push([name, params]), name === "knowledge.stats" ? { entries: 7 } : { entries: [name === "knowledge.search" ? { ...entry, snippet: "[agents]" } : entry] }) };
   const el = knowledgePanel({ client, owner: true });
   await el.ready;
+  const heard = [];
+  el.addEventListener("input", () => heard.push(el.value.length && el.value[0].snippet));
   expect([el.value.length, el.textContent.includes("7 entries. The last entered:"), asked[0]]).toEqual([1, true, ["knowledge.list", { limit: 50 }]]);
   const q = el.querySelector("input[type=text]");
   q.value = "agents";
   el.querySelector("form").dispatchEvent(new Event("submit", { cancelable: true }));
   await el.load();
   expect(asked.some(([name, params]) => name === "knowledge.search" && params.q === "agents")).toBe(true);
+  // The element says when its value is the new result, so a cell that reads the value sees it.
+  expect(heard.at(-1)).toBe("[agents]");
+  // An address the browser cannot parse is shown as written, and the table is still drawn.
+  const odd = knowledgePanel({ client: { query: async (name) => (name === "knowledge.stats" ? { entries: 1 } : { entries: [{ ...entry, url: "https://[" }] }) }, owner: true });
+  await odd.ready;
+  expect([odd.textContent.includes("knowledge failed"), odd.textContent.includes("https://["), !!odd.querySelector("table")]).toEqual([false, true, true]);
   expect([el.textContent.includes("1 found."), el.textContent.includes("[agents]"), el.querySelector("a").href]).toEqual([true, true, "https://arxiv.org/abs/1"]);
   expect(knowledgePanel({ client, owner: false }).textContent).toMatch(/Sign in to a Brain as the owner/);
   return "listed, then searched";
@@ -34275,18 +34500,19 @@ export default function define(runtime, observer) {
   $def("_brainknowledge_anon_8aa58815e2", null, ["md"], _brainknowledge_anon_8aa58815e2);
   $def("_brainknowledge_viewof_knowledgeView", "viewof knowledgeView", ["knowledgePanel","client","session"], _brainknowledge_viewof_knowledgeView);
   $def("_brainknowledge_knowledgeView", "knowledgeView", ["Generators","viewof knowledgeView"], _brainknowledge_knowledgeView);
-  $def("_brainknowledge_anon_876e5bc16b", null, ["md","knowledgeLimits","knowledgeKinds"], _brainknowledge_anon_876e5bc16b);
+  $def("_brainknowledge_anon_dc9b1eb371", null, ["md","knowledgeLimits","knowledgeKinds"], _brainknowledge_anon_dc9b1eb371);
   $def("_brainknowledge_anon_80322a97fb", null, ["md"], _brainknowledge_anon_80322a97fb);
   $def("_brainknowledge_knowledge_service", "knowledge_service", ["cloudflare","knowledgeApp"], _brainknowledge_knowledge_service);
   $def("_brainknowledge_knowledge_announce", "knowledge_announce", ["plugins","knowledge_service","invalidation"], _brainknowledge_knowledge_announce);
   $def("_brainknowledge_knowledgeKinds", "knowledgeKinds", [], _brainknowledge_knowledgeKinds);
   $def("_brainknowledge_knowledgeLimits", "knowledgeLimits", [], _brainknowledge_knowledgeLimits);
+  $def("_brainknowledge_knowledgePatterns", "knowledgePatterns", [], _brainknowledge_knowledgePatterns);
   $def("_brainknowledge_knowledgeSchema", "knowledgeSchema", [], _brainknowledge_knowledgeSchema);
   $def("_brainknowledge_knowledgeSql", "knowledgeSql", [], _brainknowledge_knowledgeSql);
   $def("_brainknowledge_knowledgeMatch", "knowledgeMatch", [], _brainknowledge_knowledgeMatch);
-  $def("_brainknowledge_knowledgeEntry", "knowledgeEntry", ["knowledgeLimits","knowledgeKinds","sha256"], _brainknowledge_knowledgeEntry);
-  $def("_brainknowledge_knowledgeApp", "knowledgeApp", ["hono","knowledgeLimits","knowledgeSql","database","knowledgeSchema","knowledgeKinds","knowledgeEntry","knowledgeMatch"], _brainknowledge_knowledgeApp);
-  $def("_brainknowledge_knowledgePanel", "knowledgePanel", ["htl","Inputs","knowledgeKinds"], _brainknowledge_knowledgePanel);
+  $def("_brainknowledge_knowledgeEntry", "knowledgeEntry", ["knowledgeLimits","knowledgePatterns","knowledgeKinds","sha256"], _brainknowledge_knowledgeEntry);
+  $def("_brainknowledge_knowledgeApp", "knowledgeApp", ["hono","knowledgeLimits","knowledgeSql","database","knowledgeSchema","knowledgePatterns","knowledgeKinds","knowledgeEntry","knowledgeMatch"], _brainknowledge_knowledgeApp);
+  $def("_brainknowledge_knowledgePanel", "knowledgePanel", ["htl","Inputs","knowledgeKinds","Event"], _brainknowledge_knowledgePanel);
   $def("_brainknowledge_anon_c91f4dad24", null, ["md"], _brainknowledge_anon_c91f4dad24);
   $def("_brainknowledge_knowledgeFakeSql", "knowledgeFakeSql", ["knowledgeSql","knowledgeSchema"], _brainknowledge_knowledgeFakeSql);
   $def("_brainknowledge_knowledgeRig", "knowledgeRig", ["knowledgeFakeSql","simulate","knowledge_service","URLSearchParams"], _brainknowledge_knowledgeRig);
@@ -34710,8 +34936,9 @@ const _cloudbrain_brain = function _brain(session,brainDeployer,client,fromBrain
       },
       // A deploy is not finished when the deployer says deployed: the page then loads the module back from the Worker,
       // runs its tests and tells the core, which marks the version verified or has the deployer put the old one back.
-      apply: async (emitted, { force = false, reason } = {}) => {
-        const out = await client.procedure("infra.apply", { workers: [{ ...asSource(emitted), force }], reason });
+      // was: the hash the caller saw running, null for no Worker. The deployer refuses when it is no longer that.
+      apply: async (emitted, { force = false, reason, was } = {}) => {
+        const out = await client.procedure("infra.apply", { workers: [{ ...asSource(emitted), force, was }], reason });
         // The deployer's answer is what was deployed. A hash other than this page's is said, not hidden.
         for (const r of out.results) if (r.hash && r.hash !== emitted.hash) r.note = `the deployer distilled ${r.hash.slice(0, 12)}; this page made ${emitted.hash.slice(0, 12)}`;
         for (const r of out.results) if (r.state === "deployed" || r.state === "probation") r.verdict = await verifyService(r.worker, { expect: r.hash }).catch((e) => ({ state: "not verified", reason: String((e && e.message) || e) }));
@@ -34859,7 +35086,7 @@ const _cloudbrain_platformWiring = function _platformWiring(brain,backend,client
     rowsDelete: async (key) => (await client.procedure("rows.delete", { worker: "tab", key })).deleted,
     rowsList: async (prefix = "") => (await client.query("rows.list", { worker: "tab", prefix })).rows,
     xrpc: (kind, nsid, data) => (kind === "query" ? client.query(nsid, data) : client.procedure(nsid, data)),
-    deploy: (emitted, reason) => brain.apply(emitted, { reason })
+    deploy: (emitted, reason, was) => brain.apply(emitted, { reason, was })
   });
   return "platform cells use " + brainOrigin;
 };
@@ -34976,7 +35203,7 @@ const _cloudbrain_inboxPump = async function* _inboxPump(brain,invalidation,clie
           if (inboxStarted.has(entry.id) || (!conversation && !handlers.length)) continue;
           inboxStarted.add(entry.id);
           if (conversation) {
-            // A turn can take minutes and the lease lasts 30 s, so it is renewed while the turn runs.
+            // A turn can take minutes and the lease lasts 90 s, so it is renewed while the turn runs.
             const renew = setInterval(() => client.procedure("lease.take", { tab }).catch(() => null), 10000);
             try {
               await conversationTurn(entry, { client });
@@ -34996,7 +35223,8 @@ const _cloudbrain_inboxPump = async function* _inboxPump(brain,invalidation,clie
       if (status.error !== e.message) yield (status = { ...status, answering: false, error: e.message });
     }
     // One call a turn. The rows it reads are in D1, which bills nothing between calls.
-    await new Promise((r) => setTimeout(r, 5000));
+    // 30 s (Tom, 2026-10-09): a message waits up to that long. The lease lasts 3 of these.
+    await new Promise((r) => setTimeout(r, 30000));
   }
 };
 const _cloudbrain_deployerInbox = function _deployerInbox(plugins,$0,invalidation) {
@@ -35074,7 +35302,7 @@ const _cloudbrain_assistantTools = function _assistantTools(brain,defineTool,$0,
           brain: brainOrigin,
           approvalNeeded: state.approval,
           deployerClock: state.tick ? { secondsAgo: Math.round((Date.now() - state.tick.at) / 1000), error: state.tick.error || null } : "never ran",
-          workers: rows.map((r) => ({ worker: r.worker, state: r.state, note: r.note || null, running: r.running ? String(r.running).slice(0, 12) : null, notebook: r.hash ? String(r.hash).slice(0, 12) : null })),
+          workers: rows.map((r) => ({ worker: r.worker, state: r.state, note: r.note || null, running: r.running || null, notebook: r.hash ? String(r.hash).slice(0, 12) : null })),
           probation: Object.fromEntries(Object.entries(state.kernel || {}).map(([k, v]) => [k, { state: v.state, reason: v.reason || null, secondsLeft: v.deadline ? Math.max(0, Math.round((v.deadline - Date.now()) / 1000)) : null }])),
           heldForApproval: (state.pending || []).map((p) => ({ worker: p.worker, hash: String(p.hash).slice(0, 12) })),
           secretsNotSet: [...new Set(rows.flatMap((r) => r.secrets || []))].filter((n) => !/^(BRAIN_|CF_|COOKIE_KEY$|SESSION_KEY$|RECOVERY_KEY$)/.test(n) && !set.has(n)),
@@ -35100,13 +35328,13 @@ const _cloudbrain_assistantTools = function _assistantTools(brain,defineTool,$0,
     }),
     defineTool({
       id: "brain_apply",
-      description: "Ask the deployer to deploy one declared service as it is in this notebook now. worker is its Worker name from brain_services, e.g. brain-x-echo. reason says why it is changed, in 3 to 300 characters; the deployer logs it and refuses a deploy without one. Returns deployed, probation, waiting (the owner must approve on the deployer page), refused or put-back with the reason.",
-      parameters: { type: "object", properties: { worker: { type: "string" }, reason: { type: "string" } }, required: ["worker", "reason"] },
-      execute: async ({ worker, reason }) => {
+      description: "Ask the deployer to deploy one declared service as it is in this notebook now. worker is its Worker name from brain_services, e.g. brain-x-echo. reason says why it is changed, in 3 to 300 characters; the deployer logs it and refuses a deploy without one. was is the hash brain_services gave as running for this worker when you read it, or an empty string when it gave none; the deployer refuses when the Worker has changed since, and you then read brain_services again. Returns deployed, probation, waiting (the owner must approve on the deployer page), refused or put-back with the reason.",
+      parameters: { type: "object", properties: { worker: { type: "string" }, reason: { type: "string" }, was: { type: "string" } }, required: ["worker", "reason", "was"] },
+      execute: async ({ worker, reason, was }) => {
         need();
         const emitted = (await Promise.all(declaredWorkers.map((s) => s.emit().catch((e) => ({ error: String(e.message || e), name: s.name }))))).find((e) => e.meta && e.meta.worker === worker);
         if (!emitted) throw new Error(`No declared service deploys as ${worker}. brain_services lists them.`);
-        const out = await brain.apply(emitted, { reason });
+        const out = await brain.apply(emitted, { reason, was: was || null });
         $0.refresh();
         return { title: "apply " + worker, output: JSON.stringify(out.results, null, 1) };
       }
@@ -35267,7 +35495,7 @@ const _cloudbrain_installBrain = function _installBrain(deployer_service,wrapper
   form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
   for (const p of deployerEmit.parts) form.append(p.path, p.base64 != null ? new File([Uint8Array.from(atob(p.base64), (ch) => ch.charCodeAt(0))], p.path, { type: "application/wasm" }) : new File([p.text], p.path, { type: "application/javascript+module" }));
   await api(S, { method: "PUT", body: form });
-  await api(S + "/subdomain", { method: "POST", headers: json, body: JSON.stringify({ enabled: true }) });
+  await api(S + "/subdomain", { method: "POST", headers: json, body: JSON.stringify({ enabled: true, previews_enabled: false }) });
   await api(S + "/schedules", { method: "PUT", headers: json, body: JSON.stringify(deployerEmit.meta.crons.map((cron) => ({ cron }))) });
 
   // A new workers.dev name takes some seconds to answer. Measured 2026-10-05: 15 to 20 s.
@@ -35285,10 +35513,12 @@ const _cloudbrain_installBrain = function _installBrain(deployer_service,wrapper
     await wait(2000);
   }
 
+  // What the deployer held when it first answered: nothing, on a new Brain.
+  const seen = ((await deployer("getState")).workers || []).filter((w) => w.worker);
   const apply = async (service, extra = {}) => {
     const e = await service.emit();
     log(`deploying ${e.meta.worker}…`);
-    const out = (await deployer("apply", { workers: [{ ...asSource(e), ...extra }], reason: "install" })).results[0];
+    const out = (await deployer("apply", { workers: [{ ...asSource(e), ...extra, was: (seen.find((w) => w.worker === e.meta.worker) || {}).hash || null }], reason: "install" })).results[0];
     if (!["deployed", "probation", "unchanged"].includes(out.state)) throw new Error(`${e.meta.worker}: ${out.state} ${out.reason || ""}`);
   };
   await apply(core_service);
@@ -35549,7 +35779,7 @@ const _cloudbraindocs_anon_d92764b897 = function _anonymous(md,mod) {return (md`
 | Make a new Brain in another Cloudflare account. | **Clone** in ${mod("cloud-brain")}. Clone copies code and no data. |
 
 A message arrives on a channel. A turn of the assistant in a Brain tab answers it. One tab at a time holds the inbox. With no tab open, no message is answered: no Worker calls a model.`);};
-const _cloudbraindocs_anon_ade5e3a758 = function _anonymous(md,mod) {return (md`## What a member can do
+const _cloudbraindocs_anon_41abe01905 = function _anonymous(md,mod) {return (md`## What a member can do
 
 A member is a DID that the owner added. Any other signed-in account has no rights.
 
@@ -35557,7 +35787,7 @@ A member is a DID that the owner added. Any other signed-in account has no right
 |---|---|
 | Ask the Brain a question. | Send a message on a channel from a linked address. The turn runs with the member's permissions, not the owner's. |
 | Keep files and blobs. | \`static.*\` and \`blob.*\`, under the member's own tags. The default limit is 20 MB. |
-| Deploy a service. | \`member.deploy { module, source }\`. The Worker has its author's permissions. No approval. The default limit is 3 Workers. |
+| Deploy a service. | \`member.deploy { module, source, reason, was }\`: why, and the hash you saw running (\`null\` for none). The Worker has its author's permissions. No approval. The default limit is 3 Workers. |
 | Use another member's service. | **Open** in ${mod("brain-shell")}. The module runs in a sandboxed frame and calls its Worker as the viewer. |
 
 Not verified: no member other than the owner has signed in to a deployed Brain. Each member path was run with minted sessions and under \`simulate\` (2026-10-07).`);};
@@ -35817,7 +36047,7 @@ export default function define(runtime, observer) {
   };
   $def("_cloudbraindocs_anon_00701232f0", null, ["md","mod"], _cloudbraindocs_anon_00701232f0);
   $def("_cloudbraindocs_anon_d92764b897", null, ["md","mod"], _cloudbraindocs_anon_d92764b897);
-  $def("_cloudbraindocs_anon_ade5e3a758", null, ["md","mod"], _cloudbraindocs_anon_ade5e3a758);
+  $def("_cloudbraindocs_anon_41abe01905", null, ["md","mod"], _cloudbraindocs_anon_41abe01905);
   $def("_cloudbraindocs_anon_62692d0a5a", null, ["md","mod"], _cloudbraindocs_anon_62692d0a5a);
   $def("_cloudbraindocs_anon_bdeda74ab9", null, ["md","mod"], _cloudbraindocs_anon_bdeda74ab9);
   $def("_cloudbraindocs_anon_84a07460df", null, ["md","mod"], _cloudbraindocs_anon_84a07460df);
@@ -37285,7 +37515,7 @@ const _cloudbrainspecs_requirements = function _requirements() {return ([
   { id: "R29", status: "built", text: "A file or a blob is read and changed by tag. Only the store writes a by: tag or a worker: tag. A blob's address is the CID of its bytes.", check: "brain-static: test_static_a_files_tags_decide_who_reads_and_who_changes_it, test_static_only_the_owner_writes_the_shell. brain-blob: test_blob_tags_decide_who_reads_and_who_changes_it, test_blob_cid_is_the_cid_a_pds_gives_the_bytes. cb4 2026-10-07 13:12: 95 rows, 0 bad" },
   { id: "R30", status: "built", text: "The core must count each call that it answers or forwards and must send the counts to brain-metrics.", check: "brain-core: test_calls_are_counted_and_handed_to_the_metrics_service. brain-metrics: test_metrics_record_and_query" },
   { id: "R31", status: "built", text: "Each event from outside reaches the page through the inbox: one entry per key, in order, kept until a tab marks it done.", check: "brain-inbox: test_inbox_once_per_key_in_order" },
-  { id: "R32", status: "built", text: "One tab at a time holds the inbox lease. The lease ends 30 s after its last renewal.", check: "brain-inbox: test_lease_one_tab_at_a_time. Live: lease.get answers held: true" },
+  { id: "R32", status: "built", text: "One tab at a time holds the inbox lease. The lease ends 90 s after its last renewal.", check: "brain-inbox: test_lease_one_tab_at_a_time. Live: lease.get answers held: true" },
   { id: "R33", status: "built", text: "A turn must run as the sender of its entry, with a turn token. The turn must not reach more than the sender can call. The reply must go back on the entry's channel.", check: "brain-kernel: test_a_turn_is_made_as_its_sender, test_turn_token, test_poll_names_the_sender_and_hands_the_owner_turn_tokens. cloud-brain: test_turn_tool_calls_as_the_sender_or_not_at_all. brain-inbox: test_reply_goes_back_where_the_entry_came_from. cb4 2026-10-07 08:40 to 08:47" },
   { id: "R34", status: "part", text: "A turn in a room must reach inbox.reply and only the methods that each participant has a grant for.", check: "brain-kernel: test_a_room_turn_reaches_what_everyone_in_the_room_may_call, test_a_channel_can_narrow_a_turn_and_not_widen_one. cb4 2026-10-07 20:14: 74 rows. Not verified: a real group" },
   { id: "R35", status: "built", text: "When a turn fails, the page must mark the entry failed and tell the sender one time.", check: "cloud-brain: test_turn_failed_is_told_once_and_not_retried, test_turn_for_someone_not_added_runs_nothing" },
@@ -69623,7 +69853,7 @@ Limits:
 
 ## Limits
 
-- A hidden tab computes nothing. With the tab in the background the inbox is not read and the lease lapses after 30 s; the WhatsApp recipe then answers with a link, at most once an hour.
+- A hidden tab computes nothing. With the tab in the background the inbox is not read and the lease lapses after 90 s; the WhatsApp recipe then answers with a link, at most once an hour.
 - The emitted Worker has no Observable runtime: a cell value is computed once per isolate, on the first request, and is not reactive.
 - `calls` lists each method that the function calls with `xrpc`. The core refuses a call that is not in the list. `*` is one part of a name. Do not list `secret.get`, `db.sql` or `inbox.append`: the platform cells `secrets`, `sql` and `inbox` call them. `brain_call` with method `calls.list` shows each refused call.
 - Not built: a pairing relay for a page with no CDP socket (a phone), calls between Brains. A page in a browser of the cluster pairs with no relay (`page up`, above).
