@@ -28330,7 +28330,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainstatic_anon_493d1b1624 = function _anonymous(md) {return (md`# brain-static
+const _brainstatic_anon_b3503cdd06 = function _anonymous(md) {return (md`# brain-static
 
 Files kept by a Cloud Brain and served from its address.
 
@@ -28342,7 +28342,7 @@ Files kept by a Cloud Brain and served from its address.
 | \`static.list\` | query. \`?prefix=\` and \`?tag=\`. \`{ files: [{ path, size, type, sha256, public, tags, savedAt }] }\`, the files the caller may read. |
 | \`static.tag\` | procedure. \`{ path, tags }\` replaces the file's labels. |
 | \`static.setPublic\` | procedure. \`{ path, public }\` adds or removes the \`public\` label. |
-| \`static.delete\` | procedure. \`{ path }\` drops one file. \`{ prefix, before }\` drops each file under the prefix that the caller may change, saved before \`before\` (an ISO date or milliseconds; all of them without it). Answers \`{ deleted, paths }\`. An empty prefix is refused, and nothing under \`shell/\` is dropped this way. |
+| \`static.delete\` | procedure. \`{ path }\` drops one file. \`{ prefix, before }\` drops each file under the prefix that the caller may change, saved before \`before\` (an ISO date or milliseconds; all of them without it). Answers \`{ deleted, paths }\`. The prefix is a folder: it ends in \`/\`, and one that does not (\`"s"\`, \`""\`) is refused with 400. Nothing under \`shell/\` is dropped this way. |
 | \`GET /static/<path>\` | whoever may read the file by its tags. \`ETag\` is the SHA-256; \`If-None-Match\` answers 304. |
 | Storage | bytes in \`blobs\` and one row per file in \`rows\`, both under \`f/<path>\` |
 
@@ -28573,7 +28573,8 @@ const _brainstatic_staticApp = function _staticApp(hono,config,sha256,rows,Respo
     // { prefix, before }: each file under the prefix that this caller may change, saved before then. Never the shell.
     if (prefix !== undefined) {
       const m = await me(c), t = until === undefined ? Infinity : typeof until === "number" ? until : Date.parse(until);
-      if (typeof prefix !== "string" || !prefix || !okPath(prefix.replace(/\/$/, "")) || Number.isNaN(t)) return fail(c, 400, "InvalidRequest", "{ prefix, before }: a prefix that is not empty, and a date");
+      // A folder, not the start of a name: "s" would match site/ and snapshot/.
+      if (typeof prefix !== "string" || !prefix.endsWith("/") || !okPath(prefix.slice(0, -1)) || Number.isNaN(t)) return fail(c, 400, "InvalidRequest", "{ prefix, before }: a prefix that ends in /, and a date");
       if (!m || !(m.all || m.fixed || m.did)) return fail(c, 403, "Forbidden", "this caller has no files");
       const paths = (await rows.list("f/" + prefix)).filter(({ key, value }) => !key.startsWith("f/shell/") && (value.savedAt || 0) < t && can(m, value, key.slice(2), "write")).map((r) => r.key.slice(2));
       for (const p of paths) {
@@ -28654,13 +28655,16 @@ const _brainstatic_test_static_delete_by_prefix_and_date_keeps_to_what_the_calle
   // The date is savedAt, not the path: give two files an older one.
   for (const day of ["2026-07-01", "2026-10-08"]) rig.sim.rows.set(`f/snapshot/${day}/hn.json`, { ...rig.sim.rows.get(`f/snapshot/${day}/hn.json`), savedAt: Date.parse(day) });
   expect(await del(snap, { prefix: "snapshot/", before: "2026-08-01" })).toEqual([200, ["snapshot/2026-07-01/hn.json"]]);
-  // A Worker's prefix outside its name drops nothing; an empty prefix and a bad date are refused.
+  // A Worker's prefix outside its name drops nothing; an empty prefix, one that is not a folder and a bad date are refused.
   expect(await del(snap, { prefix: "site/" })).toEqual([200, []]);
   expect((await rig.post(snap, "delete", { prefix: "" })).status).toBe(400);
+  for (const prefix of ["s", "snapshot", "snapshot/2026-10", "/"]) expect((await rig.post("owner", "delete", { prefix })).status).toBe(400);
   expect((await rig.post("owner", "delete", { prefix: "snapshot/", before: "soon" })).status).toBe(400);
   expect((await rig.post("anonymous", "delete", { prefix: "snapshot/" })).status).toBe(403);
-  // The owner drops any prefix, and never the shell.
-  expect((await del("owner", { prefix: "s" }))[1]).toEqual(["site/a.css", "snapshot/2026-10-08/hn.json", "snapshot/2026-10-09/hn.json"]);
+  // The owner drops any folder, and never the shell.
+  expect((await del("owner", { prefix: "snapshot/2026-10-08/" }))[1]).toEqual(["snapshot/2026-10-08/hn.json"]);
+  expect((await del("owner", { prefix: "snapshot/" }))[1]).toEqual(["snapshot/2026-10-09/hn.json"]);
+  expect((await del("owner", { prefix: "site/" }))[1]).toEqual(["site/a.css"]);
   expect((await del("owner", { prefix: "shell/" }))[1]).toEqual([]);
   expect([...rig.sim.blobs.keys()].filter((k) => !k.includes("/shell/"))).toEqual([]);
   return "by prefix and date";
@@ -28775,6 +28779,7 @@ const _brainstatic_test_static_a_files_tags_decide_who_reads_and_who_changes_it 
   rig.sim.rows.set("f/old/pic.png", { size: 1, type: "image/png", sha256: "s", public: true, savedAt: 1 });
   expect((await (await rig.call("owner", rig.X + "list?tag=public")).json()).files.map((f) => [f.path, f.tags]).sort((x, y) => (x[0] < y[0] ? -1 : 1))).toEqual([["old/pic.png", ["by:owner", "public"]], ["site/a.html", ["by:owner", "public"]], [file, ["by:" + A, "members", "public"]]]);
   expect((await rig.post("owner", "delete", { path: file })).status).toBe(200);
+  return "read and changed by tag";
 };
 const _brainstatic_test_static_a_members_worker_writes_as_its_author_within_their_limit = async function _test_static_a_members_worker_writes_as_its_author_within_their_limit(tagRig,expect) {
   const rig = await tagRig(), { A, a, b } = rig;
@@ -28792,6 +28797,7 @@ const _brainstatic_test_static_a_members_worker_writes_as_its_author_within_thei
   await rig.put("worker:brain-x-library", "library/n.html", "n");
   expect(rig.sim.rows.get("f/library/n.html").tags).toEqual(["by:owner", "worker:brain-x-library"]);
   expect((await rig.get({ "x-brain-caller": "worker:brain-x-library" }, file)).status).toBe(403);
+  return "a member's Worker, within the limit";
 };
 
 export default function define(runtime, observer) {
@@ -28799,7 +28805,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainstatic_anon_493d1b1624", null, ["md"], _brainstatic_anon_493d1b1624);
+  $def("_brainstatic_anon_b3503cdd06", null, ["md"], _brainstatic_anon_b3503cdd06);
   $def("_brainstatic_static_service", "static_service", ["cloudflare","staticApp"], _brainstatic_static_service);
   $def("_brainstatic_static_announce", "static_announce", ["plugins","static_service","invalidation"], _brainstatic_static_announce);
   $def("_brainstatic_staticTypes", "staticTypes", [], _brainstatic_staticTypes);
@@ -32640,7 +32646,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainsnapshot_anon_0765d7a724 = function _anonymous(md,snapshotAgent) {return (md`# brain-snapshot
+const _brainsnapshot_anon_c06818009b = function _anonymous(md,snapshotAgent) {return (md`# brain-snapshot
 
 A Cloud Brain recipe: once a day it fetches a list of public feeds and keeps what each one said as a public JSON file. It records. It makes no model call, ranks nothing and writes no summary: a notebook reads the files and does that.
 
@@ -32661,34 +32667,36 @@ Anyone reads these with no session. \`<day>\` is the UTC date, \`2026-10-09\`.
 
 | Address | Holds |
 |---|---|
-| \`/static/snapshot/days.json\` | \`{ days: [{ day, ranAt, items }] }\`, newest first |
+| \`/static/snapshot/days.json\` | \`{ days: [{ day, ranAt, items, papers }] }\`, newest first; \`papers\` is the count in that day's \`papers.json\` |
 | \`/static/snapshot/<day>/index.json\` | \`{ day, ranAt, sources: [{ name, tier, status, count, matched, of, bytes, ms, path, error, lookup }], papers: { count, path }, errors }\` |
 | \`/static/snapshot/<day>/<source>.json\` | \`{ source, tier, url, day, fetchedAt, count, items }\` |
-| \`/static/snapshot/<day>/papers.json\` | \`{ day, ranAt, count, papers: [{ id, url, title, summary, points, signals, via }] }\`: the papers of the day that carry a signal (below) |
+| \`/static/snapshot/<day>/papers.json\` | \`{ day, ranAt, count, papers: [{ id, url, title, summary, points, signals, via }] }\`: the papers with a signal seen that day (below) |
 
 An item is \`{ id, title, source, tier }\` and, where the feed gives them, \`url points comments author published discussion summary papers\`. An Ask HN post has no \`url\`. \`published\` is an ISO time. \`summary\` is text, cut at 1500 characters. \`papers\` is the arXiv ids the item links to.
 
-Text from a feed has its markup taken out: a \`<\` that starts a tag name is read as a tag up to the next \`>\`, so \`p < 0.05 and n > 3\` is kept and \`a<b and c>d\` loses \`<b and c>\`. Text from a JSON source is kept as it is.
+A feed's summary has its markup taken out, after its entities are read: a \`<\` that starts a tag name is read as a tag up to the next \`>\`, so \`p < 0.05 and n > 3\` is kept and \`a<b and c>d\` loses \`<b and c>\`. A title is text: \`The &lt;dialog&gt; element\` is kept as \`The <dialog> element\`, and so is markup a feed escaped into a title (\`new <i>results</i>\`). Only an Atom title that says \`type="html"\` or \`"xhtml"\` has markup taken out. An Atom entry's \`<source>\`, the feed it was copied from, is not read. Text from a JSON source is kept as it is.
 
 - A second run on one day replaces that day's files: the last run is what is kept.
 - A source that fails, or that has nothing to keep, writes no file. Its row in the index says why (\`status\`, \`error\`, \`count: 0\`), and a file an earlier run of that day made for it stays.
 - Every source is fetched at the same time. Give one host one source: Reddit answered 429 to the second of two feeds, also 2 s apart (cb4, 2026-10-09), so its two subreddits are one feed.
 - A failed source does not fail the run. The timer runs once a day and does not try again; \`snapshot.run\` does.
-- \`of\` is how many items the feed held, \`matched\` how many passed \`keep\` and \`days\`, \`count\` how many were kept. \`matched\` above \`count\` means \`limit\` cut the list.
+- \`of\` is how many items the feed held, \`matched\` how many passed \`keep\` and \`days\`, \`count\` how many were kept. \`matched\` above \`count\` means \`limit\` cut the list, unless the row has an \`error\`: a source whose file was refused has \`count: 0\` and its \`matched\`.
 - \`errors\` in the index, and in the log line, names a write of \`index.json\`, \`papers.json\` or \`days.json\` that failed.
 - The daily run drops the files of days older than \`keepDays\` with \`static.delete\` \`{ prefix: "snapshot/", before }\`. \`snapshot.run\` drops nothing.
 
 ## Papers
 
-arXiv lists 600 to 900 new papers a day in these three categories. Nobody reads that list, and its feed gives authors with no affiliation, so it cannot be cut down to known labs. \`arxiv.json\` is kept for looking a paper up (\`lookup: true\` in the index): do not read it whole. \`papers.json\` holds the papers that carry at least one signal, and says which:
+arXiv lists 600 to 900 new papers a day in these three categories (\`limit: 1000\`). Nobody reads that list, and its feed gives authors with no affiliation, so it cannot be cut down to known labs. \`arxiv.json\` is kept for looking a paper up (\`lookup: true\` in the index): do not read it whole. \`papers.json\` holds the papers that carry at least one signal, and says which:
 
 | signal | means |
 |---|---|
-| \`votes:<source>\` | the paper is in a source that has \`papers: { min }\` with at least \`min\` points. Hugging Face's daily papers, 10. |
+| \`votes:<source>\` | the paper is in a source that has \`papers: { min }\` with at least \`min\` points. Hugging Face's daily papers, 10, published in the last 3 days. |
 | \`lab:<source>\` | an item of a \`research\` feed links to it (\`arxiv.org/abs\`, \`/pdf\`, \`/html\`, or \`huggingface.co/papers\`). |
 | \`mention:<source>\` | an item of a \`blogger\` or \`aggregator\` source links to it. |
 
-\`via\` is the items that linked to it. Title and summary come from the voting source, else from \`arxiv.json\` when the paper is in that day's list; a paper from an earlier day has only its id and \`via\`. Papers are in order of how many signals they carry, then points.
+\`via\` is the items that linked to it. Title and summary come from the voting source, else from \`arxiv.json\` when the paper is in that day's list; a paper in neither, linked from an item only, has its id and \`via\` and nothing else. Papers are in order of how many signals they carry, then points.
+
+\`papers.json\` is not the papers published that day. Hugging Face's list held 50 papers published on 11 dates, 2026-09-23 to 2026-10-07, when read on 2026-10-09; \`days: 3\` keeps the last three days of it, so a voted paper is in up to 3 days' files. A paper linked from an item is in each day's file that the item is in.
 
 ## Sources
 
@@ -32699,6 +32707,7 @@ A source is a row, not code: \`{ name, tier, url, kind }\`. The list is public, 
 - \`days\`: keep only items published in that many days before the run. A blog's feed holds its old posts; every \`research\` blog and every \`blogger\` here has \`days: 7\`, so most of them keep nothing on most days.
 - \`keep\`: a pattern an item's text must match. arXiv's feed also lists replaced papers; \`keep\` leaves new and cross-listed ones.
 - \`limit\`: at most this many items, 500 unless given.
+- A list has 1 to 40 sources. One run is one invocation of the Worker: one fetch and one \`static.put\` for each source that keeps items, then three more writes, and one delete on the timer. The 21 here ran on cb4. 40 was not run, and the count was not measured against the plan's limit of subrequests in one invocation.
 - \`papers: { min }\`: the items are papers, their \`id\` an arXiv id, and one with \`min\` points or more is in \`papers.json\`. \`lookup: true\`: the items are papers to look up, not to read.
 
 Each source is fetched once a run, with the \`User-Agent\` \`${snapshotAgent}\`.
@@ -32710,8 +32719,8 @@ const _brainsnapshot_snapshotAgent = function _snapshotAgent() {return ("lopecod
 const _brainsnapshot_snapshotSources = function _snapshotSources() {
   const blog = (name, url, tier = "blogger") => ({ name, tier, url, kind: "rss", days: 7 });
   return [
-    { name: "arxiv", tier: "research", url: "https://rss.arxiv.org/rss/cs.AI+cs.LG+cs.CL", kind: "rss", keep: "Announce Type: (new|cross)", limit: 700, lookup: true },
-    { name: "hf-papers", tier: "research", url: "https://huggingface.co/api/daily_papers?limit=50", kind: "json", map: { id: "paper.id", title: "paper.title", url: "https://huggingface.co/papers/{paper.id}", points: "paper.upvotes", comments: "numComments", published: "publishedAt", summary: "paper.summary" }, papers: { min: 10 } },
+    { name: "arxiv", tier: "research", url: "https://rss.arxiv.org/rss/cs.AI+cs.LG+cs.CL", kind: "rss", keep: "Announce Type: (new|cross)", limit: 1000, lookup: true },
+    { name: "hf-papers", tier: "research", url: "https://huggingface.co/api/daily_papers?limit=50", kind: "json", map: { id: "paper.id", title: "paper.title", url: "https://huggingface.co/papers/{paper.id}", points: "paper.upvotes", comments: "numComments", published: "publishedAt", summary: "paper.summary" }, days: 3, papers: { min: 10 } },
     blog("openai", "https://openai.com/news/rss.xml", "research"),
     blog("deepmind", "https://deepmind.google/blog/rss.xml", "research"),
     blog("google-research", "https://research.google/blog/rss/", "research"),
@@ -32733,13 +32742,14 @@ const _brainsnapshot_snapshotSources = function _snapshotSources() {
     { name: "lobsters-ai", tier: "aggregator", url: "https://lobste.rs/t/ai.json", kind: "json", map: { id: "short_id", title: "title", url: "url", points: "score", comments: "comment_count", author: "submitter_user", published: "created_at", discussion: "comments_url", summary: "description_plain" } }
   ];
 };
-const _brainsnapshot_snapshotText = function _snapshotText(snapshotPlain) {return ((s, max = 1500) => {
+const _brainsnapshot_snapshotText = function _snapshotText(snapshotPlain) {return ((s, max = 1500, markup = true) => {
   const named = { lt: "<", gt: ">", quot: '"', apos: "'", amp: "&", nbsp: " ", mdash: "\u2014", ndash: "\u2013", hellip: "\u2026", lsquo: "\u2018", rsquo: "\u2019", ldquo: "\u201c", rdquo: "\u201d" };
   const point = (n, e) => (n >= 0 && n <= 0x10ffff ? String.fromCodePoint(n) : e);
   const entities = (t) => t.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (e, k) => (k[0] !== "#" ? (named[k.toLowerCase()] ?? e) : point(/^#x/i.test(k) ? parseInt(k.slice(2), 16) : Number(k.slice(1)), e)));
   // A tag is < and a name; "p < 0.05 and n > 3" has none.
   const tags = (t) => t.replace(/<!--[\s\S]*?-->|<\/?[a-zA-Z][^<>]*>/g, " ");
-  return snapshotPlain(entities(tags(entities(tags(String(s ?? ""))))), max);
+  const once = entities(tags(String(s ?? "")));
+  return snapshotPlain(entities(markup ? tags(once) : once), max);
 });};
 const _brainsnapshot_snapshotPlain = function _snapshotPlain() {return ((s, max = 1500) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, max));};
 const _brainsnapshot_snapshotPapers = function _snapshotPapers() {return ((text) => [...new Set([...String(text ?? "").replace(/&#x2F;|&#47;/gi, "/").matchAll(/(?:arxiv\.org\/(?:abs|pdf|html)\/|huggingface\.co\/papers\/)(\d{4}\.\d{4,5})/g)].map((m) => m[1]))]);};
@@ -32752,14 +32762,16 @@ const _brainsnapshot_snapshotFeed = function _snapshotFeed(snapshotText) {return
   };
   // A CDATA section is text: its < and & are written as entities, so a tag inside one is not read as a field.
   const flat = String(xml).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
-  return flat.split(/<(?:item|entry)[\s>]/).slice(1).map((s) => ({
+  // An Atom entry's <source> is the feed it was copied from, with a title and id of its own.
+  return flat.split(/<(?:item|entry)[\s>]/).slice(1).map((entry) => [entry, entry.replace(/<source[\s>][\s\S]*?<\/source>/g, "")]).map(([raw, s]) => ({
     id: snapshotText(tag(s, "guid") || tag(s, "id"), 500),
-    title: snapshotText(tag(s, "title"), 500),
+    // A title is text unless Atom says it is markup.
+    title: snapshotText(tag(s, "title"), 500, /<title\s[^>]*\btype=["'](?:html|xhtml)["']/.test(s)),
     url: snapshotText(tag(s, "link") || href(s), 2000),
     author: snapshotText(tag(s, "dc:creator") || tag(tag(s, "author"), "name"), 200),
     published: snapshotText(tag(s, "pubDate") || tag(s, "published") || tag(s, "updated"), 100),
     summary: snapshotText(tag(s, "description") || tag(s, "summary") || tag(s, "content") || tag(s, "content:encoded")),
-    raw: s
+    raw
   }));
 });};
 const _brainsnapshot_snapshotJson = function _snapshotJson() {return ((data, src) => {
@@ -32947,7 +32959,13 @@ const _brainsnapshot_snapshotPanel = function _snapshotPanel(htl,Inputs,Event) {
   const link = (u) => (u ? htl.html`<a href=${u} target="_blank">json</a>` : "");
   const load = async () => {
     const days = ((await get("days.json")) || { days: [] }).days;
-    const now = owner && client ? Inputs.button("Run now", { reduce: () => void client.procedure("snapshot.run", {}).then(() => el.load(), (e) => void (note.textContent = String((e && e.message) || e))) }) : "";
+    // One run at a time: the button is off until the run settles (a new one is drawn when it does).
+    const now = owner && client ? Inputs.button("Run now", { reduce: () => {
+      const b = now.querySelector("button");
+      if (b.disabled) return;
+      b.disabled = true;
+      void client.procedure("snapshot.run", {}).then(() => el.load(), (e) => void ((b.disabled = false), (note.textContent = String((e && e.message) || e))));
+    } }) : "";
     // The panel's one input event is its own, in draw.
     if (now) now.addEventListener("input", (e) => e.stopPropagation());
     if (!days.length) return void box.replaceChildren(htl.html`<i style=${muted}>No snapshot yet.</i>`, now);
@@ -32955,7 +32973,7 @@ const _brainsnapshot_snapshotPanel = function _snapshotPanel(htl,Inputs,Event) {
     const table = htl.html`<div></div>`;
     const draw = async () => {
       const index = await get(pick.value.day + "/index.json");
-      table.replaceChildren(Inputs.table((index ? index.sources : []).map((s) => ({ source: s.name, tier: s.tier, kept: s.count, of: s.of, status: s.status, note: [s.error, s.matched > s.count ? `cut from ${s.matched}` : "", s.lookup ? "to look up" : ""].filter(Boolean).join("; "), file: s.path ? root.replace(/snapshot\/$/, "") + s.path : "" })), { format: { file: link }, layout: "auto" }));
+      table.replaceChildren(Inputs.table((index ? index.sources : []).map((s) => ({ source: s.name, tier: s.tier, kept: s.count, of: s.of, status: s.status, note: [s.error, !s.error && s.matched > s.count ? `cut from ${s.matched}` : "", s.lookup ? "to look up" : ""].filter(Boolean).join("; "), file: s.path ? root.replace(/snapshot\/$/, "") + s.path : "" })), { format: { file: link }, layout: "auto" }));
       note.replaceChildren(...(index ? [`ran ${index.ranAt}`, ...(index.papers ? [`, ${index.papers.count} papers with a signal `, link(root.replace(/snapshot\/$/, "") + index.papers.path)] : []), ...(index.errors && index.errors.length ? [`. Not written: ${index.errors.join("; ")}`] : [])] : []));
       // The value is the day's index. The select's own event is stopped below, so this is the one a cell hears.
       el.value = index;
@@ -33007,7 +33025,7 @@ const _brainsnapshot_snapshotFixtures = function _snapshotFixtures() {return ({
 const _brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out = function _test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out(snapshotItems,snapshotFixtures,expect,snapshotFeed) {
   const now = Date.parse("2026-10-09T06:00:00Z");
   const rss = snapshotItems(snapshotFixtures.rss, { name: "blog", tier: "blogger", kind: "rss", days: 7 }, now);
-  expect(rss).toEqual({ of: 2, matched: 1, items: [{ id: "a-1", title: "A & B: new results", url: "https://blog.example/a", author: "Ada", published: "2026-10-08T16:00:00.000Z", summary: "It's bold .", source: "blog", tier: "blogger" }] });
+  expect(rss).toEqual({ of: 2, matched: 1, items: [{ id: "a-1", title: "A & B: new <i>results</i>", url: "https://blog.example/a", author: "Ada", published: "2026-10-08T16:00:00.000Z", summary: "It's bold .", source: "blog", tier: "blogger" }] });
   // Without `days` the old post is kept as well.
   expect(snapshotItems(snapshotFixtures.rss, { name: "blog", tier: "blogger", kind: "rss" }, now).items.map((i) => i.id)).toEqual(["a-1", "old-1"]);
   const atom = snapshotItems(snapshotFixtures.atom, { name: "reddit-x", tier: "aggregator", kind: "atom" }, now);
@@ -33016,7 +33034,9 @@ const _brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entiti
   const many = `<rss>${[1, 2, 3, 4].map((n) => `<item><title>T${n}</title><guid>${n}</guid><description>Announce Type: ${n % 2 ? "new" : "replace"} ${"x".repeat(3000)}</description></item>`).join("")}</rss>`;
   const kept = snapshotItems(many, { name: "arxiv", tier: "research", kind: "rss", keep: "Announce Type: (new|cross)", limit: 1 }, now);
   expect([kept.of, kept.matched, kept.items.map((i) => i.id), kept.items[0].summary.length]).toEqual([4, 2, ["1"], 1500]);
-  // An Atom entry's link is the page: rel alternate or no rel, wherever it comes. A title in CDATA is text.
+  // An Atom entry's link is the page: rel alternate or no rel, wherever it comes. A title that says it is html has its markup taken out.
+  // The feed an entry was copied from has a title and an id of its own, which are not the entry's.
+  expect(snapshotFeed('<feed><entry><source><id>other</id><title>Other feed</title><link href="https://o.example/"/></source><id>1</id><title>Mine</title><link href="https://a.example/mine"/></entry></feed>')[0]).toMatchObject({ id: "1", title: "Mine", url: "https://a.example/mine" });
   const entry = (links) => snapshotFeed(`<feed><entry><id>1</id><title type="html"><![CDATA[Fast <em>&amp;</em> small </title><x>]]></title>${links}</entry></feed>`)[0];
   expect(entry('<link rel="self" href="https://a.example/feed"/><link rel="alternate" href="https://a.example/post"/>')).toMatchObject({ title: "Fast & small", url: "https://a.example/post" });
   expect(entry('<link rel="replies" href="https://a.example/c"/><link href="https://a.example/post"/>').url).toBe("https://a.example/post");
@@ -33029,16 +33049,23 @@ const _brainsnapshot_test_text_keeps_a_comparison_and_reads_hex_and_named_entiti
   expect(snapshotText("It&#x2019;s &#8212; caf&#xE9; &mdash; &hellip;&nbsp;&unknown; &#x110000;")).toBe("It\u2019s \u2014 caf\u00e9 \u2014 \u2026 &unknown; &#x110000;");
   // Escaped twice: markup written about, not markup.
   expect(snapshotText("&amp;lt;div&amp;gt; in a title")).toBe("<div> in a title");
+  // Escaped once: markup in a summary, text in a title.
+  expect(snapshotText("Vec&lt;T&gt; and <b>more</b>")).toBe("Vec and more");
+  expect(snapshotText("Vec&lt;T&gt; and Option&lt;Box&lt;T&gt;&gt; in Rust", 500, false)).toBe("Vec<T> and Option<Box<T>> in Rust");
+  const feed = snapshotItems("<rss><item><guid>1</guid><title>The &lt;dialog&gt; element, AT&amp;amp;T</title><description>&lt;p&gt;About &lt;b&gt;it&lt;/b&gt;&lt;/p&gt;</description></item></rss>", { name: "f", tier: "blogger", kind: "rss" }).items[0];
+  expect([feed.title, feed.summary]).toEqual(["The <dialog> element, AT&T", "About it"]);
   // A JSON source's text is text: nothing in it is a tag or an entity.
   const item = snapshotItems(JSON.stringify([{ id: "1", title: "Why a<b and c>d &amp; more", summary: "x <i>y</i>" }]), { name: "j", tier: "aggregator", kind: "json", map: { id: "id", title: "title", summary: "summary" } }).items[0];
   expect([item.title, item.summary]).toEqual(["Why a<b and c>d &amp; more", "x <i>y</i>"]);
-  return "5 texts";
+  return "8 texts";
 };
 const _brainsnapshot_test_a_json_source_is_read_by_the_paths_its_map_names = function _test_a_json_source_is_read_by_the_paths_its_map_names(snapshotSources,snapshotItems,expect) {
   const hn = snapshotSources.find((s) => s.name === "hn"), hf = snapshotSources.find((s) => s.name === "hf-papers");
   const a = snapshotItems(JSON.stringify({ hits: [{ objectID: "7", title: "Show HN", url: null, points: 12, num_comments: 3, author: "pg", created_at: "2026-10-09T00:00:00Z" }, { objectID: "8" }] }), hn);
   expect(a).toEqual({ of: 2, matched: 2, items: [{ id: "7", title: "Show HN", points: 12, comments: 3, author: "pg", published: "2026-10-09T00:00:00.000Z", discussion: "https://news.ycombinator.com/item?id=7", source: "hn", tier: "aggregator" }] });
-  const b = snapshotItems(JSON.stringify([{ paper: { id: "2610.1", title: "A paper", upvotes: 5, summary: "An\nabstract" }, numComments: 0, publishedAt: "2026-10-08T00:00:00.000Z" }]), hf);
+  const b = snapshotItems(JSON.stringify([{ paper: { id: "2610.1", title: "A paper", upvotes: 5, summary: "An\nabstract" }, numComments: 0, publishedAt: "2026-10-08T00:00:00.000Z" }, { paper: { id: "2609.9", title: "An old paper", upvotes: 90, summary: "old" }, numComments: 0, publishedAt: "2026-09-23T00:00:00.000Z" }]), hf, Date.parse("2026-10-09T06:00:00Z"));
+  // The list holds weeks of papers; one published more than 3 days before the run is not kept, whatever its votes.
+  expect([b.of, b.matched]).toEqual([2, 1]);
   expect(b.items).toEqual([{ id: "2610.1", title: "A paper", url: "https://huggingface.co/papers/2610.1", points: 5, comments: 0, published: "2026-10-08T00:00:00.000Z", summary: "An abstract", source: "hf-papers", tier: "research" }]);
   // An answer that is not the list the source names gives nothing.
   expect(snapshotItems("{}", hn)).toEqual({ of: 0, matched: 0, items: [] });
@@ -33190,11 +33217,19 @@ const _brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one = asyn
   expect([el.value.sources.length, heard]).toEqual([2, 1]);
   expect(el.textContent).toContain("ran 2026-10-09T06:00:10.000Z, 4 papers with a signal");
   expect(el.textContent).toContain("cut from 40");
+  // A row with an error is not said to be cut.
+  files["https://b.example/static/snapshot/2026-10-09/index.json"].sources[1].matched = 2;
   expect(el.textContent).toContain("Not written: static.put snapshot/days.json 403");
   expect([...el.querySelectorAll("a")].map((a) => a.href)).toEqual(["https://b.example/static/snapshot/2026-10-09/hn.json", "https://b.example/static/snapshot/2026-10-09/papers.json"]);
   // Run now calls the Brain and reads the days again. A reader who is not the owner has no button.
-  el.querySelector("button").click();
+  const button = el.querySelector("button");
+  button.click();
+  // Off until the run settles: a second press does nothing.
+  expect(button.disabled).toBe(true);
+  button.click();
   await new Promise((r) => setTimeout(r, 50));
+  expect(el.textContent).not.toContain("cut from 2");
+  expect(el.querySelector("button").disabled).toBe(false);
   expect([ran, heard]).toEqual([["snapshot.run"], 2]);
   expect(snapshotPanel({ base: "https://b.example/", fetch: send }).querySelector("button")).toBe(null);
   // A fetch that fails is said, not left as a blank panel.
@@ -33213,7 +33248,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainsnapshot_anon_0765d7a724", null, ["md","snapshotAgent"], _brainsnapshot_anon_0765d7a724);
+  $def("_brainsnapshot_anon_c06818009b", null, ["md","snapshotAgent"], _brainsnapshot_anon_c06818009b);
   $def("_brainsnapshot_viewof_snapshotView", "viewof snapshotView", ["snapshotPanel","client","session"], _brainsnapshot_viewof_snapshotView);
   $def("_brainsnapshot_snapshotView", "snapshotView", ["Generators","viewof snapshotView"], _brainsnapshot_snapshotView);
   $def("_brainsnapshot_snapshotAgent", "snapshotAgent", [], _brainsnapshot_snapshotAgent);
@@ -36906,7 +36941,7 @@ How the Brain works is in \`@tomlarkworthy/cloud-brain-docs\`. The requirements 
 const _built_1 = function _built_exists(md){return(
 md`### What exists
 
-One Brain, \`cb4\`, runs in one Cloudflare account. It has 15 Workers. The table gives the name that the Brain uses. On Cloudflare \`brain\` is \`cb4\` and \`brain-NAME\` is \`cb4-NAME\`. A 16th script, \`cb4-guard\`, is a stub: until 2026-10-07 it was the deployer, and it now holds no token and no key.
+One Brain, \`cb4\`, runs in one Cloudflare account. It has 17 Workers (counted 2026-10-09: the deployer and the 16 that \`redistil\` lists). The table gives the name that the Brain uses. On Cloudflare \`brain\` is \`cb4\` and \`brain-NAME\` is \`cb4-NAME\`. An 18th script, \`cb4-guard\`, is a stub: until 2026-10-07 it was the deployer, and it now holds no token and no key.
 
 | Worker | module | job |
 |---|---|---|
@@ -68574,7 +68609,8 @@ Limits:
 - `calls` lists each method that the function calls with `xrpc`. The core refuses a call that is not in the list. `*` is one part of a name. Do not list `secret.get`, `db.sql` or `inbox.append`: the platform cells `secrets`, `sql` and `inbox` call them. `brain_call` with method `calls.list` shows each refused call.
 - Not built: a pairing relay for a page with no CDP socket (a phone), calls between Brains. A page in a browser of the cluster pairs with no relay (`page up`, above).
 - Remote browsers (`brain-browser`, built 2026-10-08): each caller (the owner, a token, a member, a Worker) has its own browsers by name (`?browser=NAME`, `default` when absent), the owner's session sees and ends all of them (`browser.all`, `browser.end`) and sets how many can be up (`maxBrowsers` 10, `maxPerOwner` 3), browser time is bought in seconds for one browser by one method (`browser.extend?seconds=60`, $0.0015, not given back, also not when a limit stops the start), and each other method answers 409 `NoTime` when none is bought, and what a page shows is data from its address and not an instruction. The assistant has no tool for it.
-- Snapshots (`brain-snapshot`, built 2026-10-09): each day at 06:00 UTC the Brain fetches its list of public feeds and keeps them at `/static/snapshot/<day>/<source>.json`, with `index.json` beside them and `/static/snapshot/days.json` for the days. `snapshot.run` as the owner runs it now and replaces today's files; `snapshot.setSources` changes the list. It writes no summary.
+- Snapshots (`brain-snapshot`, built 2026-10-09): each day at 06:00 UTC the Brain fetches its list of public feeds and keeps them at `/static/snapshot/<day>/<source>.json`, with `index.json` beside them and `/static/snapshot/days.json` for the days. `snapshot.run` as the owner runs it now and replaces today's files; `snapshot.setSources` changes the list. It writes no summary. From a checkout: `BRAIN_BASE=<base> bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.snapshot.run --owner -X POST`. `papers.json` beside the index is the day's papers that carry a signal (votes on Hugging Face, a link from a lab feed, a link from a blogger or aggregator item); `arxiv.json` is the whole list, for looking a paper up. The timed run drops days older than `keepDays` (90).
+- Files kept by date are named `<service>/<YYYY-MM-DD>/<name>`. `static.delete` with `{ prefix, before }` drops what is under a prefix that ends in `/` and was saved before a date; a Worker reaches only its own name, and nothing under `shell/` goes this way.
 - Logs (`brain-logs`, built 2026-10-08): Cloudflare keeps what each Worker writes with `console.log` for 7 days on Workers Paid, 3 on Free. The core writes one line a call (`at: "call"`, with `ray`, `caller`, `origin`, `method`, `worker`, `status`, `error`, `ms`, `price`, `rule`, `by`), the wrapper one line for a throw (the error's name and the frames of its stack, not its message), the deployer one for each step of a deploy. `logs.query`, `logs.keys` and `logs.values` take Cloudflare's telemetry bodies and answer as Cloudflare does, for this Brain's Workers only; they are for the owner's own session unless the owner sets a rule. `ray` is the `cf-ray` of an answer without the part after the hyphen. `method` is the name after `com.lopecode.brain.` (`bluesky.poll`), and `(unknown)` for a name nobody declared. Cloudflare adds `$metadata.trigger` to each line, the verb and the path of the request without its query, so a path a caller typed is kept there. It also stores the URL of the call with its query string beside each line, not headers and not the body: the parameters of a method are in the logs. Do not put a long-lived secret in a path or a query string; a short-lived single-use code may be. A line can be read 11 to 16 s after it is written (3 calls on cb4, 2026-10-08). In a service, `log({ at: "name", … })` writes a line; write names and decisions, never a secret, a header or a body. The page has a Logs panel.
 - A service that needs the Cloudflare API declares its permission groups: `cloudflare.Service(name, fn, { cloudflare: ["Workers Observability Read"] })`, and calls `cloudflareApi.fetch(path, init)`. Only `Workers Observability Read` and `Workers Tail Read` can be declared. The owner approves such a deploy on the deployer page, also when deploys need no approval. To mint, the deployer's own token needs `Account API Tokens Write` and each group it hands out: name them when the next deployer token is made.
 - The Cloudflare token on `cb4-deployer` ends on 2026-10-11 and has every permission group of the account (read 2026-10-08). The deploy of a browser binding worked with it. If a token with only Workers Scripts and R2 can deploy a browser binding is not known.
