@@ -20211,7 +20211,7 @@ const _cloudflareiac_simulate = function _simulate(Response,Request,simWaits) {r
     if (init && init.headers) Object.defineProperty(req, "headers", { value: new Headers(init.headers) });
     return mod.default.fetch(req, env, { waitUntil: simWaits.hold });
   };
-  sim.scheduled = () => mod.default.scheduled({ scheduledTime: Date.now() }, env, { waitUntil: simWaits.hold });
+  sim.scheduled = (event = { scheduledTime: Date.now() }) => mod.default.scheduled(event, env, { waitUntil: simWaits.hold });
   return sim;
 });};
 const _cloudflareiac_simWaits = function _simWaits() {
@@ -28330,7 +28330,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainstatic_anon_110a85919a = function _anonymous(md) {return (md`# brain-static
+const _brainstatic_anon_493d1b1624 = function _anonymous(md) {return (md`# brain-static
 
 Files kept by a Cloud Brain and served from its address.
 
@@ -28342,7 +28342,7 @@ Files kept by a Cloud Brain and served from its address.
 | \`static.list\` | query. \`?prefix=\` and \`?tag=\`. \`{ files: [{ path, size, type, sha256, public, tags, savedAt }] }\`, the files the caller may read. |
 | \`static.tag\` | procedure. \`{ path, tags }\` replaces the file's labels. |
 | \`static.setPublic\` | procedure. \`{ path, public }\` adds or removes the \`public\` label. |
-| \`static.delete\` | procedure. \`{ path }\` |
+| \`static.delete\` | procedure. \`{ path }\` drops one file. \`{ prefix, before }\` drops each file under the prefix that the caller may change, saved before \`before\` (an ISO date or milliseconds; all of them without it). Answers \`{ deleted, paths }\`. An empty prefix is refused, and nothing under \`shell/\` is dropped this way. |
 | \`GET /static/<path>\` | whoever may read the file by its tags. \`ETag\` is the SHA-256; \`If-None-Match\` answers 304. |
 | Storage | bytes in \`blobs\` and one row per file in \`rows\`, both under \`f/<path>\` |
 
@@ -28373,6 +28373,10 @@ A tag with \`:\` in it is never taken from a caller and never changes after the 
 A recipe is the owner's code and is not checked by tag: it reads and changes what is under its own name, and reads what is public. A file kept before tags (2026-10-07) is read as the owner's, \`public\` if its flag said so. A token is the owner's and reaches everything it reached before.
 
 The core sends, with each call by a person, whether they are a member, their tag grants and their limit in bytes. The limit counts every file under \`u/ID/\`, default 20 MB. A file not made by the owner is served with \`Content-Security-Policy: sandbox\`, so a browser gives it no script and no origin.
+
+## Where a file goes
+
+A service that keeps files by date names them \`<service>/<YYYY-MM-DD>/<name>\`: \`snapshot/2026-10-09/arxiv.json\`. The first segment is not a choice (a recipe makes a new path only under its own name) and each file carries \`worker:<name>\` and \`savedAt\`, both set by this Worker. The day is the second segment so that one day, or every day before a date, is one prefix: \`static.delete\` with \`{ prefix: "snapshot/", before: "2026-07-01" }\`. A listing reads every record under its prefix, so a prefix that ends at a day reads that day's files only.
 
 \`static.list\` reads every record under the prefix and filters; with \`?tag=\` it still reads them all. On cb4 that is 14 records (2026-10-07). There is no index by tag.
 
@@ -28565,7 +28569,20 @@ const _brainstatic_staticApp = function _staticApp(hono,config,sha256,rows,Respo
     return retag(c, path, (labels) => (open ? [...new Set([...labels, "public"])] : labels.filter((t) => t !== "public")));
   });
   app.post(NS + "delete", async (c) => {
-    const { path } = await c.req.json().catch(() => ({}));
+    const { path, prefix, before: until } = await c.req.json().catch(() => ({}));
+    // { prefix, before }: each file under the prefix that this caller may change, saved before then. Never the shell.
+    if (prefix !== undefined) {
+      const m = await me(c), t = until === undefined ? Infinity : typeof until === "number" ? until : Date.parse(until);
+      if (typeof prefix !== "string" || !prefix || !okPath(prefix.replace(/\/$/, "")) || Number.isNaN(t)) return fail(c, 400, "InvalidRequest", "{ prefix, before }: a prefix that is not empty, and a date");
+      if (!m || !(m.all || m.fixed || m.did)) return fail(c, 403, "Forbidden", "this caller has no files");
+      const paths = (await rows.list("f/" + prefix)).filter(({ key, value }) => !key.startsWith("f/shell/") && (value.savedAt || 0) < t && can(m, value, key.slice(2), "write")).map((r) => r.key.slice(2));
+      for (const p of paths) {
+        await rows.delete("f/" + p);
+        await blobs.delete("f/" + p);
+        await blobs.delete("z/" + p);
+      }
+      return c.json({ deleted: paths.length, paths });
+    }
     const { no } = await writable(c, path);
     if (no) return no;
     const deleted = await rows.delete("f/" + path);
@@ -28624,6 +28641,29 @@ const _brainstatic_test_static_a_worker_reaches_only_paths_under_its_name = asyn
   expect((await rig.put("worker:brain-core", "core/x", "x")).status).toBe(403);
   expect((await rig.call("anonymous", rig.X + "list")).status).toBe(403);
   return "4 refusals";
+};
+const _brainstatic_test_static_delete_by_prefix_and_date_keeps_to_what_the_caller_may_change = async function _test_static_delete_by_prefix_and_date_keeps_to_what_the_caller_may_change(staticRig,expect) {
+  const rig = await staticRig(), snap = "worker:brain-x-snapshot", del = async (who, input) => { const r = await rig.post(who, "delete", input); return [r.status, (await r.json()).paths]; };
+  for (const day of ["2026-07-01", "2026-10-08", "2026-10-09"]) await rig.put(snap, `snapshot/${day}/hn.json`, "{}");
+  await rig.put("owner", "site/a.css", "a");
+  await rig.put("owner", "shell/index.html", "<html>");
+  // What a Worker makes is under its own name, stamped with it and with the time. No caller names either.
+  const made = rig.sim.rows.get("f/snapshot/2026-10-09/hn.json");
+  expect([made.tags, typeof made.savedAt]).toEqual([["by:owner", "worker:brain-x-snapshot"], "number"]);
+  expect((await rig.put(snap, "other/2026-10-09/hn.json", "{}")).status).toBe(403);
+  // The date is savedAt, not the path: give two files an older one.
+  for (const day of ["2026-07-01", "2026-10-08"]) rig.sim.rows.set(`f/snapshot/${day}/hn.json`, { ...rig.sim.rows.get(`f/snapshot/${day}/hn.json`), savedAt: Date.parse(day) });
+  expect(await del(snap, { prefix: "snapshot/", before: "2026-08-01" })).toEqual([200, ["snapshot/2026-07-01/hn.json"]]);
+  // A Worker's prefix outside its name drops nothing; an empty prefix and a bad date are refused.
+  expect(await del(snap, { prefix: "site/" })).toEqual([200, []]);
+  expect((await rig.post(snap, "delete", { prefix: "" })).status).toBe(400);
+  expect((await rig.post("owner", "delete", { prefix: "snapshot/", before: "soon" })).status).toBe(400);
+  expect((await rig.post("anonymous", "delete", { prefix: "snapshot/" })).status).toBe(403);
+  // The owner drops any prefix, and never the shell.
+  expect((await del("owner", { prefix: "s" }))[1]).toEqual(["site/a.css", "snapshot/2026-10-08/hn.json", "snapshot/2026-10-09/hn.json"]);
+  expect((await del("owner", { prefix: "shell/" }))[1]).toEqual([]);
+  expect([...rig.sim.blobs.keys()].filter((k) => !k.includes("/shell/"))).toEqual([]);
+  return "by prefix and date";
 };
 const _brainstatic_test_static_only_the_owner_writes_the_shell = async function _test_static_only_the_owner_writes_the_shell(staticRig,expect) {
   const rig = await staticRig();
@@ -28759,7 +28799,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainstatic_anon_110a85919a", null, ["md"], _brainstatic_anon_110a85919a);
+  $def("_brainstatic_anon_493d1b1624", null, ["md"], _brainstatic_anon_493d1b1624);
   $def("_brainstatic_static_service", "static_service", ["cloudflare","staticApp"], _brainstatic_static_service);
   $def("_brainstatic_static_announce", "static_announce", ["plugins","static_service","invalidation"], _brainstatic_static_announce);
   $def("_brainstatic_staticTypes", "staticTypes", [], _brainstatic_staticTypes);
@@ -28768,6 +28808,7 @@ export default function define(runtime, observer) {
   $def("_brainstatic_staticRig", "staticRig", ["simulate","static_service"], _brainstatic_staticRig);
   $def("_brainstatic_test_static_put_get_list_delete", "test_static_put_get_list_delete", ["staticRig","expect","sha256"], _brainstatic_test_static_put_get_list_delete);
   $def("_brainstatic_test_static_a_worker_reaches_only_paths_under_its_name", "test_static_a_worker_reaches_only_paths_under_its_name", ["staticRig","expect"], _brainstatic_test_static_a_worker_reaches_only_paths_under_its_name);
+  $def("_brainstatic_test_static_delete_by_prefix_and_date_keeps_to_what_the_caller_may_change", "test_static_delete_by_prefix_and_date_keeps_to_what_the_caller_may_change", ["staticRig","expect"], _brainstatic_test_static_delete_by_prefix_and_date_keeps_to_what_the_caller_may_change);
   $def("_brainstatic_test_static_only_the_owner_writes_the_shell", "test_static_only_the_owner_writes_the_shell", ["staticRig","expect"], _brainstatic_test_static_only_the_owner_writes_the_shell);
   $def("_brainstatic_test_static_serves_a_public_file_to_anyone", "test_static_serves_a_public_file_to_anyone", ["staticRig","expect","Response","DecompressionStream"], _brainstatic_test_static_serves_a_public_file_to_anyone);
   $def("_brainstatic_test_static_declares_what_it_needs", "test_static_declares_what_it_needs", ["static_service","expect"], _brainstatic_test_static_declares_what_it_needs);
@@ -32599,7 +32640,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainsnapshot_anon_6e8edd11f6 = function _anonymous(md,snapshotAgent) {return (md`# brain-snapshot
+const _brainsnapshot_anon_0765d7a724 = function _anonymous(md,snapshotAgent) {return (md`# brain-snapshot
 
 A Cloud Brain recipe: once a day it fetches a list of public feeds and keeps what each one said as a public JSON file. It records. It makes no model call, ranks nothing and writes no summary: a notebook reads the files and does that.
 
@@ -32607,10 +32648,12 @@ A Cloud Brain recipe: once a day it fetches a list of public feeds and keeps wha
 |---|---|
 | Worker | \`brain-x-snapshot\` |
 | \`snapshot.run\` | procedure, the owner's own session. Fetches every source now and keeps today's files. Answers the day's index. |
-| \`snapshot.sources\` | query, anyone. \`{ sources, default }\`: the list in use, and whether it is the list below. |
-| \`snapshot.setSources\` | procedure, the owner's own session. \`{ sources: [...] }\` replaces the list; \`{ sources: null }\` goes back to the list below. |
-| Timer | each day at the first tick after 06:00 UTC, once (\`rows\`: \`ran/<day>\`). |
-| Storage | files in \`brain-static\` under \`snapshot/\`, public, tag \`snapshot\`. \`rows\`: \`sources\`, \`ran/<day>\`, \`day/<day>\`. |
+| \`snapshot.sources\` | query, anyone. \`{ sources, default, keepDays }\`: the list in use, whether it is the list below, and how many days are kept. |
+| \`snapshot.setSources\` | procedure, the owner's own session. \`{ sources: [...] }\` replaces the list; \`{ sources: null }\` goes back to the list below. \`{ keepDays }\` sets how many days are kept (90 unless set). |
+| Timer | each day at the first tick after 06:00 UTC, once (\`rows\`: \`ran/<day>\`). The tick is the wrapper's minute alarm, armed by the deployer's health check at deploy; the cron is declared as well. |
+| Storage | files in \`brain-static\` under \`snapshot/<day>/\`, public, tag \`snapshot\`. \`rows\`: \`sources\`, \`keepDays\`, \`ran/<day>\`, \`day/<day>\`. |
+
+To run it now: the **Run now** button below, in the owner's own session. From this checkout: \`BRAIN_BASE=cb4 bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.snapshot.run --owner -X POST\`. A token is refused.
 
 ## What is kept
 
@@ -32619,38 +32662,56 @@ Anyone reads these with no session. \`<day>\` is the UTC date, \`2026-10-09\`.
 | Address | Holds |
 |---|---|
 | \`/static/snapshot/days.json\` | \`{ days: [{ day, ranAt, items }] }\`, newest first |
-| \`/static/snapshot/<day>/index.json\` | \`{ day, ranAt, sources: [{ name, tier, status, count, of, bytes, ms, path, error }] }\` |
+| \`/static/snapshot/<day>/index.json\` | \`{ day, ranAt, sources: [{ name, tier, status, count, matched, of, bytes, ms, path, error, lookup }], papers: { count, path }, errors }\` |
 | \`/static/snapshot/<day>/<source>.json\` | \`{ source, tier, url, day, fetchedAt, count, items }\` |
+| \`/static/snapshot/<day>/papers.json\` | \`{ day, ranAt, count, papers: [{ id, url, title, summary, points, signals, via }] }\`: the papers of the day that carry a signal (below) |
 
-An item is \`{ id, title, url, source, tier }\` and, where the feed gives them, \`points comments author published discussion summary\`. \`published\` is an ISO time. \`summary\` is text with the markup taken out, cut at 1500 characters.
+An item is \`{ id, title, source, tier }\` and, where the feed gives them, \`url points comments author published discussion summary papers\`. An Ask HN post has no \`url\`. \`published\` is an ISO time. \`summary\` is text, cut at 1500 characters. \`papers\` is the arXiv ids the item links to.
+
+Text from a feed has its markup taken out: a \`<\` that starts a tag name is read as a tag up to the next \`>\`, so \`p < 0.05 and n > 3\` is kept and \`a<b and c>d\` loses \`<b and c>\`. Text from a JSON source is kept as it is.
 
 - A second run on one day replaces that day's files: the last run is what is kept.
 - A source that fails, or that has nothing to keep, writes no file. Its row in the index says why (\`status\`, \`error\`, \`count: 0\`), and a file an earlier run of that day made for it stays.
 - Every source is fetched at the same time. Give one host one source: Reddit answered 429 to the second of two feeds, also 2 s apart (cb4, 2026-10-09), so its two subreddits are one feed.
 - A failed source does not fail the run. The timer runs once a day and does not try again; \`snapshot.run\` does.
-- \`of\` is how many items the feed held, \`count\` how many were kept.
+- \`of\` is how many items the feed held, \`matched\` how many passed \`keep\` and \`days\`, \`count\` how many were kept. \`matched\` above \`count\` means \`limit\` cut the list.
+- \`errors\` in the index, and in the log line, names a write of \`index.json\`, \`papers.json\` or \`days.json\` that failed.
+- The daily run drops the files of days older than \`keepDays\` with \`static.delete\` \`{ prefix: "snapshot/", before }\`. \`snapshot.run\` drops nothing.
+
+## Papers
+
+arXiv lists 600 to 900 new papers a day in these three categories. Nobody reads that list, and its feed gives authors with no affiliation, so it cannot be cut down to known labs. \`arxiv.json\` is kept for looking a paper up (\`lookup: true\` in the index): do not read it whole. \`papers.json\` holds the papers that carry at least one signal, and says which:
+
+| signal | means |
+|---|---|
+| \`votes:<source>\` | the paper is in a source that has \`papers: { min }\` with at least \`min\` points. Hugging Face's daily papers, 10. |
+| \`lab:<source>\` | an item of a \`research\` feed links to it (\`arxiv.org/abs\`, \`/pdf\`, \`/html\`, or \`huggingface.co/papers\`). |
+| \`mention:<source>\` | an item of a \`blogger\` or \`aggregator\` source links to it. |
+
+\`via\` is the items that linked to it. Title and summary come from the voting source, else from \`arxiv.json\` when the paper is in that day's list; a paper from an earlier day has only its id and \`via\`. Papers are in order of how many signals they carry, then points.
 
 ## Sources
 
-A source is a row, not code: \`{ name, tier, url, kind }\`.
+A source is a row, not code: \`{ name, tier, url, kind }\`. The list is public, and each kept file names its source's address: do not give a source an address that carries a key.
 
 - \`kind\`: \`rss\` or \`atom\` (one reader for both), or \`json\` with \`map\`, the path of each field in an item (\`"paper.id"\`), and \`items\`, the path of the list when it is not the whole answer. A \`map\` value with braces is a pattern: \`"https://huggingface.co/papers/{paper.id}"\`.
 - \`tier\`: \`research\`, \`blogger\` or \`aggregator\`. Research and named writers lead. An aggregator says what people discuss.
 - \`days\`: keep only items published in that many days before the run. A blog's feed holds its old posts; every \`research\` blog and every \`blogger\` here has \`days: 7\`, so most of them keep nothing on most days.
 - \`keep\`: a pattern an item's text must match. arXiv's feed also lists replaced papers; \`keep\` leaves new and cross-listed ones.
 - \`limit\`: at most this many items, 500 unless given.
+- \`papers: { min }\`: the items are papers, their \`id\` an arXiv id, and one with \`min\` points or more is in \`papers.json\`. \`lookup: true\`: the items are papers to look up, not to read.
 
 Each source is fetched once a run, with the \`User-Agent\` \`${snapshotAgent}\`.
 
 Measured from a Worker of cb4 on 2026-10-09 (\`tools/scratch/snapshot-probe\`): the arXiv API answered 429 "Rate exceeded" and its RSS feed 200, so the feed is used. Reddit's \`.json\` answered 403 and its \`.rss\` 200, so the feed is used, which gives no score; after about ten requests in an hour from the tests it answered 429 to each one. Anthropic and Meta AI have no feed at the addresses tried (404) and are not in the list. Gwern's feed has nothing after 2021 and is not in the list.`);};
-const _brainsnapshot_viewof_snapshotView = function _snapshotView(snapshotPanel,client) {return (snapshotPanel({ base: client && client.base }));};
+const _brainsnapshot_viewof_snapshotView = function _snapshotView(snapshotPanel,client,session) {return (snapshotPanel({ base: client && client.base, client, owner: !!(session && session.owner) }));};
 const _brainsnapshot_snapshotView = (G, _) => G.input(_);
 const _brainsnapshot_snapshotAgent = function _snapshotAgent() {return ("lopecode-cloud-brain-snapshot/1 (+https://github.com/tomlarkworthy/lopecode)");};
 const _brainsnapshot_snapshotSources = function _snapshotSources() {
   const blog = (name, url, tier = "blogger") => ({ name, tier, url, kind: "rss", days: 7 });
   return [
-    { name: "arxiv", tier: "research", url: "https://rss.arxiv.org/rss/cs.AI+cs.LG+cs.CL", kind: "rss", keep: "Announce Type: (new|cross)", limit: 700 },
-    { name: "hf-papers", tier: "research", url: "https://huggingface.co/api/daily_papers?limit=50", kind: "json", map: { id: "paper.id", title: "paper.title", url: "https://huggingface.co/papers/{paper.id}", points: "paper.upvotes", comments: "numComments", published: "publishedAt", summary: "paper.summary" } },
+    { name: "arxiv", tier: "research", url: "https://rss.arxiv.org/rss/cs.AI+cs.LG+cs.CL", kind: "rss", keep: "Announce Type: (new|cross)", limit: 700, lookup: true },
+    { name: "hf-papers", tier: "research", url: "https://huggingface.co/api/daily_papers?limit=50", kind: "json", map: { id: "paper.id", title: "paper.title", url: "https://huggingface.co/papers/{paper.id}", points: "paper.upvotes", comments: "numComments", published: "publishedAt", summary: "paper.summary" }, papers: { min: 10 } },
     blog("openai", "https://openai.com/news/rss.xml", "research"),
     blog("deepmind", "https://deepmind.google/blog/rss.xml", "research"),
     blog("google-research", "https://research.google/blog/rss/", "research"),
@@ -32672,40 +32733,82 @@ const _brainsnapshot_snapshotSources = function _snapshotSources() {
     { name: "lobsters-ai", tier: "aggregator", url: "https://lobste.rs/t/ai.json", kind: "json", map: { id: "short_id", title: "title", url: "url", points: "score", comments: "comment_count", author: "submitter_user", published: "created_at", discussion: "comments_url", summary: "description_plain" } }
   ];
 };
-const _brainsnapshot_snapshotText = function _snapshotText() {return ((s, max = 1500) => {
-  const entities = (t) => t.replace(/&(lt|gt|quot|apos|amp|#39|#x27|nbsp);/g, (_, e) => ({ lt: "<", gt: ">", quot: '"', apos: "'", amp: "&", "#39": "'", "#x27": "'", nbsp: " " })[e]).replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
-  return entities(entities(String(s ?? "").replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")).replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim().slice(0, max);
+const _brainsnapshot_snapshotText = function _snapshotText(snapshotPlain) {return ((s, max = 1500) => {
+  const named = { lt: "<", gt: ">", quot: '"', apos: "'", amp: "&", nbsp: " ", mdash: "\u2014", ndash: "\u2013", hellip: "\u2026", lsquo: "\u2018", rsquo: "\u2019", ldquo: "\u201c", rdquo: "\u201d" };
+  const point = (n, e) => (n >= 0 && n <= 0x10ffff ? String.fromCodePoint(n) : e);
+  const entities = (t) => t.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (e, k) => (k[0] !== "#" ? (named[k.toLowerCase()] ?? e) : point(/^#x/i.test(k) ? parseInt(k.slice(2), 16) : Number(k.slice(1)), e)));
+  // A tag is < and a name; "p < 0.05 and n > 3" has none.
+  const tags = (t) => t.replace(/<!--[\s\S]*?-->|<\/?[a-zA-Z][^<>]*>/g, " ");
+  return snapshotPlain(entities(tags(entities(tags(String(s ?? ""))))), max);
 });};
+const _brainsnapshot_snapshotPlain = function _snapshotPlain() {return ((s, max = 1500) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, max));};
+const _brainsnapshot_snapshotPapers = function _snapshotPapers() {return ((text) => [...new Set([...String(text ?? "").replace(/&#x2F;|&#47;/gi, "/").matchAll(/(?:arxiv\.org\/(?:abs|pdf|html)\/|huggingface\.co\/papers\/)(\d{4}\.\d{4,5})/g)].map((m) => m[1]))]);};
 const _brainsnapshot_snapshotFeed = function _snapshotFeed(snapshotText) {return ((xml) => {
   const tag = (s, name) => (new RegExp("<" + name + "(?:\\s[^>]*)?>([\\s\\S]*?)</" + name + ">").exec(s) || [])[1] || "";
-  const href = (s) => (/<link\s[^>]*?href="([^"]*)"/.exec(s) || [])[1] || "";
-  return String(xml).split(/<(?:item|entry)[\s>]/).slice(1).map((s) => ({
+  // The link of an Atom entry: the one that is the page (rel alternate, or no rel), else the first.
+  const href = (s) => {
+    const links = [...s.matchAll(/<link\s[^>]*?>/g)].map((m) => ({ rel: (/\srel="([^"]*)"/.exec(m[0]) || [])[1], href: (/\shref="([^"]*)"/.exec(m[0]) || [])[1] })).filter((l) => l.href);
+    return ((links.find((l) => !l.rel || l.rel === "alternate") || links[0] || {}).href) || "";
+  };
+  // A CDATA section is text: its < and & are written as entities, so a tag inside one is not read as a field.
+  const flat = String(xml).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  return flat.split(/<(?:item|entry)[\s>]/).slice(1).map((s) => ({
     id: snapshotText(tag(s, "guid") || tag(s, "id"), 500),
     title: snapshotText(tag(s, "title"), 500),
     url: snapshotText(tag(s, "link") || href(s), 2000),
     author: snapshotText(tag(s, "dc:creator") || tag(tag(s, "author"), "name"), 200),
     published: snapshotText(tag(s, "pubDate") || tag(s, "published") || tag(s, "updated"), 100),
-    summary: tag(s, "description") || tag(s, "summary") || tag(s, "content") || tag(s, "content:encoded")
+    summary: snapshotText(tag(s, "description") || tag(s, "summary") || tag(s, "content") || tag(s, "content:encoded")),
+    raw: s
   }));
 });};
 const _brainsnapshot_snapshotJson = function _snapshotJson() {return ((data, src) => {
   const at = (o, path) => String(path).split(".").reduce((v, k) => (v == null ? undefined : v[k]), o);
   const list = src.items ? at(data, src.items) : data;
-  return (Array.isArray(list) ? list : []).map((o) => Object.fromEntries(Object.entries(src.map || {}).map(([k, p]) => [k, /\{/.test(p) ? String(p).replace(/\{([^}]+)\}/g, (_, q) => at(o, q) ?? "") : at(o, p)])));
+  return (Array.isArray(list) ? list : []).map((o) => ({ ...Object.fromEntries(Object.entries(src.map || {}).map(([k, p]) => [k, /\{/.test(p) ? String(p).replace(/\{([^}]+)\}/g, (_, q) => at(o, q) ?? "") : at(o, p)])), raw: JSON.stringify(o) }));
 });};
-const _brainsnapshot_snapshotItems = function _snapshotItems(snapshotJson,snapshotFeed,snapshotText) {return ((body, src, now = Date.now()) => {
+const _brainsnapshot_snapshotItems = function _snapshotItems(snapshotJson,snapshotFeed,snapshotPapers,snapshotPlain) {return ((body, src, now = Date.now()) => {
   const raw = src.kind === "json" ? snapshotJson(JSON.parse(body), src) : snapshotFeed(body);
   const keep = src.keep ? new RegExp(src.keep) : null, since = src.days ? now - src.days * 86400000 : null;
   const items = [];
+  let matched = 0;
   for (const r of raw) {
     if (keep && !keep.test(String(r.title) + " " + String(r.summary))) continue;
     const t = r.published ? Date.parse(r.published) : NaN;
     if (since !== null && !(t >= since)) continue;
-    const item = { id: String(r.id || r.url || r.title || ""), title: snapshotText(r.title, 500), url: r.url ? String(r.url) : undefined, points: r.points == null ? undefined : Number(r.points), comments: r.comments == null ? undefined : Number(r.comments), author: r.author ? String(r.author) : undefined, published: Number.isFinite(t) ? new Date(t).toISOString() : undefined, discussion: r.discussion ? String(r.discussion) : undefined, summary: snapshotText(r.summary) || undefined, source: src.name, tier: src.tier };
+    matched++;
+    if (items.length >= (src.limit || 500)) continue;
+    // A list of papers links to its own; any other item's links to papers are kept with it.
+    const papers = src.papers || src.lookup ? [] : snapshotPapers(String(r.url) + " " + String(r.discussion) + " " + r.raw);
+    const item = { id: String(r.id || r.url || r.title || ""), title: snapshotPlain(r.title, 500), url: r.url ? String(r.url) : undefined, points: r.points == null ? undefined : Number(r.points), comments: r.comments == null ? undefined : Number(r.comments), author: r.author ? String(r.author) : undefined, published: Number.isFinite(t) ? new Date(t).toISOString() : undefined, discussion: r.discussion ? String(r.discussion) : undefined, summary: snapshotPlain(r.summary) || undefined, papers: papers.length ? papers : undefined, source: src.name, tier: src.tier };
     if (item.id && item.title) items.push(JSON.parse(JSON.stringify(item)));
-    if (items.length >= (src.limit || 500)) break;
   }
-  return { of: raw.length, items };
+  return { of: raw.length, matched, items };
+});};
+const _brainsnapshot_snapshotSignals = function _snapshotSignals(snapshotPapers) {return ((list, kept) => {
+  const papers = new Map(), at = (id) => papers.get(id) || papers.set(id, { id, url: "https://arxiv.org/abs/" + id, signals: [], via: [] }).get(id);
+  const add = (p, signal) => void (p.signals.includes(signal) || p.signals.push(signal));
+  const known = new Map();
+  for (const src of list)
+    for (const item of kept.get(src.name) || []) {
+      if (src.lookup) {
+        const id = snapshotPapers(String(item.url))[0];
+        if (id) known.set(id, item);
+      } else if (src.papers) {
+        if (!(item.points >= src.papers.min)) continue;
+        add(Object.assign(at(item.id), { title: item.title, summary: item.summary, points: item.points }), "votes:" + src.name);
+      } else
+        for (const id of item.papers || []) {
+          const p = at(id);
+          add(p, (src.tier === "research" ? "lab:" : "mention:") + src.name);
+          p.via.push({ source: src.name, title: item.title, url: item.discussion || item.url });
+        }
+    }
+  for (const p of papers.values()) {
+    const k = known.get(p.id);
+    if (k && !p.title) Object.assign(p, { title: k.title, summary: k.summary });
+  }
+  return [...papers.values()].sort((a, b) => b.signals.length - a.signals.length || (b.points || 0) - (a.points || 0));
 });};
 const _brainsnapshot_snapshotCheck = function _snapshotCheck() {return ((list) => {
   if (!Array.isArray(list) || !list.length || list.length > 40) return "sources is a list of 1 to 40";
@@ -32718,27 +32821,33 @@ const _brainsnapshot_snapshotCheck = function _snapshotCheck() {return ((list) =
     try { if (new URL(s.url).protocol !== "https:") throw 0; } catch { return s.name + ": url is an https address"; }
     if (s.kind === "json" && (!s.map || typeof s.map !== "object" || !s.map.title)) return s.name + ": a json source has a map with a title";
     if (s.keep !== undefined) try { new RegExp(s.keep); } catch { return s.name + ": keep is a pattern"; }
+    for (const k of ["days", "limit"]) if (s[k] !== undefined && !(typeof s[k] === "number" && s[k] > 0)) return `${s.name}: ${k} is a number above 0`;
+    if (s.map !== undefined && (!s.map || typeof s.map !== "object" || !Object.values(s.map).every((v) => typeof v === "string"))) return s.name + ": each value of map is a path or a pattern";
+    if (s.items !== undefined && typeof s.items !== "string") return s.name + ": items is a path";
+    if (s.papers !== undefined && !(s.papers && typeof s.papers.min === "number")) return s.name + ": papers is { min }";
   }
   return null;
 });};
-const _brainsnapshot_snapshotOps = function _snapshotOps(xrpc,rows,snapshotSources,snapshotAgent,snapshotItems,log) {
-  const STATIC = "com.lopecode.brain.static.put";
+const _brainsnapshot_snapshotOps = function _snapshotOps(xrpc,rows,snapshotSources,snapshotAgent,snapshotItems,snapshotSignals,log) {
+  const STATIC = "com.lopecode.brain.static.";
   const dayOf = (now) => new Date(now).toISOString().slice(0, 10);
   const put = async (path, value) => {
-    const r = await xrpc.fetch(STATIC, { method: "POST", params: { path, type: "application/json", public: "true", tags: "snapshot" }, body: new TextEncoder().encode(JSON.stringify(value)) });
-    return r.ok ? null : "static.put " + r.status;
+    const r = await xrpc.fetch(STATIC + "put", { method: "POST", params: { path, type: "application/json", public: "true", tags: "snapshot" }, body: new TextEncoder().encode(JSON.stringify(value)) });
+    return r.ok ? null : `static.put ${path} ${r.status}`;
   };
   const sources = async () => (await rows.get("sources")) || snapshotSources;
-  const one = async (src, day, now) => {
-    const t = Date.now(), row = { name: src.name, tier: src.tier, status: 0, count: 0, of: 0, bytes: 0, ms: 0, path: null, error: null };
+  const keepDays = async () => (await rows.get("keepDays")) || 90;
+  const one = async (src, day, now, kept) => {
+    const t = Date.now(), row = { name: src.name, tier: src.tier, status: 0, count: 0, matched: 0, of: 0, bytes: 0, ms: 0, path: null, error: null, ...(src.lookup ? { lookup: true } : {}) };
     try {
       const r = await fetch(src.url, { headers: { "user-agent": snapshotAgent, accept: "application/json, application/atom+xml, application/rss+xml, application/xml;q=0.9, */*;q=0.5" } });
       const body = await r.text();
       Object.assign(row, { status: r.status, bytes: body.length });
       if (!r.ok) row.error = "the source answered " + r.status;
       else {
-        const { of, items } = snapshotItems(body, src, now);
-        Object.assign(row, { of, count: items.length });
+        const { of, matched, items } = snapshotItems(body, src, now);
+        Object.assign(row, { of, matched, count: items.length });
+        kept.set(src.name, items);
         if (items.length) {
           row.path = `snapshot/${day}/${src.name}.json`;
           row.error = await put(row.path, { source: src.name, tier: src.tier, url: src.url, day, fetchedAt: new Date(now).toISOString(), count: items.length, items });
@@ -32752,26 +32861,43 @@ const _brainsnapshot_snapshotOps = function _snapshotOps(xrpc,rows,snapshotSourc
     return row;
   };
   const run = async (now = Date.now()) => {
-    const day = dayOf(now), list = await sources();
-    const index = { day, ranAt: new Date(now).toISOString(), sources: await Promise.all(list.map((s) => one(s, day, now))) };
-    const items = index.sources.reduce((n, s) => n + s.count, 0);
-    await put(`snapshot/${day}/index.json`, index);
-    await rows.put("day/" + day, { day, ranAt: index.ranAt, items });
-    await put("snapshot/days.json", { days: (await rows.list("day/")).map((r) => r.value).sort((a, b) => (a.day < b.day ? 1 : -1)) });
-    log({ at: "snapshot.run", day, items, sources: index.sources.map((s) => `${s.name}:${s.status}:${s.count}`).join(" ") });
+    const day = dayOf(now), list = await sources(), kept = new Map(), errors = [], tried = async (e) => void ((e = await e) && errors.push(e));
+    const index = { day, ranAt: new Date(now).toISOString(), sources: await Promise.all(list.map((s) => one(s, day, now, kept))) };
+    const items = index.sources.reduce((n, s) => n + s.count, 0), papers = snapshotSignals(list, kept);
+    index.papers = { count: papers.length, path: `snapshot/${day}/papers.json` };
+    await tried(put(index.papers.path, { day, ranAt: index.ranAt, count: papers.length, papers }));
+    await rows.put("day/" + day, { day, ranAt: index.ranAt, items, papers: papers.length });
+    await tried(put("snapshot/days.json", { days: (await rows.list("day/")).map((r) => r.value).sort((a, b) => (a.day < b.day ? 1 : -1)) }));
+    index.errors = errors;
+    // The index is written last, with what failed before it. Its own failure is in the answer and the log.
+    await tried(put(`snapshot/${day}/index.json`, index));
+    log({ at: "snapshot.run", day, items, papers: papers.length, sources: index.sources.map((s) => `${s.name}:${s.status}:${s.count}`).join(" "), ...(errors.length ? { error: errors.join("; ") } : {}) });
     return index;
+  };
+  // Days older than keepDays: their files, by prefix and date, and their rows.
+  const prune = async (now) => {
+    const before = new Date(now - (await keepDays()) * 86400000).toISOString().slice(0, 10);
+    try {
+      const { deleted } = await xrpc.procedure(STATIC + "delete", { prefix: "snapshot/", before });
+      for (const k of ["day/", "ran/"]) for (const row of await rows.list(k)) if (row.key.slice(k.length) < before) await rows.delete(row.key);
+      log({ at: "snapshot.prune", before, deleted });
+    } catch (e) {
+      log({ at: "snapshot.prune", before, error: String((e && e.message) || e).slice(0, 200) });
+    }
   };
   // The wrapper ticks once a minute. One run a day, at the first tick after 06:00 UTC.
   let ticked = null;
   const tick = async (now = Date.now()) => {
     const day = dayOf(now);
     if (new Date(now).getUTCHours() < 6 || ticked === day) return false;
+    const first = await rows.putIfAbsent("ran/" + day, now);
     ticked = day;
-    if (!(await rows.putIfAbsent("ran/" + day, now))) return false;
+    if (!first) return false;
+    await prune(now);
     await run(now);
     return true;
   };
-  return { run, tick, sources };
+  return { run, tick, sources, keepDays };
 };
 const _brainsnapshot_snapshot_service = function _snapshot_service(cloudflare,Response,snapshotOps,rows,snapshotSources,snapshotCheck) {return (cloudflare.Service(
   "snapshot",
@@ -32779,10 +32905,15 @@ const _brainsnapshot_snapshot_service = function _snapshot_service(cloudflare,Re
     const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
     const what = new URL(request.url).pathname.split(".").pop();
     if (what === "run") return json(200, await snapshotOps.run());
-    if (what === "sources") return json(200, { sources: await snapshotOps.sources(), default: !(await rows.get("sources")) });
+    if (what === "sources") return json(200, { sources: await snapshotOps.sources(), default: !(await rows.get("sources")), keepDays: await snapshotOps.keepDays() });
     if (what === "setSources") {
       const body = await request.json().catch(() => null);
       if (!body || typeof body !== "object") return json(400, { error: "InvalidRequest", message: "{ sources }" });
+      if (body.keepDays !== undefined) {
+        if (!(Number.isInteger(body.keepDays) && body.keepDays >= 1 && body.keepDays <= 3650)) return json(400, { error: "InvalidRequest", message: "keepDays is a whole number of days, 1 to 3650" });
+        await rows.put("keepDays", body.keepDays);
+        if (body.sources === undefined) return json(200, { keepDays: body.keepDays });
+      }
       if (body.sources === null) return (await rows.delete("sources")), json(200, { sources: snapshotSources.length, default: true });
       const bad = snapshotCheck(body.sources);
       if (bad) return json(400, { error: "InvalidRequest", message: bad });
@@ -32793,8 +32924,9 @@ const _brainsnapshot_snapshot_service = function _snapshot_service(cloudflare,Re
   },
   {
     crons: ["0 6 * * *"],
-    scheduled: () => snapshotOps.tick(),
-    calls: ["com.lopecode.brain.static.put"],
+    // A cron event carries its time; the wrapper's minute alarm does not.
+    scheduled: (event) => snapshotOps.tick((event && event.scheduledTime) || Date.now()),
+    calls: ["com.lopecode.brain.static.put", "com.lopecode.brain.static.delete"],
     methods: {
       "com.lopecode.brain.snapshot.run": { type: "procedure", allow: "caller.session" },
       "com.lopecode.brain.snapshot.sources": { type: "query", who: "anyone" },
@@ -32806,32 +32938,41 @@ const _brainsnapshot_snapshot_announce = function _snapshot_announce(plugins,sna
   plugins.add("workers", snapshot_service, { invalidation });
   return "announced snapshot_service";
 };
-const _brainsnapshot_snapshotPanel = function _snapshotPanel(htl,Inputs) {return (({ base, fetch: send = (...a) => fetch(...a) } = {}) => {
+const _brainsnapshot_snapshotPanel = function _snapshotPanel(htl,Inputs,Event) {return (({ base, client, owner = false, fetch: send = (...a) => fetch(...a) } = {}) => {
   const muted = "color:var(--theme-foreground-muted)";
   if (!base) return Object.assign(htl.html`<i style=${muted}>Open this on a Brain to see its snapshots.</i>`, { value: null });
   const root = String(base).replace(/\/$/, "") + "/static/snapshot/", box = htl.html`<div></div>`, note = htl.html`<div style=${muted}></div>`;
   const el = Object.assign(htl.html`<div>${box}${note}</div>`, { value: null });
   const get = async (path) => { const r = await send(root + path); return r.ok ? r.json() : null; };
-  el.ready = (async () => {
+  const link = (u) => (u ? htl.html`<a href=${u} target="_blank">json</a>` : "");
+  const load = async () => {
     const days = ((await get("days.json")) || { days: [] }).days;
-    if (!days.length) return void box.replaceChildren(htl.html`<i style=${muted}>No snapshot yet.</i>`);
+    const now = owner && client ? Inputs.button("Run now", { reduce: () => void client.procedure("snapshot.run", {}).then(() => el.load(), (e) => void (note.textContent = String((e && e.message) || e))) }) : "";
+    // The panel's one input event is its own, in draw.
+    if (now) now.addEventListener("input", (e) => e.stopPropagation());
+    if (!days.length) return void box.replaceChildren(htl.html`<i style=${muted}>No snapshot yet.</i>`, now);
     const pick = Inputs.select(days, { label: "Day", format: (d) => `${d.day}  (${d.items} items)` });
     const table = htl.html`<div></div>`;
     const draw = async () => {
       const index = await get(pick.value.day + "/index.json");
+      table.replaceChildren(Inputs.table((index ? index.sources : []).map((s) => ({ source: s.name, tier: s.tier, kept: s.count, of: s.of, status: s.status, note: [s.error, s.matched > s.count ? `cut from ${s.matched}` : "", s.lookup ? "to look up" : ""].filter(Boolean).join("; "), file: s.path ? root.replace(/snapshot\/$/, "") + s.path : "" })), { format: { file: link }, layout: "auto" }));
+      note.replaceChildren(...(index ? [`ran ${index.ranAt}`, ...(index.papers ? [`, ${index.papers.count} papers with a signal `, link(root.replace(/snapshot\/$/, "") + index.papers.path)] : []), ...(index.errors && index.errors.length ? [`. Not written: ${index.errors.join("; ")}`] : [])] : []));
+      // The value is the day's index. The select's own event is stopped below, so this is the one a cell hears.
       el.value = index;
-      table.replaceChildren(Inputs.table((index ? index.sources : []).map((s) => ({ source: s.name, tier: s.tier, kept: s.count, of: s.of, status: s.status, note: s.error || "", file: s.path ? root.replace(/snapshot\/$/, "") + s.path : "" })), { format: { file: (u) => (u ? htl.html`<a href=${u} target="_blank">json</a>` : "") }, layout: "auto" }));
-      note.textContent = index ? `ran ${index.ranAt}` : "";
+      el.dispatchEvent(new Event("input", { bubbles: true }));
     };
-    pick.addEventListener("input", draw);
-    box.replaceChildren(pick, table);
+    pick.addEventListener("input", (e) => (e.stopPropagation(), draw().catch(failed)));
+    box.replaceChildren(pick, now, table);
     await draw();
-  })();
+  };
+  const failed = (e) => void (note.textContent = "The snapshot files could not be read: " + String((e && e.message) || e));
+  el.load = () => load().catch(failed);
+  el.ready = el.load();
   return el;
 });};
 const _brainsnapshot_anon_be3d699220 = function _anonymous(md) {return (md`## Tests`);};
-const _brainsnapshot_snapshotRig = function _snapshotRig(simulate,snapshot_service,Response) {return (async ({ feeds = {}, rows = new Map() } = {}) => {
-  const files = new Map(), asked = [];
+const _brainsnapshot_snapshotRig = function _snapshotRig(simulate,snapshot_service,Response) {return (async ({ feeds = {}, rows = new Map(), fail = null } = {}) => {
+  const files = new Map(), asked = [], dropped = [];
   const sim = await simulate(snapshot_service, {
     rows,
     secrets: { BRAIN_KEY: "k" },
@@ -32843,6 +32984,8 @@ const _brainsnapshot_snapshotRig = function _snapshotRig(simulate,snapshot_servi
     },
     core: async (request) => {
       const u = new URL(request.url);
+      if (u.pathname.endsWith("static.delete")) return dropped.push(await request.json()), Response.json({ deleted: 2, paths: [] });
+      if (fail && fail(u.searchParams.get("path"))) return Response.json({ error: "Forbidden" }, { status: 403 });
       files.set(u.searchParams.get("path"), { public: u.searchParams.get("public"), tags: u.searchParams.get("tags"), caller: request.headers.get("x-brain-caller"), value: JSON.parse(await request.text()) });
       return Response.json({ path: u.searchParams.get("path") });
     }
@@ -32851,7 +32994,7 @@ const _brainsnapshot_snapshotRig = function _snapshotRig(simulate,snapshot_servi
     const r = await sim.fetch("https://snapshot.internal/xrpc/com.lopecode.brain.snapshot." + name, { method: body === undefined ? "GET" : "POST", headers: { "content-type": "application/json", "x-brain-caller": caller }, body: body === undefined ? undefined : JSON.stringify(body) });
     return { status: r.status, data: await r.json() };
   };
-  return { sim, files, asked, rows, call };
+  return { sim, files, asked, dropped, rows, call };
 });};
 const _brainsnapshot_snapshotFixtures = function _snapshotFixtures() {return ({
   rss: `<?xml version="1.0"?><rss><channel><title>Feed</title><link>https://blog.example/</link>
@@ -32861,10 +33004,10 @@ const _brainsnapshot_snapshotFixtures = function _snapshotFixtures() {return ({
   atom: `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>r/x</title>
 <entry><author><name>/u/ada</name></author><content type="html">&lt;div&gt;Body &amp;amp; more&lt;/div&gt;</content><id>t3_1</id><link href="https://www.reddit.com/r/x/comments/1/?a=1&amp;b=2" /><updated>2026-10-09T01:00:00+00:00</updated><published>2026-10-09T01:00:00+00:00</published><title>[D] A thread</title></entry></feed>`
 });};
-const _brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out = function _test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out(snapshotItems,snapshotFixtures,expect) {
+const _brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out = function _test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out(snapshotItems,snapshotFixtures,expect,snapshotFeed) {
   const now = Date.parse("2026-10-09T06:00:00Z");
   const rss = snapshotItems(snapshotFixtures.rss, { name: "blog", tier: "blogger", kind: "rss", days: 7 }, now);
-  expect(rss).toEqual({ of: 2, items: [{ id: "a-1", title: "A & B: new results", url: "https://blog.example/a", author: "Ada", published: "2026-10-08T16:00:00.000Z", summary: "It's bold .", source: "blog", tier: "blogger" }] });
+  expect(rss).toEqual({ of: 2, matched: 1, items: [{ id: "a-1", title: "A & B: new results", url: "https://blog.example/a", author: "Ada", published: "2026-10-08T16:00:00.000Z", summary: "It's bold .", source: "blog", tier: "blogger" }] });
   // Without `days` the old post is kept as well.
   expect(snapshotItems(snapshotFixtures.rss, { name: "blog", tier: "blogger", kind: "rss" }, now).items.map((i) => i.id)).toEqual(["a-1", "old-1"]);
   const atom = snapshotItems(snapshotFixtures.atom, { name: "reddit-x", tier: "aggregator", kind: "atom" }, now);
@@ -32872,17 +33015,33 @@ const _brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entiti
   // keep, limit, and a summary cut at 1500 characters.
   const many = `<rss>${[1, 2, 3, 4].map((n) => `<item><title>T${n}</title><guid>${n}</guid><description>Announce Type: ${n % 2 ? "new" : "replace"} ${"x".repeat(3000)}</description></item>`).join("")}</rss>`;
   const kept = snapshotItems(many, { name: "arxiv", tier: "research", kind: "rss", keep: "Announce Type: (new|cross)", limit: 1 }, now);
-  expect([kept.of, kept.items.map((i) => i.id), kept.items[0].summary.length]).toEqual([4, ["1"], 1500]);
+  expect([kept.of, kept.matched, kept.items.map((i) => i.id), kept.items[0].summary.length]).toEqual([4, 2, ["1"], 1500]);
+  // An Atom entry's link is the page: rel alternate or no rel, wherever it comes. A title in CDATA is text.
+  const entry = (links) => snapshotFeed(`<feed><entry><id>1</id><title type="html"><![CDATA[Fast <em>&amp;</em> small </title><x>]]></title>${links}</entry></feed>`)[0];
+  expect(entry('<link rel="self" href="https://a.example/feed"/><link rel="alternate" href="https://a.example/post"/>')).toMatchObject({ title: "Fast & small", url: "https://a.example/post" });
+  expect(entry('<link rel="replies" href="https://a.example/c"/><link href="https://a.example/post"/>').url).toBe("https://a.example/post");
+  expect(entry('<link rel="enclosure" href="https://a.example/a.mp3"/>').url).toBe("https://a.example/a.mp3");
   return "rss, atom, keep, days, limit";
+};
+const _brainsnapshot_test_text_keeps_a_comparison_and_reads_hex_and_named_entities = function _test_text_keeps_a_comparison_and_reads_hex_and_named_entities(expect,snapshotText,snapshotItems) {
+  expect(snapshotText("p &lt; 0.05 and n &gt; 3")).toBe("p < 0.05 and n > 3");
+  expect(snapshotText("p < 0.05 <b>bold</b> <!-- no --> x")).toBe("p < 0.05 bold x");
+  expect(snapshotText("It&#x2019;s &#8212; caf&#xE9; &mdash; &hellip;&nbsp;&unknown; &#x110000;")).toBe("It\u2019s \u2014 caf\u00e9 \u2014 \u2026 &unknown; &#x110000;");
+  // Escaped twice: markup written about, not markup.
+  expect(snapshotText("&amp;lt;div&amp;gt; in a title")).toBe("<div> in a title");
+  // A JSON source's text is text: nothing in it is a tag or an entity.
+  const item = snapshotItems(JSON.stringify([{ id: "1", title: "Why a<b and c>d &amp; more", summary: "x <i>y</i>" }]), { name: "j", tier: "aggregator", kind: "json", map: { id: "id", title: "title", summary: "summary" } }).items[0];
+  expect([item.title, item.summary]).toEqual(["Why a<b and c>d &amp; more", "x <i>y</i>"]);
+  return "5 texts";
 };
 const _brainsnapshot_test_a_json_source_is_read_by_the_paths_its_map_names = function _test_a_json_source_is_read_by_the_paths_its_map_names(snapshotSources,snapshotItems,expect) {
   const hn = snapshotSources.find((s) => s.name === "hn"), hf = snapshotSources.find((s) => s.name === "hf-papers");
   const a = snapshotItems(JSON.stringify({ hits: [{ objectID: "7", title: "Show HN", url: null, points: 12, num_comments: 3, author: "pg", created_at: "2026-10-09T00:00:00Z" }, { objectID: "8" }] }), hn);
-  expect(a).toEqual({ of: 2, items: [{ id: "7", title: "Show HN", points: 12, comments: 3, author: "pg", published: "2026-10-09T00:00:00.000Z", discussion: "https://news.ycombinator.com/item?id=7", source: "hn", tier: "aggregator" }] });
+  expect(a).toEqual({ of: 2, matched: 2, items: [{ id: "7", title: "Show HN", points: 12, comments: 3, author: "pg", published: "2026-10-09T00:00:00.000Z", discussion: "https://news.ycombinator.com/item?id=7", source: "hn", tier: "aggregator" }] });
   const b = snapshotItems(JSON.stringify([{ paper: { id: "2610.1", title: "A paper", upvotes: 5, summary: "An\nabstract" }, numComments: 0, publishedAt: "2026-10-08T00:00:00.000Z" }]), hf);
   expect(b.items).toEqual([{ id: "2610.1", title: "A paper", url: "https://huggingface.co/papers/2610.1", points: 5, comments: 0, published: "2026-10-08T00:00:00.000Z", summary: "An abstract", source: "hf-papers", tier: "research" }]);
   // An answer that is not the list the source names gives nothing.
-  expect(snapshotItems("{}", hn)).toEqual({ of: 0, items: [] });
+  expect(snapshotItems("{}", hn)).toEqual({ of: 0, matched: 0, items: [] });
   return "hn, hf-papers";
 };
 const _brainsnapshot_test_a_run_keeps_one_public_file_a_source_and_a_failed_source_does_not_stop_it = async function _test_a_run_keeps_one_public_file_a_source_and_a_failed_source_does_not_stop_it(snapshotRig,snapshotFixtures,logged,expect) {
@@ -32896,7 +33055,7 @@ const _brainsnapshot_test_a_run_keeps_one_public_file_a_source_and_a_failed_sour
   const rig = await snapshotRig({ rows: new Map([["sources", sources]]), feeds: { "https://blog.example/feed": snapshotFixtures.rss.replace(/Thu, 08 Oct 2026 16:00:00 GMT/, new Date().toUTCString()), "https://quiet.example/feed": "<rss></rss>", "https://refused.example/top.json": 403, "https://broken.example/x.json": "<html>" } });
   let out;
   const lines = await logged(async () => void (out = await rig.call("run", {})));
-  // The day the Worker read from its clock, which the timer test may be holding.
+  // The day the Worker read from its clock.
   const day = out.data.day;
   expect(out.status).toBe(200);
   expect(out.data.sources.map((s) => [s.name, s.status, s.count, s.path, s.error && s.error.slice(0, 22)])).toEqual([
@@ -32905,29 +33064,67 @@ const _brainsnapshot_test_a_run_keeps_one_public_file_a_source_and_a_failed_sour
   // One fetch a source. (A browser drops User-Agent from a Request, so the header is not seen under simulate.)
   expect(rig.asked.map((a) => a.url)).toEqual(sources.map((s) => s.url));
   // Only the source with items wrote a file; the index and the list of days are written whatever happened.
-  expect([...rig.files.keys()].sort()).toEqual([`snapshot/${day}/blog.json`, `snapshot/${day}/index.json`, "snapshot/days.json"].sort());
+  expect([...rig.files.keys()].sort()).toEqual([`snapshot/${day}/blog.json`, `snapshot/${day}/index.json`, `snapshot/${day}/papers.json`, "snapshot/days.json"].sort());
+  expect([out.data.papers, out.data.errors, rig.dropped]).toEqual([{ count: 0, path: `snapshot/${day}/papers.json` }, [], []]);
   const file = rig.files.get(`snapshot/${day}/blog.json`);
   expect([file.public, file.tags]).toEqual(["true", "snapshot"]);
   expect(file.value).toMatchObject({ source: "blog", tier: "blogger", day, count: 1, items: [{ id: "a-1", source: "blog" }] });
-  expect(rig.files.get("snapshot/days.json").value).toEqual({ days: [{ day, ranAt: out.data.ranAt, items: 1 }] });
+  expect(rig.files.get("snapshot/days.json").value).toEqual({ days: [{ day, ranAt: out.data.ranAt, items: 1, papers: 0 }] });
   // One line a run: names, statuses and counts, nothing a source said.
-  expect(lines).toContainEqual({ at: "snapshot.run", day, items: 1, sources: "blog:200:1 quiet:200:0 refused:403:0 down:0:0 broken:200:0", worker: "brain-x-snapshot", ray: "" });
+  expect(lines).toContainEqual({ at: "snapshot.run", day, items: 1, papers: 0, sources: "blog:200:1 quiet:200:0 refused:403:0 down:0:0 broken:200:0", worker: "brain-x-snapshot", ray: "" });
   // A second run the same day writes the same paths again.
   rig.files.clear();
   await rig.call("run", {});
   expect(rig.files.has(`snapshot/${day}/blog.json`)).toBe(true);
   expect(rig.files.get("snapshot/days.json").value.days.length).toBe(1);
+  // A write the file store refuses is in the answer and the log line; a source's own is on its row.
+  const poor = await snapshotRig({ rows: new Map([["sources", [{ ...sources[0], days: undefined }]]]), feeds: { "https://blog.example/feed": snapshotFixtures.rss }, fail: (path) => !path.endsWith("papers.json") });
+  let bad;
+  const said = await logged(async () => void (bad = (await poor.call("run", {})).data));
+  expect(bad.sources[0]).toMatchObject({ count: 0, path: null, error: `static.put snapshot/${bad.day}/blog.json 403` });
+  expect(bad.errors).toEqual(["static.put snapshot/days.json 403", `static.put snapshot/${bad.day}/index.json 403`]);
+  expect(said.filter((l) => l.at === "snapshot.run").map((l) => l.error)).toContain(bad.errors.join("; "));
   return "5 sources, 1 file";
+};
+const _brainsnapshot_test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention = async function _test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention(snapshotSources,snapshotRig,expect) {
+  const day = new Date().toISOString(), paper = (id, upvotes) => ({ paper: { id, title: "HF " + id, upvotes, summary: "s" + id }, numComments: 0, publishedAt: day });
+  const arxiv = (id) => `<item><title>arXiv ${id}</title><link>https://arxiv.org/abs/${id}</link><guid>oai:arXiv.org:${id}v1</guid><description>Announce Type: new Abstract ${id}</description></item>`;
+  const sources = [
+    { ...snapshotSources.find((s) => s.name === "arxiv"), url: "https://arxiv.example/rss" },
+    { ...snapshotSources.find((s) => s.name === "hf-papers"), url: "https://hf.example/papers" },
+    { name: "lab", tier: "research", url: "https://lab.example/feed", kind: "rss" },
+    { name: "blog", tier: "blogger", url: "https://blog.example/feed", kind: "atom" },
+    { ...snapshotSources.find((s) => s.name === "hn"), url: "https://hn.example/top" }
+  ];
+  const rig = await snapshotRig({ rows: new Map([["sources", sources]]), feeds: {
+    "https://arxiv.example/rss": `<rss>${["2610.00001", "2610.00002", "2610.00003", "2610.00009"].map(arxiv).join("")}</rss>`,
+    "https://hf.example/papers": [paper("2610.00001", 40), paper("2610.00004", 10), paper("2610.00005", 9)],
+    // A link in the item's own markup, escaped as a feed escapes it.
+    "https://lab.example/feed": `<rss><item><title>Our new model</title><link>https://lab.example/model</link><guid>m</guid><description>&lt;a href="https://arxiv.org/pdf/2610.00002v2"&gt;paper&lt;/a&gt;</description></item></rss>`,
+    "https://blog.example/feed": `<feed><entry><id>b1</id><title>Notes</title><link href="https://blog.example/notes"/><content type="html">&lt;a href="https://huggingface.co/papers/2610.00001"&gt;this&lt;/a&gt; and https://arxiv.org/abs/2509.12345</content></entry></feed>`,
+    "https://hn.example/top": { hits: [{ objectID: "9", title: "A paper on HN", url: "https://arxiv.org/abs/2610.00002", points: 300 }, { objectID: "10", title: "Ask HN", story_text: "see arxiv.org&#x2F;abs&#x2F;2610.00003" }] }
+  } });
+  const out = (await rig.call("run", {})).data, got = rig.files.get(out.papers.path).value;
+  expect(out.papers.count).toBe(5);
+  expect(got.papers.map((p) => [p.id, p.signals, p.title, p.points])).toEqual([
+    ["2610.00001", ["votes:hf-papers", "mention:blog"], "HF 2610.00001", 40],
+    ["2610.00002", ["lab:lab", "mention:hn"], "arXiv 2610.00002", undefined],
+    ["2610.00004", ["votes:hf-papers"], "HF 2610.00004", 10],
+    // Not in the day's list: an id and who linked it.
+    ["2509.12345", ["mention:blog"], undefined, undefined],
+    ["2610.00003", ["mention:hn"], "arXiv 2610.00003", undefined]
+  ]);
+  expect(got.papers[1]).toMatchObject({ url: "https://arxiv.org/abs/2610.00002", summary: "Announce Type: new Abstract 2610.00002", via: [{ source: "lab", title: "Our new model", url: "https://lab.example/model" }, { source: "hn", title: "A paper on HN", url: "https://news.ycombinator.com/item?id=9" }] });
+  // Under the threshold, or linked by nobody: not there. The whole list is kept and marked.
+  expect(got.papers.some((p) => ["2610.00005", "2610.00009"].includes(p.id))).toBe(false);
+  expect(out.sources.map((s) => [s.name, s.count, !!s.lookup])).toEqual([["arxiv", 4, true], ["hf-papers", 3, false], ["lab", 1, false], ["blog", 1, false], ["hn", 2, false]]);
+  expect(rig.files.get(out.sources[4].path).value.items.map((i) => i.papers)).toEqual([["2610.00002"], ["2610.00003"]]);
+  return "5 papers, 3 signals";
 };
 const _brainsnapshot_test_the_timer_runs_once_a_day_after_six = async function _test_the_timer_runs_once_a_day_after_six(snapshotRig,snapshotFixtures,expect) {
   const rig = await snapshotRig({ rows: new Map([["sources", [{ name: "blog", tier: "blogger", url: "https://blog.example/feed", kind: "rss" }]]]), feeds: { "https://blog.example/feed": snapshotFixtures.rss } });
-  // The Worker reads the clock; the test sets it.
-  const clock = Date.now;
-  const at = async (iso, sim = rig.sim) => {
-    Date.now = () => Date.parse(iso);
-    try { await sim.scheduled(); } finally { Date.now = clock; }
-    return rig.asked.length;
-  };
+  // A cron event carries its time, and the tick reads that.
+  const at = async (iso, sim = rig.sim) => (await sim.scheduled({ scheduledTime: Date.parse(iso) }), rig.asked.length);
   expect(await at("2026-10-09T05:59:00Z")).toBe(0);
   expect(await at("2026-10-09T06:00:30Z")).toBe(1);
   expect(await at("2026-10-09T06:01:30Z")).toBe(1);
@@ -32937,15 +33134,27 @@ const _brainsnapshot_test_the_timer_runs_once_a_day_after_six = async function _
   expect(await at("2026-10-09T09:00:00Z", second.sim)).toBe(1);
   expect(second.asked.length).toBe(0);
   expect(await at("2026-10-10T07:00:00Z")).toBe(2);
-  return "2 runs in 2 days";
+  // Each timed run drops what is older than keepDays, files by prefix and date, and the rows of those days.
+  expect(rig.dropped).toEqual([{ prefix: "snapshot/", before: "2026-07-11" }, { prefix: "snapshot/", before: "2026-07-12" }]);
+  expect((await rig.call("setSources", { keepDays: 1 })).data).toEqual({ keepDays: 1 });
+  expect((await rig.call("setSources", { keepDays: 0 })).status).toBe(400);
+  expect(await at("2026-10-12T07:00:00Z")).toBe(3);
+  expect([rig.dropped[2], [...rig.rows.keys()].filter((k) => /^(day|ran)\//.test(k)).sort()]).toEqual([{ prefix: "snapshot/", before: "2026-10-11" }, ["day/2026-10-12", "ran/2026-10-12"]]);
+  // A tick whose row write failed is tried again at the next one.
+  const flaky = await snapshotRig({ rows: Object.assign(new Map([["sources", [{ name: "blog", tier: "blogger", url: "https://blog.example/feed", kind: "rss" }]]]), { has: () => { throw new Error("rows are away"); } }), feeds: { "https://blog.example/feed": snapshotFixtures.rss } });
+  await flaky.sim.scheduled({ scheduledTime: Date.parse("2026-10-09T06:00:30Z") }).catch(() => null);
+  delete flaky.rows.has;
+  await flaky.sim.scheduled({ scheduledTime: Date.parse("2026-10-09T06:01:30Z") });
+  expect(flaky.asked.length).toBe(1);
+  return "3 runs in 4 days";
 };
 const _brainsnapshot_test_the_owner_sets_the_sources_and_a_bad_list_is_refused = async function _test_the_owner_sets_the_sources_and_a_bad_list_is_refused(snapshotRig,expect,snapshotSources,snapshotCheck) {
   const rig = await snapshotRig();
-  expect((await rig.call("sources")).data).toEqual({ sources: snapshotSources, default: true });
+  expect((await rig.call("sources")).data).toEqual({ sources: snapshotSources, default: true, keepDays: 90 });
   const mine = [{ name: "blog", tier: "blogger", url: "https://blog.example/feed", kind: "rss", days: 7 }];
   expect(await rig.call("setSources", { sources: mine })).toEqual({ status: 200, data: { sources: 1, default: false } });
-  expect((await rig.call("sources")).data).toEqual({ sources: mine, default: false });
-  for (const bad of [[], [{ ...mine[0], name: "Blog" }], [mine[0], mine[0]], [{ ...mine[0], tier: "news" }], [{ ...mine[0], kind: "html" }], [{ ...mine[0], url: "http://blog.example/" }], [{ ...mine[0], kind: "json" }], [{ ...mine[0], keep: "(" }], "x"])
+  expect((await rig.call("sources")).data).toEqual({ sources: mine, default: false, keepDays: 90 });
+  for (const bad of [[], [{ ...mine[0], name: "Blog" }], [mine[0], mine[0]], [{ ...mine[0], tier: "news" }], [{ ...mine[0], kind: "html" }], [{ ...mine[0], url: "http://blog.example/" }], [{ ...mine[0], kind: "json" }], [{ ...mine[0], keep: "(" }], [{ ...mine[0], days: "7" }], [{ ...mine[0], days: 0 }], [{ ...mine[0], limit: -1 }], [{ ...mine[0], limit: NaN }], [{ ...mine[0], kind: "json", map: { id: 1 } }], [{ ...mine[0], kind: "json", map: { id: "id" }, items: 3 }], [{ ...mine[0], papers: {} }], "x"])
     expect((await rig.call("setSources", { sources: bad })).status).toBe(400);
   expect((await rig.call("setSources", { sources: null })).data).toEqual({ sources: snapshotSources.length, default: true });
   expect((await rig.call("nope", {})).status).toBe(404);
@@ -32954,10 +33163,10 @@ const _brainsnapshot_test_the_owner_sets_the_sources_and_a_bad_list_is_refused =
   expect(new Set(snapshotSources.map((s) => s.tier))).toEqual(new Set(["research", "blogger", "aggregator"]));
   return snapshotSources.length + " default sources";
 };
-const _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_one_call = async function _test_snapshot_declares_its_rules_its_timer_and_one_call(snapshot_service,expect,decide,callerOf) {
+const _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_two_calls = async function _test_snapshot_declares_its_rules_its_timer_and_two_calls(snapshot_service,expect,decide,callerOf) {
   const { meta } = await snapshot_service.emit();
   expect(meta.worker).toBe("brain-x-snapshot");
-  expect([meta.calls, meta.secrets, meta.crons]).toEqual([["com.lopecode.brain.static.put"], [], ["0 6 * * *"]]);
+  expect([meta.calls, meta.secrets, meta.crons]).toEqual([["com.lopecode.brain.static.delete", "com.lopecode.brain.static.put"], [], ["0 6 * * *"]]);
   const N = "com.lopecode.brain.snapshot.";
   const ask = (m, caller, via = "") => decide(meta.access[N + m], { caller: callerOf({ caller, via }), origin: callerOf({ caller, via }), request: { params: {} } }).allow;
   expect([ask("run", "owner", "session"), ask("run", "owner", "token"), ask("run", "token:laptop"), ask("run", "worker:brain-x-echo"), ask("run", "anonymous")]).toEqual([true, false, false, false, false]);
@@ -32965,16 +33174,33 @@ const _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_one_call = a
   expect([ask("sources", "anonymous"), ask("sources", "did:plc:friend")]).toEqual([true, true]);
   return meta.worker;
 };
-const _brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one = async function _test_the_panel_lists_the_days_and_the_sources_of_one(snapshotPanel,Response,expect) {
+const _brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one = async function _test_the_panel_lists_the_days_and_the_sources_of_one(Response,snapshotPanel,expect) {
   const files = {
     "https://b.example/static/snapshot/days.json": { days: [{ day: "2026-10-09", ranAt: "2026-10-09T06:00:10.000Z", items: 3 }] },
     "https://b.example/static/snapshot/2026-10-09/index.json": { day: "2026-10-09", ranAt: "2026-10-09T06:00:10.000Z", sources: [{ name: "hn", tier: "aggregator", status: 200, count: 3, of: 30, path: "snapshot/2026-10-09/hn.json", error: null }, { name: "blog", tier: "blogger", status: 403, count: 0, of: 0, path: null, error: "the source answered 403" }] }
   };
-  const el = snapshotPanel({ base: "https://b.example/", fetch: async (u) => (files[u] ? Response.json(files[u]) : new Response("", { status: 404 })) });
+  files["https://b.example/static/snapshot/2026-10-09/index.json"].sources[0].matched = 40;
+  Object.assign(files["https://b.example/static/snapshot/2026-10-09/index.json"], { papers: { count: 4, path: "snapshot/2026-10-09/papers.json" }, errors: ["static.put snapshot/days.json 403"] });
+  const ran = [], send = async (u) => (files[u] ? Response.json(files[u]) : new Response("", { status: 404 }));
+  const el = snapshotPanel({ base: "https://b.example/", fetch: send, owner: true, client: { procedure: async (name) => void ran.push(name) } });
+  let heard = 0;
+  el.addEventListener("input", () => heard++);
   await el.ready;
-  expect(el.value.sources.length).toBe(2);
-  expect(el.textContent).toContain("ran 2026-10-09T06:00:10.000Z");
-  expect([...el.querySelectorAll("a")].map((a) => a.href)).toEqual(["https://b.example/static/snapshot/2026-10-09/hn.json"]);
+  // One input event a draw, after the value is set.
+  expect([el.value.sources.length, heard]).toEqual([2, 1]);
+  expect(el.textContent).toContain("ran 2026-10-09T06:00:10.000Z, 4 papers with a signal");
+  expect(el.textContent).toContain("cut from 40");
+  expect(el.textContent).toContain("Not written: static.put snapshot/days.json 403");
+  expect([...el.querySelectorAll("a")].map((a) => a.href)).toEqual(["https://b.example/static/snapshot/2026-10-09/hn.json", "https://b.example/static/snapshot/2026-10-09/papers.json"]);
+  // Run now calls the Brain and reads the days again. A reader who is not the owner has no button.
+  el.querySelector("button").click();
+  await new Promise((r) => setTimeout(r, 50));
+  expect([ran, heard]).toEqual([["snapshot.run"], 2]);
+  expect(snapshotPanel({ base: "https://b.example/", fetch: send }).querySelector("button")).toBe(null);
+  // A fetch that fails is said, not left as a blank panel.
+  const down = snapshotPanel({ base: "https://b.example/", fetch: async () => { throw new Error("offline"); } });
+  await down.ready;
+  expect(down.textContent).toBe("The snapshot files could not be read: offline");
   const none = snapshotPanel({ base: "https://b.example/", fetch: async () => new Response("", { status: 404 }) });
   await none.ready;
   expect(none.textContent).toBe("No snapshot yet.");
@@ -32987,30 +33213,35 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainsnapshot_anon_6e8edd11f6", null, ["md","snapshotAgent"], _brainsnapshot_anon_6e8edd11f6);
-  $def("_brainsnapshot_viewof_snapshotView", "viewof snapshotView", ["snapshotPanel","client"], _brainsnapshot_viewof_snapshotView);
+  $def("_brainsnapshot_anon_0765d7a724", null, ["md","snapshotAgent"], _brainsnapshot_anon_0765d7a724);
+  $def("_brainsnapshot_viewof_snapshotView", "viewof snapshotView", ["snapshotPanel","client","session"], _brainsnapshot_viewof_snapshotView);
   $def("_brainsnapshot_snapshotView", "snapshotView", ["Generators","viewof snapshotView"], _brainsnapshot_snapshotView);
   $def("_brainsnapshot_snapshotAgent", "snapshotAgent", [], _brainsnapshot_snapshotAgent);
   $def("_brainsnapshot_snapshotSources", "snapshotSources", [], _brainsnapshot_snapshotSources);
-  $def("_brainsnapshot_snapshotText", "snapshotText", [], _brainsnapshot_snapshotText);
+  $def("_brainsnapshot_snapshotText", "snapshotText", ["snapshotPlain"], _brainsnapshot_snapshotText);
+  $def("_brainsnapshot_snapshotPlain", "snapshotPlain", [], _brainsnapshot_snapshotPlain);
+  $def("_brainsnapshot_snapshotPapers", "snapshotPapers", [], _brainsnapshot_snapshotPapers);
   $def("_brainsnapshot_snapshotFeed", "snapshotFeed", ["snapshotText"], _brainsnapshot_snapshotFeed);
   $def("_brainsnapshot_snapshotJson", "snapshotJson", [], _brainsnapshot_snapshotJson);
-  $def("_brainsnapshot_snapshotItems", "snapshotItems", ["snapshotJson","snapshotFeed","snapshotText"], _brainsnapshot_snapshotItems);
+  $def("_brainsnapshot_snapshotItems", "snapshotItems", ["snapshotJson","snapshotFeed","snapshotPapers","snapshotPlain"], _brainsnapshot_snapshotItems);
+  $def("_brainsnapshot_snapshotSignals", "snapshotSignals", ["snapshotPapers"], _brainsnapshot_snapshotSignals);
   $def("_brainsnapshot_snapshotCheck", "snapshotCheck", [], _brainsnapshot_snapshotCheck);
-  $def("_brainsnapshot_snapshotOps", "snapshotOps", ["xrpc","rows","snapshotSources","snapshotAgent","snapshotItems","log"], _brainsnapshot_snapshotOps);
+  $def("_brainsnapshot_snapshotOps", "snapshotOps", ["xrpc","rows","snapshotSources","snapshotAgent","snapshotItems","snapshotSignals","log"], _brainsnapshot_snapshotOps);
   $def("_brainsnapshot_snapshot_service", "snapshot_service", ["cloudflare","Response","snapshotOps","rows","snapshotSources","snapshotCheck"], _brainsnapshot_snapshot_service);
   $def("_brainsnapshot_snapshot_announce", "snapshot_announce", ["plugins","snapshot_service","invalidation"], _brainsnapshot_snapshot_announce);
-  $def("_brainsnapshot_snapshotPanel", "snapshotPanel", ["htl","Inputs"], _brainsnapshot_snapshotPanel);
+  $def("_brainsnapshot_snapshotPanel", "snapshotPanel", ["htl","Inputs","Event"], _brainsnapshot_snapshotPanel);
   $def("_brainsnapshot_anon_be3d699220", null, ["md"], _brainsnapshot_anon_be3d699220);
   $def("_brainsnapshot_snapshotRig", "snapshotRig", ["simulate","snapshot_service","Response"], _brainsnapshot_snapshotRig);
   $def("_brainsnapshot_snapshotFixtures", "snapshotFixtures", [], _brainsnapshot_snapshotFixtures);
-  $def("_brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out", "test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out", ["snapshotItems","snapshotFixtures","expect"], _brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out);
+  $def("_brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out", "test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out", ["snapshotItems","snapshotFixtures","expect","snapshotFeed"], _brainsnapshot_test_a_feed_item_is_read_by_its_tags_with_markup_and_entities_taken_out);
+  $def("_brainsnapshot_test_text_keeps_a_comparison_and_reads_hex_and_named_entities", "test_text_keeps_a_comparison_and_reads_hex_and_named_entities", ["expect","snapshotText","snapshotItems"], _brainsnapshot_test_text_keeps_a_comparison_and_reads_hex_and_named_entities);
   $def("_brainsnapshot_test_a_json_source_is_read_by_the_paths_its_map_names", "test_a_json_source_is_read_by_the_paths_its_map_names", ["snapshotSources","snapshotItems","expect"], _brainsnapshot_test_a_json_source_is_read_by_the_paths_its_map_names);
   $def("_brainsnapshot_test_a_run_keeps_one_public_file_a_source_and_a_failed_source_does_not_stop_it", "test_a_run_keeps_one_public_file_a_source_and_a_failed_source_does_not_stop_it", ["snapshotRig","snapshotFixtures","logged","expect"], _brainsnapshot_test_a_run_keeps_one_public_file_a_source_and_a_failed_source_does_not_stop_it);
+  $def("_brainsnapshot_test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention", "test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention", ["snapshotSources","snapshotRig","expect"], _brainsnapshot_test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention);
   $def("_brainsnapshot_test_the_timer_runs_once_a_day_after_six", "test_the_timer_runs_once_a_day_after_six", ["snapshotRig","snapshotFixtures","expect"], _brainsnapshot_test_the_timer_runs_once_a_day_after_six);
   $def("_brainsnapshot_test_the_owner_sets_the_sources_and_a_bad_list_is_refused", "test_the_owner_sets_the_sources_and_a_bad_list_is_refused", ["snapshotRig","expect","snapshotSources","snapshotCheck"], _brainsnapshot_test_the_owner_sets_the_sources_and_a_bad_list_is_refused);
-  $def("_brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_one_call", "test_snapshot_declares_its_rules_its_timer_and_one_call", ["snapshot_service","expect","decide","callerOf"], _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_one_call);
-  $def("_brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one", "test_the_panel_lists_the_days_and_the_sources_of_one", ["snapshotPanel","Response","expect"], _brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one);
+  $def("_brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_two_calls", "test_snapshot_declares_its_rules_its_timer_and_two_calls", ["snapshot_service","expect","decide","callerOf"], _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_two_calls);
+  $def("_brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one", "test_the_panel_lists_the_days_and_the_sources_of_one", ["Response","snapshotPanel","expect"], _brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("rows", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("rows", _));
@@ -33026,6 +33257,7 @@ export default function define(runtime, observer) {
   main.define("expect", ["module @tomlarkworthy/jest-expect-standalone","@variable"], (_, v) => v.import("expect", _));
   main.define("module @tomlarkworthy/cloud-brain", [], async () => runtime.module((await import("/@tomlarkworthy/cloud-brain.js?v=4")).default));
   main.define("client", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("client", _));
+  main.define("session", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("session", _));
   return main;
 }
 </script>
@@ -36687,6 +36919,7 @@ One Brain, \`cb4\`, runs in one Cloudflare account. It has 15 Workers. The table
 | \`brain-x-metrics\`, \`brain-x-static\`, \`brain-x-blob\`, \`brain-x-library\`, \`brain-x-proxy\`, \`brain-x-feed\` | one module each | Metrics, files, blobs, saved notebooks, outbound fetch, Bluesky feeds. |
 | \`brain-x-whatsapp\`, \`brain-x-bluesky\` | one module each | Channels. |
 | \`brain-x-logs\` | \`brain-logs\` | The logs of this Brain's Workers, read from Cloudflare Workers Logs with Cloudflare's own query bodies. It holds a Cloudflare token with one permission, which the deployer minted for it. |
+| \`brain-x-snapshot\` | \`brain-snapshot\` | Once a day, at 06:00 UTC, fetches a list of public feeds (arXiv, Hugging Face papers, lab blogs, named writers, Hacker News, Reddit, Lobsters) and keeps each as a public JSON file under \`/static/snapshot/<day>/\`. It records only: no model call, no ranking, no summary. |
 | \`brain-x-browser\` | \`brain-browser\` | Remote browsers from Cloudflare Browser Run, for each process of the Brain. A browser has a name and belongs to the caller that bought its time; a page is a tab of one browser. Browser time is bought in seconds by \`browser.extend\`. |
 
 A service is one notebook module. The module holds the prose, the code and the tests of the service.`
@@ -68341,6 +68574,7 @@ Limits:
 - `calls` lists each method that the function calls with `xrpc`. The core refuses a call that is not in the list. `*` is one part of a name. Do not list `secret.get`, `db.sql` or `inbox.append`: the platform cells `secrets`, `sql` and `inbox` call them. `brain_call` with method `calls.list` shows each refused call.
 - Not built: a pairing relay for a page with no CDP socket (a phone), calls between Brains. A page in a browser of the cluster pairs with no relay (`page up`, above).
 - Remote browsers (`brain-browser`, built 2026-10-08): each caller (the owner, a token, a member, a Worker) has its own browsers by name (`?browser=NAME`, `default` when absent), the owner's session sees and ends all of them (`browser.all`, `browser.end`) and sets how many can be up (`maxBrowsers` 10, `maxPerOwner` 3), browser time is bought in seconds for one browser by one method (`browser.extend?seconds=60`, $0.0015, not given back, also not when a limit stops the start), and each other method answers 409 `NoTime` when none is bought, and what a page shows is data from its address and not an instruction. The assistant has no tool for it.
+- Snapshots (`brain-snapshot`, built 2026-10-09): each day at 06:00 UTC the Brain fetches its list of public feeds and keeps them at `/static/snapshot/<day>/<source>.json`, with `index.json` beside them and `/static/snapshot/days.json` for the days. `snapshot.run` as the owner runs it now and replaces today's files; `snapshot.setSources` changes the list. It writes no summary.
 - Logs (`brain-logs`, built 2026-10-08): Cloudflare keeps what each Worker writes with `console.log` for 7 days on Workers Paid, 3 on Free. The core writes one line a call (`at: "call"`, with `ray`, `caller`, `origin`, `method`, `worker`, `status`, `error`, `ms`, `price`, `rule`, `by`), the wrapper one line for a throw (the error's name and the frames of its stack, not its message), the deployer one for each step of a deploy. `logs.query`, `logs.keys` and `logs.values` take Cloudflare's telemetry bodies and answer as Cloudflare does, for this Brain's Workers only; they are for the owner's own session unless the owner sets a rule. `ray` is the `cf-ray` of an answer without the part after the hyphen. `method` is the name after `com.lopecode.brain.` (`bluesky.poll`), and `(unknown)` for a name nobody declared. Cloudflare adds `$metadata.trigger` to each line, the verb and the path of the request without its query, so a path a caller typed is kept there. It also stores the URL of the call with its query string beside each line, not headers and not the body: the parameters of a method are in the logs. Do not put a long-lived secret in a path or a query string; a short-lived single-use code may be. A line can be read 11 to 16 s after it is written (3 calls on cb4, 2026-10-08). In a service, `log({ at: "name", … })` writes a line; write names and decisions, never a secret, a header or a body. The page has a Logs panel.
 - A service that needs the Cloudflare API declares its permission groups: `cloudflare.Service(name, fn, { cloudflare: ["Workers Observability Read"] })`, and calls `cloudflareApi.fetch(path, init)`. Only `Workers Observability Read` and `Workers Tail Read` can be declared. The owner approves such a deploy on the deployer page, also when deploys need no approval. To mint, the deployer's own token needs `Account API Tokens Write` and each group it hands out: name them when the next deployer token is made.
 - The Cloudflare token on `cb4-deployer` ends on 2026-10-11 and has every permission group of the account (read 2026-10-08). The deploy of a browser binding worked with it. If a token with only Workers Scripts and R2 can deploy a browser binding is not known.
