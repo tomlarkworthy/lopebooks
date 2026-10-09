@@ -19715,6 +19715,11 @@ const _cloudflareiac_workerRuntime = function _workerRuntime(Response,URLSearchP
     headers.set("x-brain-key", ENV.BRAIN_KEY || "");
     return new Request(request, { headers });
   };
+  // The text of the first md`…` in a module's source, with the escapes of a template literal undone.
+  const referenceOf = (text) => {
+    const from = text.indexOf("md`") + 3, end = from < 3 ? null : /(?<!\\)`/.exec(text.slice(from));
+    return end ? text.slice(from, from + end.index).replace(/\\([`\\$])/g, "$1") : "";
+  };
   const bindingName = (name) => "X_" + name.toUpperCase().replace(/[^A-Z0-9]/g, "_");
   const secretsHeld = new Map();
   // Settings the owner stored for this Worker (config.set, rows of the core). The core sends them with each call it
@@ -19894,6 +19899,9 @@ const _cloudflareiac_workerRuntime = function _workerRuntime(Response,URLSearchP
         // Every Worker describes itself: its manifest, and the module it was emitted from. Both are public; a
         // Worker that does not answer the internet is reached for them through the kernel and the core.
         const describes = url.pathname === "/xrpc/com.lopecode.brain.getInfo" ? "info" : url.pathname === "/xrpc/com.lopecode.brain.getSource" ? "source" : null;
+        // part=reference: the module's first prose cell, which holds its method table, as text.
+        if (describes === "source" && url.searchParams.get("part") === "reference" && request.method === "GET" && (!asked || asked === info().name) && (inside || edge || keyed))
+          return new Response(referenceOf(source ? source.text : ""), { headers: { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" } });
         if (describes && request.method === "GET" && (!asked || asked === info().name) && (inside || edge || keyed))
           return new Response(JSON.stringify(describes === "info" ? info() : { worker: info().name, hash: info().hash, module: source ? source.module : null, text: source ? source.text : null }), {
             headers: { "content-type": "application/json", "access-control-allow-origin": "*" }
@@ -20985,6 +20993,13 @@ const _cloudflareiac_test_a_worker_serves_its_manifest_and_its_source = async fu
   // Every response says which Worker and version produced it.
   expect(got.headers.get("x-brain-served-by")).toBe("brain-x-fixture@" + e.hash.slice(0, 12));
   expect(body.text).toBe(e.source.text);
+  // part=reference: the first prose cell of the module as text, with the escapes of its template undone.
+  const reference = await sim.fetch("https://cb.sub.workers.dev/xrpc/com.lopecode.brain.getSource?part=reference");
+  expect(reference.headers.get("content-type")).toMatch(/^text\/plain/);
+  const said = await reference.text();
+  expect(said.length).toBeGreaterThan(100);
+  expect(body.text).toContain(said.slice(0, 60).replace(/[`\\$]/g, "\\$&"));
+  expect(said).not.toMatch(/\\`/);
   // A question about another Worker is not this Worker's to answer.
   expect((await sim.fetch("https://cb.sub.workers.dev/xrpc/com.lopecode.brain.getSource?worker=brain-x-other")).status).not.toBe(200);
   // A recipe does not answer the internet at all; over a binding it does.
@@ -23719,7 +23734,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braincore_anon_6aa2d00c67 = function _anonymous(md) {return (md`# brain-core
+const _braincore_anon_936102ae77 = function _anonymous(md) {return (md`# brain-core
 
 The Worker every other Worker is bound to. It routes a method or a path to the Worker of the service that declared it, and keeps what must last: the notebook-side rows, the route table and the rules the owner sets.
 
@@ -23745,6 +23760,7 @@ It answers bindings only. A caller is who the kernel says it is, and the kernel 
 | \`config.list\` | query, the owner's own session. \`{ workers: [{ worker, values }], protected, ttl }\`: every stored setting. |
 | \`config.get\` | query, the owner's own session. \`?worker=\`. \`{ worker, values, changes, read }\`. \`changes\`: the last 100, each \`{ at, by, key, old, value }\`. \`read\`: the keys one running instance of the Worker has read from \`config\`, each with its value and \`from\`: \`deploy\`, \`stored\` or \`unset\`. |
 | \`config.set\` | procedure, the owner's own session. \`{ worker, key, value }\`. A number, a boolean or text of at most 500 characters; \`null\` removes the key. |
+| \`GET /llms.txt\` | anyone. Text for a program: how to call this Brain, how the owner makes a token, and one line for each method and path of each Worker, written from \`config.host\` and the route table on each request. It points at \`getSource?worker=NAME&part=reference\` for what a method takes and answers. A member's Worker and what the owner set in place of a rule or price are left out. |
 | \`price.list\` | query, owner. \`{ prices: [{ target, worker, declared, set, setAt }], unit, defaults }\`. |
 | \`price.put\`, \`price.delete\` | procedure, the owner's own session. \`{ target, price }\`: a CEL expression in place of the price a service declared. |
 | \`quota.get\` | query, any account. \`{ who, day, spent, daily, remaining, resetsAt }\` for the caller's own account. The owner reads another with \`?who=\`. |
@@ -24493,13 +24509,80 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     return c.json({ day, unit: "USD", charges: charges.slice(0, Math.min(2000, Number(c.req.query("limit")) || 200)), total: Number(charges.reduce((t, e) => t + e.cost, 0).toFixed(6)), byWho: sum("who"), byMethod: sum("method") });
   });
 
+  // /llms.txt: how a program calls this Brain, for anyone. Written from config.host and the route table on each
+  // request, so a clone and a newly deployed service are right with no edit. It points at each Worker's own reference
+  // (getSource) and copies none of it. A member's Worker is left out, and so is what the owner set in place of a
+  // declared rule or price: only that one was set.
+  app.get("/llms.txt", async (c) => {
+    const at = "https://" + config.host, X = "/xrpc/com.lopecode.brain.", short = (n) => (n.startsWith("com.lopecode.brain.") ? n.slice(19) : n);
+    const set = new Set([...(await settings.list("rule/")), ...(await settings.list("price/"))].map((r) => r.key.replace(/^(rule|price)\//, "")));
+    const line = (name, r, kind) => `- ${short(name)}: ${kind}${r.who || "owner"}${r.allow ? ", with a rule" : ""}${r.price ? ", has a price" : ""}${set.has(name) ? ", changed by the owner" : ""}`;
+    const routes = (await settings.list("route/")).map((r) => r.value).filter((r) => routed(r) && r.role !== "member").sort((a, b) => (a.worker < b.worker ? -1 : 1));
+    const deployed = routes.filter((r) => Object.keys(r.methods).length + r.paths.length).map((r) => [`### ${r.worker}`, ...Object.entries(r.methods).sort().map(([n, m]) => line(n, m, m.type + ", ")), ...r.paths.map((p) => line(p.path, p, "path, "))].join("\n"));
+    const text = `# Cloud Brain at ${at}
+
+Cloudflare Workers that one notebook defines, deploys and operates. This file is written on each request from what is deployed here. It points at the reference and copies none of it.
+
+## Calling
+
+- A method is ${at}/xrpc/<name>. A name below with no \`com.\` is short for \`com.lopecode.brain.<name>\`.
+- query: GET with query parameters. procedure: POST with a JSON body.
+- A refusal is JSON \`{ error, message }\`: 401 \`AuthRequired\` (the rule is not true for this caller), 403 \`Forbidden\`, 402 (the call has a price), 501 (nothing declares the method).
+- With no \`Authorization\` header the caller is \`anonymous\`. Methods marked \`anyone\` answer it.
+
+## A token, for a caller with no browser
+
+- The owner makes one in a signed-in session: POST ${at}${X}token.create with \`{ "name": "laptop", "methods": ["knowledge.search"] }\`. The answer shows the token once.
+- A token calls the methods it names and no others. It cannot name \`infra.*\`, \`secret.*\`, \`token.*\`, \`grant.*\` or \`people.*\`, and a method marked "with a rule" may refuse it; the reference says.
+- Send it as \`Authorization: Bearer <token>\`. Not in a query string: paths and query strings are kept in the logs.
+- \`token.list\`, and \`token.revoke\` with \`{ name }\`, are the owner's.
+
+## From Claude Code on the web
+
+- The session's environment must allow \`${config.host}\`: in the environment's settings set network access to custom and add that host (https://code.claude.com/docs/en/cloud-environments, read 2026-10-09).
+- Put the token in an environment variable of that environment, not in the repository or the prompt.
+- \`curl -H "Authorization: Bearer $BRAIN_TOKEN" "${at}${X}<a method the token names>"\`
+
+## Finding your way
+
+Three calls, with no account, say what this Brain is made of:
+
+- \`GET ${at}${X}service.list\`: every Worker. For each: \`worker\`, the notebook \`module\` it is made from, \`role\`, \`methods\`, \`paths\`, and the \`hash\` of the code running. Start here.
+- \`GET ${at}${X}getInfo?worker=<worker>\`: what one Worker declares: who may call each method (\`access\`), the methods of other Workers it \`calls\`, the names of its secrets, the platform cells it uses.
+- \`GET ${at}${X}getSource?worker=<worker>\`: JSON \`{ worker, hash, module, text }\`. \`text\` is the whole module that Worker runs, as deployed: its code, its tests (\`test_\` cells) and its documentation (the first \`md\` cell). \`hash\` is what a deploy of that module replaces.
+- \`GET ${at}${X}getSource?worker=<worker>&part=reference\`: only the documentation, as text: that Worker's methods, inputs and answers. Read this before calling a method.
+
+The shape: the kernel (\`brain\`) is this address and says who the caller is. The core (\`brain-core\`) checks the rule of each method, charges its price and passes the call to a service (\`brain-x-NAME\`). \`brain-db\` keeps every Worker's rows. The deployer, a Worker at its own address, is the only holder of a Cloudflare token: it deploys a module's source as a Worker and puts back one that fails. A service is one notebook module; its source is its definition.
+
+## Making a service
+
+- A member of this Brain deploys their own: \`member.deploy\` with \`{ module, source, reason, was }\`. \`source\` is a module as \`getSource\` gives one. \`reason\` says why, in 3 to 300 characters, and is logged. \`was\` is the hash you saw running for that service, \`null\` for a new one; the deploy is refused when it is no longer that. No approval is needed. \`member.services\` lists them, \`member.remove\` takes \`{ name, reason, was }\`.
+- The owner makes a DID a member with \`people.put\`. A member calls from a signed-in page, or from a program with a service token of their own PDS (\`com.atproto.server.getServiceAuth\`, \`aud\` \`did:web:${config.host}\`, \`lxm\` the method's whole name).
+- A member's service has no secrets, no paths and no Cloudflare permissions, and its methods are \`com.lopecode.brain.m.<id>.<name>\`. The limits and the rules are in the deployer's reference and in \`getSource?worker=brain&part=reference\`.
+- The owner deploys any service with \`infra.apply\`, in their own session; a token cannot.
+
+## Reference
+
+- \`GET ${at}${X}getSource?worker=<worker>&part=reference\`: that Worker's methods, inputs and answers, as text. Without \`part\`: JSON whose \`text\` is the whole module.
+- \`worker=brain\` is the kernel (sign-in, tokens, grants, people). \`worker=brain-core\` is the core (rules, prices, quota, settings).
+- \`${at}/.well-known/did.json\`. \`quota.get\`: what this caller has spent today (a token must name it). \`${at}/\` is the notebook that defines all of this, for a person.
+
+## Deployed
+
+Each line: name, query or procedure, who the service says may call. \`owner\`: the owner, and a token or a member the owner gave the method. \`workers\`: those, and this Brain's own Workers. \`anyone\`: those, and a caller with no account. \`worker:NAME\`: the owner side, and that one Worker.
+
+${deployed.join("\n\n")}
+`;
+    return c.text(text, 200, { "cache-control": "no-store", "access-control-allow-origin": "*" });
+  });
+
   // A Worker's manifest and source, for anyone. The wrapper has already answered for the core itself.
   for (const what of ["getInfo", "getSource"])
     app.get(NS + what, async (c) => {
       const name = c.req.query("worker") || "brain-core";
       const route = await settings.get("route/" + name);
       if (!route || !routed(route) || route.role === "member") return fail(c, 404, "NotFound", name);
-      return forward(route, c, NS + what + "?worker=" + encodeURIComponent(name));
+      return forward(route, c, NS + what + "?worker=" + encodeURIComponent(name) + (c.req.query("part") === "reference" ? "&part=reference" : ""));
     });
   app.all("*", async (c) => {
     const url = new URL(c.req.url), who = c.get("who");
@@ -24586,6 +24669,34 @@ const _braincore_coreRig = function _coreRig(simulate,core_service,Response,sha2
   });
   return { sim, seen, toDeployer, deployer, as, worker, echo, heard, hear, send, owner: as("owner"), anonymous: as("anonymous", ""), nobody: send("https://core.internal", {}) };
 });};
+const _braincore_test_llms_txt_is_written_from_the_host_and_the_route_table = async function _test_llms_txt_is_written_from_the_host_and_the_route_table(coreRig,expect) {
+  const rig = await coreRig({ config: { host: "clone.example.workers.dev" } });
+  const read = async () => (await rig.anonymous("/llms.txt")).data;
+  const first = await rig.anonymous("/llms.txt");
+  expect(first.status).toBe(200);
+  expect(first.headers.get("content-type")).toMatch(/^text\/plain/);
+  // Every address is this Brain's own: a clone needs no edit.
+  expect(first.data).toContain("# Cloud Brain at https://clone.example.workers.dev\n");
+  expect(first.data.match(/https:\/\/[a-z0-9.-]+/g).filter((u) => !/^https:\/\/(clone\.example\.workers\.dev|code\.claude\.com)$/.test(u))).toEqual([]);
+  expect(first.data).toContain("### brain-x-echo\n- echo.key: query, owner\n- echo.read: query, anyone\n- echo.say: procedure, owner\n- /hooks/echo: path, anyone");
+  expect(first.data).toContain("getSource?worker=<worker>&part=reference");
+  // Where to begin, what getSource answers, and how a member makes a service.
+  for (const said of ["service.list`: every Worker", "getInfo?worker=<worker>", "`{ worker, hash, module, text }`", "`member.deploy` with `{ module, source, reason, was }`", "`aud` `did:web:clone.example.workers.dev`"]) expect(first.data).toContain(said);
+  // A service deployed later is listed, with its rule and price said to exist. Another lexicon's name is whole.
+  await rig.deployer("service.register", { worker: "brain-x-shop", role: "recipe", keyHash: "shop", paths: [], secrets: [], methods: { "com.lopecode.brain.shop.buy": { type: "procedure", who: "anyone", allow: "caller.session", price: "0.01" }, "app.bsky.feed.getFeedSkeleton": { type: "query", who: "anyone" } } });
+  expect(await read()).toContain("### brain-x-shop\n- app.bsky.feed.getFeedSkeleton: query, anyone\n- shop.buy: procedure, anyone, with a rule, has a price");
+  // What the owner set is not shown, only that it was. A member's Worker is not listed.
+  await rig.owner("rule.put", { target: "com.lopecode.brain.echo.read", allow: 'caller.id == "did:plc:private"' });
+  await rig.deployer("service.register", { worker: "brain-m-ada-notes", role: "member", author: "did:plc:ada", keyHash: "ada", paths: [], secrets: [], methods: { "com.lopecode.brain.m.ada.notes.list": { type: "query", who: "anyone" } } });
+  const last = await read();
+  expect(last).toContain("- echo.read: query, anyone, changed by the owner");
+  expect(last).not.toContain("did:plc:");
+  expect(last).not.toContain("brain-m-ada");
+  // The reference of one Worker is asked of that Worker.
+  await rig.anonymous("getSource?worker=brain-x-echo&part=reference");
+  expect(rig.seen.at(-1).url).toBe("https://echo.internal/xrpc/com.lopecode.brain.getSource?worker=brain-x-echo&part=reference");
+  return last.length + " characters";
+};
 const _braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call = async function _test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call(Response,coreRig,expect) {
   const got = [], logged = [];
   const workers = {
@@ -25361,12 +25472,13 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braincore_anon_6aa2d00c67", null, ["md"], _braincore_anon_6aa2d00c67);
+  $def("_braincore_anon_936102ae77", null, ["md"], _braincore_anon_936102ae77);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
   $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","decide"], _braincore_coreApp);
   $def("_braincore_anon_cf662cd9e9", null, ["md"], _braincore_anon_cf662cd9e9);
   $def("_braincore_coreRig", "coreRig", ["simulate","core_service","Response","sha256"], _braincore_coreRig);
+  $def("_braincore_test_llms_txt_is_written_from_the_host_and_the_route_table", "test_llms_txt_is_written_from_the_host_and_the_route_table", ["coreRig","expect"], _braincore_test_llms_txt_is_written_from_the_host_and_the_route_table);
   $def("_braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call", "test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call", ["Response","coreRig","expect"], _braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwarded_call);
   $def("_braincore_test_calls_are_counted_and_handed_to_the_metrics_service", "test_calls_are_counted_and_handed_to_the_metrics_service", ["Response","coreRig","expect"], _braincore_test_calls_are_counted_and_handed_to_the_metrics_service);
   $def("_braincore_test_routes_by_method_and_path", "test_routes_by_method_and_path", ["coreRig","expect"], _braincore_test_routes_by_method_and_path);
@@ -28583,17 +28695,25 @@ const _brainbluesky_test_bluesky_writes_only_a_feed_generator_record = async fun
   return "1 written, 1 deleted, 8 refused by collection";
 };
 const _brainbluesky_test_bluesky_reads_its_secrets_once_in_the_window = async function _test_bluesky_reads_its_secrets_once_in_the_window(blueskyRig,expect) {
-  const rig = await blueskyRig({ credsMs: 150 });
-  const reads = () => rig.state.reads || 0;
-  await rig.poll();
-  const first = reads();
-  await rig.poll();
-  const second = reads();
-  await new Promise((r) => setTimeout(r, 200));
-  await rig.poll();
-  // One pair for two polls inside the window, and a second pair after it.
-  expect([first, second, reads()]).toEqual([2, 2, 4]);
-  return "2 reads for 2 polls, 4 after the window";
+  // The wrapper itself holds a secret for 5 s, so a read is seen at the core only after that. Two instances wait
+  // the same 5.2 s: one keeps its credentials 150 ms, one for the default 5 minutes.
+  const run = async (credsMs) => {
+    const rig = await blueskyRig({ credsMs });
+    const reads = () => rig.state.reads || 0;
+    await rig.poll();
+    const first = reads();
+    await rig.poll();
+    const second = reads();
+    await new Promise((r) => setTimeout(r, 5200));
+    await rig.poll();
+    return [first, second, reads()];
+  };
+  const [short, long] = await Promise.all([run(150), run(300000)]);
+  // One pair for two polls inside the window. After it a second pair, and none while the window lasts.
+  expect(short.slice(0, 2)).toEqual([2, 2]);
+  expect(short[2]).toBeGreaterThan(2);
+  expect(long).toEqual([2, 2, 2]);
+  return "2 reads for 2 polls; more after 150 ms and 5.2 s; still 2 inside 5 minutes";
 };
 const _brainbluesky_test_bluesky_declares_what_it_needs = async function _test_bluesky_declares_what_it_needs(bluesky_service,expect,decide,callerOf) {
   const { meta } = await bluesky_service.emit();
@@ -38482,6 +38602,8 @@ md`### What is verified
 | \`secret.copy\` gives a secret a second name and shows no value. | cb4: 20 rows, 0 bad, with made-up values. | 2026-10-07 |
 | A session from before the key rename is read after it. | cb4: the kernel has both bindings. | 2026-10-07 |
 | A priced call is charged to the origin's account for the UTC day, and calls made at one time do not spend past it. | cb4, scratch service, removed after: 150 calls of $0.03, 50 at one time, on $1.00: 33 passed, 117 got 402. A failed call was then given back; since the same day no charge is returned. Through 2 Workers the owner paid at each priced method. Priced p50 104 ms, free 46 ms. | 2026-10-08 |
+| The owner changes a value a service reads from \`config\` with one call and no deploy. A value set at deploy is never replaced. | cb4: \`pollMs\` 60000 on \`brain-x-inbox\`, \`inbox.poll\` 20 → 10 in 10 minutes; a member 403, no session 401, key \`owner\` 400, the kernel 404. | 2026-10-09 |
+| \`/llms.txt\` tells a program how to call this Brain, from the host and the route table of the Brain that answers. | cb4: 6660 bytes; 101 listed names, none 501; a token made as it says called \`knowledge.search\` with curl. | 2026-10-09 |
 
 The tests of each module run in the page under \`simulate\`. A deploy is unverified until the page runs those tests from the deployed source.`
 )};
@@ -70040,6 +70162,24 @@ bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.quota.put --owner -
 ```
 
 A 402 `OutOfCredits` names the price, what the account spent, its allowance, and the minutes to 00:00 UTC. A charge is not returned, whatever the Worker then answers. A service declares a price in its manifest, and `price.put` sets a different one.
+
+## Settings
+
+Added 2026-10-09. A value a service reads as `config.NAME ?? default` is changed with a call, the owner's own session only. The reference is **Settings** in the `brain-core` module; each service lists its names in its own table.
+
+```
+bun tools/cloud-brain/brain.ts curl '/xrpc/com.lopecode.brain.config.get?worker=brain-x-inbox' --owner    # stored values, the last 100 changes, what the Worker has read
+bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.config.set --owner -X POST -H 'content-type: application/json' -d '{"worker":"brain-x-inbox","key":"pollMs","value":60000}'
+bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.config.list --owner                          # every stored setting
+```
+
+`"value": null` removes the key and the default is back. A change is read within 60 s. A name the deployer sets (`owner`, `host`, `base`, …) is refused, and the kernel, the core and the deployer take none.
+
+## For a program: `/llms.txt`
+
+Added 2026-10-09. `https://<host>/llms.txt` says how to call this Brain, how the owner makes a token for a caller with no browser, and what each Worker answers. It is written on each request from the host and what is deployed, so it is right on a clone. The reference of one Worker is `/xrpc/com.lopecode.brain.getSource?worker=NAME&part=reference`.
+
+From Claude Code on the web the environment must allow the Brain's host and hold the token in an environment variable. Not tried from there.
 
 ## Messages
 
