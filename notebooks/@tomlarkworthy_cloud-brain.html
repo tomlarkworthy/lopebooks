@@ -24075,7 +24075,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braincore_anon_cc07a23e35 = function _anonymous(md) {return (md`# brain-core
+const _braincore_anon_08b506eddd = function _anonymous(md) {return (md`# brain-core
 
 The Worker every other Worker is bound to. It routes a method or a path to the Worker of the service that declared it, and keeps what must last: the notebook-side rows, the route table and the rules the owner sets.
 
@@ -24126,7 +24126,8 @@ xrpc.fetch("com.lopecode.brain.m.0a1b.shop.receive", { method: "POST", headers: 
 - It is allowed when the method is in the scope and the maker may call it at that moment. A revoked delegation, an ended one or a removed member is refused within 5 s, the time a core instance remembers a row.
 - It reaches no \`infra\`, \`secret\`, \`token\`, \`grant\`, \`people\` or \`delegation\` method, and no method of the owner's own session, whatever the scope says. It is not held to the Worker's own \`calls\`.
 - It begins a chain of its own: the origin is the maker, and the origin of whatever the Worker was answering is not read. \`x-brain-hops\` says how long the chain already is; the core adds one, sends it on with each forwarded call, and refuses a chain over 8.
-- \`daily\` is the most the chain may spend in a UTC day, counted beside the maker's own allowance. \`delegation.list\` shows \`spentToday\`.
+- \`daily\` is the most the chain may spend in a UTC day, counted beside the maker's own allowance. \`delegation.list\` shows \`spentToday\`. Calls made at the same moment can pass it by the price of those calls; the maker's allowance is exact.
+- A member's delegations are deleted when the member is removed.
 - A holder that takes a delegation's id from a caller must check that the caller made it (\`from\`). An id is not a secret.
 
 **Origin.** A rule reads \`caller\`, who made the call, and \`origin\`, who started the chain of calls it is part of. The two have the same fields. For a call from outside they are equal. When a Worker makes a call while it answers one, \`caller\` is the Worker and \`origin\` is the origin of the call it answers. A call a Worker makes by its own schedule has the Worker as \`origin\`. For a member's Worker \`caller\` is its author, and so is \`origin\` when it answers nobody.
@@ -24290,7 +24291,8 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
   //   error   the XRPC error name of an answer of 400 and above
   //   price   US dollars, when the method has a price
   //   rule    allow, deny or error; by: what decided. manifest (the service's rule), owner (the owner's rule),
-  //           fixed (a rule the service fixed), calls (what a Worker declared), grant (a member's), core (its own methods)
+  //           fixed (a rule the service fixed), calls (what a Worker declared), grant (a member's), core (its own methods),
+  //           delegation (a call with x-brain-as that was refused)
   const errorOf = (c, res) =>
     c.get("error") || (res.status >= 400 && /json/.test(res.headers.get("content-type") || "") ? res.clone().json().then((b) => (b && typeof b.error === "string" ? b.error.slice(0, 80) : null), () => null) : null);
   const say = async (c, started, status, error) => {
@@ -24507,6 +24509,8 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     const { people = [] } = await c.req.json();
     const now = new Set(people.map((p) => p.did));
     for (const { key } of await rows.list("person/")) if (!now.has(key.slice("person/".length))) await rows.delete(key);
+    // What a removed member delegated goes with them: added again later, they begin with none.
+    for (const { key, value } of await rows.list("delegation/")) if (value.from !== "owner" && !now.has(value.from)) await settings.delete(key);
     for (const p of people) await rows.put("person/" + p.did, { did: p.did, methods: p.methods || [], quota: p.quota || null, tags: p.tags || [] });
     return c.json({ people: people.length });
   });
@@ -24783,13 +24787,16 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     if (!account) return fail(c, 402, "OutOfCredits", `${target} costs ${money(price.usd)} and ${callerOf(origin).id} has no credits`);
     if (!workers.has(route.worker.replace(/^brain-(x-)?/, ""))) return forward(route, c);
     const allowance = await allowanceOf(account, p);
-    // A chain under a delegation with a daily amount is counted under it first, in the same kind of list.
-    const held = origin.d ? await settings.get("delegation/" + origin.d) : null;
-    if (held && Number.isFinite(held.daily)) {
-      const cap = await charge("delegation/" + held.id, u, held.daily, { m: target, c: c.get("who").caller, o: origin.caller, v: origin.via || "" });
-      if (!cap.ok) return fail(c, 402, "OutOfCredits", `${target} costs ${money(usd(u))}. Delegation ${held.name} has spent ${money(usd(cap.spent))} of ${money(held.daily)} today`);
+    // A chain under a delegation with a daily amount: refused when what it has spent, with this, is over the amount.
+    // Its count is written after the account has paid, so a call the account refused is not in it. The cost of that
+    // order: calls made at the same moment can each read the count before any is written, and pass the amount.
+    const held = origin.d ? await settings.get("delegation/" + origin.d) : null, capped = held && Number.isFinite(held.daily);
+    if (capped) {
+      const { spent } = fold(await rows.get(spendKey(today(), "delegation/" + held.id)));
+      if (spent + u > micro(held.daily)) return fail(c, 402, "OutOfCredits", `${target} costs ${money(usd(u))}. Delegation ${held.name} has spent ${money(usd(spent))} of ${money(held.daily)} today`);
     }
     const got = await charge(account, u, allowance, { m: target, c: c.get("who").caller, o: origin.caller, v: origin.via || "" });
+    if (got.ok && capped) await rows.append(spendKey(today(), "delegation/" + held.id), { t: Date.now(), i: crypto.randomUUID().slice(0, 13), u, A: Number.MAX_SAFE_INTEGER, m: target }, KEEP);
     if (!got.ok)
       return fail(c, 402, "OutOfCredits", got.full
         ? `${account} has made ${CHARGES} priced calls today, which is the most for one day. The count is new at 00:00 UTC`
@@ -24883,7 +24890,8 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     const day = c.req.query("day") || today(), who = c.req.query("who");
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return fail(c, 400, "InvalidRequest", "day is YYYY-MM-DD");
     const base = `spend/${day}/`;
-    const lists = who ? [[who, await rows.get(base + who)]] : (await rows.list(base)).map(({ key, value }) => [key.slice(base.length), value]);
+    // Not the delegations' own counts: each of those charges is in its account's list too.
+    const lists = who ? [[who, await rows.get(base + who)]] : (await rows.list(base)).map(({ key, value }) => [key.slice(base.length), value]).filter(([w]) => !w.startsWith("delegation/"));
     const charges = lists.flatMap(([w, list]) => ledgerOf(w, list)).sort((a, b) => b.at - a.at);
     const sum = (by) => Object.entries(charges.reduce((t, e) => ((t[e[by]] = (t[e[by]] || 0) + e.cost), t), {})).map(([k, v]) => ({ [by]: k, cost: Number(v.toFixed(6)) }));
     return c.json({ day, unit: "USD", charges: charges.slice(0, Math.min(2000, Number(c.req.query("limit")) || 200)), total: Number(charges.reduce((t, e) => t + e.cost, 0).toFixed(6)), byWho: sum("who"), byMethod: sum("method") });
@@ -25965,6 +25973,14 @@ const _braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_i
   // Money: the owner pays, and the delegation's daily amount is the most it spends in a day.
   expect([(await echo("shop.paid", {})).status, (await echo("shop.paid", {})).status]).toEqual([200, 402]);
   expect((await rig.owner("quota.list")).data.accounts.map((a) => [a.who, a.spent])).toEqual([["owner", 0.04]]);
+  // The ledger has the one charge once.
+  expect(((l) => [l.total, l.byWho, l.charges.length])((await rig.owner("quota.ledger")).data)).toEqual([0.04, [{ who: "owner", cost: 0.04 }], 1]);
+  // A call the owner's own allowance refuses is not in the delegation's count.
+  const poor = (await rig.owner("delegation.create", { name: "poor", holder: { worker: "brain-x-echo" }, scope: ["shop.paid"], daily: 1 })).data;
+  await rig.owner("quota.put", { who: "owner", daily: 0.05 });
+  expect([(await held(poor.id)("shop.paid", {})).status, (await rig.owner("delegation.list")).data.delegations.find((x) => x.name === "poor").spentToday]).toEqual([402, 0]);
+  await rig.owner("quota.put", { who: "owner", daily: null });
+  await rig.owner("delegation.revoke", { id: poor.id });
   expect((await rig.owner("delegation.list")).data.delegations.map((x) => [x.name, x.spentToday]).sort()).toEqual([["push", 0.04], ["wide", 0]]);
   // A member's: the caller is the member, and what the member may not call now, it does not reach.
   const ada = (await rig.as(ADA)("delegation.create", { name: "mine", holder: { worker: "brain-x-echo" }, scope: ["shop.receive"] })).data;
@@ -25974,6 +25990,9 @@ const _braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_i
   expect((await held(ada.id)("shop.receive", {})).status).toBe(403);
   await rig.as("kernel", "")("people.sync", { people: [] });
   expect((await held(ada.id)("shop.receive", {})).status).toBe(403);
+  // Added again, they have no delegation: what they made went when they were removed.
+  await rig.as("kernel", "")("people.sync", { people: [{ did: ADA, methods: [B + "shop.receive"] }] });
+  expect([(await held(ada.id)("shop.receive", {})).status, (await rig.as(ADA)("delegation.list")).data.delegations]).toEqual([403, []]);
   // Ended, and revoked: the next call is refused.
   const brief = (await rig.owner("delegation.create", { name: "brief", holder: { worker: "brain-x-echo" }, scope: ["shop.receive"], until: Date.now() + 60000 })).data;
   expect((await held(brief.id)("shop.receive", {})).status).toBe(200);
@@ -25989,7 +26008,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braincore_anon_cc07a23e35", null, ["md"], _braincore_anon_cc07a23e35);
+  $def("_braincore_anon_08b506eddd", null, ["md"], _braincore_anon_08b506eddd);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
   $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","matches","may","neverHeld","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","scoped","MEMBER","decide"], _braincore_coreApp);
@@ -26451,7 +26470,6 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   // A link made to deploy with no approval can deploy a kernel with nobody asked, so keeping the page at / from it
   // would keep nothing: it reaches infra.shell too, and finishes a deploy of the page.
   const deploys = (who) => (who.unattended ? [...DEPLOYS, "com.lopecode.brain.infra.shell"] : DEPLOYS);
-  // delegation: the record a token becomes (plan/cloud-brain-authority.md). Named here before the core has it.
   const never = neverHeld;
   // A token's list holds whole names and prefixes: "browser.*" is every method of that service, "*" every method
   // of this Brain. No prefix reaches a name a token may not have.
@@ -33333,7 +33351,9 @@ const _brainbrowser_test_browser_open_makes_a_tab_and_reuses_it_by_name = async 
 };
 const _brainbrowser_test_browser_time_is_bought_by_extend_alone = async function _test_browser_time_is_bought_by_extend_alone(browserRig,expect) {
   const rig = await browserRig({ paid: 0 }), A = { url: "https://a.example/" };
-  const near = (got, want) => (Math.abs(got - want) <= 3 ? want : got);
+  // Bought time runs down by the clock while the test runs: what is left is the amount less the seconds the test
+  // has taken so far, however slow the machine. A fixed tolerance failed on a slow run (96 for 100, 2026-10-10).
+  const began = Date.now(), near = (got, want) => (got <= want + 1 && got >= want - 2 - (Date.now() - began) / 1000 ? want : got);
   // With no time bought, each method that uses the browser says so, and no browser starts.
   for (const [m, body] of [["open", { name: "a", ...A }], ["run", A], ["goto", { name: "a", ...A }], ["eval", { name: "a", expression: "1" }]]) {
     const r = await rig.owner.post(m, body);
@@ -33590,12 +33610,16 @@ const _brainbrowser_test_browser_tick_makes_rows_and_sessions_agree = async func
   expect((await rig.owner.post("eval", { name: "g", expression: "1" })).data.message).toBe("page g is closed: page ended");
   expect((await rig.owner.post("eval", { name: "h", expression: "1 + 1" })).data.value).toBe(2);
   // Browser time that was used is counted once for the browser, and not for each tab.
-  rig.rows.set(rig.keys("browser/")[0], { ...rig.rows.get(rig.keys("browser/")[0]), counted: Date.now() - 100000 });
-  const used = (await rig.owner.get("status")).data.usage.usedSeconds;
-  expect(used >= 100 && used <= 110 ? "about 100" : used).toBe("about 100");
+  // Measured as a difference: the seconds this test has itself run are in the day's count, and they were what a
+  // bound of 100 to 110 failed on (111, 2026-10-10).
+  const usedBefore = (await rig.owner.get("status")).data.usage.usedSeconds;
+  const row = rig.rows.get(rig.keys("browser/")[0]);
+  rig.rows.set(rig.keys("browser/")[0], { ...row, counted: row.counted - 100000 });
+  const total = (await rig.owner.get("status")).data.usage.usedSeconds, used = total - usedBefore;
+  expect(used >= 99 && used <= 102 ? "about 100" : used).toBe("about 100");
   await rig.tick();
   const after = (await rig.owner.get("status")).data.usage.usedSeconds;
-  expect(after - used >= 0 && after - used <= 1 ? "the same" : [used, after]).toBe("the same");
+  expect(after - total >= 0 && after - total <= 1 ? "the same" : [total, after]).toBe("the same");
   return "another Worker's session kept; a dead start, a second browser, a dead browser and a dead tab handled";
 };
 const _brainbrowser_test_browser_that_stops_answering_is_closed = async function _test_browser_that_stops_answering_is_closed(browserRig,expect) {
@@ -33630,7 +33654,9 @@ const _brainbrowser_test_browser_refuses_urls_and_too_many_pages = async functio
 const _brainbrowser_test_browser_each_caller_has_its_own_browsers = async function _test_browser_each_caller_has_its_own_browsers(browserRig,expect) {
   const rig = await browserRig({ paid: 0 }), A = "https://a.example/";
   const reader = rig.as("worker:brain-x-reader", "owner"), R = "worker:brain-x-reader/default";
-  const near = (got, want) => (Math.abs(got - want) <= 10 ? want : got);
+  // Bought time runs down by the clock while the test runs: what is left is the amount less the seconds the test
+  // has taken so far, however slow the machine. A fixed tolerance failed on a slow run (96 for 100, 2026-10-10).
+  const began = Date.now(), near = (got, want) => (got <= want + 1 && got >= want - 2 - (Date.now() - began) / 1000 ? want : got);
   // Two callers, the same browser name: two browsers, each with its own time and its own pages.
   expect([(await rig.owner.post("extend", {}, { seconds: 100 })).data.cold, (await reader.post("extend", {}, { seconds: 50 })).data.cold]).toEqual([true, true]);
   expect([rig.fake.sessions.size, near(rig.paid(), 100), near(rig.paid(R), 50), rig.session() !== rig.session(R)]).toEqual([2, 100, 50, true]);
