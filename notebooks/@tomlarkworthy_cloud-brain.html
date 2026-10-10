@@ -40237,9 +40237,9 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braingit_anon_ada501dd1e = function _anonymous(md,gitDefaults) {return (md`# brain-git
+const _braingit_anon_29664bce9e = function _anonymous(md,gitDefaults) {return (md`# brain-git
 
-Git repositories for a Cloud Brain, kept by [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/). The service makes a repository and hands out a token for it. Cloning, fetching and pushing are plain \`git\` over HTTPS against Cloudflare's own address, with that token; no git traffic passes this Brain. Each answer is Cloudflare's, its errors included.
+Git repositories for a Cloud Brain, kept by [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/). The service makes a repository and hands out a token for it. Cloning, fetching and pushing are plain \`git\` over HTTPS against Cloudflare's own address, with that token; no git traffic passes this Brain, but for a clone of a repository the owner made readable by anyone (below). Each answer is Cloudflare's, its errors included.
 
 | Method | Cloudflare endpoint |
 |---|---|
@@ -40274,7 +40274,7 @@ A member gives the short name or the full one. A name on Cloudflare is at most 4
 Artifacts has no public repositories: a clone with no token is refused (tried 2026-10-10). So the owner names the ones anyone may read, and this Brain passes a clone or a fetch of those on:
 
 \`\`\`sh
-# the owner, once, no deploy: config.set { worker: "brain-x-git", key: "public", value: "cloud-brain-dev" }   (text: names with a comma between them)
+# the owner, once, no deploy: config.set { worker: "brain-x-git", key: "public", value: "cloud-brain-dev" }   (text: names with a comma between them; spaces around a name are dropped)
 git clone https://BRAIN/git/cloud-brain-dev.git
 \`\`\`
 
@@ -40282,7 +40282,7 @@ git clone https://BRAIN/git/cloud-brain-dev.git
 
 ## Who can call
 
-The owner, a token that names the method and an account the owner gave it (\`grant.put\`). To hold a token to reading one repository: \`caller.session || (request.params.name == "core" && request.params.scope != "write")\` as the rule of \`com.lopecode.brain.git.token\`.
+\`/git/*\` is for anyone and has no rule but the setting \`public\`. The methods: the owner, a token that names the method and an account the owner gave it (\`grant.put\`). To hold a token to reading one repository: \`caller.session || (request.params.name == "core" && request.params.scope != "write")\` as the rule of \`com.lopecode.brain.git.token\`.
 
 ## The Cloudflare token
 
@@ -40301,8 +40301,9 @@ const _braingit_gitDefaults = function _gitDefaults() {return ({ seconds: 3600, 
 const _braingit_gitTenant = function _gitTenant(sha256) {return (async (who) =>
   who === "owner" || who === "deployer" || /^token:/.test(who || "") || /^worker:brain(-(?!m-)|$)/.test(who || "") ? "" : /^did:/.test(who || "") ? "m-" + (await sha256(who)).slice(0, 10) + "-" : null);};
 const _braingit_gitMember = function _gitMember() {return (/^m-[0-9a-f]{10}-/);};
-const _braingit_gitRepo = function _gitRepo(gitMember) {return ((prefix, name) => {
-  const ok = (n) => /^[a-z0-9][a-z0-9._-]{0,39}$/.test(n);
+const _braingit_gitName = function _gitName() {return (/^[a-z0-9][a-z0-9._-]{0,39}$/);};
+const _braingit_gitRepo = function _gitRepo(gitName,gitMember) {return ((prefix, name) => {
+  const ok = (n) => gitName.test(n);
   if (typeof name !== "string" || !ok(name)) return null;
   if (prefix === "") return name;
   const full = name.startsWith(prefix) ? name : gitMember.test(name) ? "" : prefix + name;
@@ -40310,7 +40311,7 @@ const _braingit_gitRepo = function _gitRepo(gitMember) {return ((prefix, name) =
 });};
 const _braingit_gitRead = function _gitRead(gitDefaults) {
   const kept = new Map();
-  return async (space, repo, send) => {
+  const read = async (space, repo, send) => {
     const had = kept.get(repo);
     if (had && had.until > Date.now() + 60000) return had;
     const token = await send(space + "/tokens", "POST", { repo, scope: "read", ttl: gitDefaults.seconds });
@@ -40320,24 +40321,36 @@ const _braingit_gitRead = function _gitRead(gitDefaults) {
     kept.set(repo, got);
     return got;
   };
+  // A token Cloudflare refused, or of a repository that was deleted, is not sent again.
+  read.drop = (repo) => kept.delete(repo);
+  return read;
 };
-const _braingit_git_service = function _git_service(cloudflare,Response,cloudflareApi,config,gitRead,gitTenant,URLSearchParams,gitRepo,gitMember,gitDefaults) {return (cloudflare.Service(
+const _braingit_git_service = function _git_service(cloudflare,Response,cloudflareApi,config,gitName,gitRead,gitTenant,URLSearchParams,gitRepo,gitMember,gitDefaults) {return (cloudflare.Service(
   "git",
   async (request) => {
     const refuse = (status, error, message) => new Response(JSON.stringify({ error, message }), { status, headers: { "content-type": "application/json" } });
     const url = new URL(request.url), what = url.pathname.split(".").pop(), q = url.searchParams;
     const api = (path, method, body) => cloudflareApi.fetch(path, { method, ...(body ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {}) });
+    const space = "/artifacts/namespaces/" + config.base;
     if (url.pathname.startsWith("/git/")) {
       // A clone or a fetch, by anyone, of a repository the owner named in config.public. Reading only.
-      const m = /^\/git\/([a-z0-9][a-z0-9._-]{0,39})\.git\/(info\/refs|git-upload-pack)$/.exec(url.pathname);
+      const m = /^\/git\/([^/]+)\.git\/(info\/refs|git-upload-pack)$/.exec(url.pathname);
       const refs = m && m[2] === "info/refs";
-      if (!m || !String(config.public || "").split(",").includes(m[1]) || request.method !== (refs ? "GET" : "POST") || (refs && q.get("service") !== "git-upload-pack"))
+      const open = String(config.public || "").split(",").map((n) => n.trim());
+      if (!m || !gitName.test(m[1]) || !open.includes(m[1]) || request.method !== (refs ? "GET" : "POST") || (refs && q.get("service") !== "git-upload-pack"))
         return refuse(404, "NotFound", "a repository anyone may read is cloned from /git/NAME.git");
-      const to = await gitRead("/artifacts/namespaces/" + config.base, m[1], api);
-      if (!to) return refuse(502, "UpstreamFailure", "Cloudflare did not give the repository");
-      const headers = { authorization: "Bearer " + to.plaintext };
-      for (const h of ["content-type", "accept", "git-protocol", "content-encoding"]) if (request.headers.get(h)) headers[h] = request.headers.get(h);
-      const r = await fetch("https://" + config.account + ".artifacts.cloudflare.net/git/" + config.base + "/" + m[1] + ".git/" + m[2] + (refs ? "?service=git-upload-pack" : ""), { method: request.method, headers, body: refs ? undefined : await request.arrayBuffer() });
+      const body = refs ? undefined : await request.arrayBuffer();
+      let r;
+      // A second time with a new token when Cloudflare refuses the kept one (the repository was made again, say).
+      for (let i = 0; i < 2; i++) {
+        const to = await gitRead(space, m[1], api);
+        if (!to) return refuse(502, "UpstreamFailure", "Cloudflare did not give a token for the repository");
+        const headers = { authorization: "Bearer " + to.plaintext };
+        for (const h of ["content-type", "accept", "git-protocol", "content-encoding"]) if (request.headers.get(h)) headers[h] = request.headers.get(h);
+        r = await fetch("https://" + config.account + ".artifacts.cloudflare.net/git/" + config.base + "/" + m[1] + ".git/" + m[2] + (refs ? "?service=git-upload-pack" : ""), { method: request.method, headers, body });
+        if (r.status !== 401 && r.status !== 403) break;
+        gitRead.drop(m[1]);
+      }
       return new Response(r.body, { status: r.status, headers: { "content-type": r.headers.get("content-type") || "application/octet-stream", "cache-control": "no-cache" } });
     }
     const verb = { create: "POST", token: "POST", delete: "POST", get: "GET", list: "GET" }[what];
@@ -40345,7 +40358,6 @@ const _braingit_git_service = function _git_service(cloudflare,Response,cloudfla
     if (request.method !== verb) return refuse(405, "InvalidRequest", "git." + what + " is sent with " + verb);
     const prefix = await gitTenant(request.headers.get("x-brain-caller"));
     if (prefix === null) return refuse(403, "Forbidden", "this caller has no repositories");
-    const space = "/artifacts/namespaces/" + config.base;
     const pass = (r) => new Response(r.body, { status: r.status, headers: { "content-type": r.headers.get("content-type") || "application/json" } });
     const send = (path, method, body) => api(space + path, method, body);
     if (what === "list") {
@@ -40361,7 +40373,7 @@ const _braingit_git_service = function _git_service(cloudflare,Response,cloudfla
       return pass(await send("/repos", "POST", { name: repo, default_branch: "main" }));
     }
     if (what === "get") return pass(await send("/repos/" + repo, "GET"));
-    if (what === "delete") return pass(await send("/repos/" + repo, "DELETE"));
+    if (what === "delete") { gitRead.drop(repo); return pass(await send("/repos/" + repo, "DELETE")); }
     const scope = q.get("scope") || "read", seconds = q.get("seconds") === null ? gitDefaults.seconds : Number(q.get("seconds"));
     if (scope !== "read" && scope !== "write") return refuse(400, "InvalidRequest", "scope is read or write");
     if (!Number.isInteger(seconds) || seconds < gitDefaults.least || seconds > gitDefaults.most) return refuse(400, "InvalidRequest", "seconds is a whole number from " + gitDefaults.least + " to " + gitDefaults.most);
@@ -40466,14 +40478,18 @@ const _braingit_test_git_refuses_a_bad_scope_a_bad_time_and_a_wrong_verb = async
 };
 const _braingit_test_anyone_clones_a_repository_the_owner_named_and_no_other = async function _test_anyone_clones_a_repository_the_owner_named_and_no_other(simulate,git_service,Response,expect) {
   const seen = [];
+  let again = 0;
   const sim = await simulate(git_service, {
     secrets: { CF_TOKEN: "minted-1", BRAIN_KEY: "k" },
-    config: { base: "cb4", account: "acct", public: "other,open" },
+    config: { base: "cb4", account: "acct", public: "other, open,soon,shut,again" },
     fetch: async (request) => {
       const url = new URL(request.url);
       seen.push([request.method, url.host + url.pathname + url.search, request.headers.get("authorization"), request.headers.get("git-protocol"), request.method === "POST" && url.host !== "api.cloudflare.com" ? await request.text() : null]);
+      if (url.pathname.includes("/again.git/") && !again++) return new Response("no", { status: 403 });
       if (url.host !== "api.cloudflare.com") return new Response("PACK", { headers: { "content-type": "application/x-git-upload-pack-result" } });
-      return new Response(JSON.stringify({ success: true, result: { plaintext: "art_v1_read?expires=" + Math.floor(Date.now() / 1000 + 3600) } }), { headers: { "content-type": "application/json" } });
+      const repo = (await request.json()).repo;
+      if (repo === "shut") return new Response(JSON.stringify({ success: false }), { status: 403, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ success: true, result: { plaintext: "art_v1_read?expires=" + Math.floor(Date.now() / 1000 + (repo === "soon" ? 30 : 3600)) } }), { headers: { "content-type": "application/json" } });
     }
   });
   const get = (path, init = {}) => sim.fetch("https://git.internal" + path, { ...init, headers: { "x-brain-caller": "anonymous", ...(init.headers || {}) } });
@@ -40495,7 +40511,17 @@ const _braingit_test_anyone_clones_a_repository_the_owner_named_and_no_other = a
     ["/git/open.git/git-receive-pack", { method: "POST", body: "x" }], ["/git/open.git/git-upload-pack"], ["/git/open.git/HEAD"], ["/git/open/info/refs?service=git-upload-pack"], ["/git/../open.git/info/refs?service=git-upload-pack"]
   ]) expect((await get(path, init)).status).toBe(404);
   expect(seen.length).toBe(3);
-  return "2 passed on, 8 not found";
+  // A token in its last minute is not used: each request asks for one. A name with a space before it in the setting is found.
+  const tokens = () => seen.filter((x) => x[1].endsWith("/tokens")).length, before = tokens();
+  for (let i = 0; i < 2; i++) expect((await get("/git/soon.git/info/refs?service=git-upload-pack")).status).toBe(200);
+  expect(tokens() - before).toBe(2);
+  // Cloudflare gives no token: 502, and the repository's address is not called.
+  const n = seen.length, shut = await get("/git/shut.git/info/refs?service=git-upload-pack");
+  expect([shut.status, (await shut.json()).error, seen.length - n, seen[n][1]]).toEqual([502, "UpstreamFailure", 1, expect.stringMatching(/\/tokens$/)]);
+  // Cloudflare refuses the kept token once (the repository was made again): a new token, and the clone goes on.
+  const t = tokens(), made = await get("/git/again.git/info/refs?service=git-upload-pack");
+  expect([made.status, tokens() - t]).toEqual([200, 2]);
+  return "2 passed on, 8 not found, 2 tokens for a token that ends, 1 refused by Cloudflare, 1 asked again";
 };
 const _braingit_test_git_declares_one_cloudflare_permission_and_keeps_nothing = async function _test_git_declares_one_cloudflare_permission_and_keeps_nothing(git_service,expect,decide,callerOf) {
   const { meta, parts } = await git_service.emit();
@@ -40516,13 +40542,14 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braingit_anon_ada501dd1e", null, ["md","gitDefaults"], _braingit_anon_ada501dd1e);
+  $def("_braingit_anon_29664bce9e", null, ["md","gitDefaults"], _braingit_anon_29664bce9e);
   $def("_braingit_gitDefaults", "gitDefaults", [], _braingit_gitDefaults);
   $def("_braingit_gitTenant", "gitTenant", ["sha256"], _braingit_gitTenant);
   $def("_braingit_gitMember", "gitMember", [], _braingit_gitMember);
-  $def("_braingit_gitRepo", "gitRepo", ["gitMember"], _braingit_gitRepo);
+  $def("_braingit_gitName", "gitName", [], _braingit_gitName);
+  $def("_braingit_gitRepo", "gitRepo", ["gitName","gitMember"], _braingit_gitRepo);
   $def("_braingit_gitRead", "gitRead", ["gitDefaults"], _braingit_gitRead);
-  $def("_braingit_git_service", "git_service", ["cloudflare","Response","cloudflareApi","config","gitRead","gitTenant","URLSearchParams","gitRepo","gitMember","gitDefaults"], _braingit_git_service);
+  $def("_braingit_git_service", "git_service", ["cloudflare","Response","cloudflareApi","config","gitName","gitRead","gitTenant","URLSearchParams","gitRepo","gitMember","gitDefaults"], _braingit_git_service);
   $def("_braingit_git_announce", "git_announce", ["plugins","git_service","invalidation"], _braingit_git_announce);
   $def("_braingit_anon_be3d699220", null, ["md"], _braingit_anon_be3d699220);
   $def("_braingit_gitRig", "gitRig", ["sha256","simulate","git_service","Response"], _braingit_gitRig);
