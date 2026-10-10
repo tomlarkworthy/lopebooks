@@ -34300,16 +34300,23 @@ const _brainbrowser_test_browser_run_closes_its_tab = async function _test_brows
 const _brainbrowser_test_browser_run_stops_at_its_timeout = async function _test_browser_run_stops_at_its_timeout(browserRig,expect) {
   const rig = await browserRig({ sites: { "https://a.example/": { title: "A", text: "alpha" }, "https://never.example/": { title: "N", text: "", never: true } } });
   const t0 = Date.now();
+  // The time bound below is on the time this page's timers were given, not on the clock. A timer of 100 ms runs beside
+  // the three calls, and what it is late by is taken off. (2026-10-10: at the page's load, with its other tests running,
+  // one such timer was 7.4 s late and the three took 11.8 s.)
+  let held = 0, last = t0;
+  const beat = setInterval(() => ((held += Math.max(0, Date.now() - last - 100)), (last = Date.now())), 100);
   const [waited, hung, never] = await Promise.all([
     rig.owner.post("run", { url: "https://a.example/", wait: "window.never", timeout: 5000 }),
     rig.owner.post("run", { url: "https://a.example/", expression: "new Promise(() => {})", timeout: 5000 }),
     // A page whose load event does not come: the run goes on at half of its time with loaded false.
     rig.owner.post("run", { url: "https://never.example/", expression: "document.title", timeout: 5000 })
-  ]);
+  ]).finally(() => clearInterval(beat));
+  const took = Date.now() - t0 - held - Math.max(0, Date.now() - last - 100);
   expect([waited.status, waited.data.message]).toEqual([504, "wait was not true in 5000 ms"]);
   expect([hung.status, hung.data.error]).toEqual([504, "Timeout"]);
   expect(never.data).toMatchObject({ loaded: false, value: "N" });
-  expect(Date.now() - t0 < 7000).toBe(true);
+  // Together and not one after another, which is 12.5 s.
+  expect(took).toBeLessThan(7000);
   expect([rig.keys("page/"), rig.fake.targets(rig.session()).length]).toEqual([[], 0]);
   return "a wait, a promise and a load that do not end: 5 s each, no tab left";
 };
