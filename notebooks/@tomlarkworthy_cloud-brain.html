@@ -36632,7 +36632,7 @@ const _brainissues_anon_39ddc52072 = function _anonymous(md,issuesStore) {return
 - A write is drawn before the service answers, and withdrawn with the refusal if it refuses.
 
 \`issuesPanel({ client, owner, by, store, every, invalidation })\`: \`by\` is who the page judges guards as (the owner's session if left out); \`store\` is \`{ get, set }\` in place of \`localStorage\`; \`every\` is a poll interval that overrides the service's; \`invalidation\` stops the poll. Its value is the view, and it sends \`input\` when the view changes.`);};
-const _brainissues_anon_515ecc630e = function _anonymous(md,issuesDefaultPolicy,issuesLimits) {return (md`## Methods
+const _brainissues_anon_a7739bf88d = function _anonymous(md,issuesDefaultPolicy,issuesLimits) {return (md`## Methods
 
 | | |
 |---|---|
@@ -36653,7 +36653,7 @@ const _brainissues_anon_515ecc630e = function _anonymous(md,issuesDefaultPolicy,
 | \`issue.list\` | query. \`?state=&kind=&about=&parent=&label=&limit=100\`. \`{ issues }\`, last changed first. |
 | \`issue.verify\` | query. \`?after=<seq>\`. Checks \`seq\`, \`prev\`, \`hash\` and \`sig\` of each event after \`after\`. \`{ ok, seq, head, checked, guards }\`, or \`{ ok: false, seq, why, checked }\` at the first that fails; \`checked\` is how many passed. With \`guards=true\` it starts at 1 and also judges each event against the workflow in force when it was written. |
 | \`issue.key\` | query, anyone. \`{ alg: "Ed25519", key }\`: the public key, a JWK. |
-| \`issue.rebuild\` | procedure, the owner present. Makes the view again from the record. \`{ seq, issues }\` |
+| \`issue.rebuild\` | procedure, the owner present. Makes the view again from the record. \`{ seq, issues }\`. A write that lands while it runs is in the view it leaves: the head is read in the transaction that writes the last rows, and while it has moved the events after it are read and their rows written. After ${issuesLimits.rebuildRounds + 1} writes with the head still moving it answers 503 \`Busy\`; send it again. Up to 297 rows the view is cleared and written in one transaction; past that in several, and a call between two of them is answered from part of the view |
 | Storage | \`sql\`: \`issues_events\` (the record), \`issues_view\`, \`issues_meta\` (the policy and every workflow by hash) |
 | Secret | \`ISSUES_SIGNING_KEY\`: an Ed25519 private key as a JWK. Without it a write, \`issue.verify\` and \`issue.key\` answer 503 \`NotConfigured\`; the other queries answer. |
 
@@ -36739,7 +36739,7 @@ const _brainissues_issues_announce = function _issues_announce(plugins,issues_se
   plugins.add("workers", issues_service, { invalidation });
   return "announced issues_service";
 };
-const _brainissues_issuesLimits = function _issuesLimits() {return ({ body: 20000, title: 300, reason: 2000, key: 100, refs: 20, labels: 20, policy: 100000, page: 500, syncMs: 5000, syncPage: 200, verdicts: ["pass", "changes", "block"] });};
+const _brainissues_issuesLimits = function _issuesLimits() {return ({ body: 20000, title: 300, reason: 2000, key: 100, refs: 20, labels: 20, policy: 100000, page: 500, syncMs: 5000, syncPage: 200, rebuildRounds: 5, verdicts: ["pass", "changes", "block"] });};
 const _brainissues_issuesDefaultPolicy = function _issuesDefaultPolicy() {
   const triage = 'caller.kind in ["owner", "token"]';
   const other = "caller.actor != issue.by.start";
@@ -37264,11 +37264,21 @@ const _brainissues_issuesApp = function _issuesApp(hono,issuesSql,issuesLimits,i
     if (!issueCaller(who(c).by).present) throw refuse(403, "Refused", "the owner, present");
     await schema();
     const view = issueView();
-    await walk(0, async (e) => void issueApply(view, e));
-    const rows = [...(view.policy ? metaRows(view) : []), ...Object.values(view.issues).map(issueRow)];
-    await sql.batch([[S.clearView], [S.clearMeta], ...rows.slice(0, 300)]);
-    for (let at = 300; at < rows.length; at += 300) await sql.batch(rows.slice(at, at + 300));
-    return { seq: view.seq, issues: Object.keys(view.issues).length };
+    // The view is written whole from the record as read. A write that landed since that read has its row cleared or
+    // put back as it was, so the head is read in the transaction of the last rows: while it is past what was read,
+    // the events after it are read and the rows they touch written, and the head read again.
+    for (let round = 0; ; round++) {
+      const touched = new Set();
+      let policy = false;
+      await walk(view.seq, async (e) => void (issueApply(view, e), e.type === "policy" ? (policy = true) : touched.add(e.id)));
+      const rows = round
+        ? [...(policy ? metaRows(view) : []), ...[...touched].filter((id) => issueAt(view.issues, id)).map((id) => issueRow(view.issues[id]))]
+        : [[S.clearView], [S.clearMeta], ...(view.policy ? metaRows(view) : []), ...Object.values(view.issues).map(issueRow)];
+      let head = null;
+      for (let at = 0; at < rows.length + 1; at += 300) head = (await sql.batch([...rows, [S.head]].slice(at, at + 300))).at(-1).rows[0];
+      if ((head ? head.seq : 0) <= view.seq) return { seq: view.seq, issues: Object.keys(view.issues).length };
+      if (round >= L.rebuildRounds) throw refuse(503, "Busy", `events were still arriving after the view was written ${round + 1} times: the view is as of event ${view.seq}; send it again`);
+    }
   }));
   return app;
 };
@@ -37440,9 +37450,12 @@ const _brainissues_anon_d3f0b4f807 = function _anonymous(md) {return (md`## Test
 
 No SQL engine runs in a page. \`issuesFakeSql\` answers for the statements of \`issuesSql\` from three maps, and refuses any other statement. Its insert fails on a \`seq\` or a \`key\` that is kept, as the table's key and its unique index do.`);};
 const _brainissues_issuesFakeSql = function _issuesFakeSql(issuesSql,issuesSchema) {return (() => {
-  const events = [], view = new Map(), meta = new Map(), S = issuesSql, hooks = [];
+  const events = [], view = new Map(), meta = new Map(), S = issuesSql, hooks = [], before = [];
   const row = (rows, changes = 0) => ({ rows, changes });
   const run = async (statement, a) => {
+    // A test's [statement, fn]: fn runs once, ahead of the next run of that statement.
+    const due = before.findIndex(([s]) => s === statement);
+    if (due >= 0) await before.splice(due, 1)[0][1]();
     if (issuesSchema.includes(statement)) return row([]);
     if (statement === S.head) return row(events.length ? [{ seq: events.at(-1).seq, hash: events.at(-1).hash }] : []);
     if (statement === S.byKey) return row(events.filter((e) => e.key === a[0]).map((e) => ({ event: e.event })));
@@ -37467,7 +37480,7 @@ const _brainissues_issuesFakeSql = function _issuesFakeSql(issuesSql,issuesSchem
     if (statement === S.clearMeta) return meta.clear(), row([]);
     throw new Error("issuesFakeSql: " + statement);
   };
-  return { run, events, view, meta, hooks };
+  return { run, events, view, meta, hooks, before };
 });};
 const _brainissues_issuesRig = function _issuesRig(issuesFakeSql,issueKeys,simulate,issues_service,sha256,issueCanon) {return (async () => {
   const db = issuesFakeSql();
@@ -37862,6 +37875,45 @@ const _brainissues_test_issues_rebuild_and_replay_judge_the_record = async funct
   expect((await rig.owner("verify?guards=true")).data).toEqual({ ok: false, seq: forged.seq, why: "the guard of pass refuses", checked: forged.seq - 1 });
   return "the view made again equals the view kept; a forged pass is named";
 };
+const _brainissues_test_issues_rebuild_keeps_a_write_made_while_it_runs = async function _test_issues_rebuild_keeps_a_write_made_while_it_runs(issuesRig,issuesSql,expect,issuesExamplePolicy) {
+  const rig = await issuesRig(), S = issuesSql;
+  await rig.inReview("r1");
+  await rig.owner("open", { id: "r2", title: "Other", kind: "feedback" });
+  const head = rig.db.events.length, quiet = async () => ((await rig.owner("rebuild", {})), (await rig.owner("snapshot")).data);
+  // After the rebuild has read the record and before it writes the view: a comment, a new issue, a move.
+  rig.db.before.push([S.clearView, async () => {
+    await rig.a("comment", { id: "r1", body: "while it ran" });
+    await rig.owner("open", { id: "r3", title: "Opened meanwhile", kind: "task" });
+    await rig.owner("move", { id: "r2", to: "closed" });
+  }]);
+  expect((await rig.owner("rebuild", {})).data).toEqual({ seq: head + 3, issues: 3 });
+  expect(rig.db.before.length).toBe(0);
+  const during = (await rig.owner("snapshot")).data, at = (id) => during.issues.find((i) => i.id === id);
+  expect([during.seq, at("r1").comments, at("r3").title, at("r2").closed]).toEqual([head + 3, 1, "Opened meanwhile", true]);
+  expect((await rig.a("comment", { id: "r3", body: "it is there" })).status).toBe(200);
+  // The same view as a rebuild nothing interrupts.
+  const after = (await rig.owner("snapshot")).data;
+  expect(await quiet()).toEqual(after);
+  // A policy installed meanwhile is the policy in force after it.
+  let installed = null;
+  rig.db.before.push([S.clearView, async () => void (installed = (await rig.owner("install", { key: "meanwhile", policy: issuesExamplePolicy })).data)]);
+  await rig.owner("rebuild", {});
+  const policy = (await rig.owner("policy")).data;
+  expect([policy.policy.seq, policy.policy.names]).toEqual([installed.seq, installed.hashes]);
+  expect(await quiet()).toMatchObject({ policy: policy.policy });
+  // A record that another writer adds to at every read of its head: refused after 6 writes of the view, not run for ever.
+  const wf = at("r1").workflow, writes = () => rig.db.events.length;
+  for (let n = 0; n < 8; n++) rig.db.before.push([S.head, () => rig.forge({ id: "r1", type: "commented", workflow: wf, body: "again " + n })]);
+  const was = writes();
+  expect((await rig.owner("rebuild", {})).data).toMatchObject({ error: "Busy" });
+  expect([writes() - was, rig.db.before.length]).toEqual([6, 2]);
+  rig.db.before.length = 0;
+  // The view it left holds every event but the last, and the next rebuild has that one too.
+  expect((await rig.owner("snapshot")).data.issues.find((i) => i.id === "r1").comments).toBe(1 + 5);
+  expect((await quiet()).issues.find((i) => i.id === "r1").comments).toBe(1 + 6);
+  expect((await rig.owner("verify?guards=true")).data).toMatchObject({ ok: true });
+  return "3 writes and an install made while a rebuild ran are in the view it left; a record that never rests is refused";
+};
 const _brainissues_test_issues_migrate_moves_what_is_still_there = async function _test_issues_migrate_moves_what_is_still_there(issuesRig,issueApply,issueView,issuesLimits,expect) {
   const rig = await issuesRig();
   for (const id of ["aaaaaaaaaa1", "aaaaaaaaaa2", "gone"]) await rig.owner("open", { id, title: id, kind: "feedback" });
@@ -38027,7 +38079,7 @@ export default function define(runtime, observer) {
   $def("_brainissues_viewof_issuesView", "viewof issuesView", ["issuesPanel","client","session","invalidation"], _brainissues_viewof_issuesView);
   $def("_brainissues_issuesView", "issuesView", ["Generators","viewof issuesView"], _brainissues_issuesView);
   $def("_brainissues_anon_39ddc52072", null, ["md","issuesStore"], _brainissues_anon_39ddc52072);
-  $def("_brainissues_anon_515ecc630e", null, ["md","issuesDefaultPolicy","issuesLimits"], _brainissues_anon_515ecc630e);
+  $def("_brainissues_anon_a7739bf88d", null, ["md","issuesDefaultPolicy","issuesLimits"], _brainissues_anon_a7739bf88d);
   $def("_brainissues_anon_ee7e7b4cb9", null, ["md","issuesExampleText","issuesDefaultPolicy"], _brainissues_anon_ee7e7b4cb9);
   $def("_brainissues_issuesExamplePolicy", "issuesExamplePolicy", [], _brainissues_issuesExamplePolicy);
   $def("_brainissues_issuesExampleText", "issuesExampleText", ["issuesExamplePolicy"], _brainissues_issuesExampleText);
@@ -38063,6 +38115,7 @@ export default function define(runtime, observer) {
   $def("_brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates", "test_issues_policy_is_installed_by_the_owner_and_migrates", ["issuesRig","expect","issuesLimits","issuePolicyAct","issuesDefaultPolicy","issuesExamplePolicy","issuesExampleText"], _brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates);
   $def("_brainissues_test_issues_hidden_from_who_may_not_read", "test_issues_hidden_from_who_may_not_read", ["issuesRig","expect"], _brainissues_test_issues_hidden_from_who_may_not_read);
   $def("_brainissues_test_issues_rebuild_and_replay_judge_the_record", "test_issues_rebuild_and_replay_judge_the_record", ["issuesRig","expect"], _brainissues_test_issues_rebuild_and_replay_judge_the_record);
+  $def("_brainissues_test_issues_rebuild_keeps_a_write_made_while_it_runs", "test_issues_rebuild_keeps_a_write_made_while_it_runs", ["issuesRig","issuesSql","expect","issuesExamplePolicy"], _brainissues_test_issues_rebuild_keeps_a_write_made_while_it_runs);
   $def("_brainissues_test_issues_migrate_moves_what_is_still_there", "test_issues_migrate_moves_what_is_still_there", ["issuesRig","issueApply","issueView","issuesLimits","expect"], _brainissues_test_issues_migrate_moves_what_is_still_there);
   $def("_brainissues_test_issues_declares_what_it_needs", "test_issues_declares_what_it_needs", ["issues_service","expect","decide","callerOf","issuePolicyAct","issuesDefaultPolicy","simulate","issuesFakeSql"], _brainissues_test_issues_declares_what_it_needs);
   $def("_brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer", "test_issues_panel_draws_and_applies_a_write_before_the_answer", ["issuesRig","URLSearchParams","issuesPanel","expect","Event","issuesStore"], _brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer);
