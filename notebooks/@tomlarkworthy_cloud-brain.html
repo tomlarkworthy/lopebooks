@@ -24075,7 +24075,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braincore_anon_08b506eddd = function _anonymous(md) {return (md`# brain-core
+const _braincore_anon_a89addba30 = function _anonymous(md) {return (md`# brain-core
 
 The Worker every other Worker is bound to. It routes a method or a path to the Worker of the service that declared it, and keeps what must last: the notebook-side rows, the route table and the rules the owner sets.
 
@@ -24113,7 +24113,8 @@ It answers bindings only. A caller is who the kernel says it is, and the kernel 
 | \`quota.get\` | query, any account. \`{ who, day, spent, daily, remaining, resetsAt }\` for the caller's own account. The owner reads another with \`?who=\`. |
 | \`quota.list\`, \`quota.ledger\` | query, owner. Each account's day, and the charges of one day (\`?day=&who=&limit=\`) with totals by account and by method. |
 | \`quota.put\`, \`quota.setDefaults\` | procedure, the owner's own session. \`{ who, daily }\`, and \`{ owner, member, worker, token, perCall, keepDays }\`. \`null\` is the default again. |
-| \`delegation.create\` | procedure, the owner's or a member's own session. \`{ name, holder: { worker }, scope, until, daily, note }\` → the record, with its \`id\`. |
+| \`delegation.create\` | procedure, the owner's or a member's own session. \`{ name, holder: { worker }, scope, until, daily, note }\` → the record, with its \`id\`. With \`holder: { secret: true }\` and \`caps\` (the owner only) the answer has \`secret\`, once: a token. The kernel's \`token.create\` and a sign-in link make these. |
+| \`delegation.resolve\` | procedure, the kernel. \`{ sha256 }\` of a secret → \`{ delegation }\` or null. |
 | \`delegation.list\`, \`delegation.revoke\` | query and procedure, the same callers. The owner reads and revokes any, a member their own. \`{ id }\`. |
 
 **Delegations** (design: \`plan/cloud-brain-authority.md\`; built 2026-10-10 for a Worker holder only). The owner or a member lets a Worker the owner deployed call the methods in a \`scope\`, until a time or until it is revoked. The Worker names the delegation on a call it makes:
@@ -24128,6 +24129,7 @@ xrpc.fetch("com.lopecode.brain.m.0a1b.shop.receive", { method: "POST", headers: 
 - It begins a chain of its own: the origin is the maker, and the origin of whatever the Worker was answering is not read. \`x-brain-hops\` says how long the chain already is; the core adds one, sends it on with each forwarded call, and refuses a chain over 8.
 - \`daily\` is the most the chain may spend in a UTC day, counted beside the maker's own allowance. \`delegation.list\` shows \`spentToday\`. Calls made at the same moment can pass it by the price of those calls; the maker's allowance is exact.
 - A member's delegations are deleted when the member is removed.
+- A secret holder (a token made from 2026-10-10) sends the secret to the kernel as \`Authorization: Bearer\`. Its calls are the owner's: the owner's rules and allowance, \`caller.holder\` is \`secret\`. It is the owner's own tab only with the cap \`session\`; without it what it makes in a store is kept under \`d:<id>\`. \`deploy\` and \`unattended\` are read by the kernel for \`infra.*\`.
 - A holder that takes a delegation's id from a caller must check that the caller made it (\`from\`). An id is not a secret.
 
 **Origin.** A rule reads \`caller\`, who made the call, and \`origin\`, who started the chain of calls it is part of. The two have the same fields. For a call from outside they are equal. When a Worker makes a call while it answers one, \`caller\` is the Worker and \`origin\` is the origin of the call it answers. A call a Worker makes by its own schedule has the Worker as \`origin\`. For a member's Worker \`caller\` is its author, and so is \`origin\` when it answers nobody.
@@ -24172,7 +24174,8 @@ The order is rule, price, charge, forward. The price is for the Worker's own wor
 | the owner's session, the owner's turn, the owner's PDS, the token of a sign-in link made with \`unattended\` | \`owner\` | $1.00 |
 | a member's session, PDS, portal or turn | \`did:…\`, the member | $0.10 |
 | a turn in a room | the person who wrote the message, as any turn | |
-| a token | \`token:NAME\` | $0.10 |
+| a token made from 2026-10-10 (a delegation with a secret holder), a Worker calling under the owner's delegation | \`owner\`, and no more than the delegation's \`daily\` | $1.00 |
+| a token made before 2026-10-10 | \`token:NAME\` | $0.10 |
 | a Worker by its own clock | \`worker:NAME\` | $0.10 |
 | a member's Worker by its own clock | its author | |
 | nobody (\`anonymous\`) | none: a priced call is refused | |
@@ -24220,7 +24223,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     // A member's Worker is known by its key like any other, and is then checked as its author.
     if (known.role === "member") return { caller: "worker:" + known.worker, keyed: known.worker, member: { worker: known.worker, author: known.author } };
     if (known.role !== "kernel") return { caller: "worker:" + known.worker, keyed: known.worker };
-    return { caller: request.headers.get("x-brain-caller") || "anonymous", via: request.headers.get("x-brain-via") || "" };
+    return { caller: request.headers.get("x-brain-caller") || "anonymous", via: request.headers.get("x-brain-via") || "", kernel: true };
   };
   // Origin. The caller of a call is who made it; the origin is who started the chain of calls it is part of. With
   // each call the core forwards goes a reference: the origin, the Worker it is for and when it ends, signed with a
@@ -24344,17 +24347,34 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     const person = from.startsWith("did:") ? await rows.get("person/" + from) : null;
     return !!person && may({ member: true, grant: person.methods }, nsid);
   };
-  const asHolder = async (c, worker, id) => {
+  // What every call under a delegation passes, whoever holds it. null when it stands.
+  const stands = async (c, d) => {
     const url = new URL(c.req.url), nsid = url.pathname.startsWith("/xrpc/") ? url.pathname.slice("/xrpc/".length) : null;
+    if (d.until && d.until <= clock()) return fail(c, 403, "Forbidden", `delegation ${d.name} has ended`);
+    if (!nsid || neverHeld(nsid) || !matches(d.scope, nsid)) return fail(c, 403, "Forbidden", `delegation ${d.name} does not reach ${nsid || url.pathname}`);
+    if (!(await mayNow(d.from, nsid))) return fail(c, 403, "Forbidden", `${d.from} may not call ${nsid} now, so delegation ${d.name} does not`);
+    return null;
+  };
+  const asHolder = async (c, worker, id) => {
     const d = /^[0-9a-f]{12}$/.test(id) ? await settings.get("delegation/" + id) : null;
     if (!d || !d.holder || d.holder.worker !== worker) return fail(c, 403, "Forbidden", `${worker} holds no such delegation`);
-    if (d.until && d.until <= clock()) return fail(c, 403, "Forbidden", `delegation ${d.name} has ended`);
     // The holder says how long the chain is that this call goes on from. A push that causes a push is one longer.
     const hops = Number(c.req.header("x-brain-hops") || 0);
     if (!Number.isInteger(hops) || hops < 0 || hops >= HOPS) return fail(c, 403, "Forbidden", `a chain of calls under delegations is at most ${HOPS} long`);
-    if (!nsid || neverHeld(nsid) || !matches(d.scope, nsid)) return fail(c, 403, "Forbidden", `delegation ${d.name} does not reach ${nsid || url.pathname}`);
-    if (!(await mayNow(d.from, nsid))) return fail(c, 403, "Forbidden", `${d.from} may not call ${nsid} now, so delegation ${d.name} does not`);
+    const no = await stands(c, d);
+    if (no) return no;
     c.set("who", { caller: d.from, via: "delegation:" + d.id, tab: false, holder: "worker:" + worker, d: d.id, hops: hops + 1 });
+    return null;
+  };
+  // A call the kernel passes on for whoever sent a delegation's secret (a token). The kernel matched the secret to
+  // the row; the row is read again here and is what decides. It is the maker's own tab when the delegation has the
+  // cap `session`, and not otherwise.
+  const asSecret = async (c, id) => {
+    const d = /^[0-9a-f]{12}$/.test(id) ? await settings.get("delegation/" + id) : null;
+    if (!d || !d.holder || !d.holder.secret) return fail(c, 401, "AuthRequired", "unknown token");
+    const no = await stands(c, d);
+    if (no) return no;
+    c.set("who", { caller: d.from, via: "delegation:" + d.id, tab: d.caps.includes("session"), holder: "secret", d: d.id, hops: 0 });
     return null;
   };
   // A Worker calls what its service declared in `calls`, and what a platform cell calls for it (IMPLICIT). The list is
@@ -24412,11 +24432,13 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     c.set("who", who);
     // x-brain-as is read from a Worker known by its key, and not from a member's: that one runs as its author.
     const as = !who.member && who.keyed ? c.req.header("x-brain-as") : null;
-    const no = who.member ? await asAuthor(c, who.member) : as ? await asHolder(c, who.keyed, as) : who.caller.startsWith("worker:") ? await asDeclared(c, who.caller.slice("worker:".length)) : null;
+    // x-brain-delegation is read from the kernel's key only.
+    const token = who.kernel ? c.req.header("x-brain-delegation") : null;
+    const no = who.member ? await asAuthor(c, who.member) : as ? await asHolder(c, who.keyed, as) : token ? await asSecret(c, token) : who.caller.startsWith("worker:") ? await asDeclared(c, who.caller.slice("worker:".length)) : null;
     if (no) {
       await routeOf(c);
       c.set("rule", "deny");
-      c.set("by", who.member ? "grant" : as ? "delegation" : "calls");
+      c.set("by", who.member ? "grant" : as || token ? "delegation" : "calls");
       await say(c, started, no.status, c.get("error"));
       return no;
     }
@@ -24510,7 +24532,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     const now = new Set(people.map((p) => p.did));
     for (const { key } of await rows.list("person/")) if (!now.has(key.slice("person/".length))) await rows.delete(key);
     // What a removed member delegated goes with them: added again later, they begin with none.
-    for (const { key, value } of await rows.list("delegation/")) if (value.from !== "owner" && !now.has(value.from)) await settings.delete(key);
+    for (const { value } of await rows.list("delegation/")) if (value.from !== "owner" && !now.has(value.from)) await drop(value);
     for (const p of people) await rows.put("person/" + p.did, { did: p.did, methods: p.methods || [], quota: p.quota || null, tags: p.tags || [] });
     return c.json({ people: people.length });
   });
@@ -24982,17 +25004,29 @@ ${deployed.join("\n\n")}
       if (!route || !routed(route) || route.role === "member") return fail(c, 404, "NotFound", name);
       return forward(route, c, NS + what + "?worker=" + encodeURIComponent(name) + (c.req.query("part") === "reference" ? "&part=reference" : ""));
     });
-  // Making a delegation. Only a Worker holder so far, and it has no caps: a secret holder and a DID holder are the
-  // kernel's tokens and grants until they move here.
+  // Making a delegation. The holder is a Worker the owner deployed, or a secret that this answers once: a token.
+  // A secret is the owner's to make so far, and it alone has caps. A DID holder is the kernel's grant until that moves here.
+  const CAPS = ["session", "deploy", "unattended"];
+  const drop = async (d) => {
+    await settings.delete("delegation/" + d.id);
+    if (d.holder && d.holder.secret) await settings.delete("holder/secret/" + d.holder.secret);
+  };
   app.post(NS + "delegation.create", inPerson, async (c) => {
     const from = c.get("who").caller, b = (await c.req.json().catch(() => null)) || {};
-    const { name, holder, caps = [], until = null, daily = null, note = "" } = b, scope = scoped(b.scope);
+    const { name, holder, caps = [], until = null, daily = null, note = "" } = b;
+    const one = holder && typeof holder === "object" && Object.keys(holder).length === 1, secretHeld = !!one && holder.secret === true;
+    // A token may name no method: a sign-in link made only to deploy.
+    const scope = secretHeld && Array.isArray(b.scope) && !b.scope.length ? [] : scoped(b.scope);
     if (typeof name !== "string" || !/^[a-z0-9-]{1,40}$/.test(name)) return fail(c, 400, "InvalidRequest", "name is a-z, 0-9 and -, 1 to 40 characters");
-    if (!holder || typeof holder.worker !== "string" || Object.keys(holder).length !== 1) return fail(c, 400, "InvalidRequest", "holder is { worker: NAME }");
+    if (!secretHeld && !(one && typeof holder.worker === "string")) return fail(c, 400, "InvalidRequest", "holder is { worker: NAME } or { secret: true }");
+    if (secretHeld && from !== "owner") return fail(c, 403, "Forbidden", "a secret holder is the owner's to make");
     // A delegation names a Worker and not its code, so the Worker is one the owner deploys.
-    const route = await rows.get("route/" + holder.worker);
-    if (!route || !["recipe", "system"].includes(route.role)) return fail(c, 400, "InvalidRequest", `${holder.worker} is not a service the owner deployed`);
-    if (!Array.isArray(caps) || caps.length) return fail(c, 400, "InvalidRequest", "a Worker holder has no caps");
+    const route = secretHeld ? null : await rows.get("route/" + holder.worker);
+    if (!secretHeld && (!route || !["recipe", "system"].includes(route.role))) return fail(c, 400, "InvalidRequest", `${holder.worker} is not a service the owner deployed`);
+    if (!Array.isArray(caps) || caps.some((x) => !CAPS.includes(x)) || new Set(caps).size !== caps.length) return fail(c, 400, "InvalidRequest", "caps are session, deploy and unattended");
+    if (caps.length && !secretHeld) return fail(c, 400, "InvalidRequest", "a Worker holder has no caps");
+    // Deploying with nobody asked can deploy a kernel, so it is the owner in effect and is said to be: both other caps.
+    if (caps.includes("unattended") && !(caps.includes("deploy") && caps.includes("session"))) return fail(c, 400, "InvalidRequest", "unattended goes with deploy and session");
     if (!scope) return fail(c, 400, "InvalidRequest", "scope is 1 to 50 method names; a prefix ends .* or /*, and * is every method");
     const no = scope.find(neverHeld);
     if (no) return fail(c, 400, "InvalidRequest", `${no} is not reached under a delegation`);
@@ -25004,11 +25038,17 @@ ${deployed.join("\n\n")}
     if (until !== null && !(Number.isInteger(until) && until > clock())) return fail(c, 400, "InvalidRequest", "until is a time in ms after now, or null");
     if (daily !== null && !(typeof daily === "number" && Number.isFinite(daily) && daily >= 0)) return fail(c, 400, "InvalidRequest", "daily is US dollars a UTC day, or null");
     if (typeof note !== "string" || note.length > 300) return fail(c, 400, "InvalidRequest", "note is text, at most 300 characters");
-    if ((await rows.list("delegation/")).some((r) => r.value.from === from && r.value.name === name)) return fail(c, 400, "InvalidRequest", `a delegation named ${name} exists; revoke it first`);
-    const id = [...crypto.getRandomValues(new Uint8Array(6))].map((x) => x.toString(16).padStart(2, "0")).join("");
-    const d = { id, name, from, holder: { worker: holder.worker }, scope, caps: [], until, daily, parent: null, note, created: Date.now(), by: c.get("who").via };
+    // What has ended goes when its maker makes another.
+    const mine = (await rows.list("delegation/")).map((r) => r.value).filter((o) => o.from === from), live = [];
+    for (const o of mine) o.until && o.until <= clock() ? await drop(o) : live.push(o.name);
+    if (live.includes(name)) return fail(c, 400, "InvalidRequest", `a delegation named ${name} exists; revoke it first`);
+    const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((x) => x.toString(16).padStart(2, "0")).join("");
+    const id = hex(6), secret = secretHeld ? hex(32) : null;
+    const d = { id, name, from, holder: secretHeld ? { secret: await sha256(secret) } : { worker: holder.worker }, scope, caps, until, daily, parent: null, note, created: Date.now(), by: c.get("who").via };
     await settings.put("delegation/" + id, d);
-    return c.json(d);
+    if (secret) await settings.put("holder/secret/" + d.holder.secret, id);
+    // The secret is in this answer and nowhere else: the row has its hash.
+    return c.json(secret ? { ...d, secret } : d);
   });
   // The owner reads every delegation, a member their own. spentToday: what was charged under it this UTC day.
   app.get(NS + "delegation.list", inPerson, async (c) => {
@@ -25020,8 +25060,17 @@ ${deployed.join("\n\n")}
     const me = c.get("who").caller, { id } = (await c.req.json().catch(() => null)) || {};
     const d = typeof id === "string" && /^[0-9a-f]{12}$/.test(id) ? await rows.get("delegation/" + id) : null;
     if (!d || (me !== "owner" && d.from !== me)) return c.json({ revoked: false });
-    await settings.delete("delegation/" + id);
+    await drop(d);
     return c.json({ revoked: true, id });
+  });
+  // The kernel asks whose secret it was sent: it needs the scope for the routes it answers itself and the caps for
+  // infra.*. The row is found by the hash, and the answer has no secret in it.
+  app.post(NS + "delegation.resolve", async (c) => {
+    const w = c.get("who"), { sha256: hash } = (await c.req.json().catch(() => null)) || {};
+    if (!(w.kernel && w.caller === "kernel")) return fail(c, 401, "AuthRequired", "the kernel");
+    const id = typeof hash === "string" && /^[0-9a-f]{64}$/.test(hash) ? await settings.get("holder/secret/" + hash) : null;
+    const d = id ? await settings.get("delegation/" + id) : null;
+    return c.json({ delegation: d && d.holder.secret === hash ? d : null });
   });
   app.all("*", async (c) => {
     const url = new URL(c.req.url), who = c.get("who");
@@ -25931,6 +25980,52 @@ const _braincore_test_a_delegation_is_made_in_a_persons_own_session_for_a_worker
   expect([(await rig.owner("delegation.revoke", { id: hers })).data, (await rig.owner("delegation.revoke", { id: "nope" })).data, await list(ada)]).toEqual([{ revoked: true, id: hers }, { revoked: false }, []]);
   return "made by a session, for a system Worker";
 };
+const _braincore_test_a_token_is_a_delegation_with_a_secret_holder_that_the_kernel_resolves = async function _test_a_token_is_a_delegation_with_a_secret_holder_that_the_kernel_resolves(Response,coreRig,sha256,expect) {
+  const heard = [], B = "com.lopecode.brain.", ADA = "did:plc:ada";
+  const hear = async (request) => {
+    if (request.url.endsWith(".getInfo")) return Response.json({ name: "brain-x-shop", hash: "h", calls: [] });
+    heard.push(Object.fromEntries(["caller", "via", "tab", "holder", "origin", "origin-tab", "hops"].map((h) => [h, request.headers.get("x-brain-" + h)])));
+    return Response.json({ ok: true });
+  };
+  const config = {}, rig = await coreRig({ config, workers: { shop: hear } }), kernel = rig.as("kernel", "");
+  await rig.deployer("service.register", { worker: "brain-x-shop", role: "recipe", paths: [], secrets: [], hash: "h", keyHash: await sha256("shop-key"), methods: { [B + "shop.receive"]: { type: "procedure", who: "owner" }, [B + "shop.tab"]: { type: "procedure", who: "anyone", allow: "caller.session" }, [B + "shop.paid"]: { type: "procedure", who: "owner", price: "0.04" } } });
+  await kernel("people.sync", { people: [{ did: ADA, methods: [] }] });
+  const make = (body) => rig.owner("delegation.create", { holder: { secret: true }, ...body });
+  // The secret is answered once. The row has its hash, and no list has the secret.
+  const t = (await make({ name: "laptop", scope: ["shop.receive", "shop.tab", "shop.paid"], daily: 0.05 })).data;
+  expect([/^[0-9a-f]{64}$/.test(t.secret), t.holder, t.caps, t.from]).toEqual([true, { secret: await sha256(t.secret) }, [], "owner"]);
+  expect(JSON.stringify([(await rig.owner("delegation.list")).data, [...rig.sim.rows]])).not.toContain(t.secret);
+  // The kernel asks whose secret it was sent. Nobody else does, and a hash nobody made gives nothing.
+  expect((await kernel("delegation.resolve", { sha256: t.holder.secret })).data.delegation).toMatchObject({ id: t.id, name: "laptop", from: "owner", scope: [B + "shop.receive", B + "shop.tab", B + "shop.paid"] });
+  expect([(await rig.owner("delegation.resolve", { sha256: t.holder.secret })).status, (await rig.worker("delegation.resolve", { sha256: t.holder.secret })).status, (await kernel("delegation.resolve", { sha256: "0".repeat(64) })).data, (await kernel("delegation.resolve", {})).data]).toEqual([401, 401, { delegation: null }, { delegation: null }]);
+  // The kernel passes the call on with the id. It is the owner's, and not in their tab, whatever else the kernel said.
+  const sent = (id) => (m, body) => rig.as("token:laptop", "session")(m, body, { "x-brain-delegation": id });
+  expect((await sent(t.id)("shop.receive", {})).status).toBe(200);
+  expect(heard.at(-1)).toMatchObject({ caller: "owner", via: "delegation:" + t.id, tab: "0", holder: "secret", origin: "owner", "origin-tab": "0" });
+  // Not the session guard of a rule or of the core, not out of its scope, and never a delegation method.
+  expect([(await sent(t.id)("shop.tab", {})).status, (await sent(t.id)("rule.list")).status, (await sent(t.id)("delegation.list")).status, (await sent("0123456789ab")("shop.receive", {})).status]).toEqual([401, 403, 403, 401]);
+  // Only the kernel's key sends the header: from a Worker it is not read, and the Worker is itself.
+  expect((await rig.send("https://core.internal", { "x-brain-key": "echo-key", "x-brain-delegation": t.id })("shop.receive", {})).status).toBe(401);
+  // The owner pays, and daily is the most it spends in a day.
+  expect([(await sent(t.id)("shop.paid", {})).status, (await sent(t.id)("shop.paid", {})).status, (await rig.owner("quota.list")).data.accounts.map((a) => [a.who, a.spent])]).toEqual([200, 402, [["owner", 0.04]]]);
+  // Caps are a secret holder's. With session it is the owner's own tab. unattended goes with the other two.
+  expect([(await make({ name: "x", scope: ["*"], caps: ["unattended", "deploy"] })).status, (await make({ name: "x", scope: ["*"], caps: ["root"] })).status, (await make({ name: "x", scope: ["*"], caps: ["deploy", "deploy"] })).status, (await rig.owner("delegation.create", { name: "x", holder: { worker: "brain-x-echo" }, scope: ["*"], caps: ["session"] })).status, (await make({ name: "x", scope: ["secret.get"] })).status, (await rig.as(ADA)("delegation.create", { name: "x", holder: { secret: true }, scope: ["static.get"] })).status]).toEqual([400, 400, 400, 400, 400, 403]);
+  const button = (await make({ name: "button", scope: ["shop.*"], caps: ["deploy", "unattended", "session"], until: Date.now() + 3600000, note: "sign-in link" })).data;
+  expect([(await sent(button.id)("shop.tab", {})).status, heard.at(-1).tab, heard.at(-1)["origin-tab"], (await sent(button.id)("delegation.create", { name: "y", holder: { secret: true }, scope: ["*"] })).status]).toEqual([200, "1", "1", 403]);
+  // A link made only to deploy names no method, so it reaches none here.
+  const ship = (await make({ name: "ship", scope: [], caps: ["deploy"] })).data;
+  expect([ship.scope, (await sent(ship.id)("shop.receive", {})).status]).toEqual([[], 403]);
+  // A name is one of the maker's, until it is revoked. Revoked, the hash finds nothing.
+  expect((await make({ name: "laptop", scope: ["*"] })).status).toBe(400);
+  expect((await rig.owner("delegation.revoke", { id: t.id })).data).toEqual({ revoked: true, id: t.id });
+  expect([(await kernel("delegation.resolve", { sha256: t.holder.secret })).data, (await sent(t.id)("shop.receive", {})).status, (await make({ name: "laptop", scope: ["*"] })).status]).toEqual([{ delegation: null }, 401, 200]);
+  // Ended, it is refused, and it goes when the owner makes another.
+  config.clockSkewMs = 2 * 3600000;
+  expect((await sent(button.id)("shop.receive", {})).status).toBe(403);
+  await make({ name: "next", scope: ["*"] });
+  expect([(await rig.owner("delegation.list")).data.delegations.map((d) => d.name).sort(), (await kernel("delegation.resolve", { sha256: button.holder.secret })).data]).toEqual([["laptop", "next", "ship"], { delegation: null }]);
+  return "a secret holder: resolved by the kernel only, the owner's call, the owner's tab with the cap session";
+};
 const _braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab = async function _test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab(Response,coreRig,sha256,expect) {
   const heard = [], B = "com.lopecode.brain.", ADA = "did:plc:ada";
   const hear = (worker) => async (request) => {
@@ -26009,7 +26104,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braincore_anon_08b506eddd", null, ["md"], _braincore_anon_08b506eddd);
+  $def("_braincore_anon_a89addba30", null, ["md"], _braincore_anon_a89addba30);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
   $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","matches","may","neverHeld","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","scoped","MEMBER","decide"], _braincore_coreApp);
@@ -26049,6 +26144,7 @@ export default function define(runtime, observer) {
   $def("_braincore_test_a_posted_body_reaches_the_service_whole", "test_a_posted_body_reaches_the_service_whole", ["coreRig","expect"], _braincore_test_a_posted_body_reaches_the_service_whole);
   $def("_braincore_test_the_log_line_of_a_priced_call_has_its_price", "test_the_log_line_of_a_priced_call_has_its_price", ["coreRig","logged","expect"], _braincore_test_the_log_line_of_a_priced_call_has_its_price);
   $def("_braincore_test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed", "test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed", ["coreRig","expect"], _braincore_test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed);
+  $def("_braincore_test_a_token_is_a_delegation_with_a_secret_holder_that_the_kernel_resolves", "test_a_token_is_a_delegation_with_a_secret_holder_that_the_kernel_resolves", ["Response","coreRig","sha256","expect"], _braincore_test_a_token_is_a_delegation_with_a_secret_holder_that_the_kernel_resolves);
   $def("_braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab", "test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab", ["Response","coreRig","sha256","expect"], _braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
@@ -26091,7 +26187,7 @@ var Es=Object.defineProperty;var As=(e)=>e;function Ss(e,t){this[e]=As.bind(null
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainkernel_anon_d29fcff05b = function _anonymous(md) {return (md`# brain-kernel
+const _brainkernel_anon_d09e7ec3b1 = function _anonymous(md) {return (md`# brain-kernel
 
 The Worker at the Brain's address. It serves the notebook, signs people in with atproto, works out who is calling, and forwards everything else to the core with that answer attached.
 
@@ -26127,6 +26223,8 @@ A person is an atproto account, named by its DID. There are two roles. The **own
 **Linking.** A channel sends a stranger \`https://HOST/link?channel=NAME&code=CODE\`. The page asks them to sign in with atproto, shows the address the code stands for, and binds it to the signed-in DID when they press Link. The kernel learns the address by calling the channel's \`NAME.claim\` with the code; the answer is taken only from the Worker \`brain-x-NAME\`. Linking does not make anyone a member. When the signed-in DID is the owner, Link also asks for the last 4 characters of the address, because whoever writes from it is then answered as the owner. The page refuses to be shown in a frame.
 
 **Sign-in links** (added 2026-10-09). For a program with no browser, such as Claude Code on the web. \`token.link\` (procedure, owner's session) takes \`{ name, methods, minutes, hours, deploy, unattended }\` and answers \`{ name, deploy, unattended, link, until }\`; \`minutes\` (1 to 480, 480 if left out; 10 until 2026-10-10, which a session that first had to have its network opened ran past) is how long the link is good, \`hours\` (1 to 24, 8 if left out) how long its token lasts. The link is \`/auth/link?code=…\`. A GET of it answers text that says what to do and spends nothing, so a preview of a pasted link does not use it. The first POST answers \`{ name, token, methods, until, deploy, unattended }\` and deletes the link; a second answers 401. The token is one as \`token.create\` makes, with an end: it may not name \`infra.*\`, \`secret.*\`, \`token.*\`, \`grant.*\` or \`people.*\`, and \`token.list\` gives it with \`by: "link"\` until it ends. \`token.revoke\` with \`{ name }\` ends the token early, and deletes a link of that name nobody has used. A link is refused a name that a token or another link has.
+
+**A token is a delegation** (2026-10-10). \`token.create\`, and the POST of a sign-in link, make a delegation with a secret holder in the core (\`delegation.create\`), and the kernel keeps no row for it. \`token.list\` and \`token.revoke\` read and end those and the tokens made before, which are rows here and work as they did. A call with such a token is sent to the core with the delegation's id, and there it is the owner's call: the owner's rules and the owner's allowance, which \`daily\` in \`token.create\` (US dollars a UTC day) caps. It is not the owner's own tab, so what it makes in a store is kept under \`d:<id>\` and not under \`token:NAME\`; a link made with \`unattended\` is the owner's tab, as before. A token ends within 5 s of \`token.revoke\`, the time a core instance remembers a row.
 
 **Lists of methods** (2026-10-10). In \`token.create\` and \`token.link\` an entry of \`methods\` is a whole name or a prefix that ends \`.*\`: \`browser.*\` is every method of that service, \`*\` every method of this Brain. A name may go on after a \`/\` (\`ai.v1/chat/completions\`), and \`ai.v1/*\` is every method under \`ai.v1/\` and not \`ai.run\` (2026-10-10: the first shape check had refused every name with a \`/\`). No prefix reaches a name a token may not have (\`infra\`, \`secret\`, \`token\`, \`grant\`, \`people\`), whether it goes on with a \`.\` or a \`/\`. A grant to a DID still names whole methods.
 
@@ -26264,7 +26362,7 @@ const _brainkernel_verifyServiceJwt = function _verifyServiceJwt(atcute) {return
   const ok = await atcute.verifySig(atcute.parsePublicMultikey(vm.publicKeyMultibase), b64u(s), new TextEncoder().encode(h + "." + p), { allowMalleableSig: true });
   return ok ? { iss: claims.iss.split("#")[0] } : { error: "BadJwtSignature", message: "signature does not verify" };
 });};
-const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,rows,sessionToken,turnToken,portalToken,verifyServiceJwt,sha256,matches,may,atcute,neverHeld,core,Request,deployer) {
+const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,rows,sessionToken,turnToken,portalToken,verifyServiceJwt,sha256,core,Request,matches,may,atcute,neverHeld,deployer) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.";
   // A body of a known small size is read before it is sent on: a stream the core does not read to its end throws
@@ -26333,10 +26431,24 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
       const v = await verifyServiceJwt(bearer, nsid, "did:web:" + config.host, async (did) => did === config.owner || !!(await rows.get("member/" + did)) || !!(await rows.get("grant/" + did)));
       return v.error ? { refused: v } : { caller: v.iss === config.owner ? "owner" : v.iss, via: "jwt", did: v.iss };
     }
-    const token = await rows.get("token/" + (await sha256(bearer)));
+    const hash = await sha256(bearer), token = await rows.get("token/" + hash);
     if (token && token.until < Date.now()) return { refused: { error: "AuthRequired", message: "this token has expired" } };
-    return token ? { caller: "token:" + token.name, via: "token", methods: token.methods, deploy: token.deploy === true, unattended: token.unattended === true } : { refused: { error: "AuthRequired", message: "unknown token" } };
+    if (token) return { caller: "token:" + token.name, via: "token", methods: token.methods, deploy: token.deploy === true, unattended: token.unattended === true };
+    // A token made from 2026-10-10 is a delegation that the core keeps, found by the hash. Here it is read as a
+    // token is: its scope is the list, two of its caps are deploy and unattended. The core is sent its id.
+    const d = await resolve(hash);
+    if (d && d.until && d.until < Date.now()) return { refused: { error: "AuthRequired", message: "this token has expired" } };
+    return d ? { caller: "token:" + d.name, via: "token", methods: d.scope, deploy: d.caps.includes("deploy"), unattended: d.caps.includes("unattended"), delegation: d.id } : { refused: { error: "AuthRequired", message: "unknown token" } };
   };
+  // Calls the kernel makes to the core's delegation methods: as itself to ask whose secret a hash is, and as the
+  // owner's session for a route below that its own session guard has passed, or for a link the owner's session made.
+  const coreCall = async (headers, method, body) => {
+    const r = await core.fetch(new Request("https://core.internal/xrpc/com.lopecode.brain." + method, { method: body === undefined ? "GET" : "POST", headers: { "content-type": "application/json", ...headers }, body: body === undefined ? undefined : JSON.stringify(body) })).catch(() => null);
+    return { status: r ? r.status : 502, data: r ? await r.json().catch(() => null) : null };
+  };
+  const resolve = async (hash) => ((await coreCall({ "x-brain-caller": "kernel" }, "delegation.resolve", { sha256: hash })).data || {}).delegation || null;
+  const asOwnerSession = (method, body) => coreCall({ "x-brain-caller": "owner", "x-brain-via": "session" }, method, body);
+  const delegations = async () => ((await asOwnerSession("delegation.list")).data || {}).delegations || [];
   app.use("*", async (c, next) => {
     const path = new URL(c.req.url).pathname;
     const nsid = path.startsWith("/xrpc/") ? path.slice("/xrpc/".length) : null;
@@ -26477,16 +26589,20 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   // A name may go on in segments after a / (ai.v1/chat/completions); "ai.v1/*" is every method under ai.v1/.
   const listed = (m) => /^[A-Za-z0-9]+(\.[A-Za-z0-9]+)*(\/[A-Za-z0-9]+)*([./]\*)?$/.test(m);
   const names = (methods, nsid) => !never(nsid) && matches(methods, nsid);
-  app.get(NS + "token.list", session, async (c) => c.json({ tokens: (await rows.list("token/")).map((r) => r.value).filter((t) => !(t.until < Date.now())) }));
+  // A token made before 2026-10-10 is a row here. One made since is a delegation with a secret holder, in the core.
+  const LINK = "sign-in link";
+  const shown = (d) => ({ name: d.name, methods: d.scope, created: d.created, id: d.id, ...(d.until ? { until: d.until } : {}), ...(d.note === LINK ? { by: "link" } : {}), ...(d.caps.includes("deploy") ? { deploy: true } : {}), ...(d.caps.includes("unattended") ? { unattended: true } : {}), ...(d.daily === null ? {} : { daily: d.daily }) });
+  const tokens = async () => (await delegations()).filter((d) => d.holder && d.holder.secret);
+  app.get(NS + "token.list", session, async (c) => c.json({ tokens: [...(await rows.list("token/")).map((r) => r.value), ...(await tokens()).map(shown)].filter((t) => !(t.until < Date.now())) }));
   app.post(NS + "token.create", session, async (c) => {
-    const { name, methods = [] } = await c.req.json();
+    const { name, methods = [], daily = null } = await c.req.json();
     const named = methods.map(full);
     if (!/^[a-z0-9-]{1,40}$/.test(name || "")) return fail(c, 400, "InvalidRequest", "name is lower case letters, digits and -");
     if (!named.every(listed)) return fail(c, 400, "InvalidRequest", "a method is a name, or a prefix that ends .* or /* (browser.*, ai.v1/*), or *");
     if (named.some(never)) return fail(c, 400, "InvalidRequest", "a token cannot name infra, secret, token, grant, people or delegation methods");
-    const token = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
-    await rows.put("token/" + (await sha256(token)), { name, methods: named, created: Date.now() });
-    return c.json({ name, token });
+    const made = await asOwnerSession("delegation.create", { name, holder: { secret: true }, scope: named, daily });
+    if (made.status !== 200) return c.json(made.data || { error: "UpstreamFailure", message: "the core did not answer" }, made.status);
+    return c.json({ name, token: made.data.secret });
   });
   // A sign-in link, for a program with no browser (Claude Code on the web). The owner makes one and pastes it;
   // whoever POSTs it first is given a token for the methods it names, and the link is gone. A GET explains and
@@ -26504,6 +26620,9 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
     // What has ended is deleted here: links nobody used, and the tokens of links.
     const live = [];
     for (const r of [...(await rows.list("link/")), ...(await rows.list("token/"))]) r.value.until < Date.now() ? await rows.delete(r.key) : live.push(r.value.name);
+    // The core has one name for each of the owner's delegations. Found here, the link is not made; found when the
+    // link is used, the link would be spent on nothing.
+    for (const d of await delegations()) if (!(d.until && d.until < Date.now())) live.push(d.name);
     if (live.includes(name)) return fail(c, 400, "InvalidRequest", `a token or a link is named ${name}; token.revoke ends it`);
     const code = hex(), until = Date.now() + minutes * 60000;
     await rows.put("link/" + (await sha256(code)), { name, methods: named, until, hours, deploy, unattended });
@@ -26536,15 +26655,22 @@ other address): how to call, and what this Brain is made of.
     const made = await rows.get(key);
     // The delete says whether this caller is the one that spent it.
     if (!made || !(await rows.delete(key)) || made.until < Date.now()) return fail(c, 401, "AuthRequired", "this link was used, has expired or is not this Brain's");
-    const token = hex(), until = Date.now() + made.hours * 3600000;
-    await rows.put("token/" + (await sha256(token)), { name: made.name, methods: made.methods, created: Date.now(), until, by: "link", ...(made.deploy ? { deploy: true } : {}), ...(made.unattended ? { unattended: true } : {}) });
-    return c.json({ name: made.name, token, methods: made.methods, until, deploy: !!made.deploy, unattended: !!made.unattended });
+    // The owner's session made the link, so the delegation is made as the owner's session. A token that deploys
+    // with nobody asked is the owner in effect, and has the cap that says so: session.
+    const until = Date.now() + made.hours * 3600000, caps = made.unattended ? ["deploy", "unattended", "session"] : made.deploy ? ["deploy"] : [];
+    const got = await asOwnerSession("delegation.create", { name: made.name, holder: { secret: true }, scope: made.methods, caps, until, note: LINK });
+    if (got.status !== 200) {
+      await rows.put(key, made);
+      return fail(c, 502, "UpstreamFailure", "no token was made and the link is not spent: " + ((got.data && got.data.message) || got.status));
+    }
+    return c.json({ name: made.name, token: got.data.secret, methods: made.methods, until, deploy: !!made.deploy, unattended: !!made.unattended });
   });
   app.post(NS + "token.revoke", session, async (c) => {
     const { name } = await c.req.json();
     let revoked = 0;
     // A link of that name that nobody has used goes too.
     for (const r of [...(await rows.list("token/")), ...(await rows.list("link/"))]) if (r.value.name === name) revoked += (await rows.delete(r.key)) ? 1 : 0;
+    for (const d of await tokens()) if (d.name === name) revoked += ((await asOwnerSession("delegation.revoke", { id: d.id })).data || {}).revoked ? 1 : 0;
     return c.json({ revoked });
   });
   app.get(NS + "grant.list", session, async (c) => c.json({ grants: (await rows.list("grant/")).map((r) => r.value) }));
@@ -26583,6 +26709,8 @@ other address): how to call, and what this Brain is made of.
     const asOwner = who.via === "token" && who.unattended;
     headers.set("x-brain-caller", asOwner ? "owner" : who.caller);
     headers.set("x-brain-via", asOwner ? "session" : who.via);
+    // A delegation's id. The core reads the row and says who the call is by; what is set above is for a core from before it did.
+    if (who.delegation) headers.set("x-brain-delegation", who.delegation);
     if (asOwner) console.log(JSON.stringify({ event: "call.by.link", token: who.caller, method: (c.get("nsid") || url.pathname).replace("com.lopecode.brain.", ""), at: Date.now() }));
     // The ray Cloudflare gave this call. The core writes it in its log line, and a caller already has it as cf-ray.
     if (c.req.header("cf-ray")) headers.set("x-brain-ray", c.req.header("cf-ray"));
@@ -26790,17 +26918,33 @@ run();`;
 const _brainkernel_anon_8016cc4bc1 = function _anonymous(md) {return (md`## Tests
 
 The kernel runs under \`simulate\` with the core and the deployer replaced by recorders. Sign-in itself needs a PDS and is checked on a deployed kernel.`);};
-const _brainkernel_kernelRig = function _kernelRig(Response,simulate,kernel_service,sessionToken) {return (async ({ core, secrets = { SESSION_KEY: "cookie-key", COOKIE_KEY: "cookie-key" } } = {}) => {
+const _brainkernel_kernelRig = function _kernelRig(Response,sha256,simulate,kernel_service,sessionToken) {return (async ({ core, secrets = { SESSION_KEY: "cookie-key", COOKIE_KEY: "cookie-key" } } = {}) => {
   const seen = [], toDeployer = [];
   const record = (list) => async (request) => {
     const body = ["GET", "HEAD"].includes(request.method) ? null : new TextDecoder().decode(await request.arrayBuffer());
     list.push({ url: request.url, method: request.method, headers: Object.fromEntries(request.headers), body });
     return request.url.endsWith("/go") ? new Response(null, { status: 302, headers: { location: "https://example.com/" } }) : Response.json({ ok: true });
   };
+  // The core's delegation methods, as far as the kernel uses them: a secret holder made by the owner's session,
+  // found by its hash by the kernel. These calls are not in `seen`.
+  const held = new Map(), inner = core || record(seen), hexOf = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const withDelegations = async (request) => {
+    const m = new URL(request.url).pathname.split("com.lopecode.brain.delegation.")[1], h = request.headers;
+    // Anyone else's call is passed on like any other: a member's own delegation.list.
+    if (!m || !(h.get("x-brain-caller") === "kernel" || (h.get("x-brain-caller") === "owner" && h.get("x-brain-via") === "session"))) return inner(request);
+    const b = request.method === "POST" ? await request.json() : {};
+    if (m === "resolve") return Response.json({ delegation: [...held.values()].find((d) => d.holder.secret === b.sha256) || null });
+    if (m === "list") return Response.json({ delegations: [...held.values()] });
+    if (m === "revoke") return Response.json({ revoked: held.delete(b.id) });
+    if ([...held.values()].some((d) => d.name === b.name && !(d.until && d.until < Date.now()))) return Response.json({ error: "InvalidRequest", message: `a delegation named ${b.name} exists; revoke it first` }, { status: 400 });
+    const secret = hexOf(32), d = { id: hexOf(6), name: b.name, from: "owner", holder: { secret: await sha256(secret) }, scope: b.scope, caps: b.caps || [], until: b.until ?? null, daily: b.daily ?? null, note: b.note || "", created: Date.now() };
+    held.set(d.id, d);
+    return Response.json({ ...d, secret });
+  };
   const sim = await simulate(kernel_service, {
     secrets: { ...secrets, BRAIN_KEY: "kernel-key" },
     config: { host: "cb.sub.workers.dev", owner: "did:plc:owner", deployer: "https://cb-deployer.sub.workers.dev" },
-    core: core || record(seen),
+    core: withDelegations,
     deployer: record(toDeployer)
   });
   const B = "https://cb.sub.workers.dev";
@@ -26817,7 +26961,7 @@ const _brainkernel_kernelRig = function _kernelRig(Response,simulate,kernel_serv
     try { data = JSON.parse(text); } catch {}
     return { status: r.status, data, headers: r.headers };
   };
-  return { sim, seen, toDeployer, call, owner: await sessionToken.make("cookie-key", "did:plc:owner"), other: await sessionToken.make("cookie-key", "did:plc:other") };
+  return { sim, seen, toDeployer, held, call, owner: await sessionToken.make("cookie-key", "did:plc:owner"), other: await sessionToken.make("cookie-key", "did:plc:other") };
 });};
 const _brainkernel_test_the_signing_key_is_read_under_either_name = async function _test_the_signing_key_is_read_under_either_name(sessionToken,expect,kernelRig,portalToken,kernel_service) {
   const status = async (rig, token) => (await rig.call("/auth/session", { session: token })).status;
@@ -26897,14 +27041,15 @@ const _brainkernel_test_redirect_from_a_recipe_reaches_the_client = async functi
   expect(r.headers.get("location")).toBe("https://example.com/");
   return "302";
 };
-const _brainkernel_test_tokens_reach_only_their_methods = async function _test_tokens_reach_only_their_methods(kernelRig,expect) {
+const _brainkernel_test_tokens_reach_only_their_methods = async function _test_tokens_reach_only_their_methods(kernelRig,expect,sha256) {
   const rig = await kernelRig();
   expect((await rig.call("token.create", { body: { name: "laptop", methods: ["proxy.fetch"] } })).status).toBe(401);
   const made = await rig.call("token.create", { session: rig.owner, body: { name: "laptop", methods: ["proxy.fetch"] } });
   expect(made.data.token).toMatch(/^[0-9a-f]{64}$/);
   expect(JSON.stringify([...rig.sim.rows])).not.toContain(made.data.token);
   expect((await rig.call("proxy.fetch", { bearer: made.data.token, body: {} })).status).toBe(200);
-  expect(rig.seen[0].headers["x-brain-caller"]).toBe("token:laptop");
+  // The core is sent the delegation's id, and from the row says who the call is by.
+  expect([rig.seen[0].headers["x-brain-caller"], rig.seen[0].headers["x-brain-delegation"], rig.held.size]).toEqual(["token:laptop", [...rig.held.values()][0].id, 1]);
   // Another origin can read the answer to a call that carried a token.
   expect((await rig.call("proxy.fetch", { bearer: made.data.token, body: {} })).headers.get("access-control-allow-origin")).toBe("*");
   expect((await rig.call("inbox.list", { bearer: made.data.token })).status).toBe(403);
@@ -26938,13 +27083,12 @@ const _brainkernel_test_tokens_reach_only_their_methods = async function _test_t
   expect(await listed()).toEqual([["laptop", null], ["web", "link"]]);
   expect(Math.round((web.until - Date.now()) / 60000)).toBe(60);
   // The token ends by itself, and so does a link nobody used.
-  for (const [k, v] of rig.sim.rows) if (v && v.by === "link") rig.sim.rows.set(k, { ...v, until: Date.now() - 1 });
+  for (const d of rig.held.values()) if (d.note === "sign-in link") d.until = Date.now() - 1;
   expect((await rig.call("proxy.fetch", { bearer: web.token, body: {} })).data.message).toBe("this token has expired");
   expect(await listed()).toEqual([["laptop", null]]);
   const madeLate = (await rig.call("token.link", { session: rig.owner, body: { name: "late", methods: [] } })).data;
   const late = madeLate.link;
-  // Making it deleted the ended token. Left alone, a link is good for 8 hours.
-  expect([...rig.sim.rows.values()].filter((v) => v && v.by === "link")).toEqual([]);
+  // Left alone, a link is good for 8 hours.
   expect(Math.round((madeLate.until - Date.now()) / 60000)).toBe(480);
   for (const [k, v] of rig.sim.rows) if (v && v.name === "late") rig.sim.rows.set(k, { ...v, until: Date.now() - 1 });
   expect((await rig.call(late.slice(late.indexOf("/auth/link")), { method: "POST" })).status).toBe(401);
@@ -27003,6 +27147,16 @@ const _brainkernel_test_tokens_reach_only_their_methods = async function _test_t
   expect((await rig.call("proxy.fetch", { bearer: star, body: {} })).status).toBe(200);
   expect(rig.seen.at(-1).headers["x-brain-caller"]).toBe("token:star");
   expect((await rig.call("proxyx.fetch", { bearer: star, body: {} })).status).toBe(403);
+  // A link whose name a token took since it was made: no token is made, and the link is not spent.
+  const twice = (await rig.call("token.link", { session: rig.owner, body: { name: "twice", methods: [] } })).data.link;
+  await rig.call("token.create", { session: rig.owner, body: { name: "twice", methods: [] } });
+  const links = () => [...rig.sim.rows.keys()].filter((k) => k.startsWith("link/")).length;
+  expect([(await rig.call(twice.slice(twice.indexOf("/auth/link")), { method: "POST" })).status, links(), (await rig.call("token.revoke", { session: rig.owner, body: { name: "twice" } })).data, links()]).toEqual([502, 1, { revoked: 2 }, 0]);
+  // A token made before 2026-10-10 is a row of the kernel, and works as it did: the core is sent no id.
+  rig.sim.rows.set("token/" + (await sha256("made-before")), { name: "old", methods: ["com.lopecode.brain.proxy.fetch"], created: 1 });
+  expect([(await rig.call("proxy.fetch", { bearer: "made-before", body: {} })).status, rig.seen.at(-1).headers["x-brain-caller"], rig.seen.at(-1).headers["x-brain-delegation"], (await rig.call("inbox.list", { bearer: "made-before" })).status]).toEqual([200, "token:old", undefined, 403]);
+  expect((await listed()).map((t) => t[0])).toContain("old");
+  expect([(await rig.call("token.revoke", { session: rig.owner, body: { name: "old" } })).data, (await rig.call("proxy.fetch", { bearer: "made-before", body: {} })).status]).toEqual([{ revoked: 1 }, 401]);
   const every = (await rig.call("token.create", { session: rig.owner, body: { name: "every", methods: ["*"] } })).data.token;
   expect((await rig.call("inbox.list", { bearer: every })).status).toBe(200);
   for (const m of ["secret.get", "token.list", "infra.getState", "people.list"]) expect((await rig.call(m, { bearer: every })).status).toBe(403);
@@ -27591,7 +27745,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainkernel_anon_d29fcff05b", null, ["md"], _brainkernel_anon_d29fcff05b);
+  $def("_brainkernel_anon_d09e7ec3b1", null, ["md"], _brainkernel_anon_d09e7ec3b1);
   $def("_brainkernel_kernel_service", "kernel_service", ["cloudflare","kernelApp"], _brainkernel_kernel_service);
   $def("_brainkernel_kernel_announce", "kernel_announce", ["plugins","kernel_service","invalidation"], _brainkernel_kernel_announce);
   $def("_brainkernel_atcute", "atcute", ["library","FileAttachment"], _brainkernel_atcute);
@@ -27599,15 +27753,15 @@ export default function define(runtime, observer) {
   $def("_brainkernel_turnToken", "turnToken", [], _brainkernel_turnToken);
   $def("_brainkernel_portalToken", "portalToken", [], _brainkernel_portalToken);
   $def("_brainkernel_verifyServiceJwt", "verifyServiceJwt", ["atcute"], _brainkernel_verifyServiceJwt);
-  $def("_brainkernel_kernelApp", "kernelApp", ["hono","Response","secrets","config","rows","sessionToken","turnToken","portalToken","verifyServiceJwt","sha256","matches","may","atcute","neverHeld","core","Request","deployer"], _brainkernel_kernelApp);
+  $def("_brainkernel_kernelApp", "kernelApp", ["hono","Response","secrets","config","rows","sessionToken","turnToken","portalToken","verifyServiceJwt","sha256","core","Request","matches","may","atcute","neverHeld","deployer"], _brainkernel_kernelApp);
   $def("_brainkernel_anon_8016cc4bc1", null, ["md"], _brainkernel_anon_8016cc4bc1);
-  $def("_brainkernel_kernelRig", "kernelRig", ["Response","simulate","kernel_service","sessionToken"], _brainkernel_kernelRig);
+  $def("_brainkernel_kernelRig", "kernelRig", ["Response","sha256","simulate","kernel_service","sessionToken"], _brainkernel_kernelRig);
   $def("_brainkernel_test_the_signing_key_is_read_under_either_name", "test_the_signing_key_is_read_under_either_name", ["sessionToken","expect","kernelRig","portalToken","kernel_service"], _brainkernel_test_the_signing_key_is_read_under_either_name);
   $def("_brainkernel_test_session_token", "test_session_token", ["sessionToken","expect","kernelRig"], _brainkernel_test_session_token);
   $def("_brainkernel_test_forged_caller_is_dropped", "test_forged_caller_is_dropped", ["kernelRig","expect"], _brainkernel_test_forged_caller_is_dropped);
   $def("_brainkernel_test_credentials_are_not_forwarded", "test_credentials_are_not_forwarded", ["kernelRig","expect"], _brainkernel_test_credentials_are_not_forwarded);
   $def("_brainkernel_test_redirect_from_a_recipe_reaches_the_client", "test_redirect_from_a_recipe_reaches_the_client", ["kernelRig","expect"], _brainkernel_test_redirect_from_a_recipe_reaches_the_client);
-  $def("_brainkernel_test_tokens_reach_only_their_methods", "test_tokens_reach_only_their_methods", ["kernelRig","expect"], _brainkernel_test_tokens_reach_only_their_methods);
+  $def("_brainkernel_test_tokens_reach_only_their_methods", "test_tokens_reach_only_their_methods", ["kernelRig","expect","sha256"], _brainkernel_test_tokens_reach_only_their_methods);
   $def("_brainkernel_test_another_did_needs_a_grant", "test_another_did_needs_a_grant", ["kernelRig","expect"], _brainkernel_test_another_did_needs_a_grant);
   $def("_brainkernel_peopleCore", "peopleCore", ["Response"], _brainkernel_peopleCore);
   $def("_brainkernel_peopleRig", "peopleRig", ["peopleCore","kernelRig"], _brainkernel_peopleRig);
@@ -35859,6 +36013,1136 @@ export default function define(runtime, observer) {
   return main;
 }
 </script>
+<script id="@tomlarkworthy/brain-issues" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _brainissues_anon_8ee7cebb43 = function _anonymous(md) {return (md`# brain-issues
+
+Issues of a Cloud Brain: work, bugs, feedback and security reports about the Brain and its services.
+
+Two things are kept apart. The **record** is every event in one order, each naming the hash of the one before it and signed. The **view** is what is true now, made from the record by one function (\`issueApply\`) and made again at will (\`issue.rebuild\`).
+
+The tracker's code is the mechanism: the chain, and the rule that an act goes ahead only when its installed guard is true. Which states an issue has, who may move it and what a move needs are a **policy**: data, installed by an event of the same record. Built 2026-10-10; the design and what it leaves out are in \`plan/cloud-brain-issues.md\`.`);};
+const _brainissues_viewof_issuesView = function _issuesView(issuesPanel,client,session,invalidation) {return (issuesPanel({ client, owner: !!(session && session.owner), invalidation }));};
+const _brainissues_issuesView = (G, _) => G.input(_);
+const _brainissues_anon_701394d35c = function _anonymous(md,issuesDefaultPolicy,issuesLimits) {return (md`## Methods
+
+| | |
+|---|---|
+| Worker | \`brain-x-issues\` |
+| \`issue.open\` | procedure. \`{ key, title, body, kind, about, parent, labels, id }\`. \`kind\` is one the policy names (${Object.keys(issuesDefaultPolicy.kinds).map((k) => "\`" + k + "\`").join(", ")} in the default). \`about\` is \`brain\` or a Worker's name. \`id\` may be made by the caller (\`a-z 0-9 -\`, 40 at most, not \`i<number>\`); left out it is \`i<seq>\`. A subtask is an issue with a \`parent\`. |
+| \`issue.comment\` | procedure. \`{ key, id, body }\` |
+| \`issue.label\` | procedure. \`{ key, id, add, remove }\`, lists of names |
+| \`issue.review\` | procedure. \`{ key, id, verdict, body, refs }\`. \`verdict\`: ${issuesLimits.verdicts.map((k) => "\`" + k + "\`").join(", ")} |
+| \`issue.move\` | procedure. \`{ key, id, to, reason, refs }\`. \`to\` is a state. Approval and revert are moves. |
+| \`issue.swap\` | procedure. \`{ key, id, swap, reason }\`: a swap the issue's workflow lists. \`{ key, id, workflow, state, reason }\`: any other, the owner present. |
+| \`issue.narrow\` | procedure. \`{ key, id, move, guard, reason }\` adds a guard to one move of one issue. \`{ key, id, remove, reason }\` removes guard number \`remove\`, the owner present. |
+| \`issue.install\` | procedure, the owner present. \`{ key, policy, migrate }\`. \`migrate\`: \`{ HASH: { workflow, states: { old: new } } }\` moves the open issues of workflow \`HASH\`, each with its own event. \`{ seq, hashes, moved }\` |
+| \`issue.policy\` | query. \`{ policy, workflows }\` in force; \`?hash=\` one workflow, an older one too. |
+| \`issue.snapshot\` | query. \`{ seq, head, policy, workflows, issues }\`: the whole view at \`seq\`. The \`body\` of a closed issue is left out. |
+| \`issue.sync\` | query. \`?after=<seq>&limit=200\`. \`{ seq, wait, events }\`: the events after \`after\`, and the milliseconds the page waits before it asks again. |
+| Settings | \`syncMs\` (5000): what \`issue.sync\` and \`issue.snapshot\` answer as \`wait\`. Changed with \`config.set\` on the core, no deploy. |
+| \`issue.get\` | query. \`?id=\`. \`{ issue, children, events }\` |
+| \`issue.list\` | query. \`?state=&kind=&about=&parent=&label=&limit=100\`. \`{ issues }\`, last changed first. |
+| \`issue.verify\` | query. \`?after=<seq>\`. Checks \`seq\`, \`prev\`, \`hash\` and \`sig\` of each event after \`after\`. \`{ ok, seq, head, checked }\`, or \`{ ok: false, seq, why }\` at the first that fails. With \`guards=true\` it starts at 1 and also judges each event against the workflow in force when it was written. |
+| \`issue.key\` | query, anyone. \`{ alg: "Ed25519", key }\`: the public key, a JWK. |
+| \`issue.rebuild\` | procedure, the owner present. Makes the view again from the record. \`{ seq, issues }\` |
+| Storage | \`sql\`: \`issues_events\` (the record), \`issues_view\`, \`issues_meta\` (the policy and every workflow by hash) |
+| Secret | \`ISSUES_SIGNING_KEY\`: an Ed25519 private key as a JWK. Without it a write answers 503. |
+
+Every write takes a \`key\`. A key is kept once: a second write with it answers the first event and \`duplicate: true\`. A write answers \`{ id, seq, event }\`. A refused act answers 403 \`Refused\` with the guard that refused it.
+
+**Who can call**: the owner, a token and a Worker of the Brain. A member cannot yet (\`plan/cloud-brain-authority.md\` decides that).
+
+## An event
+
+\`\`\`
+seq, key        its place in the record, and the caller's key
+id, type        the issue; opened commented labelled reviewed moved swapped narrowed policy
+workflow        the hash of the workflow the act was judged under
+…               the act's own fields (title, body, to, reason, refs, verdict, …)
+by, origin      { caller, via, holder, tab } as the core named them on this call, and the same for who started the chain
+ray, at         the call's ray in Workers Logs, and the time in ms
+prev            the hash of the event before it
+hash            SHA-256 of the JSON of every field above, keys sorted, no whitespace
+sig             Ed25519 signature of hash
+\`\`\`
+
+A changed or removed event breaks \`prev\` of each one after it. What the chain does not show: the last events removed, or a whole new record written by whoever holds the key and the database. Nothing outside the Brain holds the head (Tom, 2026-10-10: a signed chain only).`);};
+const _brainissues_anon_5a96271726 = function _anonymous(md,issuesDefaultPolicy) {return (md`## A policy
+
+\`\`\`js
+{ kinds: { bug: "task", security: "security" },
+  workflows: { task: {
+    states: ["open", "done"], start: "open", closed: ["done"],
+    read: "true", open: "true", comment: "true", label: GUARD, review: GUARD, narrow: GUARD,
+    moves: [{ name: "finish", from: "open", to: "done", guard: GUARD }],     // from: a state, a list, or "*"
+    swaps: [{ name: "escalate", to: { workflow: "security", state: "open" }, guard: GUARD }] } } }
+\`\`\`
+
+A guard is one CEL expression (*Access rules* in \`@tomlarkworthy/cloudflare-iac\`). It is true or the act is refused; an error refuses. A guard that does not parse refuses the install. A workflow is named in an event by the SHA-256 of its JSON, so an issue stays on the workflow it was opened under until a swap moves it.
+
+| a guard reads | |
+|---|---|
+| \`caller.id\`, \`caller.kind\`, \`caller.via\`, \`caller.holder\`, \`caller.delegation\` | as a method's rule does |
+| \`caller.actor\` | the holder of the delegation the call is under, or else \`caller.id\`. Two delegations of the owner are two actors. |
+| \`caller.present\` | the owner, via \`session\`, in their own tab |
+| \`issue.id\`, \`.kind\`, \`.about\`, \`.state\`, \`.labels\`, \`.parent\`, \`.opener\` | \`opener\` is an actor |
+| \`issue.major\` | the issue has the label \`major\` |
+| \`issue.by\` | a map: the name of a move → the actor who last made it. \`issue.by.start\` is the implementer in the default workflow. A move not made yet is an error, so the guard refuses. |
+| \`issue.reviews\` | \`[{ actor, verdict }]\` since the issue came into its state |
+| \`issue.children.total\`, \`.open\` | issues whose \`parent\` this is, and those not in a closed state |
+| \`event.to\`, \`.reason\`, \`.refs\`, \`.refKinds\`, \`.verdict\`, \`.add\`, \`.remove\` | the act asked for |
+
+Every fact is in the record, so \`issue.verify?guards=true\` can judge every event again.
+
+**Fixed in the code**, whatever the policy says: installing a policy, a swap the workflow does not list, removing a guard of an issue and \`issue.rebuild\` need the owner present. The first write into an empty record installs \`issuesDefaultPolicy\` as event 1, by this Worker. That is the one policy written without the owner, and it cannot be written again: a record with events and no policy in its view answers 503 \`ViewLost\` until \`issue.rebuild\`.
+
+**Present is not exact yet.** A sign-in link's token made with \`unattended\` reaches a service as \`owner\` via \`session\` (\`plan/cloud-brain-authority.md\`, read 2026-10-10). Until that token has its own via, it passes \`caller.present\` unless the core sends \`x-brain-tab: 0\` for it.
+
+## The default policy
+
+| workflow | kinds | |
+|---|---|---|
+| \`task\` | \`bug\`, \`task\` | ${issuesDefaultPolicy.workflows.task.states.join(" → ")}. Listed swap \`escalate\` to \`security\` at \`triaged\`, for whoever may triage, when the issue has the label \`security\`. |
+| \`security\` | \`security\` | as \`task\`, every issue needs approval, read by the owner and its opener, no swap out |
+| \`feedback\` | \`feedback\` | open → closed. Listed swap \`promote\` to \`task\`. |
+
+Who may triage, label and narrow: the owner or a token. A reviewer and whoever passes the issue is not the implementer. \`approve\`, \`revert\` and a reject from any state are the owner present. The guards are the cell \`issuesDefaultPolicy\`.`);};
+const _brainissues_issues_service = function _issues_service(cloudflare,issuesApp) {return (cloudflare.Service("issues", issuesApp, {
+  methods: Object.fromEntries(
+    [["open", "procedure"], ["comment", "procedure"], ["label", "procedure"], ["review", "procedure"], ["move", "procedure"], ["swap", "procedure"], ["narrow", "procedure"], ["install", "procedure"], ["rebuild", "procedure"], ["policy", "query"], ["snapshot", "query"], ["sync", "query"], ["get", "query"], ["list", "query"], ["verify", "query"], ["key", "query"]].map(([name, type]) => [
+      "com.lopecode.brain.issue." + name,
+      // The owner, a token and a Worker of the Brain. A member's Worker calls as its author's DID and is not let in.
+      name === "key" ? { type, who: "anyone" } : { type, allow: 'caller.kind in ["owner", "token", "worker"]' }
+    ])
+  )
+}));};
+const _brainissues_issues_announce = function _issues_announce(plugins,issues_service,invalidation) {
+  plugins.add("workers", issues_service, { invalidation });
+  return "announced issues_service";
+};
+const _brainissues_issuesLimits = function _issuesLimits() {return ({ body: 20000, title: 300, reason: 2000, key: 100, refs: 20, labels: 20, policy: 100000, page: 500, verdicts: ["pass", "changes", "block"] });};
+const _brainissues_issuesDefaultPolicy = function _issuesDefaultPolicy() {
+  const triage = 'caller.kind in ["owner", "token"]';
+  const other = "caller.actor != issue.by.start";
+  const passed = `issue.reviews.exists(r, r.verdict == "pass" && r.actor != issue.by.start) && ${other}`;
+  const acts = { read: "true", open: "true", comment: "true", label: triage, review: `issue.state == "in-review" && ${other}`, narrow: triage };
+  const states = ["open", "triaged", "ready", "in-progress", "in-review", "awaiting-approval", "done", "rejected", "reverted"];
+  const moves = (always) => [
+    { name: "triage", from: "open", to: "triaged", guard: `${triage} && event.reason != ""` },
+    { name: "reject", from: ["open", "triaged"], to: "rejected", guard: `${triage} && event.reason != ""` },
+    { name: "ready", from: "triaged", to: "ready", guard: `${triage} && issue.children.open == 0` },
+    { name: "start", from: "ready", to: "in-progress", guard: "true" },
+    { name: "submit", from: "in-progress", to: "in-review", guard: "caller.actor == issue.by.start && size(event.refs) > 0 && issue.children.open == 0" },
+    ...(always ? [] : [{ name: "pass", from: "in-review", to: "done", guard: `!issue.major && ${passed}` }]),
+    { name: "to-approval", from: "in-review", to: "awaiting-approval", guard: always ? passed : `issue.major && ${passed}` },
+    { name: "rework", from: "in-review", to: "in-progress", guard: `issue.reviews.exists(r, r.verdict in ["changes", "block"]) && ${other}` },
+    { name: "approve", from: "awaiting-approval", to: "done", guard: "caller.present" },
+    { name: "revert", from: "done", to: "reverted", guard: 'caller.present && event.reason != "" && size(event.refs) > 0' },
+    { name: "owner-reject", from: "*", to: "rejected", guard: 'caller.present && event.reason != ""' }
+  ];
+  const closed = ["done", "rejected", "reverted"];
+  return {
+    kinds: { bug: "task", task: "task", feedback: "feedback", security: "security" },
+    workflows: {
+      task: { states, start: "open", closed, ...acts, moves: moves(false), swaps: [{ name: "escalate", to: { workflow: "security", state: "triaged" }, guard: `${triage} && "security" in issue.labels` }] },
+      security: { states, start: "open", closed, ...acts, read: 'caller.id == "owner" || caller.actor == issue.opener', moves: moves(true), swaps: [] },
+      feedback: { states: ["open", "closed"], start: "open", closed: ["closed"], ...acts, moves: [{ name: "close", from: "open", to: "closed", guard: triage }], swaps: [{ name: "promote", to: { workflow: "task", state: "open" }, guard: triage }] }
+    }
+  };
+};
+const _brainissues_issuesSchema = function _issuesSchema() {return ([
+  "CREATE TABLE IF NOT EXISTS issues_events (seq INTEGER PRIMARY KEY, key TEXT NOT NULL, id TEXT, type TEXT NOT NULL, at INTEGER NOT NULL, hash TEXT NOT NULL, event TEXT NOT NULL)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS issues_events_key ON issues_events (key)",
+  "CREATE INDEX IF NOT EXISTS issues_events_id ON issues_events (id, seq)",
+  "CREATE TABLE IF NOT EXISTS issues_view (id TEXT NOT NULL, state TEXT, kind TEXT, about TEXT, parent TEXT, workflow TEXT, closed INTEGER, updated INTEGER, issue TEXT NOT NULL, PRIMARY KEY (id)) WITHOUT ROWID",
+  "CREATE INDEX IF NOT EXISTS issues_view_parent ON issues_view (parent)",
+  "CREATE TABLE IF NOT EXISTS issues_meta (k TEXT NOT NULL, v TEXT NOT NULL, PRIMARY KEY (k)) WITHOUT ROWID"
+]);};
+const _brainissues_issuesSql = function _issuesSql() {return ({
+  head: "SELECT seq, hash FROM issues_events ORDER BY seq DESC LIMIT 1",
+  byKey: "SELECT event FROM issues_events WHERE key = ?1",
+  insert: "INSERT INTO issues_events (seq, key, id, type, at, hash, event) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+  after: "SELECT event FROM issues_events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+  of: "SELECT event FROM issues_events WHERE id = ?1 ORDER BY seq",
+  one: "SELECT event FROM issues_events WHERE seq = ?1",
+  meta: "SELECT k, v FROM issues_meta",
+  putMeta: "REPLACE INTO issues_meta (k, v) VALUES (?1, ?2)",
+  // The issue, its children, and a second id (the parent of an issue being opened).
+  near: "SELECT issue FROM issues_view WHERE id = ?1 OR parent = ?1 OR id = ?2",
+  all: "SELECT issue FROM issues_view",
+  putIssue: "REPLACE INTO issues_view (id, state, kind, about, parent, workflow, closed, updated, issue) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+  onWorkflow: "SELECT issue FROM issues_view WHERE workflow = ?1 AND closed = 0",
+  clearView: "DELETE FROM issues_view",
+  clearMeta: "DELETE FROM issues_meta"
+});};
+const _brainissues_issueCanon = function _issueCanon() {
+  const canon = (v) =>
+    v === null || typeof v !== "object"
+      ? JSON.stringify(v ?? null)
+      : Array.isArray(v)
+        ? "[" + v.map(canon).join(",") + "]"
+        : "{" + Object.keys(v).filter((k) => v[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+  return canon;
+};
+const _brainissues_issueKeys = function _issueKeys() {return (async (text) => {
+  const jwk = typeof text === "string" ? JSON.parse(text) : text, pub = { kty: jwk.kty, crv: jwk.crv, x: jwk.x };
+  const b64 = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const un = (s) => Uint8Array.from(atob(String(s).replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  const enc = (s) => new TextEncoder().encode(s);
+  const priv = jwk.d ? await crypto.subtle.importKey("jwk", { ...pub, d: jwk.d }, { name: "Ed25519" }, false, ["sign"]) : null;
+  const key = await crypto.subtle.importKey("jwk", pub, { name: "Ed25519" }, false, ["verify"]);
+  return {
+    public: pub,
+    sign: async (hash) => b64(await crypto.subtle.sign("Ed25519", priv, enc(hash))),
+    verify: async (hash, sig) => crypto.subtle.verify("Ed25519", key, un(sig), enc(hash)).catch(() => false)
+  };
+});};
+const _brainissues_issueView = function _issueView() {return (() => ({ seq: 0, head: "", policy: null, workflows: {}, issues: {} }));};
+const _brainissues_issueCaller = function _issueCaller(callerOf) {return ((by) => {
+  const c = callerOf(by);
+  return { id: c.id, kind: c.kind, via: (by && by.via) || "", holder: c.holder, delegation: c.delegation, actor: c.holder || c.id, present: c.id === "owner" && !!by && by.via === "session" && by.tab !== false };
+});};
+const _brainissues_issueApply = function _issueApply() {return ((view, e) => {
+  view.seq = e.seq;
+  view.head = e.hash;
+  if (e.type === "policy") {
+    view.policy = { seq: e.seq, kinds: e.policy.kinds, names: e.hashes };
+    for (const [name, hash] of Object.entries(e.hashes)) view.workflows[hash] = e.policy.workflows[name];
+    return view;
+  }
+  const actor = (e.by && (e.by.holder || e.by.caller)) || "anonymous";
+  const closed = (i) => (((view.workflows[i.workflow] || {}).closed || []).includes(i.state));
+  if (e.type === "opened") {
+    const i = { id: e.id, title: e.title, body: e.body, kind: e.kind, about: e.about, parent: e.parent || null, labels: e.labels || [], state: e.state, workflow: e.workflow, opener: actor, by: {}, reviews: [], extra: [], closed: false, comments: 0, opened_at: e.at, updated_at: e.at, seq: e.seq };
+    view.issues[e.id] = { ...i, closed: closed(i) };
+    return view;
+  }
+  const i = view.issues[e.id];
+  if (!i || i.hidden) return view;
+  i.updated_at = e.at;
+  i.seq = e.seq;
+  if (e.type === "commented") i.comments++;
+  if (e.type === "labelled") i.labels = [...new Set([...i.labels.filter((l) => !(e.remove || []).includes(l)), ...(e.add || [])])];
+  if (e.type === "reviewed") i.reviews.push({ actor, verdict: e.verdict });
+  if (e.type === "moved") Object.assign(i, { state: e.to, by: { ...i.by, [e.move]: actor }, reviews: [] });
+  if (e.type === "swapped") Object.assign(i, { workflow: e.to.workflow, state: e.to.state, reviews: [] });
+  if (e.type === "narrowed") i.extra = e.remove != null ? i.extra.filter((x) => x.n !== e.remove) : [...i.extra, { n: e.seq, move: e.move, guard: e.guard }];
+  i.closed = closed(i);
+  return view;
+});};
+const _brainissues_issueAllowed = function _issueAllowed(issueCaller,decide) {return ((view, by, act) => {
+  const caller = issueCaller(by), no = (why, missing) => ({ allow: false, why, ...(missing ? { missing: true } : {}) });
+  const present = () => (caller.present ? { allow: true } : no("the owner, present"));
+  // The first policy of a Brain is the default one, written by the Worker itself.
+  if (act.type === "policy") return !view.seq && !view.policy && caller.id === "worker:brain-x-issues" ? { allow: true } : present();
+  if (!view.policy) return no("no policy is installed");
+  const facts = (i) => {
+    const kids = Object.values(view.issues).filter((k) => k.parent === i.id);
+    return { id: i.id, kind: i.kind, about: i.about, state: i.state, labels: i.labels, parent: i.parent || "", opener: i.opener, major: i.labels.includes("major"), by: i.by, reviews: i.reviews, children: { total: kids.length, open: kids.filter((k) => !k.closed).length } };
+  };
+  const refs = act.refs || [];
+  const event = { type: act.type, to: typeof act.to === "string" ? act.to : "", reason: act.reason || "", refs, refKinds: refs.map((r) => r.kind), verdict: act.verdict || "", add: act.add || [], remove: Array.isArray(act.remove) ? act.remove : [] };
+  const test = (guard, issue) => typeof guard === "string" && decide({ allow: guard }, { caller, issue, event }).allow;
+  if (act.type === "open") {
+    const hash = view.policy.names[view.policy.kinds[act.kind]], wf = view.workflows[hash];
+    if (!wf) return no("no workflow for the kind " + act.kind);
+    if (view.issues[act.id]) return no("an issue has this id");
+    if (act.parent && !view.issues[act.parent]) return no("no such parent", true);
+    const issue = facts({ id: act.id, kind: act.kind, about: act.about, state: wf.start, labels: act.labels || [], parent: act.parent, opener: caller.actor, by: {}, reviews: [] });
+    return test(wf.open, issue) ? { allow: true, workflow: hash, state: wf.start } : no("the workflow's open guard refuses");
+  }
+  const i = view.issues[act.id];
+  if (!i || i.hidden) return no("no such issue", true);
+  const wf = view.workflows[i.workflow];
+  if (!wf) return no("the issue's workflow is not kept");
+  const issue = facts(i);
+  if (act.type === "move") {
+    const from = wf.moves.filter((m) => m.to === act.to && (m.from === "*" || [].concat(m.from).includes(i.state)));
+    if (!from.length) return no(`no move from ${i.state} to ${act.to}`);
+    const m = from.find((m) => test(m.guard, issue));
+    if (!m) return no(`the guard of ${from.map((m) => m.name).join(", ")} refuses`);
+    const extra = i.extra.find((x) => x.move === m.name && !test(x.guard, issue));
+    return extra ? no(`this issue's guard ${extra.n} on ${m.name} refuses`) : { allow: true, name: m.name };
+  }
+  if (act.type === "swap") {
+    if (act.swap) {
+      const s = wf.swaps.find((s) => s.name === act.swap);
+      if (!s) return no("the workflow lists no swap " + act.swap);
+      const to = { workflow: view.policy.names[s.to.workflow], state: s.to.state };
+      return view.workflows[to.workflow] && test(s.guard, issue) ? { allow: true, name: s.name, to } : no(`the guard of ${s.name} refuses`);
+    }
+    const hash = view.policy.names[act.workflow] || act.workflow, target = view.workflows[hash];
+    if (!target || !target.states.includes(act.state)) return no("no such workflow or state");
+    return caller.present ? { allow: true, name: null, to: { workflow: hash, state: act.state } } : no("a swap the workflow does not list needs the owner, present");
+  }
+  if (act.type === "narrow" && act.remove != null) return i.extra.some((x) => x.n === act.remove) ? present() : no("no such guard", true);
+  if (act.type === "narrow" && !wf.moves.some((m) => m.name === act.move)) return no("the workflow has no move " + act.move);
+  return test(wf[act.type], issue) ? { allow: true } : no(`the workflow's ${act.type} guard refuses`);
+});};
+const _brainissues_issueEvent = function _issueEvent() {return ((view, act, verdict) => {
+  const i = view.issues[act.id], base = { id: act.id, workflow: i ? i.workflow : verdict.workflow };
+  const reason = act.reason || "", refs = act.refs || [];
+  if (act.type === "policy") return { type: "policy", policy: act.policy, hashes: act.hashes };
+  if (act.type === "open") return { type: "opened", ...base, title: act.title, body: act.body || "", kind: act.kind, about: act.about, parent: act.parent || null, labels: act.labels || [], state: verdict.state };
+  if (act.type === "comment") return { type: "commented", ...base, body: act.body };
+  if (act.type === "label") return { type: "labelled", ...base, add: act.add || [], remove: act.remove || [] };
+  if (act.type === "review") return { type: "reviewed", ...base, verdict: act.verdict, body: act.body || "", refs };
+  if (act.type === "move") return { type: "moved", ...base, move: verdict.name, from: i.state, to: act.to, reason, refs };
+  if (act.type === "swap") return { type: "swapped", ...base, swap: verdict.name, from: { workflow: i.workflow, state: i.state }, to: verdict.to, reason, ...(act.policy ? { policy: act.policy } : {}) };
+  return act.remove != null ? { type: "narrowed", ...base, remove: act.remove, reason } : { type: "narrowed", ...base, move: act.move, guard: act.guard, reason };
+});};
+const _brainissues_issueReplay = function _issueReplay(issueAllowed) {return ((view, e) => {
+  const type = { opened: "open", commented: "comment", labelled: "label", reviewed: "review", moved: "move", swapped: "swap", narrowed: "narrow", policy: "policy" }[e.type];
+  if (!type) return "no such type of event";
+  const act = { ...e, type, ...(e.type === "swapped" ? { workflow: e.to.workflow, state: e.to.state } : {}) };
+  const i = view.issues[e.id];
+  if (i && e.workflow !== i.workflow) return "judged under a workflow the issue was not on";
+  const v = issueAllowed(view, e.by, act);
+  if (!v.allow) return v.why;
+  if (e.type === "opened" && (e.workflow !== v.workflow || e.state !== v.state)) return "opened in another workflow or state than its kind's";
+  if (e.type === "moved" && (e.move !== v.name || e.from !== i.state)) return "names another move than the one allowed";
+  if (e.type === "swapped" && (e.to.workflow !== v.to.workflow || e.to.state !== v.to.state)) return "lands elsewhere than the swap says";
+  return null;
+});};
+const _brainissues_issueCheck = function _issueCheck(sha256,issueCanon) {return (async (e, prev, seq, keys) => {
+  const { hash, sig, ...rest } = e;
+  if (e.seq !== seq) return "seq";
+  if (e.prev !== prev) return "prev";
+  if (hash !== (await sha256(issueCanon(rest)))) return "hash";
+  return (await keys.verify(hash, sig)) ? null : "sig";
+});};
+const _brainissues_issuePolicyAct = function _issuePolicyAct(issuesLimits,checkedRule,sha256,issueCanon) {return (async (policy) => {
+  const bad = (m) => {
+    throw Object.assign(new Error(m), { status: 400, code: "InvalidPolicy" });
+  };
+  const name = /^[a-z0-9][a-z0-9-]{0,39}$/, list = (v) => Array.isArray(v) && v.every((s) => typeof s === "string" && name.test(s));
+  if (!policy || typeof policy !== "object" || !policy.workflows || typeof policy.workflows !== "object" || !policy.kinds || typeof policy.kinds !== "object") bad("policy: { workflows, kinds }");
+  if (JSON.stringify(policy).length > issuesLimits.policy) bad(`policy: ${issuesLimits.policy} characters at most`);
+  const names = Object.keys(policy.workflows);
+  if (!names.length || names.length > 20 || !names.every((n) => name.test(n))) bad("workflows: 1 to 20, named a-z 0-9 -");
+  for (const n of names) {
+    const w = policy.workflows[n], at = `workflow ${n}: `;
+    if (!w || !list(w.states) || !w.states.length) bad(at + "states");
+    if (!w.states.includes(w.start)) bad(at + "start is not one of its states");
+    if (!list(w.closed) || !w.closed.every((s) => w.states.includes(s))) bad(at + "closed: a list of its states");
+    if (!Array.isArray(w.moves) || !Array.isArray(w.swaps)) bad(at + "moves and swaps are lists");
+    const guard = (label, g) => {
+      if (typeof g !== "string" || !g || g.length > 2000) bad(at + label + " needs a guard");
+      try {
+        checkedRule(at + label, g);
+      } catch (e) {
+        bad(e.message);
+      }
+    };
+    for (const a of ["read", "open", "comment", "label", "review", "narrow"]) guard(a, w[a]);
+    for (const m of w.moves) {
+      if (!m || !name.test(m.name || "")) bad(at + "a move needs a name");
+      if (!(m.from === "*" || [].concat(m.from).every((s) => w.states.includes(s))) || !w.states.includes(m.to)) bad(at + `the move ${m.name} names a state it does not have`);
+      guard("the move " + m.name, m.guard);
+    }
+    for (const s of w.swaps) {
+      if (!s || !name.test(s.name || "")) bad(at + "a swap needs a name");
+      const target = s.to && policy.workflows[s.to.workflow];
+      if (!target || !Array.isArray(target.states) || !target.states.includes(s.to.state)) bad(at + `the swap ${s.name} names a workflow or state that is not there`);
+      guard("the swap " + s.name, s.guard);
+    }
+  }
+  for (const [k, n] of Object.entries(policy.kinds)) if (!name.test(k) || !policy.workflows[n]) bad(`kinds: ${k} names no workflow`);
+  const hashes = {};
+  for (const n of names) hashes[n] = await sha256(issueCanon(policy.workflows[n]));
+  return { type: "policy", policy, hashes };
+});};
+const _brainissues_issueAct = function _issueAct(issuesLimits,checkedRule) {return ((type, b) => {
+  const L = issuesLimits;
+  const bad = (m) => {
+    throw Object.assign(new Error(m), { status: 400, code: "InvalidRequest" });
+  };
+  const text = (v, max, label, need) => {
+    if (v == null || v === "") return need ? bad(label) : "";
+    if (typeof v !== "string" || v.length > max) bad(`${label}: text, ${max} characters at most`);
+    return v;
+  };
+  const name = (v, label, need) => {
+    const s = text(v, 60, label, need);
+    if (s && !/^[a-z0-9][a-z0-9-]*$/.test(s)) bad(label + ": a-z 0-9 -");
+    return s;
+  };
+  const names = (v, label) => {
+    if (v == null) return [];
+    if (!Array.isArray(v) || v.length > L.labels) bad(label);
+    return [...new Set(v.map((x) => name(x, label, true)))];
+  };
+  const refs = (v) => {
+    if (v == null) return [];
+    if (!Array.isArray(v) || v.length > L.refs) bad("refs");
+    return v.map((r) => ({ kind: name(r && r.kind, "refs.kind", true), value: text(r && r.value, 500, "refs.value", true) }));
+  };
+  b = b && typeof b === "object" ? b : {};
+  const id = name(b.id, "id", type !== "open"), reason = text(b.reason, L.reason, "reason");
+  if (id.length > 40) bad("id: 40 characters at most");
+  if (type === "open") {
+    if (/^i\d+$/.test(id)) bad("id: i<number> is the service's to give");
+    return { type, ...(id ? { id } : {}), title: text(b.title, L.title, "title", true), body: text(b.body, L.body, "body"), kind: name(b.kind, "kind", true), about: name(b.about ?? "brain", "about", true), parent: name(b.parent, "parent") || null, labels: names(b.labels, "labels") };
+  }
+  if (type === "comment") return { type, id, body: text(b.body, L.body, "body", true) };
+  if (type === "label") {
+    const add = names(b.add, "add"), remove = names(b.remove, "remove");
+    return add.length + remove.length ? { type, id, add, remove } : bad("add or remove");
+  }
+  if (type === "review") return { type, id, verdict: L.verdicts.includes(b.verdict) ? b.verdict : bad("verdict: " + L.verdicts.join(", ")), body: text(b.body, L.body, "body"), refs: refs(b.refs) };
+  if (type === "move") return { type, id, to: name(b.to, "to", true), reason, refs: refs(b.refs) };
+  if (type === "swap") return b.swap ? { type, id, swap: name(b.swap, "swap", true), reason } : { type, id, workflow: text(b.workflow, 64, "workflow", true), state: name(b.state, "state", true), reason };
+  if (b.remove != null) return Number.isInteger(b.remove) ? { type, id, remove: b.remove, reason } : bad("remove: the number of a guard");
+  const guard = text(b.guard, 2000, "guard", true);
+  try {
+    checkedRule("guard", guard);
+  } catch (e) {
+    bad(e.message);
+  }
+  return { type, id, move: name(b.move, "move", true), guard, reason };
+});};
+const _brainissues_issuesApp = function _issuesApp(hono,issuesSql,issuesLimits,issuesSchema,sql,secrets,issueKeys,config,callerFrom,originFrom,issueView,issuePolicyAct,issuesDefaultPolicy,issueAllowed,issueEvent,sha256,issueCanon,issueApply,issueAct,issueCheck,issueReplay,issueCaller) {
+  const app = new hono.Hono();
+  const NS = "/xrpc/com.lopecode.brain.issue.", S = issuesSql, L = issuesLimits, J = JSON.parse;
+  const refuse = (status, code, message) => Object.assign(new Error(message), { status, code });
+  let made = null, keys = null;
+  const schema = () =>
+    (made ||= (async () => {
+      for (const s of issuesSchema) await sql.exec(s);
+    })().catch((e) => {
+      made = null;
+      throw e;
+    }));
+  const signer = async () => {
+    if (keys) return keys;
+    const text = await secrets.ISSUES_SIGNING_KEY;
+    if (!text) throw refuse(503, "NotConfigured", "the secret ISSUES_SIGNING_KEY is not set");
+    return (keys = await issueKeys(text));
+  };
+  // Who the core says is calling, and who started the chain: copied into the event, since a log line lasts 7 days.
+  // How long the page waits between polls: the setting syncMs, changed with config.set and no deploy.
+  const wait = () => Math.max(1000, Number(config.syncMs ?? 5000) || 5000);
+  const who = (c) => ({ by: callerFrom(c.req.raw.headers), origin: originFrom(c.req.raw.headers), ray: (c.req.header("x-brain-ray") || c.req.header("cf-ray") || "").slice(0, 64) });
+  // The head, the policy with every workflow, and some issues, read in one transaction.
+  const load = async (rows) => {
+    await schema();
+    const [head, meta, found] = await sql.batch([[S.head], [S.meta], rows]);
+    const view = { ...issueView(), ...(head.rows[0] ? { seq: head.rows[0].seq, head: head.rows[0].hash } : {}) };
+    for (const { k, v } of meta.rows) k === "policy" ? (view.policy = J(v)) : (view.workflows[k.slice(3)] = J(v));
+    for (const r of found.rows) view.issues[J(r.issue).id] = J(r.issue);
+    return view;
+  };
+  const metaRows = (view) => [[S.putMeta, "policy", JSON.stringify(view.policy)], ...Object.entries(view.workflows).map(([hash, w]) => [S.putMeta, "wf/" + hash, JSON.stringify(w)])];
+  const issueRow = (i) => [S.putIssue, i.id, i.state, i.kind, i.about, i.parent, i.workflow, i.closed ? 1 : 0, i.updated_at, JSON.stringify(i)];
+  // One event more. The insert is of seq = head + 1, the table's key: of two writers at one head one fails, reads the
+  // head again and writes after the other. The view's row is written in the same transaction.
+  const append = async (ctx, key, given) => {
+    if (typeof key !== "string" || !key || key.length > L.key) throw refuse(400, "InvalidRequest", `key: text, ${L.key} characters at most`);
+    const sign = await signer();
+    for (let attempt = 0; ; attempt++) {
+      const view = await load([S.near, given.id || "", given.parent || ""]);
+      const kept = (await sql.exec(S.byKey, key)).rows[0];
+      if (kept) return { event: J(kept.event), duplicate: true };
+      // The default policy is written only into an empty record. A record with no policy in its view has lost the view.
+      if (!view.policy && view.seq) throw refuse(503, "ViewLost", "the view has no policy: issue.rebuild makes it again from the record");
+      if (!view.policy && given.type !== "policy") {
+        await append({ by: { caller: "worker:brain-x-issues", via: "" }, origin: ctx.origin, ray: ctx.ray }, "policy/default", await issuePolicyAct(issuesDefaultPolicy));
+        continue;
+      }
+      const seq = view.seq + 1, act = given.type === "open" && !given.id ? { ...given, id: "i" + seq } : given;
+      const verdict = issueAllowed(view, ctx.by, act);
+      if (!verdict.allow) throw refuse(verdict.missing ? 404 : 403, verdict.missing ? "NotFound" : "Refused", verdict.why);
+      const e = { seq, key, ...issueEvent(view, act, verdict), by: ctx.by, origin: ctx.origin, ray: ctx.ray, at: Date.now(), prev: view.head };
+      e.hash = await sha256(issueCanon(e));
+      e.sig = await sign.sign(e.hash);
+      issueApply(view, e);
+      try {
+        await sql.batch([[S.insert, seq, key, e.id || null, e.type, e.at, e.hash, JSON.stringify(e)], ...(e.type === "policy" ? metaRows(view) : [issueRow(view.issues[e.id])])]);
+        return { event: e };
+      } catch (err) {
+        // Another writer took this seq, or this key: go round again. Anything else is an error.
+        const head = (await sql.exec(S.head)).rows[0];
+        if (attempt >= 5 || ((head ? head.seq : 0) < seq && !(await sql.exec(S.byKey, key)).rows[0])) throw err;
+      }
+    }
+  };
+  const run = (fn) => async (c) => {
+    try {
+      return c.json(await fn(c, c.req.method === "POST" ? await c.req.json().catch(() => ({})) : c.req.query()));
+    } catch (e) {
+      if (e && e.status) return c.json({ error: e.code, message: e.message }, e.status);
+      throw e;
+    }
+  };
+  for (const type of ["open", "comment", "label", "review", "move", "swap", "narrow"])
+    app.post(NS + type, run(async (c, b) => {
+      const r = await append(who(c), b && b.key, issueAct(type, b));
+      return { id: r.event.id, seq: r.event.seq, ...(r.duplicate ? { duplicate: true } : {}), event: r.event };
+    }));
+  app.post(NS + "install", run(async (c, b) => {
+    const ctx = who(c), act = await issuePolicyAct(b.policy);
+    const r = await append(ctx, b.key, act), moved = [];
+    for (const [old, to] of Object.entries(b.migrate && typeof b.migrate === "object" ? b.migrate : {}))
+      for (const row of (await sql.exec(S.onWorkflow, old)).rows) {
+        const i = J(row.issue);
+        await append(ctx, `${b.key}/${i.id}`.slice(0, L.key), { type: "swap", id: i.id, workflow: String((to && to.workflow) || ""), state: ((to && to.states) || {})[i.state] || i.state, reason: "policy " + r.event.seq, policy: r.event.seq });
+        moved.push(i.id);
+      }
+    return { seq: r.event.seq, hashes: r.event.hashes, moved, ...(r.duplicate ? { duplicate: true } : {}) };
+  }));
+  // What a caller is shown of an issue its workflow's read guard refuses.
+  const shown = (view, by, i) => (issueAllowed(view, by, { type: "read", id: i.id }).allow ? i : { id: i.id, kind: i.kind, state: i.state, closed: i.closed, parent: i.parent, hidden: true });
+  const current = (view) => (view.policy ? Object.fromEntries(Object.values(view.policy.names).map((h) => [h, view.workflows[h]])) : {});
+  app.get(NS + "snapshot", run(async (c) => {
+    const view = await load([S.all]), { by } = who(c);
+    return { seq: view.seq, head: view.head, wait: wait(), policy: view.policy, workflows: view.workflows, issues: Object.values(view.issues).map((i) => shown(view, by, i)).map((i) => (i.closed && !i.hidden ? { ...i, body: undefined, bodyLeftOut: true } : i)) };
+  }));
+  app.get(NS + "sync", run(async (c, q) => {
+    await schema();
+    const after = Math.max(0, Number(q.after) || 0), events = (await sql.exec(S.after, after, Math.min(L.page, Math.max(1, Number(q.limit) || 200)))).rows.map((r) => J(r.event));
+    const view = await load(events.length ? [S.all] : [S.near, "", ""]), { by } = who(c);
+    if (after > view.seq) return { seq: view.seq, wait: wait(), reset: true, events: [] };
+    const seen = (e) => e.type === "policy" || !view.issues[e.id] || !shown(view, by, view.issues[e.id]).hidden;
+    return { seq: view.seq, wait: wait(), events: events.map((e) => (seen(e) ? e : { seq: e.seq, id: e.id, type: e.type, at: e.at, hidden: true, issue: shown(view, by, view.issues[e.id]) })) };
+  }));
+  app.get(NS + "get", run(async (c, q) => {
+    const view = await load([S.near, String(q.id || ""), ""]), { by } = who(c), i = view.issues[q.id];
+    if (!i) throw refuse(404, "NotFound", "no such issue");
+    const issue = shown(view, by, i);
+    if (issue.hidden) return { issue, children: [], events: [] };
+    return { issue, children: Object.values(view.issues).filter((k) => k.parent === i.id).map((k) => shown(view, by, k)).map((k) => (k.hidden ? k : { id: k.id, title: k.title, kind: k.kind, state: k.state, closed: k.closed })), events: (await sql.exec(S.of, i.id)).rows.map((r) => J(r.event)) };
+  }));
+  app.get(NS + "list", run(async (c, q) => {
+    const view = await load([S.all]), { by } = who(c);
+    const pass = (i) => (!q.state || i.state === q.state) && (!q.kind || i.kind === q.kind) && (!q.about || i.about === q.about) && (!q.parent || i.parent === q.parent) && (!q.label || (i.labels || []).includes(q.label));
+    // What a caller may not read is matched by its state, kind and parent only: a label would say what it is.
+    return { issues: Object.values(view.issues).map((i) => shown(view, by, i)).filter(pass).sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0)).slice(0, Math.min(L.page, Math.max(1, Number(q.limit) || 100))).map((i) => (i.hidden ? i : { ...i, body: undefined })) };
+  }));
+  app.get(NS + "policy", run(async (c, q) => {
+    const view = await load([S.near, "", ""]);
+    if (q.hash) return view.workflows[q.hash] ? { hash: q.hash, workflow: view.workflows[q.hash] } : Promise.reject(refuse(404, "NotFound", "no such workflow"));
+    return { policy: view.policy, workflows: current(view) };
+  }));
+  app.get(NS + "key", run(async () => ({ alg: "Ed25519", key: (await signer()).public })));
+  // Every event in order, a page at a time.
+  const walk = async (after, each) => {
+    for (;;) {
+      const rows = (await sql.exec(S.after, after, L.page)).rows;
+      if (!rows.length) return;
+      for (const r of rows) {
+        const e = J(r.event), stop = await each(e);
+        if (stop) return stop;
+        after = e.seq;
+      }
+    }
+  };
+  app.get(NS + "verify", run(async (c, q) => {
+    await schema();
+    const sign = await signer(), guards = q.guards === "true", view = issueView();
+    let seq = guards ? 0 : Math.max(0, Number(q.after) || 0), prev = "", checked = 0;
+    if (seq) {
+      const at = (await sql.exec(S.one, seq)).rows[0];
+      if (!at) throw refuse(404, "NotFound", "no event " + seq);
+      prev = J(at.event).hash;
+    }
+    const bad = await walk(seq, async (e) => {
+      const chain = await issueCheck(e, prev, seq + 1, sign);
+      if (chain) return { ok: false, seq: seq + 1, why: chain, checked };
+      if (guards) {
+        const why = issueReplay(view, e) || (e.type === "policy" && issueCanon((await issuePolicyAct(e.policy).catch(() => ({}))).hashes) !== issueCanon(e.hashes) ? "the policy's hashes are not its workflows'" : null);
+        if (why) return { ok: false, seq: e.seq, why, checked };
+        issueApply(view, e);
+      }
+      prev = e.hash;
+      seq = e.seq;
+      checked++;
+    });
+    return bad || { ok: true, seq, head: prev, checked, guards };
+  }));
+  app.post(NS + "rebuild", run(async (c) => {
+    if (!issueCaller(who(c).by).present) throw refuse(403, "Refused", "the owner, present");
+    await schema();
+    const view = issueView();
+    await walk(0, async (e) => void issueApply(view, e));
+    const rows = [...(view.policy ? metaRows(view) : []), ...Object.values(view.issues).map(issueRow)];
+    await sql.batch([[S.clearView], [S.clearMeta], ...rows.slice(0, 300)]);
+    for (let at = 300; at < rows.length; at += 300) await sql.batch(rows.slice(at, at + 300));
+    return { seq: view.seq, issues: Object.keys(view.issues).length };
+  }));
+  return app;
+};
+const _brainissues_issuesStore = function _issuesStore(localStorage) {return ((name = "brain_issues") => ({
+  get: () => {
+    try {
+      return JSON.parse(localStorage.getItem(name));
+    } catch (e) {
+      return null;
+    }
+  },
+  set: (view) => {
+    try {
+      localStorage.setItem(name, JSON.stringify(view));
+    } catch (e) {}
+  }
+}));};
+const _brainissues_issuesPanel = function _issuesPanel(issuesStore,htl,issueView,issueApply,structuredClone,Inputs,issueAllowed,issueEvent,issuesLimits) {return (({ client, owner = false, by = { caller: "owner", via: "session" }, invalidation, store = issuesStore(), every = null } = {}) => {
+  const muted = "color:var(--theme-foreground-muted)";
+  if (!client || !owner) return htl.html`<i style=${muted}>Sign in as the owner to see the issues.</i>`;
+  let base = store.get() || issueView(), pending = [], open = null, wait = 5000;
+  const detail = new Map();
+  const note = htl.html`<span style=${muted}></span>`, list = htl.html`<div></div>`, one = htl.html`<div></div>`;
+  const now = () => pending.reduce((v, e) => issueApply(v, e), structuredClone(base));
+  // A select whose choices come from the copy: made again when they change, keeping what was chosen.
+  const chooser = (label, onInput) => {
+    const slot = htl.html`<span></span>`;
+    let input = null, have = null;
+    const set = (values) => {
+      if (have === values.join("\n")) return;
+      const was = input ? input.value : values[0];
+      have = values.join("\n");
+      input = Inputs.select(values, { label, value: values.includes(was) ? was : values[0] });
+      if (onInput) input.addEventListener("input", onInput);
+      slot.replaceChildren(input);
+    };
+    return { slot, set, get value() { return input ? input.value : ""; } };
+  };
+  const state = chooser("State", () => draw()), kind = chooser("Kind", () => draw()), newKind = chooser("Kind"), find = Inputs.text({ label: "Find", placeholder: "title, about or label" });
+  const title = Inputs.text({ label: "Title" }), body = Inputs.textarea({ label: "Body", rows: 3 }), about = Inputs.text({ label: "About", value: "brain" }), parent = Inputs.text({ label: "Parent" });
+  const snapshot = async () => {
+    const s = await client.query("issue.snapshot");
+    wait = s.wait || wait;
+    base = { seq: s.seq, head: s.head, policy: s.policy, workflows: s.workflows, issues: Object.fromEntries(s.issues.map((i) => [i.id, i])) };
+  };
+  const sync = async () => {
+    const fresh = !base.policy;
+    if (fresh) await snapshot();
+    const r = await client.query("issue.sync", { after: base.seq, limit: 200 });
+    wait = r.wait || wait;
+    if (r.reset) await snapshot();
+    for (const e of r.events) if (e.seq > base.seq) e.hidden ? Object.assign(base, { seq: e.seq, issues: { ...base.issues, [e.id]: e.issue } }) : issueApply(base, e);
+    store.set(base);
+    if (fresh || r.reset || r.events.length) draw();
+    return r.events.length;
+  };
+  // act: what issueAllowed judges. sent: the body of the call.
+  const send = async (method, act, sent) => {
+    const key = crypto.randomUUID(), view = now(), verdict = issueAllowed(view, by, act);
+    const local = verdict.allow ? { ...issueEvent(view, act, verdict), seq: view.seq, hash: view.head, key, by, at: Date.now(), pending: true } : null;
+    note.textContent = "";
+    if (local) pending.push(local), draw();
+    try {
+      const r = await client.procedure("issue." + method, { ...sent, key });
+      pending = pending.filter((e) => e !== local);
+      if (r.event && r.event.seq === base.seq + 1) issueApply(base, r.event), store.set(base);
+      else await sync();
+      detail.delete(act.id);
+    } catch (e) {
+      pending = pending.filter((x) => x !== local);
+      note.textContent = `issue.${method} was refused: ${e.message}`;
+    }
+    draw();
+  };
+  const when = (ms) => new Date(ms).toLocaleString();
+  const said = (e) => (e.type === "moved" ? `${e.from} → ${e.to}${e.reason ? ": " + e.reason : ""}` : e.type === "swapped" ? `to ${e.to.state}${e.swap ? " by " + e.swap : ""}` : e.type === "reviewed" ? `${e.verdict}${e.body ? ": " + e.body : ""}` : e.type === "labelled" ? [...(e.add || []).map((l) => "+" + l), ...(e.remove || []).map((l) => "-" + l)].join(" ") : e.type === "narrowed" ? (e.remove != null ? "removed guard " + e.remove : `${e.move}: ${e.guard}`) : e.type === "opened" ? e.title : e.body || "");
+  const refsOf = (text) => text.split(",").map((s) => s.trim()).filter(Boolean).map((s) => ({ kind: s.includes(":") ? s.slice(0, s.indexOf(":")) : "url", value: s.includes(":") ? s.slice(s.indexOf(":") + 1) : s }));
+  // The open issue is drawn again only when it, its children or its timeline changed: what is being typed is kept.
+  let drawn = "";
+  const drawOne = () => {
+    const view = now(), i = open && view.issues[open];
+    const kids = i ? Object.values(view.issues).filter((k) => k.parent === i.id) : [];
+    const key = i ? [i.id, i.seq, i.state, i.hidden, (detail.get(i.id) || {}).seq, pending.filter((e) => e.id === i.id).length, ...kids.map((k) => k.id + k.state)].join("|") : "";
+    if (key === drawn) return;
+    drawn = key;
+    if (!i) return one.replaceChildren();
+    if (i.hidden) return one.replaceChildren(htl.html`<i style=${muted}>${i.id} is not shown to this caller.</i>`);
+    const wf = view.workflows[i.workflow] || { moves: [], swaps: [] }, got = detail.get(i.id);
+    if (!got || got.seq !== i.seq) client.query("issue.get", { id: i.id }).then((r) => (detail.set(i.id, { seq: (view.issues[i.id] || i).seq, ...r }), open === i.id && drawOne())).catch(() => null);
+    const events = [...((got && got.events) || []), ...pending.filter((e) => e.id === i.id)];
+    const reason = Inputs.text({ label: "Reason" }), refs = Inputs.text({ label: "Refs", placeholder: "commit:abc, deploy:brain-x-a@hash" }), comment = Inputs.textarea({ label: "Comment", rows: 2 }), label = Inputs.text({ label: "Label" });
+    const verdict = Inputs.select(issuesLimits.verdicts, { label: "Review" }), acts = htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap"></div>`;
+    const buttons = () => {
+      const moves = [...new Set(wf.moves.filter((m) => m.from === "*" || [].concat(m.from).includes(i.state)).map((m) => m.to))].map((to) => ({ text: to, act: { type: "move", id: i.id, to, reason: reason.value, refs: refsOf(refs.value) }, call: ["move", { id: i.id, to, reason: reason.value, refs: refsOf(refs.value) }] }));
+      const swaps = wf.swaps.map((s) => ({ text: "swap: " + s.name, act: { type: "swap", id: i.id, swap: s.name, reason: reason.value }, call: ["swap", { id: i.id, swap: s.name, reason: reason.value }] }));
+      acts.replaceChildren(...[...moves, ...swaps].map((b) => {
+        const v = issueAllowed(now(), by, b.act);
+        return htl.html`<button disabled=${!v.allow} title=${v.allow ? "" : v.why} onclick=${() => send(b.call[0], b.act, b.call[1])}>${b.text}</button>`;
+      }));
+    };
+    reason.addEventListener("input", buttons);
+    refs.addEventListener("input", buttons);
+    buttons();
+    one.replaceChildren(htl.html`<div style="border-top:1px solid var(--theme-foreground-faintest);margin-top:12px;padding-top:8px">
+      <b>${i.title}</b> <code>${i.id}</code> <span style=${muted}>${i.state} · ${i.kind} · ${i.about}${i.labels.length ? " · " + i.labels.join(", ") : ""}${i.parent ? " · child of " + i.parent : ""}</span>
+      <div style="white-space:pre-wrap;margin:6px 0">${(got && got.issue && got.issue.body) || i.body || ""}</div>
+      ${kids.length ? htl.html`<div>${kids.map((k) => htl.html`<div><a href="#" onclick=${(ev) => (ev.preventDefault(), (open = k.id), drawOne())}>${k.id}</a> ${k.title || ""} <span style=${muted}>${k.state}</span></div>`)}</div>` : ""}
+      <div style="margin:6px 0">${events.map((e) => htl.html`<div style=${e.pending ? muted : ""}><span style=${muted}>${when(e.at)} ${e.by.holder || e.by.caller}</span> <b>${e.type}</b> ${said(e)}${(e.refs || []).map((r) => ` [${r.kind}:${r.value}]`).join("")}</div>`)}</div>
+      ${reason}${refs}${acts}
+      <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-top:6px">${verdict}${Inputs.button("Review", { reduce: () => send("review", { type: "review", id: i.id, verdict: verdict.value, body: comment.value, refs: refsOf(refs.value) }, { id: i.id, verdict: verdict.value, body: comment.value, refs: refsOf(refs.value) }) })}</div>
+      ${comment}${Inputs.button("Comment", { reduce: () => comment.value.trim() && send("comment", { type: "comment", id: i.id, body: comment.value }, { id: i.id, body: comment.value }) })}
+      <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">${label}${Inputs.button("Add label", { reduce: () => label.value.trim() && send("label", { type: "label", id: i.id, add: [label.value.trim()] }, { id: i.id, add: [label.value.trim()] }) })}</div>
+    </div>`);
+  };
+  const draw = () => {
+    const view = now(), all = Object.values(view.issues);
+    state.set(["", ...new Set(all.map((i) => i.state))]);
+    kind.set(["", ...new Set(all.map((i) => i.kind))]);
+    newKind.set(Object.keys((view.policy && view.policy.kinds) || { task: 1 }));
+    const q = find.value.trim().toLowerCase();
+    const rows = all
+      .filter((i) => (!state.value || i.state === state.value) && (!kind.value || i.kind === kind.value) && (!q || `${i.title || ""} ${i.about || ""} ${(i.labels || []).join(" ")} ${i.id}`.toLowerCase().includes(q)))
+      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
+      .map((i) => ({ id: i.id, title: i.hidden ? "(not shown)" : i.title, state: i.state, kind: i.kind, about: i.about || "", labels: (i.labels || []).join(", "), parent: i.parent || "", changed: i.updated_at ? new Date(i.updated_at) : null }));
+    const table = Inputs.table(rows, { multiple: false, layout: "auto", format: { changed: (d) => (d ? d.toLocaleString() : "") } });
+    table.addEventListener("input", () => ((open = table.value ? table.value.id : null), drawOne()));
+    list.replaceChildren(rows.length ? table : htl.html`<i style=${muted}>No issues${all.length ? " match" : ""}.</i>`);
+    if (!note.textContent.includes("refused")) note.textContent = `${all.length} issues at event ${view.seq}${pending.length ? `, ${pending.length} being sent` : ""}.`;
+    root.value = view;
+    drawOne();
+  };
+  find.addEventListener("input", () => draw());
+  const create = () => {
+    if (!title.value.trim()) return;
+    const id = "n" + crypto.randomUUID().slice(0, 8), act = { type: "open", id, title: title.value.trim(), body: body.value, kind: newKind.value, about: about.value.trim() || "brain", parent: parent.value.trim() || null, labels: [] };
+    send("open", act, act);
+    open = id;
+    title.value = body.value = "";
+  };
+  const root = htl.html`<div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap">${state.slot}${kind.slot}${find}</div>
+    ${list}${one}
+    <details style="margin-top:12px"><summary>New issue</summary>${title}${body}${newKind.slot}${about}${parent}${Inputs.button("Open", { reduce: create })}</details>
+    <div style="display:flex;gap:8px;margin-top:8px;align-items:center">${Inputs.button("Refresh", { reduce: () => sync().catch((e) => (note.textContent = "issue.sync failed: " + e.message)) })}${note}</div>
+  </div>`;
+  Object.assign(root, { value: base, send, sync, form: { title, kind: newKind, open: create }, filters: { state, kind } });
+  draw();
+  const tick = () => (typeof document === "undefined" || document.visibilityState === "visible") && sync().catch((e) => (note.textContent = "issue.sync failed: " + e.message));
+  // The service says how long to wait (its setting syncMs); `every` is a test's own.
+  let timer = null, over = false;
+  const loop = async () => {
+    await tick();
+    if (!over) timer = setTimeout(loop, every ?? wait);
+  };
+  loop();
+  if (invalidation) invalidation.then(() => ((over = true), clearTimeout(timer)));
+  return root;
+});};
+const _brainissues_anon_d3f0b4f807 = function _anonymous(md) {return (md`## Tests
+
+No SQL engine runs in a page. \`issuesFakeSql\` answers for the statements of \`issuesSql\` from three maps, and refuses any other statement. Its insert fails on a \`seq\` or a \`key\` that is kept, as the table's key and its unique index do.`);};
+const _brainissues_issuesFakeSql = function _issuesFakeSql(issuesSql,issuesSchema) {return (() => {
+  const events = [], view = new Map(), meta = new Map(), S = issuesSql, hooks = [];
+  const row = (rows, changes = 0) => ({ rows, changes });
+  const run = async (statement, a) => {
+    if (issuesSchema.includes(statement)) return row([]);
+    if (statement === S.head) return row(events.length ? [{ seq: events.at(-1).seq, hash: events.at(-1).hash }] : []);
+    if (statement === S.byKey) return row(events.filter((e) => e.key === a[0]).map((e) => ({ event: e.event })));
+    if (statement === S.insert) {
+      // A test's hook stands for another writer that gets in first.
+      if (hooks.length) await hooks.shift()();
+      if (events.some((e) => e.seq === a[0])) throw new Error("UNIQUE constraint failed: issues_events.seq");
+      if (events.some((e) => e.key === a[1])) throw new Error("UNIQUE constraint failed: issues_events.key");
+      events.push({ seq: a[0], key: a[1], id: a[2], type: a[3], at: a[4], hash: a[5], event: a[6] });
+      return row([], 1);
+    }
+    if (statement === S.after) return row(events.filter((e) => e.seq > a[0]).slice(0, a[1]).map((e) => ({ event: e.event })));
+    if (statement === S.of) return row(events.filter((e) => e.id === a[0]).map((e) => ({ event: e.event })));
+    if (statement === S.one) return row(events.filter((e) => e.seq === a[0]).map((e) => ({ event: e.event })));
+    if (statement === S.meta) return row([...meta].map(([k, v]) => ({ k, v })));
+    if (statement === S.putMeta) return meta.set(a[0], a[1]), row([], 1);
+    if (statement === S.near) return row([...view.values()].filter((r) => r.id === a[0] || r.parent === a[0] || r.id === a[1]).map((r) => ({ issue: r.issue })));
+    if (statement === S.all) return row([...view.values()].map((r) => ({ issue: r.issue })));
+    if (statement === S.putIssue) return view.set(a[0], { id: a[0], parent: a[4], workflow: a[5], closed: a[6], issue: a[8] }), row([], 1);
+    if (statement === S.onWorkflow) return row([...view.values()].filter((r) => r.workflow === a[0] && !r.closed).map((r) => ({ issue: r.issue })));
+    if (statement === S.clearView) return view.clear(), row([]);
+    if (statement === S.clearMeta) return meta.clear(), row([]);
+    throw new Error("issuesFakeSql: " + statement);
+  };
+  return { run, events, view, meta, hooks };
+});};
+const _brainissues_issuesRig = function _issuesRig(issuesFakeSql,issueKeys,simulate,issues_service,sha256,issueCanon) {return (async () => {
+  const db = issuesFakeSql();
+  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const jwk = JSON.stringify(await crypto.subtle.exportKey("jwk", pair.privateKey)), keys = await issueKeys(jwk);
+  const sim = await simulate(issues_service, { sql: db.run, stored: { ISSUES_SIGNING_KEY: jwk } });
+  const X = "/xrpc/com.lopecode.brain.issue.";
+  let n = 0;
+  const as = (who, via = "", more = {}) => async (path, body) => {
+    const r = await sim.fetch("https://issues.internal" + X + path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: { "x-brain-caller": who, "x-brain-via": via, ...more, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      body: body === undefined ? undefined : JSON.stringify({ key: "k" + ++n, ...body })
+    });
+    return { status: r.status, data: await r.json() };
+  };
+  // An event a holder of the key and the database could write past the service: chained and signed, judged by nobody.
+  const forge = async (fields, by = { caller: "token:a", via: "" }) => {
+    const head = db.events.at(-1), e = { seq: head.seq + 1, key: "forged" + ++n, ...fields, by, origin: by, ray: "", at: Date.now(), prev: head.hash };
+    e.hash = await sha256(issueCanon(e));
+    e.sig = await keys.sign(e.hash);
+    db.events.push({ seq: e.seq, key: e.key, id: e.id, type: e.type, at: e.at, hash: e.hash, event: JSON.stringify(e) });
+    return e;
+  };
+  const rig = { db, sim, keys, as, forge, owner: as("owner", "session"), a: as("token:a"), b: as("token:b"), worker: as("worker:brain-x-echo"), member: as("did:plc:other", "session") };
+  // An issue taken to in-review: opened and made ready by the owner, implemented by token a.
+  rig.inReview = async (id, more = {}) => {
+    await rig.owner("open", { id, title: id, kind: "task", ...more });
+    await rig.owner("move", { id, to: "triaged", reason: "real" });
+    await rig.owner("move", { id, to: "ready" });
+    await rig.a("move", { id, to: "in-progress" });
+    return rig.a("move", { id, to: "in-review", refs: [{ kind: "commit", value: "abc" }] });
+  };
+  return rig;
+});};
+const _brainissues_test_issues_chain_is_signed_and_a_break_is_found = async function _test_issues_chain_is_signed_and_a_break_is_found(issuesRig,expect,issueKeys) {
+  const rig = await issuesRig();
+  const opened = (await rig.owner("open", { title: "First", kind: "task" })).data;
+  await rig.owner("comment", { id: opened.id, body: "one" });
+  await rig.a("comment", { id: opened.id, body: "two" });
+  // Event 1 is the default policy, written by the Worker before the first write.
+  const events = rig.db.events.map((e) => JSON.parse(e.event));
+  expect(events.map((e) => [e.seq, e.type, e.by.caller])).toEqual([[1, "policy", "worker:brain-x-issues"], [2, "opened", "owner"], [3, "commented", "owner"], [4, "commented", "token:a"]]);
+  expect(opened).toMatchObject({ id: "i2", seq: 2 });
+  expect(events.map((e) => e.prev)).toEqual(["", ...events.slice(0, 3).map((e) => e.hash)]);
+  expect((await rig.owner("verify")).data).toEqual({ ok: true, seq: 4, head: events[3].hash, checked: 4, guards: false });
+  expect((await rig.owner("verify?after=2")).data).toMatchObject({ ok: true, checked: 2 });
+  // The public key alone checks a signature.
+  const pub = await issueKeys((await rig.member("key")).data.key);
+  expect([await pub.verify(events[1].hash, events[1].sig), await pub.verify(events[1].hash, events[2].sig)]).toEqual([true, false]);
+  // A changed body: its hash no longer matches. A removed event: the next one's prev does not.
+  const kept = rig.db.events[2].event;
+  rig.db.events[2].event = kept.replace('"one"', '"ONE"');
+  expect((await rig.owner("verify")).data).toMatchObject({ ok: false, seq: 3, why: "hash" });
+  rig.db.events[2].event = kept;
+  rig.db.events.splice(2, 1);
+  expect((await rig.owner("verify")).data).toMatchObject({ ok: false, seq: 3, why: "seq" });
+  return "4 events; a changed one and a removed one are found";
+};
+const _brainissues_test_issues_a_key_writes_once_and_two_writers_make_one_chain = async function _test_issues_a_key_writes_once_and_two_writers_make_one_chain(issuesRig,expect) {
+  const rig = await issuesRig();
+  const first = (await rig.owner("open", { key: "same", title: "Once", kind: "task", id: "once" })).data;
+  const again = (await rig.owner("open", { key: "same", title: "Once, retried", kind: "task", id: "once" })).data;
+  expect([first.seq, again.seq, again.duplicate, again.event.title]).toEqual([2, 2, true, "Once"]);
+  expect((await rig.owner("open", { title: "Taken", kind: "task", id: "once" })).data.message).toBe("an issue has this id");
+  // Another writer takes seq 3 between this write's read of the head and its insert.
+  rig.db.hooks.push(() => rig.forge({ id: "once", type: "commented", workflow: first.event.workflow, body: "got in first" }));
+  const late = (await rig.owner("comment", { id: "once", body: "second" })).data;
+  expect(late.seq).toBe(4);
+  expect(late.event.prev).toBe(JSON.parse(rig.db.events[2].event).hash);
+  // Two at once.
+  const both = await Promise.all([rig.a("comment", { id: "once", body: "x" }), rig.b("comment", { id: "once", body: "y" })]);
+  expect(both.map((r) => r.data.seq).sort()).toEqual([5, 6]);
+  expect((await rig.owner("verify")).data).toMatchObject({ ok: true, seq: 6, checked: 6 });
+  expect((await rig.owner("comment", { id: "once" })).status).toBe(400);
+  expect((await rig.owner("comment", { key: "", id: "once", body: "x" })).status).toBe(400);
+  expect((await rig.member("comment", { id: "nope", body: "x" })).status).toBe(404);
+  return "one event for one key; a write that lost its seq is written after the winner";
+};
+const _brainissues_test_issues_default_policy_review_approval_and_children = async function _test_issues_default_policy_review_approval_and_children(issuesRig,expect) {
+  const rig = await issuesRig(), ref = [{ kind: "commit", value: "abc" }];
+  await rig.owner("open", { id: "t1", title: "Task", kind: "task" });
+  // Triage needs a reason; a Worker may not triage; an implementer needs a ref to submit.
+  expect((await rig.owner("move", { id: "t1", to: "triaged" })).data).toMatchObject({ error: "Refused", message: "the guard of triage refuses" });
+  expect((await rig.worker("move", { id: "t1", to: "triaged", reason: "real" })).status).toBe(403);
+  expect((await rig.owner("move", { id: "t1", to: "done" })).data.message).toBe("no move from open to done");
+  await rig.owner("move", { id: "t1", to: "triaged", reason: "real" });
+  await rig.owner("move", { id: "t1", to: "ready" });
+  await rig.a("move", { id: "t1", to: "in-progress" });
+  expect((await rig.a("move", { id: "t1", to: "in-review" })).status).toBe(403);
+  expect((await rig.b("move", { id: "t1", to: "in-review", refs: ref })).status).toBe(403);
+  expect((await rig.a("move", { id: "t1", to: "in-review", refs: ref })).data.event).toMatchObject({ move: "submit", from: "in-progress", to: "in-review" });
+  // The implementer neither reviews nor passes. Without a passing review nobody passes.
+  expect((await rig.a("review", { id: "t1", verdict: "pass" })).data.message).toBe("the workflow's review guard refuses");
+  expect((await rig.b("move", { id: "t1", to: "done" })).status).toBe(403);
+  await rig.b("review", { id: "t1", verdict: "changes", body: "no test" });
+  expect((await rig.b("move", { id: "t1", to: "done" })).status).toBe(403);
+  // Sent back, the implementer is still token a, and the reviews start again.
+  await rig.b("move", { id: "t1", to: "in-progress" });
+  expect((await rig.b("move", { id: "t1", to: "in-review", refs: ref })).status).toBe(403);
+  await rig.a("move", { id: "t1", to: "in-review", refs: ref });
+  expect((await rig.b("move", { id: "t1", to: "done" })).status).toBe(403);
+  await rig.b("review", { id: "t1", verdict: "pass" });
+  expect((await rig.a("move", { id: "t1", to: "done" })).status).toBe(403);
+  expect((await rig.b("move", { id: "t1", to: "done" })).data.event.move).toBe("pass");
+  // Revert is the owner present, with a reason and a ref. A token of the owner is not present.
+  expect((await rig.a("move", { id: "t1", to: "reverted", reason: "broke", refs: ref })).status).toBe(403);
+  expect((await rig.as("owner", "delegation:d1", { "x-brain-holder": "secret:laptop" })("move", { id: "t1", to: "reverted", reason: "broke", refs: ref })).status).toBe(403);
+  expect((await rig.as("owner", "session", { "x-brain-tab": "0" })("move", { id: "t1", to: "reverted", reason: "broke", refs: ref })).status).toBe(403);
+  expect((await rig.owner("move", { id: "t1", to: "reverted", reason: "broke", refs: ref })).status).toBe(200);
+  // Major: a pass leads to awaiting-approval, and only the owner present approves.
+  await rig.inReview("t2", { labels: ["major"] });
+  await rig.b("review", { id: "t2", verdict: "pass" });
+  expect((await rig.b("move", { id: "t2", to: "done" })).status).toBe(403);
+  await rig.b("move", { id: "t2", to: "awaiting-approval" });
+  expect((await rig.b("move", { id: "t2", to: "done" })).status).toBe(403);
+  expect((await rig.owner("move", { id: "t2", to: "done" })).data.event.move).toBe("approve");
+  // A parent is not ready, and not submitted, while a child is open.
+  await rig.owner("open", { id: "p", title: "Parent", kind: "task" });
+  expect((await rig.owner("open", { id: "c", title: "Child", kind: "task", parent: "nope" })).status).toBe(404);
+  await rig.owner("open", { id: "c", title: "Child", kind: "task", parent: "p" });
+  await rig.owner("move", { id: "p", to: "triaged", reason: "real" });
+  expect((await rig.owner("move", { id: "p", to: "ready" })).status).toBe(403);
+  await rig.owner("move", { id: "c", to: "rejected", reason: "not needed" });
+  expect((await rig.owner("move", { id: "p", to: "ready" })).status).toBe(200);
+  expect((await rig.owner("get?id=p")).data.children).toEqual([{ id: "c", title: "Child", kind: "task", state: "rejected", closed: true }]);
+  expect((await rig.owner("verify?guards=true")).data).toMatchObject({ ok: true, guards: true });
+  return "reviewer is not the implementer; major waits for the owner; a parent waits for its children";
+};
+const _brainissues_test_issues_swaps_and_guards_of_one_issue = async function _test_issues_swaps_and_guards_of_one_issue(issuesRig,expect) {
+  const rig = await issuesRig();
+  await rig.owner("open", { id: "s1", title: "Leak", kind: "bug" });
+  const hashes = (await rig.owner("policy")).data.policy.names;
+  // The listed swap needs its guard (the label), and no owner.
+  expect((await rig.a("swap", { id: "s1", swap: "escalate" })).data.message).toBe("the guard of escalate refuses");
+  await rig.a("label", { id: "s1", add: ["security"] });
+  expect((await rig.worker("label", { id: "s1", add: ["x"] })).status).toBe(403);
+  // A guard added to one move of this issue, by whoever may triage. It only narrows.
+  expect((await rig.a("narrow", { id: "s1", move: "triage", guard: "caller.present" })).status).toBe(200);
+  expect((await rig.a("narrow", { id: "s1", move: "triage", guard: "caller.(" })).status).toBe(400);
+  expect((await rig.a("narrow", { id: "s1", move: "nope", guard: "true" })).status).toBe(403);
+  expect((await rig.a("move", { id: "s1", to: "triaged", reason: "real" })).data.message).toBe("this issue's guard 4 on triage refuses");
+  const swapped = (await rig.a("swap", { id: "s1", swap: "escalate", reason: "leaks a key" })).data.event;
+  expect(swapped).toMatchObject({ type: "swapped", swap: "escalate", from: { workflow: hashes.task, state: "open" }, to: { workflow: hashes.security, state: "triaged" } });
+  // Security lists no swap out: back to task is the owner present.
+  expect((await rig.a("swap", { id: "s1", workflow: "task", state: "open" })).data.message).toBe("a swap the workflow does not list needs the owner, present");
+  expect((await rig.owner("swap", { id: "s1", workflow: "task", state: "nope" })).status).toBe(403);
+  expect((await rig.owner("swap", { id: "s1", workflow: "task", state: "open" })).data.event).toMatchObject({ swap: null, to: { workflow: hashes.task, state: "open" } });
+  // The issue's own guard came along through both swaps. Only the owner present removes it.
+  expect((await rig.a("move", { id: "s1", to: "triaged", reason: "real" })).status).toBe(403);
+  expect((await rig.a("narrow", { id: "s1", remove: 4 })).data.message).toBe("the owner, present");
+  expect((await rig.owner("narrow", { id: "s1", remove: 9 })).status).toBe(404);
+  expect((await rig.owner("narrow", { id: "s1", remove: 4 })).status).toBe(200);
+  expect((await rig.a("move", { id: "s1", to: "triaged", reason: "real" })).status).toBe(200);
+  expect((await rig.owner("verify?guards=true")).data).toMatchObject({ ok: true });
+  return "a listed swap by a token; an unlisted one by the owner present; a guard of one issue";
+};
+const _brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates = async function _test_issues_policy_is_installed_by_the_owner_and_migrates(issuesRig,expect,issuePolicyAct,issuesDefaultPolicy) {
+  const rig = await issuesRig();
+  await rig.owner("open", { id: "f1", title: "Slow page", kind: "feedback" });
+  await rig.owner("open", { id: "f2", title: "Closed", kind: "feedback" });
+  await rig.owner("move", { id: "f2", to: "closed" });
+  const was = (await rig.owner("policy")).data.policy.names;
+  const flow = { states: ["new", "seen", "closed"], start: "new", closed: ["closed"], read: "true", open: "true", comment: "true", label: "true", review: "false", narrow: "false", moves: [{ name: "see", from: "new", to: "seen", guard: 'caller.kind == "token"' }], swaps: [] };
+  const policy = { kinds: { feedback: "feedback" }, workflows: { feedback: flow } };
+  expect((await rig.a("install", { policy })).data.message).toBe("the owner, present");
+  expect((await rig.as("owner", "delegation:d1")("install", { policy })).status).toBe(403);
+  const bad = (change) => rig.owner("install", { policy: { ...policy, workflows: { feedback: { ...flow, ...change } } } }).then((r) => [r.status, r.data.error]);
+  expect(await bad({ review: "caller.(" })).toEqual([400, "InvalidPolicy"]);
+  expect(await bad({ start: "nope" })).toEqual([400, "InvalidPolicy"]);
+  expect(await bad({ moves: [{ name: "see", from: "new", to: "gone", guard: "true" }] })).toEqual([400, "InvalidPolicy"]);
+  expect(await bad({ swaps: [{ name: "x", to: { workflow: "task", state: "open" }, guard: "true" }] })).toEqual([400, "InvalidPolicy"]);
+  const installed = (await rig.owner("install", { key: "v2", policy, migrate: { [was.feedback]: { workflow: "feedback", states: { open: "new" } } } })).data;
+  expect(installed).toMatchObject({ seq: 5, moved: ["f1"] });
+  expect(installed.hashes.feedback).not.toBe(was.feedback);
+  // The open issue moved with an event of its own that cites the policy; the closed one stays on the workflow it was closed under.
+  const moved = (await rig.owner("get?id=f1")).data;
+  expect(moved.issue).toMatchObject({ state: "new", workflow: installed.hashes.feedback });
+  expect(moved.events.at(-1)).toMatchObject({ type: "swapped", swap: null, policy: 5, to: { workflow: installed.hashes.feedback, state: "new" } });
+  expect((await rig.owner("get?id=f2")).data.issue).toMatchObject({ state: "closed", workflow: was.feedback });
+  expect((await rig.owner("policy?hash=" + was.feedback)).data.workflow.states).toEqual(["open", "closed"]);
+  expect(Object.keys((await rig.owner("policy")).data.workflows)).toEqual([installed.hashes.feedback]);
+  // The new guards hold now, and a kind the policy does not name is not opened.
+  expect((await rig.owner("move", { id: "f1", to: "seen" })).status).toBe(403);
+  expect((await rig.a("move", { id: "f1", to: "seen" })).status).toBe(200);
+  expect((await rig.owner("open", { title: "x", kind: "task" })).data.message).toBe("no workflow for the kind task");
+  expect((await rig.owner("install", { key: "v2", policy })).data).toMatchObject({ seq: 5, duplicate: true, moved: [] });
+  // The default policy was written once, into the empty record, and is not written again: not after an install, not
+  // when the view is lost, not after a rebuild. A second one written past the service is named by the replay.
+  const byWorker = () => rig.db.events.map((e) => JSON.parse(e.event)).filter((e) => e.type === "policy").map((e) => [e.seq, e.by.caller]);
+  expect(byWorker()).toEqual([[1, "worker:brain-x-issues"], [5, "owner"]]);
+  rig.db.meta.clear();
+  expect((await rig.a("comment", { id: "f1", body: "x" })).data).toMatchObject({ error: "ViewLost" });
+  expect(rig.db.events.length).toBe(7);
+  await rig.owner("rebuild", {});
+  expect((await rig.a("comment", { id: "f1", body: "x" })).status).toBe(200);
+  expect(Object.keys((await rig.owner("policy")).data.policy.kinds)).toEqual(["feedback"]);
+  expect(byWorker().length).toBe(2);
+  const again = await issuePolicyAct(issuesDefaultPolicy);
+  const forged = await rig.forge({ type: "policy", policy: again.policy, hashes: again.hashes }, { caller: "worker:brain-x-issues", via: "" });
+  expect((await rig.owner("verify?guards=true")).data).toMatchObject({ ok: false, seq: forged.seq, why: "the owner, present" });
+  rig.db.events.pop();
+  expect((await rig.owner("verify?guards=true")).data).toMatchObject({ ok: true });
+  return "installed by the owner present; 4 policies refused; 1 open issue migrated";
+};
+const _brainissues_test_issues_hidden_from_who_may_not_read = async function _test_issues_hidden_from_who_may_not_read(issuesRig,expect) {
+  const rig = await issuesRig();
+  await rig.a("open", { id: "sec", title: "Key in a log", body: "the key is …", kind: "security" });
+  await rig.a("open", { id: "pub", title: "Typo", kind: "bug" });
+  const stub = { id: "sec", kind: "security", state: "open", closed: false, parent: null, hidden: true };
+  // The opener and the owner read it; another token and a Worker are told that it is there and no more.
+  expect((await rig.a("get?id=sec")).data.issue.title).toBe("Key in a log");
+  expect((await rig.owner("get?id=sec")).data.events.length).toBe(1);
+  expect((await rig.b("get?id=sec")).data).toEqual({ issue: stub, children: [], events: [] });
+  expect((await rig.b("snapshot")).data.issues.map((i) => i.title || i.hidden)).toEqual([true, "Typo"]);
+  expect((await rig.worker("list")).data.issues.find((i) => i.id === "sec")).toEqual(stub);
+  const synced = (await rig.b("sync?after=1")).data;
+  expect(synced.events.map((e) => [e.seq, e.id, e.hidden || e.title])).toEqual([[2, "sec", true], [3, "pub", "Typo"]]);
+  expect(JSON.stringify(synced)).not.toContain("the key is");
+  expect((await rig.a("sync?after=1")).data.events[0].body).toBe("the key is …");
+  expect((await rig.b("comment", { id: "sec", body: "me too" })).status).toBe(200);
+  expect((await rig.member("list")).status).toBe(200);
+  return "a security issue: 2 readers, 2 callers shown a stub";
+};
+const _brainissues_test_issues_rebuild_and_replay_judge_the_record = async function _test_issues_rebuild_and_replay_judge_the_record(issuesRig,expect) {
+  const rig = await issuesRig();
+  await rig.inReview("r1");
+  await rig.owner("open", { id: "r2", title: "Other", kind: "feedback", labels: ["ui"] });
+  const before = (await rig.owner("snapshot")).data;
+  expect((await rig.a("rebuild", {})).status).toBe(403);
+  rig.db.view.clear();
+  rig.db.meta.clear();
+  expect((await rig.owner("rebuild", {})).data).toEqual({ seq: before.seq, issues: 2 });
+  expect((await rig.owner("snapshot")).data).toEqual(before);
+  expect((await rig.owner("sync?after=99")).data).toMatchObject({ reset: true, wait: 5000 });
+  expect((await rig.as("owner", "session", { "x-brain-settings": encodeURIComponent(JSON.stringify({ syncMs: 20000 })) })("sync?after=0")).data.wait).toBe(20000);
+  // A closed issue's body is left out of a snapshot and is in issue.get.
+  await rig.owner("move", { id: "r2", to: "closed" });
+  expect((await rig.owner("snapshot")).data.issues.find((i) => i.id === "r2")).toMatchObject({ bodyLeftOut: true });
+  // A move written past the service, chained and signed: the chain holds, and the replay names it.
+  const wf = before.issues.find((i) => i.id === "r1").workflow;
+  const forged = await rig.forge({ id: "r1", type: "moved", workflow: wf, move: "pass", from: "in-review", to: "done", reason: "", refs: [] });
+  expect((await rig.owner("verify")).data).toMatchObject({ ok: true, seq: forged.seq });
+  expect((await rig.owner("verify?guards=true")).data).toEqual({ ok: false, seq: forged.seq, why: "the guard of pass refuses", checked: forged.seq - 1 });
+  return "the view made again equals the view kept; a forged pass is named";
+};
+const _brainissues_test_issues_declares_what_it_needs = async function _test_issues_declares_what_it_needs(issues_service,expect,decide,callerOf,issuePolicyAct,issuesDefaultPolicy,simulate,issuesFakeSql) {
+  const { meta } = await issues_service.emit();
+  expect(meta).toMatchObject({ worker: "brain-x-issues", role: "recipe", module: "@tomlarkworthy/brain-issues", resources: ["sql"], secrets: ["ISSUES_SIGNING_KEY"] });
+  const methods = Object.keys(meta.access).sort().map((m) => m.replace("com.lopecode.brain.issue.", ""));
+  expect(methods).toEqual(["comment", "get", "install", "key", "label", "list", "move", "narrow", "open", "policy", "rebuild", "review", "snapshot", "swap", "sync", "verify"]);
+  const let_in = (who) => decide(meta.access["com.lopecode.brain.issue.open"], { caller: callerOf({ caller: who }), request: {} }).allow;
+  expect(["owner", "token:a", "worker:brain-x-echo", "did:plc:other", "anonymous"].map(let_in)).toEqual([true, true, true, false, false]);
+  // The default policy passes its own check.
+  expect(Object.keys((await issuePolicyAct(issuesDefaultPolicy)).hashes)).toEqual(["task", "security", "feedback"]);
+  // Without the key a write is refused and says which secret.
+  const bare = await simulate(issues_service, { sql: issuesFakeSql().run });
+  const r = await bare.fetch("https://issues.internal/xrpc/com.lopecode.brain.issue.open", { method: "POST", headers: { "x-brain-caller": "owner", "x-brain-via": "session", "content-type": "application/json" }, body: JSON.stringify({ key: "k", title: "x", kind: "task" }) });
+  expect([r.status, (await r.json()).message]).toEqual([503, "the secret ISSUES_SIGNING_KEY is not set"]);
+  return methods.length + " methods";
+};
+const _brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer = async function _test_issues_panel_draws_and_applies_a_write_before_the_answer(issuesRig,URLSearchParams,issuesPanel,expect,Event) {
+  const rig = await issuesRig();
+  await rig.owner("open", { id: "p1", title: "Shown first", kind: "task" });
+  const held = [];
+  const ok = (r) => (r.status < 400 ? r.data : Promise.reject(new Error(r.data.message)));
+  const client = {
+    query: (name, params = {}) => rig.owner(name.replace("issue.", "") + "?" + new URLSearchParams(params)).then(ok),
+    // Each write waits until the test lets it go.
+    procedure: (name, body) => new Promise((go) => held.push(go)).then(() => rig.owner(name.replace("issue.", ""), body)).then(ok)
+  };
+  const kept = {};
+  const panel = issuesPanel({ client, owner: true, every: 1e9, store: { get: () => null, set: (v) => (kept.view = JSON.parse(JSON.stringify(v))) } });
+  expect(issuesPanel({ client, owner: false }).textContent).toContain("Sign in as the owner");
+  await panel.sync();
+  expect(panel.textContent).toContain("Shown first");
+  expect(panel.textContent).toContain("1 issues at event 2");
+  // A new issue is in the table before the service has answered, and is the service's once it has.
+  const act = { type: "open", id: "p2", title: "Typed now", body: "", kind: "task", about: "brain", parent: null, labels: [] };
+  const sent = panel.send("open", act, act);
+  expect(panel.textContent).toContain("Typed now");
+  expect([panel.value.issues.p2.state, rig.db.view.has("p2"), panel.textContent.includes("1 being sent")]).toEqual(["open", false, true]);
+  held.shift()();
+  await sent;
+  expect([rig.db.view.has("p2"), panel.value.seq, kept.view.issues.p2.title]).toEqual([true, 3, "Typed now"]);
+  // A move the guard refuses is not drawn; one the service refuses is withdrawn and said.
+  const bad = panel.send("move", { type: "move", id: "p2", to: "triaged", reason: "real" }, { id: "p2", to: "triaged" });
+  expect(panel.value.issues.p2.state).toBe("triaged");
+  held.shift()();
+  await bad;
+  expect(panel.value.issues.p2.state).toBe("open");
+  expect(panel.textContent).toContain("issue.move was refused: the guard of triage refuses");
+  // The form: a title typed, the kind chosen from the policy's, Open.
+  const kinds = panel.form.kind.slot.querySelector("select");
+  expect([panel.form.kind.value, [...kinds.options].map((o) => o.textContent)]).toEqual(["task", ["bug", "task", "feedback", "security"]]);
+  kinds.selectedIndex = 0;
+  kinds.dispatchEvent(new Event("input", { bubbles: true }));
+  expect(panel.form.kind.value).toBe("bug");
+  panel.form.title.value = "From the form";
+  panel.form.open();
+  expect(panel.textContent).toContain("From the form");
+  held.shift()();
+  await new Promise((r) => setTimeout(r, 300));
+  expect([...rig.db.view.values()].map((r) => JSON.parse(r.issue)).find((i) => i.title === "From the form")).toMatchObject({ kind: "bug", about: "brain", state: "open" });
+  // A filter is answered from the copy.
+  const select = panel.filters.kind.slot.querySelector("select");
+  expect([...select.options].map((o) => o.textContent)).toEqual(["", "task", "bug"]);
+  select.selectedIndex = 2;
+  select.dispatchEvent(new Event("input", { bubbles: true }));
+  expect([panel.filters.kind.value, panel.textContent.includes("Shown first"), panel.textContent.includes("From the form")]).toEqual(["bug", false, true]);
+  // What another caller wrote arrives with the next sync.
+  await rig.a("comment", { id: "p1", body: "from elsewhere" });
+  expect(await panel.sync()).toBe(1);
+  expect(panel.value.issues.p1.comments).toBe(1);
+  return "drawn from a snapshot; a write shown before its answer; a refusal withdrawn";
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  $def("_brainissues_anon_8ee7cebb43", null, ["md"], _brainissues_anon_8ee7cebb43);
+  $def("_brainissues_viewof_issuesView", "viewof issuesView", ["issuesPanel","client","session","invalidation"], _brainissues_viewof_issuesView);
+  $def("_brainissues_issuesView", "issuesView", ["Generators","viewof issuesView"], _brainissues_issuesView);
+  $def("_brainissues_anon_701394d35c", null, ["md","issuesDefaultPolicy","issuesLimits"], _brainissues_anon_701394d35c);
+  $def("_brainissues_anon_5a96271726", null, ["md","issuesDefaultPolicy"], _brainissues_anon_5a96271726);
+  $def("_brainissues_issues_service", "issues_service", ["cloudflare","issuesApp"], _brainissues_issues_service);
+  $def("_brainissues_issues_announce", "issues_announce", ["plugins","issues_service","invalidation"], _brainissues_issues_announce);
+  $def("_brainissues_issuesLimits", "issuesLimits", [], _brainissues_issuesLimits);
+  $def("_brainissues_issuesDefaultPolicy", "issuesDefaultPolicy", [], _brainissues_issuesDefaultPolicy);
+  $def("_brainissues_issuesSchema", "issuesSchema", [], _brainissues_issuesSchema);
+  $def("_brainissues_issuesSql", "issuesSql", [], _brainissues_issuesSql);
+  $def("_brainissues_issueCanon", "issueCanon", [], _brainissues_issueCanon);
+  $def("_brainissues_issueKeys", "issueKeys", [], _brainissues_issueKeys);
+  $def("_brainissues_issueView", "issueView", [], _brainissues_issueView);
+  $def("_brainissues_issueCaller", "issueCaller", ["callerOf"], _brainissues_issueCaller);
+  $def("_brainissues_issueApply", "issueApply", [], _brainissues_issueApply);
+  $def("_brainissues_issueAllowed", "issueAllowed", ["issueCaller","decide"], _brainissues_issueAllowed);
+  $def("_brainissues_issueEvent", "issueEvent", [], _brainissues_issueEvent);
+  $def("_brainissues_issueReplay", "issueReplay", ["issueAllowed"], _brainissues_issueReplay);
+  $def("_brainissues_issueCheck", "issueCheck", ["sha256","issueCanon"], _brainissues_issueCheck);
+  $def("_brainissues_issuePolicyAct", "issuePolicyAct", ["issuesLimits","checkedRule","sha256","issueCanon"], _brainissues_issuePolicyAct);
+  $def("_brainissues_issueAct", "issueAct", ["issuesLimits","checkedRule"], _brainissues_issueAct);
+  $def("_brainissues_issuesApp", "issuesApp", ["hono","issuesSql","issuesLimits","issuesSchema","sql","secrets","issueKeys","config","callerFrom","originFrom","issueView","issuePolicyAct","issuesDefaultPolicy","issueAllowed","issueEvent","sha256","issueCanon","issueApply","issueAct","issueCheck","issueReplay","issueCaller"], _brainissues_issuesApp);
+  $def("_brainissues_issuesStore", "issuesStore", ["localStorage"], _brainissues_issuesStore);
+  $def("_brainissues_issuesPanel", "issuesPanel", ["issuesStore","htl","issueView","issueApply","structuredClone","Inputs","issueAllowed","issueEvent","issuesLimits"], _brainissues_issuesPanel);
+  $def("_brainissues_anon_d3f0b4f807", null, ["md"], _brainissues_anon_d3f0b4f807);
+  $def("_brainissues_issuesFakeSql", "issuesFakeSql", ["issuesSql","issuesSchema"], _brainissues_issuesFakeSql);
+  $def("_brainissues_issuesRig", "issuesRig", ["issuesFakeSql","issueKeys","simulate","issues_service","sha256","issueCanon"], _brainissues_issuesRig);
+  $def("_brainissues_test_issues_chain_is_signed_and_a_break_is_found", "test_issues_chain_is_signed_and_a_break_is_found", ["issuesRig","expect","issueKeys"], _brainissues_test_issues_chain_is_signed_and_a_break_is_found);
+  $def("_brainissues_test_issues_a_key_writes_once_and_two_writers_make_one_chain", "test_issues_a_key_writes_once_and_two_writers_make_one_chain", ["issuesRig","expect"], _brainissues_test_issues_a_key_writes_once_and_two_writers_make_one_chain);
+  $def("_brainissues_test_issues_default_policy_review_approval_and_children", "test_issues_default_policy_review_approval_and_children", ["issuesRig","expect"], _brainissues_test_issues_default_policy_review_approval_and_children);
+  $def("_brainissues_test_issues_swaps_and_guards_of_one_issue", "test_issues_swaps_and_guards_of_one_issue", ["issuesRig","expect"], _brainissues_test_issues_swaps_and_guards_of_one_issue);
+  $def("_brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates", "test_issues_policy_is_installed_by_the_owner_and_migrates", ["issuesRig","expect","issuePolicyAct","issuesDefaultPolicy"], _brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates);
+  $def("_brainissues_test_issues_hidden_from_who_may_not_read", "test_issues_hidden_from_who_may_not_read", ["issuesRig","expect"], _brainissues_test_issues_hidden_from_who_may_not_read);
+  $def("_brainissues_test_issues_rebuild_and_replay_judge_the_record", "test_issues_rebuild_and_replay_judge_the_record", ["issuesRig","expect"], _brainissues_test_issues_rebuild_and_replay_judge_the_record);
+  $def("_brainissues_test_issues_declares_what_it_needs", "test_issues_declares_what_it_needs", ["issues_service","expect","decide","callerOf","issuePolicyAct","issuesDefaultPolicy","simulate","issuesFakeSql"], _brainissues_test_issues_declares_what_it_needs);
+  $def("_brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer", "test_issues_panel_draws_and_applies_a_write_before_the_answer", ["issuesRig","URLSearchParams","issuesPanel","expect","Event"], _brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer);
+  main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
+  main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
+  main.define("sql", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sql", _));
+  main.define("secrets", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("secrets", _));
+  main.define("config", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("config", _));
+  main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
+  main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
+  main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
+  main.define("checkedRule", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("checkedRule", _));
+  main.define("callerOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerOf", _));
+  main.define("callerFrom", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerFrom", _));
+  main.define("originFrom", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("originFrom", _));
+  main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
+  main.define("module @tomlarkworthy/cloud-brain", [], async () => runtime.module((await import("/@tomlarkworthy/cloud-brain.js?v=4")).default));
+  main.define("client", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("client", _));
+  main.define("session", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("session", _));
+  main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
+  main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
+  main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone","@variable"], (_, v) => v.import("expect", _));
+  return main;
+}
+</script>
 <script id="@tomlarkworthy/brain-container" 
   type="text/plain"
   data-mime="application/javascript"
@@ -38850,7 +40134,7 @@ const _cloudbraindocs_architecture = function _architecture(htl) {
     ${arrow(272, 256, 568, 256, "deploys, checks health with each Worker's key", true)}
   </svg>`;
 };
-const _cloudbraindocs_anon_0f58c566c3 = function _anonymous(md) {return (md`## Who is calling
+const _cloudbraindocs_anon_71a35b757e = function _anonymous(md) {return (md`## Who is calling
 
 The kernel identifies the caller, in this order. No header from a caller can set the result.
 
@@ -38860,7 +40144,8 @@ The kernel identifies the caller, in this order. No header from a caller can set
 | a turn token | the DID of the person whose message the turn answers | \`turn:ENTRY\` |
 | a portal token | the viewer's DID | \`portal:ID\` |
 | a JWT that an atproto key signed (a PDS forwards a call) | \`owner\`, or the DID | \`jwt\` |
-| a token that the owner made | \`token:NAME\` | \`token\` |
+| a token that the owner made, from 2026-10-10 | \`owner\`, with \`caller.delegation\` and \`caller.holder == "secret"\`; not the owner's tab | \`delegation:ID\` |
+| a token that the owner made before 2026-10-10 | \`token:NAME\` | \`token\` |
 | none of these | \`anonymous\` | |
 
 The deployer gives each Worker a random key at deploy and tells the core the key's hash. A call to the core over a binding has the caller's key. Only the kernel's key can name a caller. Any other key makes the caller \`worker:NAME\`, whatever headers the Worker sent.
@@ -39018,7 +40303,7 @@ export default function define(runtime, observer) {
   $def("_cloudbraindocs_anon_84a07460df", null, ["md","mod"], _cloudbraindocs_anon_84a07460df);
   $def("_cloudbraindocs_anon_92129ed458", null, ["md","architecture","mod"], _cloudbraindocs_anon_92129ed458);
   $def("_cloudbraindocs_architecture", "architecture", ["htl"], _cloudbraindocs_architecture);
-  $def("_cloudbraindocs_anon_0f58c566c3", null, ["md"], _cloudbraindocs_anon_0f58c566c3);
+  $def("_cloudbraindocs_anon_71a35b757e", null, ["md"], _cloudbraindocs_anon_71a35b757e);
   $def("_cloudbraindocs_anon_9ebf4ee571", null, ["md","mod"], _cloudbraindocs_anon_9ebf4ee571);
   $def("_cloudbraindocs_anon_dfb6c07db0", null, ["md","mod"], _cloudbraindocs_anon_dfb6c07db0);
   $def("_cloudbraindocs_anon_79afaaa51f", null, ["md","mod"], _cloudbraindocs_anon_79afaaa51f);
@@ -105755,6 +107040,7 @@ export default function define(runtime, observer) {
     "@tomlarkworthy/brain-logs",
     "@tomlarkworthy/brain-snapshot",
     "@tomlarkworthy/brain-knowledge",
+    "@tomlarkworthy/brain-issues",
     "@tomlarkworthy/brain-container",
     "@tomlarkworthy/brain-ai",
     "@tomlarkworthy/cloud-brain",
