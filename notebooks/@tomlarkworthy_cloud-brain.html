@@ -38296,79 +38296,101 @@ const _brainissues_test_issues_panel_lists_what_waits_for_the_owner = async func
   token.end();
   return "4 of 6 issues listed, last changed first; a comment, an approval with its reason and needs-owner taken off, each one press; a hidden issue has no controls";
 };
-const _brainissues_test_issues_panel_says_when_a_newer_one_is_deployed = async function _test_issues_panel_says_when_a_newer_one_is_deployed(issuesRig,URLSearchParams,issuesPanel,expect,Event,globalThis,issuesJoinedAt) {
+const _brainissues_test_issues_panel_says_when_a_newer_one_is_deployed = async function _test_issues_panel_says_when_a_newer_one_is_deployed(issuesRig,URLSearchParams,issuesPanel,expect,globalThis,Event,issuesJoinedAt) {
   const rig = await issuesRig();
   await rig.owner("open", { id: "d1", title: "Any", kind: "task" });
   const ok = (r) => (r.status < 400 ? r.data : Promise.reject(new Error(r.data.message)));
-  const A = "a".repeat(64), B = "b".repeat(64), asked = [];
-  let running = A, down = false;
-  // getInfo is the kernel's, for anyone: what a Worker runs now. The rest is the tracker's.
-  const client = {
-    query: (name, params = {}) => (name === "getInfo" ? (asked.push(params.worker), down ? Promise.reject(new Error("getInfo 502")) : Promise.resolve({ name: params.worker, hash: running })) : rig.owner(name.replace("issue.", "") + "?" + new URLSearchParams(params)).then(ok)),
-    procedure: (name, body) => rig.owner(name.replace("issue.", ""), body).then(ok)
+  const A = "a".repeat(64), B = "b".repeat(64);
+  // getInfo is the kernel's, for anyone: what a Worker runs now. The rest is the tracker's. One client a panel,
+  // each with its own count of getInfo calls, counted when the call is made.
+  const kernel = () => {
+    const k = { asked: [], running: A, down: false };
+    k.client = {
+      query: (name, params = {}) => (name === "getInfo" ? (k.asked.push(params.worker), k.down ? Promise.reject(new Error("getInfo 502")) : Promise.resolve({ name: params.worker, hash: k.running })) : rig.owner(name.replace("issue.", "") + "?" + new URLSearchParams(params)).then(ok)),
+      procedure: (name, body) => rig.owner(name.replace("issue.", ""), body).then(ok)
+    };
+    return k;
   };
   const until = async (fn) => {
     for (let n = 0; n < 300 && !fn(); n++) await new Promise((r) => setTimeout(r, 10));
     return fn();
   };
+  const press = (text, root) => [...root.querySelectorAll("button")].find((b) => b.textContent.trim() === text).click();
+  const none = { get: () => null, set: () => null };
+  // A panel that does not listen, for everything that counts calls or reads what check() answers: a listening
+  // panel hears every visibilitychange and focus of the page the test runs in (another test's, or the owner coming
+  // back to the tab), and each one is a call more and makes the counted call no longer the last.
+  const k = kernel();
   let end = null, reloads = 0;
-  const panel = issuesPanel({ client, owner: true, every: 1e9, invalidation: new Promise((r) => (end = r)), store: { get: () => null, set: () => null }, joined: A, reload: () => reloads++ });
-  const press = (text, root = panel) => [...root.querySelectorAll("button")].find((b) => b.textContent.trim() === text).click();
+  const panel = issuesPanel({ client: k.client, owner: true, every: 1e9, invalidation: new Promise((r) => (end = r)), store: none, joined: A, reload: () => reloads++, listen: false });
   await panel.sync();
-  // The Worker runs what the page joined: the panel asks when it is made, and says nothing.
-  expect(await until(() => asked.length === 1)).toBe(true);
-  expect([asked[0], panel.newer.textContent, panel.newer.querySelectorAll("button").length]).toEqual(["brain-x-issues", "", 0]);
+  // The Worker runs what the page joined: asked, the panel says nothing.
+  expect([k.asked.length, await panel.check(), k.asked, panel.newer.textContent, panel.newer.querySelectorAll("button").length]).toEqual([0, false, ["brain-x-issues"], "", 0]);
   // A deploy while the page is open. Nothing on the page changes until it asks again.
-  running = B;
-  expect(panel.newer.textContent).toBe("");
+  k.running = B;
+  await new Promise((r) => setTimeout(r, 30));
+  expect([k.asked.length, panel.newer.textContent]).toEqual([1, ""]);
   // Refresh asks: one line with both hashes, and a button that loads the page again.
-  press("Refresh");
+  press("Refresh", panel);
   expect(await until(() => panel.newer.textContent !== "")).toBe(true);
-  expect(asked.length).toBe(2);
+  expect(k.asked.length).toBe(2);
   expect(panel.newer.textContent).toContain("A newer panel is deployed: brain-x-issues is bbbbbbbbbbbb, this page has aaaaaaaaaaaa.");
   expect(panel.textContent).toContain("A newer panel is deployed");
   press("Reload", panel.newer);
   expect(reloads).toBe(1);
   // An answer that fails leaves the line as it was.
-  down = true;
+  k.down = true;
   expect(await panel.check()).toBe(true);
   expect(panel.newer.textContent).toContain("A newer panel is deployed");
   // The Worker put back to what the page has: the line goes.
-  down = false;
-  running = A;
+  k.down = false;
+  k.running = A;
   expect(await panel.check()).toBe(false);
-  expect(panel.newer.textContent).toBe("");
-  // The tab shown again, or the window given the focus, asks too.
-  running = B;
-  const before = asked.length;
-  document.dispatchEvent(new Event("visibilitychange"));
-  expect(await until(() => panel.newer.textContent !== "")).toBe(true);
-  expect(asked.length).toBe(before + 1);
-  globalThis.dispatchEvent(new Event("focus"));
-  expect(await until(() => asked.length === before + 2)).toBe(true);
-  // A panel that has ended asks no more.
+  expect([panel.newer.textContent, k.asked.length]).toEqual(["", 4]);
   end();
+  // With no hash to compare (a copy opened from a file) getInfo is never asked, and such a panel does not listen.
+  const k2 = kernel();
+  let end2 = null;
+  const local = issuesPanel({ client: k2.client, owner: true, every: 1e9, invalidation: new Promise((r) => (end2 = r)), store: none });
+  await local.sync();
+  press("Refresh", local);
+  globalThis.dispatchEvent(new Event("focus"));
+  expect(await local.check()).toBe(false);
+  expect([k2.asked.length, local.newer.textContent]).toEqual([0, ""]);
+  end2();
+  // A panel that listens, as the page's does. Other events of the page reach it too, so nothing here is an exact
+  // count while it listens: each step sets what the Worker runs, sends one event and waits for the line that
+  // any question asked after the step ends in.
+  const h = kernel();
+  let end4 = null;
+  const heard = issuesPanel({ client: h.client, owner: true, every: 1e9, invalidation: new Promise((r) => (end4 = r)), store: none, joined: A, reload: () => null });
+  await heard.sync();
+  // It asks when it is made.
+  expect(await until(() => h.asked.length >= 1)).toBe(true);
+  expect([h.asked[0], heard.newer.textContent]).toEqual(["brain-x-issues", ""]);
+  // The tab shown again asks: the line comes.
+  h.running = B;
+  document.dispatchEvent(new Event("visibilitychange"));
+  expect(await until(() => heard.newer.textContent !== "")).toBe(true);
+  expect(heard.newer.textContent).toContain("brain-x-issues is bbbbbbbbbbbb, this page has aaaaaaaaaaaa.");
+  // The window given the focus asks: the line goes.
+  h.running = A;
+  globalThis.dispatchEvent(new Event("focus"));
+  expect(await until(() => heard.newer.textContent === "")).toBe(true);
+  // A panel that has ended asks no more. The count is read after it ended: from then no event reaches it.
+  end4();
   await new Promise((r) => setTimeout(r, 0));
+  const ended = h.asked.length;
   document.dispatchEvent(new Event("visibilitychange"));
   globalThis.dispatchEvent(new Event("focus"));
   await new Promise((r) => setTimeout(r, 30));
-  expect(asked.length).toBe(before + 2);
-  // With no hash to compare (a copy opened from a file) getInfo is never asked.
-  let end2 = null;
-  const local = issuesPanel({ client, owner: true, every: 1e9, invalidation: new Promise((r) => (end2 = r)), store: { get: () => null, set: () => null } });
-  await local.sync();
-  press("Refresh", local);
-  expect(await local.check()).toBe(false);
-  expect([asked.length, local.newer.textContent]).toEqual([before + 2, ""]);
-  end2();
+  expect(h.asked.length).toBe(ended);
   // From here the page's side is a function, as the page passes it, and getInfo can be slow. This panel does not
-  // listen: every listening panel hears a visibilitychange or a focus of the page the test runs in (another test's,
-  // or the owner coming back to the tab), and a question asked by one would overtake the ones counted here.
+  // listen either.
   const C = "c".repeat(64);
   // Each getInfo takes the next [milliseconds, hash] of `answers`; with none left it answers `running` at once.
   const answers = [];
-  let asked2 = 0;
-  running = A;
+  let asked2 = 0, running = A;
   const client2 = {
     query: (name, params = {}) => {
       if (name !== "getInfo") return rig.owner(name.replace("issue.", "") + "?" + new URLSearchParams(params)).then(ok);
@@ -38380,7 +38402,7 @@ const _brainissues_test_issues_panel_says_when_a_newer_one_is_deployed = async f
   };
   // What the page has is read at each question: the page's own record of what it loaded moves when the page deploys.
   let has = A, end3 = null;
-  const panel2 = issuesPanel({ client: client2, owner: true, every: 1e9, invalidation: new Promise((r) => (end3 = r)), store: { get: () => null, set: () => null }, joined: () => has, reload: () => null, listen: false });
+  const panel2 = issuesPanel({ client: client2, owner: true, every: 1e9, invalidation: new Promise((r) => (end3 = r)), store: none, joined: () => has, reload: () => null, listen: false });
   await panel2.sync();
   expect([asked2, await panel2.check(), asked2, panel2.newer.textContent]).toEqual([0, false, 1, ""]);
   // The page itself deploys B and loads it: the Worker runs B and so does the page. No line.
@@ -38649,7 +38671,7 @@ export default function define(runtime, observer) {
   $def("_brainissues_test_issues_panel_removes_a_label", "test_issues_panel_removes_a_label", ["issuesRig","URLSearchParams","issuesPanel","expect"], _brainissues_test_issues_panel_removes_a_label);
   $def("_brainissues_test_issues_panel_shows_the_policy_in_force", "test_issues_panel_shows_the_policy_in_force", ["issuesRig","URLSearchParams","issuesPanel","expect","issuesDefaultPolicy"], _brainissues_test_issues_panel_shows_the_policy_in_force);
   $def("_brainissues_test_issues_panel_lists_what_waits_for_the_owner", "test_issues_panel_lists_what_waits_for_the_owner", ["issuesRig","URLSearchParams","issuesPanel","Event","expect"], _brainissues_test_issues_panel_lists_what_waits_for_the_owner);
-  $def("_brainissues_test_issues_panel_says_when_a_newer_one_is_deployed", "test_issues_panel_says_when_a_newer_one_is_deployed", ["issuesRig","URLSearchParams","issuesPanel","expect","Event","globalThis","issuesJoinedAt"], _brainissues_test_issues_panel_says_when_a_newer_one_is_deployed);
+  $def("_brainissues_test_issues_panel_says_when_a_newer_one_is_deployed", "test_issues_panel_says_when_a_newer_one_is_deployed", ["issuesRig","URLSearchParams","issuesPanel","expect","globalThis","Event","issuesJoinedAt"], _brainissues_test_issues_panel_says_when_a_newer_one_is_deployed);
   $def("_brainissues_test_issues_panel_keeps_the_caret_in_a_row_box", "test_issues_panel_keeps_the_caret_in_a_row_box", ["issuesRig","URLSearchParams","issuesPanel","expect"], _brainissues_test_issues_panel_keeps_the_caret_in_a_row_box);
   $def("_brainissues_test_issues_panel_a_second_press_writes_once", "test_issues_panel_a_second_press_writes_once", ["issuesRig","URLSearchParams","issuesPanel","Event","expect"], _brainissues_test_issues_panel_a_second_press_writes_once);
   $def("_brainissues_test_issues_panel_a_refused_write_gives_the_row_back", "test_issues_panel_a_refused_write_gives_the_row_back", ["issuesRig","URLSearchParams","issuesPanel","Event","expect"], _brainissues_test_issues_panel_a_refused_write_gives_the_row_back);
