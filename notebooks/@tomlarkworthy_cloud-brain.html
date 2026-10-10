@@ -40205,7 +40205,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braingit_anon_21599c3cfb = function _anonymous(md,gitDefaults) {return (md`# brain-git
+const _braingit_anon_0c365d0a94 = function _anonymous(md,gitDefaults) {return (md`# brain-git
 
 Git repositories for a Cloud Brain, kept by [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/). The service makes a repository and hands out a token for it. Cloning, fetching and pushing are plain \`git\` over HTTPS against Cloudflare's own address, with that token; no git traffic passes this Brain. Each answer is Cloudflare's, its errors included.
 
@@ -40214,7 +40214,7 @@ Git repositories for a Cloud Brain, kept by [Cloudflare Artifacts](https://devel
 | \`git.create?name=\` | \`POST /accounts/ACCOUNT/artifacts/namespaces/BASE/repos\` with \`{ name, default_branch: "main" }\`. The answer has \`remote\` and a first write token. |
 | \`git.get?name=\` | \`GET …/repos/NAME\`: the repository, with its \`remote\`. |
 | \`git.list?limit=&cursor=\` | \`GET …/repos\`. |
-| \`git.token?name=&scope=&seconds=\` | \`POST …/tokens\` with \`{ repo, scope, ttl }\`. \`scope\` is \`read\` (when not given) or \`write\`. \`seconds\` is ${gitDefaults.seconds} when not given and at most ${gitDefaults.most}. The answer's \`plaintext\` is the token. |
+| \`git.token?name=&scope=&seconds=\` | \`POST …/tokens\` with \`{ repo, scope, ttl }\`. \`scope\` is \`read\` (when not given) or \`write\`. \`seconds\` is ${gitDefaults.seconds} when not given, from ${gitDefaults.least} to ${gitDefaults.most}. The answer's \`plaintext\` is the token. |
 | \`git.delete?name=\` | \`DELETE …/repos/NAME\`. |
 
 All but \`get\` and \`list\` are sent with POST. The parameters are in the query string so a rule can read them (\`request.params.name\`, \`request.params.scope\`); none is a secret. A token is in the body of the answer and nowhere else.
@@ -40235,7 +40235,7 @@ Inside the namespace a name belongs to whoever made it (\`gitTenant\`, \`gitRepo
 | the owner, a token, a Worker of the Brain | \`notes\` | every repository of the Brain, a member's by its full name |
 | an account the owner gave the method (\`did:…\`), and that account's Workers | \`m-ID-notes\`, where ID is 10 hex of the SHA-256 of the DID | names that start with \`m-ID-\` and no other |
 
-A member gives the short name or the full one. \`git.list\` answers a member only their own. The owner cannot make a repository whose name starts like a member's.
+A member gives the short name or the full one. A name on Cloudflare is at most 40 characters, so a member's short name is at most 27. \`git.list\` answers a member only their own: it is one page of Cloudflare's list with the others taken out, so a page can be short or empty while \`cursor\` says there is more, and any count beside it is the Brain's. The owner cannot make a repository whose name starts like a member's.
 
 ## Who can call
 
@@ -40254,16 +40254,18 @@ The service declares \`cloudflare: ["${gitDefaults.group}"]\`. The deployer mint
 1 GB a repository, 32 MB a file, 2,000 git requests in 10 s a repository (read 2026-10-10). Workers Paid only.
 
 Not built: \`fork\`, \`import\`, revoking one token, giving another account a repository of yours.`);};
-const _braingit_gitDefaults = function _gitDefaults() {return ({ seconds: 3600, most: 86400, usd: 0.001, group: "Artifacts Write" });};
+const _braingit_gitDefaults = function _gitDefaults() {return ({ seconds: 3600, least: 60, most: 86400, usd: 0.001, group: "Artifacts Write" });};
 const _braingit_gitTenant = function _gitTenant(sha256) {return (async (who) =>
   who === "owner" || who === "deployer" || /^token:/.test(who || "") || /^worker:brain(-(?!m-)|$)/.test(who || "") ? "" : /^did:/.test(who || "") ? "m-" + (await sha256(who)).slice(0, 10) + "-" : null);};
-const _braingit_gitRepo = function _gitRepo() {return ((prefix, name) => {
-  if (typeof name !== "string" || !/^[a-z0-9][a-z0-9._-]{0,39}$/.test(name)) return null;
-  const members = /^m-[0-9a-f]{10}-/;
+const _braingit_gitMember = function _gitMember() {return (/^m-[0-9a-f]{10}-/);};
+const _braingit_gitRepo = function _gitRepo(gitMember) {return ((prefix, name) => {
+  const ok = (n) => /^[a-z0-9][a-z0-9._-]{0,39}$/.test(n);
+  if (typeof name !== "string" || !ok(name)) return null;
   if (prefix === "") return name;
-  return name.startsWith(prefix) ? (name.length > prefix.length ? name : null) : members.test(name) ? null : prefix + name;
+  const full = name.startsWith(prefix) ? name : gitMember.test(name) ? "" : prefix + name;
+  return full.length > prefix.length && ok(full) ? full : null;
 });};
-const _braingit_git_service = function _git_service(cloudflare,Response,gitTenant,config,cloudflareApi,URLSearchParams,gitRepo,gitDefaults) {return (cloudflare.Service(
+const _braingit_git_service = function _git_service(cloudflare,Response,gitTenant,config,cloudflareApi,URLSearchParams,gitRepo,gitMember,gitDefaults) {return (cloudflare.Service(
   "git",
   async (request) => {
     const refuse = (status, error, message) => new Response(JSON.stringify({ error, message }), { status, headers: { "content-type": "application/json" } });
@@ -40283,16 +40285,16 @@ const _braingit_git_service = function _git_service(cloudflare,Response,gitTenan
       return new Response(JSON.stringify({ ...data, result: (Array.isArray(data.result) ? data.result : []).filter((x) => String(x && x.name).startsWith(prefix)) }), { headers: { "content-type": "application/json" } });
     }
     const repo = gitRepo(prefix, q.get("name"));
-    if (!repo) return refuse(400, "InvalidRequest", "name is a repository of yours: a lower-case letter or digit, then up to 39 of a-z 0-9 . _ -");
+    if (!repo) return refuse(400, "InvalidRequest", "name is a repository of yours: a lower-case letter or digit, then up to 39 of a-z 0-9 . _ - (26 for an account that is not the owner)");
     if (what === "create") {
-      if (prefix === "" && /^m-[0-9a-f]{10}-/.test(repo)) return refuse(400, "InvalidRequest", "a name that starts m-ID- is a member's to make");
+      if (prefix === "" && gitMember.test(repo)) return refuse(400, "InvalidRequest", "a name that starts m-ID- is a member's to make");
       return pass(await send("/repos", "POST", { name: repo, default_branch: "main" }));
     }
     if (what === "get") return pass(await send("/repos/" + repo, "GET"));
     if (what === "delete") return pass(await send("/repos/" + repo, "DELETE"));
     const scope = q.get("scope") || "read", seconds = q.get("seconds") === null ? gitDefaults.seconds : Number(q.get("seconds"));
     if (scope !== "read" && scope !== "write") return refuse(400, "InvalidRequest", "scope is read or write");
-    if (!Number.isInteger(seconds) || seconds < 60 || seconds > gitDefaults.most) return refuse(400, "InvalidRequest", "seconds is a whole number from 60 to " + gitDefaults.most);
+    if (!Number.isInteger(seconds) || seconds < gitDefaults.least || seconds > gitDefaults.most) return refuse(400, "InvalidRequest", "seconds is a whole number from " + gitDefaults.least + " to " + gitDefaults.most);
     return pass(await send("/tokens", "POST", { repo, scope, ttl: seconds }));
   },
   {
@@ -40366,6 +40368,12 @@ const _braingit_test_a_member_reaches_their_own_repositories_and_no_other = asyn
     for (const method of ["create", "token", "delete"]) expect((await rig.call(alice, method, "name=" + encodeURIComponent(name))).status).toBe(400);
   expect((await rig.call(alice, "get", "name=m-0000000000-other")).status).toBe(400);
   expect(rig.seen.length).toBe(3);
+  // A member's longest name is 27, and the owner reaches it by the name Cloudflare holds.
+  expect((await rig.call(alice, "create", "name=" + "a".repeat(28))).status).toBe(400);
+  expect((await rig.call(alice, "create", "name=" + "a".repeat(27))).status).toBe(200);
+  expect((await rig.call("owner", "delete", "name=" + rig.alice + "a".repeat(27))).status).toBe(200);
+  expect((await rig.call(alice, "get", "name=" + rig.alice + "a".repeat(27))).status).toBe(200);
+  expect(rig.seen.splice(3).map((s) => s.url)).toEqual(["cb4/repos", "cb4/repos/" + rig.alice + "a".repeat(27), "cb4/repos/" + rig.alice + "a".repeat(27)]);
   // A list is the member's own.
   expect((await rig.call(alice, "list")).data.result).toEqual([{ name: rig.alice + "notes" }]);
   // The owner reaches a member's repository by its full name, and does not make one.
@@ -40403,11 +40411,12 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braingit_anon_21599c3cfb", null, ["md","gitDefaults"], _braingit_anon_21599c3cfb);
+  $def("_braingit_anon_0c365d0a94", null, ["md","gitDefaults"], _braingit_anon_0c365d0a94);
   $def("_braingit_gitDefaults", "gitDefaults", [], _braingit_gitDefaults);
   $def("_braingit_gitTenant", "gitTenant", ["sha256"], _braingit_gitTenant);
-  $def("_braingit_gitRepo", "gitRepo", [], _braingit_gitRepo);
-  $def("_braingit_git_service", "git_service", ["cloudflare","Response","gitTenant","config","cloudflareApi","URLSearchParams","gitRepo","gitDefaults"], _braingit_git_service);
+  $def("_braingit_gitMember", "gitMember", [], _braingit_gitMember);
+  $def("_braingit_gitRepo", "gitRepo", ["gitMember"], _braingit_gitRepo);
+  $def("_braingit_git_service", "git_service", ["cloudflare","Response","gitTenant","config","cloudflareApi","URLSearchParams","gitRepo","gitMember","gitDefaults"], _braingit_git_service);
   $def("_braingit_git_announce", "git_announce", ["plugins","git_service","invalidation"], _braingit_git_announce);
   $def("_braingit_anon_be3d699220", null, ["md"], _braingit_anon_be3d699220);
   $def("_braingit_gitRig", "gitRig", ["sha256","simulate","git_service","Response"], _braingit_gitRig);
