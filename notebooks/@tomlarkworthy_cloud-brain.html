@@ -21672,7 +21672,9 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
   // A service may declare only the groups in GROUPS. Each was minted alone and tried on 2026-10-09 (spec-as-built,
   // "What a minted token reaches"): these two read their own product and nothing of a Worker. "Workers Tail Read"
   // was in the list until then, declared by no service: it read each Worker's code, settings and secret names.
-  const GROUPS = ["Workers Observability Read", "Workers AI Read"];
+  // "Artifacts Write" (brain-git, 2026-10-10) is not such a one and was not tried: it makes, reads and deletes every
+  // Artifacts repository of the account, in any namespace. The service fixes the namespace.
+  const GROUPS = ["Workers Observability Read", "Workers AI Read", "Artifacts Write"];
   const DAY = 86400000, TOKEN_DAYS = 90, ROLL_DAYS = 30;
   const audit = async (event, logical, t) => {
     const row = { at: Date.now(), event, worker: logical, token: t.id, groups: t.groups, expires: t.expires };
@@ -22777,6 +22779,7 @@ const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return
     { id: "g-obs", name: "Workers Observability Read", scopes: account },
     { id: "g-tail", name: "Workers Tail Read", scopes: account },
     { id: "g-ai", name: "Workers AI Read", scopes: account },
+    { id: "g-art", name: "Artifacts Write", scopes: account },
     { id: "g-scripts", name: "Workers Scripts Write", scopes: account }
   ];
   let n = 0;
@@ -23200,7 +23203,7 @@ const _braindeployer_test_a_declared_cloudflare_permission_is_held_for_the_owner
 const _braindeployer_test_a_cloudflare_permission_is_refused_off_the_list_and_outside_a_recipe = async function _test_a_cloudflare_permission_is_refused_off_the_list_and_outside_a_recipe(deployerRig,expect,memberRig) {
   const rig = await deployerRig();
   const reason = async (w) => (await rig.recover({ workers: [w] })).results[0].reason;
-  expect(await reason(await rig.made("brain-x-greedy", "recipe", "g", { cloudflare: ["Workers Observability Read", "Workers Scripts Write"] }))).toBe('"Workers Scripts Write" is not a Cloudflare permission a service may declare. A service may declare: Workers Observability Read, Workers AI Read');
+  expect(await reason(await rig.made("brain-x-greedy", "recipe", "g", { cloudflare: ["Workers Observability Read", "Workers Scripts Write"] }))).toBe('"Workers Scripts Write" is not a Cloudflare permission a service may declare. A service may declare: Workers Observability Read, Workers AI Read, Artifacts Write');
   // It reads each Worker's code: no service may have it (spec-as-built, 2026-10-09).
   expect(await reason(await rig.made("brain-x-tail", "recipe", "t", { cloudflare: ["Workers Tail Read"] }))).toContain('"Workers Tail Read" is not a Cloudflare permission a service may declare');
   expect(await reason(await rig.made("brain-core", "core", "c", { cloudflare: ["Workers Observability Read"] }))).toBe("only a recipe declares Cloudflare permissions");
@@ -40195,6 +40198,235 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/cloud-brain", [], async () => runtime.module((await import("/@tomlarkworthy/cloud-brain.js?v=4")).default));
   main.define("client", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("client", _));
   main.define("session", ["module @tomlarkworthy/cloud-brain","@variable"], (_, v) => v.import("session", _));
+  return main;
+}
+</script>
+<script id="@tomlarkworthy/brain-git" 
+  type="text/plain"
+  data-mime="application/javascript"
+>
+const _braingit_anon_21599c3cfb = function _anonymous(md,gitDefaults) {return (md`# brain-git
+
+Git repositories for a Cloud Brain, kept by [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/). The service makes a repository and hands out a token for it. Cloning, fetching and pushing are plain \`git\` over HTTPS against Cloudflare's own address, with that token; no git traffic passes this Brain. Each answer is Cloudflare's, its errors included.
+
+| Method | Cloudflare endpoint |
+|---|---|
+| \`git.create?name=\` | \`POST /accounts/ACCOUNT/artifacts/namespaces/BASE/repos\` with \`{ name, default_branch: "main" }\`. The answer has \`remote\` and a first write token. |
+| \`git.get?name=\` | \`GET …/repos/NAME\`: the repository, with its \`remote\`. |
+| \`git.list?limit=&cursor=\` | \`GET …/repos\`. |
+| \`git.token?name=&scope=&seconds=\` | \`POST …/tokens\` with \`{ repo, scope, ttl }\`. \`scope\` is \`read\` (when not given) or \`write\`. \`seconds\` is ${gitDefaults.seconds} when not given and at most ${gitDefaults.most}. The answer's \`plaintext\` is the token. |
+| \`git.delete?name=\` | \`DELETE …/repos/NAME\`. |
+
+All but \`get\` and \`list\` are sent with POST. The parameters are in the query string so a rule can read them (\`request.params.name\`, \`request.params.scope\`); none is a secret. A token is in the body of the answer and nowhere else.
+
+\`\`\`sh
+# TOKEN is plaintext from git.token, REMOTE is remote from git.get
+git -c http.extraHeader="Authorization: Bearer $TOKEN" clone "$REMOTE" work
+\`\`\`
+
+## Whose repository
+
+Every repository of this Brain is in one Artifacts namespace, named for the Brain (\`cb4\`). The service adds the namespace; no parameter changes it, so a caller cannot reach a repository of another Brain on the same Cloudflare account.
+
+Inside the namespace a name belongs to whoever made it (\`gitTenant\`, \`gitRepo\`):
+
+| Caller | Their repository \`notes\` is | Reaches |
+|---|---|---|
+| the owner, a token, a Worker of the Brain | \`notes\` | every repository of the Brain, a member's by its full name |
+| an account the owner gave the method (\`did:…\`), and that account's Workers | \`m-ID-notes\`, where ID is 10 hex of the SHA-256 of the DID | names that start with \`m-ID-\` and no other |
+
+A member gives the short name or the full one. \`git.list\` answers a member only their own. The owner cannot make a repository whose name starts like a member's.
+
+## Who can call
+
+The owner, a token that names the method and an account the owner gave it (\`grant.put\`). To hold a token to reading one repository: \`caller.session || (request.params.name == "core" && request.params.scope != "write")\` as the rule of \`com.lopecode.brain.git.token\`.
+
+## The Cloudflare token
+
+The service declares \`cloudflare: ["${gitDefaults.group}"]\`. The deployer mints a Cloudflare API token with that one permission and binds it to this Worker alone. That token can make, read and delete every Artifacts repository of the Cloudflare account, in any namespace, which is why the namespace is not a parameter.
+
+## The price
+
+\`create\` and \`token\` cost $${gitDefaults.usd} a call. Cloudflare charges $0.15 for 1,000 operations after the first 10,000 a month, and an operation is a create, a clone, a pull or a push. The git traffic a token leads to is not seen by this Brain, so the price of the token stands for it. The number is a guess: 6 operations.
+
+## Limits, Cloudflare's
+
+1 GB a repository, 32 MB a file, 2,000 git requests in 10 s a repository (read 2026-10-10). Workers Paid only.
+
+Not built: \`fork\`, \`import\`, revoking one token, giving another account a repository of yours.`);};
+const _braingit_gitDefaults = function _gitDefaults() {return ({ seconds: 3600, most: 86400, usd: 0.001, group: "Artifacts Write" });};
+const _braingit_gitTenant = function _gitTenant(sha256) {return (async (who) =>
+  who === "owner" || who === "deployer" || /^token:/.test(who || "") || /^worker:brain(-(?!m-)|$)/.test(who || "") ? "" : /^did:/.test(who || "") ? "m-" + (await sha256(who)).slice(0, 10) + "-" : null);};
+const _braingit_gitRepo = function _gitRepo() {return ((prefix, name) => {
+  if (typeof name !== "string" || !/^[a-z0-9][a-z0-9._-]{0,39}$/.test(name)) return null;
+  const members = /^m-[0-9a-f]{10}-/;
+  if (prefix === "") return name;
+  return name.startsWith(prefix) ? (name.length > prefix.length ? name : null) : members.test(name) ? null : prefix + name;
+});};
+const _braingit_git_service = function _git_service(cloudflare,Response,gitTenant,config,cloudflareApi,URLSearchParams,gitRepo,gitDefaults) {return (cloudflare.Service(
+  "git",
+  async (request) => {
+    const refuse = (status, error, message) => new Response(JSON.stringify({ error, message }), { status, headers: { "content-type": "application/json" } });
+    const url = new URL(request.url), what = url.pathname.split(".").pop(), q = url.searchParams;
+    const verb = { create: "POST", token: "POST", delete: "POST", get: "GET", list: "GET" }[what];
+    if (!verb) return refuse(404, "MethodNotImplemented", "git.create, git.get, git.list, git.token and git.delete");
+    if (request.method !== verb) return refuse(405, "InvalidRequest", "git." + what + " is sent with " + verb);
+    const prefix = await gitTenant(request.headers.get("x-brain-caller"));
+    if (prefix === null) return refuse(403, "Forbidden", "this caller has no repositories");
+    const space = "/artifacts/namespaces/" + config.base;
+    const pass = (r) => new Response(r.body, { status: r.status, headers: { "content-type": r.headers.get("content-type") || "application/json" } });
+    const send = (path, method, body) => cloudflareApi.fetch(space + path, { method, ...(body ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {}) });
+    if (what === "list") {
+      const r = await send("/repos?" + new URLSearchParams([...q].filter(([k]) => k === "limit" || k === "cursor")), "GET");
+      if (prefix === "" || !r.ok) return pass(r);
+      const data = await r.json();
+      return new Response(JSON.stringify({ ...data, result: (Array.isArray(data.result) ? data.result : []).filter((x) => String(x && x.name).startsWith(prefix)) }), { headers: { "content-type": "application/json" } });
+    }
+    const repo = gitRepo(prefix, q.get("name"));
+    if (!repo) return refuse(400, "InvalidRequest", "name is a repository of yours: a lower-case letter or digit, then up to 39 of a-z 0-9 . _ -");
+    if (what === "create") {
+      if (prefix === "" && /^m-[0-9a-f]{10}-/.test(repo)) return refuse(400, "InvalidRequest", "a name that starts m-ID- is a member's to make");
+      return pass(await send("/repos", "POST", { name: repo, default_branch: "main" }));
+    }
+    if (what === "get") return pass(await send("/repos/" + repo, "GET"));
+    if (what === "delete") return pass(await send("/repos/" + repo, "DELETE"));
+    const scope = q.get("scope") || "read", seconds = q.get("seconds") === null ? gitDefaults.seconds : Number(q.get("seconds"));
+    if (scope !== "read" && scope !== "write") return refuse(400, "InvalidRequest", "scope is read or write");
+    if (!Number.isInteger(seconds) || seconds < 60 || seconds > gitDefaults.most) return refuse(400, "InvalidRequest", "seconds is a whole number from 60 to " + gitDefaults.most);
+    return pass(await send("/tokens", "POST", { repo, scope, ttl: seconds }));
+  },
+  {
+    cloudflare: [gitDefaults.group],
+    methods: {
+      "com.lopecode.brain.git.create": { type: "procedure", who: "owner", price: String(gitDefaults.usd) },
+      "com.lopecode.brain.git.get": { type: "query", who: "owner" },
+      "com.lopecode.brain.git.list": { type: "query", who: "owner" },
+      "com.lopecode.brain.git.token": { type: "procedure", who: "owner", price: String(gitDefaults.usd) },
+      "com.lopecode.brain.git.delete": { type: "procedure", who: "owner" }
+    }
+  }
+));};
+const _braingit_git_announce = function _git_announce(plugins,git_service,invalidation) {
+  plugins.add("workers", git_service, { invalidation });
+  return "announced git_service";
+};
+const _braingit_anon_be3d699220 = function _anonymous(md) {return (md`## Tests`);};
+const _braingit_gitRig = function _gitRig(sha256,simulate,git_service,Response) {return (async () => {
+  const seen = [];
+  const repos = [{ name: "core" }, { name: "m-" + (await sha256("did:plc:alice")).slice(0, 10) + "-notes" }, { name: "m-0000000000-other" }];
+  const sim = await simulate(git_service, {
+    secrets: { CF_TOKEN: "minted-1", BRAIN_KEY: "k" },
+    config: { base: "cb4", account: "acct" },
+    fetch: async (request) => {
+      const body = request.method === "GET" || request.method === "DELETE" ? null : await request.json();
+      seen.push({ verb: request.method, url: request.url.replace("https://api.cloudflare.com/client/v4/accounts/acct/artifacts/namespaces/", ""), authorization: request.headers.get("authorization"), body });
+      const path = new URL(request.url).pathname;
+      if (path.endsWith("/missing")) return new Response('{"success":false,"errors":[{"code":1000,"message":"not found"}]}', { status: 404, headers: { "content-type": "application/json" } });
+      const result = path.endsWith("/tokens") ? { plaintext: "art_v1_secret?expires=9", expiresAt: 9 } : path.endsWith("/repos") && request.method === "GET" ? repos : { name: (body && body.name) || path.split("/").pop(), remote: "https://acct.artifacts.cloudflare.net/git/cb4/x.git" };
+      return new Response(JSON.stringify({ success: true, result }), { headers: { "content-type": "application/json" } });
+    }
+  });
+  const call = async (who, name, query = "", verb = name === "get" || name === "list" ? "GET" : "POST") => {
+    const r = await sim.fetch("https://git.internal/xrpc/com.lopecode.brain.git." + name + (query ? "?" + query : ""), { method: verb, headers: { "x-brain-caller": who }, ...(verb === "POST" ? { body: "{}" } : {}) });
+    return { status: r.status, data: await r.json() };
+  };
+  return { sim, seen, call, alice: "m-" + (await sha256("did:plc:alice")).slice(0, 10) + "-" };
+});};
+const _braingit_test_each_method_is_one_call_to_artifacts_in_this_brains_namespace = async function _test_each_method_is_one_call_to_artifacts_in_this_brains_namespace(gitRig,expect) {
+  const rig = await gitRig();
+  expect((await rig.call("owner", "create", "name=core")).data.result.remote).toMatch(/artifacts\.cloudflare\.net/);
+  expect((await rig.call("owner", "get", "name=core")).status).toBe(200);
+  expect((await rig.call("owner", "list", "limit=5&cursor=c&namespace=other")).data.result.length).toBe(3);
+  expect((await rig.call("token:ci", "token", "name=core")).data.result.plaintext).toBe("art_v1_secret?expires=9");
+  await rig.call("worker:brain-x-snapshot", "token", "name=core&scope=write&seconds=60");
+  expect((await rig.call("owner", "delete", "name=core")).status).toBe(200);
+  expect(rig.seen).toEqual([
+    { verb: "POST", url: "cb4/repos", authorization: "Bearer minted-1", body: { name: "core", default_branch: "main" } },
+    { verb: "GET", url: "cb4/repos/core", authorization: "Bearer minted-1", body: null },
+    { verb: "GET", url: "cb4/repos?limit=5&cursor=c", authorization: "Bearer minted-1", body: null },
+    { verb: "POST", url: "cb4/tokens", authorization: "Bearer minted-1", body: { repo: "core", scope: "read", ttl: 3600 } },
+    { verb: "POST", url: "cb4/tokens", authorization: "Bearer minted-1", body: { repo: "core", scope: "write", ttl: 60 } },
+    { verb: "DELETE", url: "cb4/repos/core", authorization: "Bearer minted-1", body: null }
+  ]);
+  // Cloudflare's refusal is the answer.
+  expect(await rig.call("owner", "get", "name=missing")).toEqual({ status: 404, data: { success: false, errors: [{ code: 1000, message: "not found" }] } });
+  return "6 calls";
+};
+const _braingit_test_a_member_reaches_their_own_repositories_and_no_other = async function _test_a_member_reaches_their_own_repositories_and_no_other(gitRig,expect,gitTenant) {
+  const rig = await gitRig(), alice = "did:plc:alice";
+  // The short name and the full one are the same repository.
+  await rig.call(alice, "create", "name=notes");
+  await rig.call(alice, "token", "name=" + rig.alice + "notes&scope=write");
+  expect(rig.seen.map((s) => s.body.name || s.body.repo)).toEqual([rig.alice + "notes", rig.alice + "notes"]);
+  // The owner's core, as a member names it, is a repository of the member's own.
+  await rig.call(alice, "token", "name=core");
+  expect(rig.seen[2].body.repo).toBe(rig.alice + "core");
+  // Another member's name, and a bare prefix, are refused before Cloudflare is asked.
+  for (const name of ["m-0000000000-other", rig.alice, "", "Core", "a/b", "../core", "a".repeat(41)])
+    for (const method of ["create", "token", "delete"]) expect((await rig.call(alice, method, "name=" + encodeURIComponent(name))).status).toBe(400);
+  expect((await rig.call(alice, "get", "name=m-0000000000-other")).status).toBe(400);
+  expect(rig.seen.length).toBe(3);
+  // A list is the member's own.
+  expect((await rig.call(alice, "list")).data.result).toEqual([{ name: rig.alice + "notes" }]);
+  // The owner reaches a member's repository by its full name, and does not make one.
+  expect((await rig.call("owner", "token", "name=" + rig.alice + "notes")).status).toBe(200);
+  expect((await rig.call("owner", "create", "name=" + rig.alice + "x")).status).toBe(400);
+  // A caller that is nobody has none.
+  for (const who of ["anonymous", "worker:brain-m-0000000000-x", "worker:other", ""]) expect((await rig.call(who, "list")).status).toBe(403);
+  expect(await gitTenant("worker:brain")).toBe("");
+  return "1 member, 4 nobodies";
+};
+const _braingit_test_git_refuses_a_bad_scope_a_bad_time_and_a_wrong_verb = async function _test_git_refuses_a_bad_scope_a_bad_time_and_a_wrong_verb(gitRig,expect) {
+  const rig = await gitRig();
+  for (const query of ["scope=admin", "seconds=59", "seconds=86401", "seconds=1.5", "seconds=abc", "seconds="]) expect((await rig.call("owner", "token", "name=core&" + query)).status).toBe(400);
+  expect((await rig.call("owner", "token", "name=core", "GET")).status).toBe(405);
+  expect((await rig.call("owner", "delete", "name=core", "GET")).status).toBe(405);
+  for (const other of ["fork", "import", "token/../../repos"]) expect((await rig.call("owner", other, "name=core")).status).toBe(404);
+  expect(rig.seen.length).toBe(0);
+  return "9 refused";
+};
+const _braingit_test_git_declares_one_cloudflare_permission_and_keeps_nothing = async function _test_git_declares_one_cloudflare_permission_and_keeps_nothing(git_service,expect,decide,callerOf) {
+  const { meta, parts } = await git_service.emit();
+  expect(meta.worker).toBe("brain-x-git");
+  expect(meta.cloudflare).toEqual(["Artifacts Write"]);
+  expect([meta.resources, meta.secrets, meta.calls]).toEqual([[], [], []]);
+  expect(parts[0].text).toContain("__rt.platform.secrets.CF_TOKEN");
+  // The owner's rule for a token that reads one repository.
+  const rule = { allow: 'caller.session || (request.params.name == "core" && request.params.scope != "write")' };
+  const ask = (params) => decide(rule, { caller: callerOf({ caller: "owner", via: "delegation:d1" }), origin: callerOf({ caller: "owner" }), request: { params } }).allow;
+  expect([ask({ name: "core", scope: "read" }), ask({ name: "core", scope: "write" }), ask({ name: "other", scope: "read" })]).toEqual([true, false, false]);
+  return meta.cloudflare[0];
+};
+
+export default function define(runtime, observer) {
+  const main = runtime.module();
+  const $def = (pid, name, deps, fn) => {
+    main.variable(observer(name)).define(name, deps, fn).pid = pid;
+  };
+  $def("_braingit_anon_21599c3cfb", null, ["md","gitDefaults"], _braingit_anon_21599c3cfb);
+  $def("_braingit_gitDefaults", "gitDefaults", [], _braingit_gitDefaults);
+  $def("_braingit_gitTenant", "gitTenant", ["sha256"], _braingit_gitTenant);
+  $def("_braingit_gitRepo", "gitRepo", [], _braingit_gitRepo);
+  $def("_braingit_git_service", "git_service", ["cloudflare","Response","gitTenant","config","cloudflareApi","URLSearchParams","gitRepo","gitDefaults"], _braingit_git_service);
+  $def("_braingit_git_announce", "git_announce", ["plugins","git_service","invalidation"], _braingit_git_announce);
+  $def("_braingit_anon_be3d699220", null, ["md"], _braingit_anon_be3d699220);
+  $def("_braingit_gitRig", "gitRig", ["sha256","simulate","git_service","Response"], _braingit_gitRig);
+  $def("_braingit_test_each_method_is_one_call_to_artifacts_in_this_brains_namespace", "test_each_method_is_one_call_to_artifacts_in_this_brains_namespace", ["gitRig","expect"], _braingit_test_each_method_is_one_call_to_artifacts_in_this_brains_namespace);
+  $def("_braingit_test_a_member_reaches_their_own_repositories_and_no_other", "test_a_member_reaches_their_own_repositories_and_no_other", ["gitRig","expect","gitTenant"], _braingit_test_a_member_reaches_their_own_repositories_and_no_other);
+  $def("_braingit_test_git_refuses_a_bad_scope_a_bad_time_and_a_wrong_verb", "test_git_refuses_a_bad_scope_a_bad_time_and_a_wrong_verb", ["gitRig","expect"], _braingit_test_git_refuses_a_bad_scope_a_bad_time_and_a_wrong_verb);
+  $def("_braingit_test_git_declares_one_cloudflare_permission_and_keeps_nothing", "test_git_declares_one_cloudflare_permission_and_keeps_nothing", ["git_service","expect","decide","callerOf"], _braingit_test_git_declares_one_cloudflare_permission_and_keeps_nothing);
+  main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
+  main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
+  main.define("cloudflareApi", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflareApi", _));
+  main.define("config", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("config", _));
+  main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
+  main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
+  main.define("callerOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerOf", _));
+  main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
+  main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
+  main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
+  main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
+  main.define("expect", ["module @tomlarkworthy/jest-expect-standalone","@variable"], (_, v) => v.import("expect", _));
   return main;
 }
 </script>
@@ -108696,6 +108928,7 @@ export default function define(runtime, observer) {
     "@tomlarkworthy/brain-issues",
     "@tomlarkworthy/brain-container",
     "@tomlarkworthy/brain-ai",
+    "@tomlarkworthy/brain-git",
     "@tomlarkworthy/cloud-brain",
     "@tomlarkworthy/cloud-brain-docs",
     "@tomlarkworthy/brain-secrets",
