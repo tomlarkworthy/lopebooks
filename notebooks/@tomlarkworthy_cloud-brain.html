@@ -24075,7 +24075,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braincore_anon_24c2d0dcfe = function _anonymous(md) {return (md`# brain-core
+const _braincore_anon_4b1d792d50 = function _anonymous(md) {return (md`# brain-core
 
 The Worker every other Worker is bound to. It routes a method or a path to the Worker of the service that declared it, and keeps what must last: the notebook-side rows, the route table and the rules the owner sets.
 
@@ -24116,7 +24116,7 @@ It answers bindings only. A caller is who the kernel says it is, and the kernel 
 | \`delegation.create\` | procedure, the owner's or a member's own session. \`{ name, holder: { worker }, scope, until, daily, note }\` → the record, with its \`id\`. With \`holder: { secret: true }\` and \`caps\` the answer has \`secret\`, once: a token. A member makes one for what they may call. The caps \`session\`, \`deploy\` and \`unattended\` are the owner's to give, \`delegate\` the owner's or a member's. The kernel's \`token.create\` and a sign-in link make these. |
 | \`delegation.resolve\`, \`delegation.adopt\` | procedures, the kernel. \`{ sha256 }\` of a secret, or \`{ did }\` for that DID's grant → \`{ delegation }\` or null; and a token from before 2026-10-10, handed over by its hash. |
 | \`delegation.list\`, \`delegation.revoke\` | query and procedure, the same callers. The owner reads and revokes any, a member their own. \`{ id }\`. |
-| | The three are also called with a token whose delegation has the cap \`delegate\`. What it makes is \`from\` the same person, with that delegation as \`parent\`: held by a Worker or a secret, no caps, each scope entry inside the parent's, \`until\` no later and \`daily\` no more. It lists and revokes what it made. A call under such a child is refused once the parent is revoked, has ended or does not reach the method. |
+| | \`delegation.create\`, \`list\` and \`revoke\` are also called with a token whose delegation has the cap \`delegate\`. What it makes is \`from\` the same person, with that delegation as \`parent\`: held by a Worker or a secret, no caps, each scope entry inside the parent's, \`until\` no later and \`daily\` no more. What a child spends counts against the parent's \`daily\` as well as its own. It lists and revokes what it made, and revoking a delegation deletes what was made under it. A call under such a child is refused once the parent is revoked, has ended or does not reach the method. |
 
 **Delegations** (design: \`plan/cloud-brain-authority.md\`; built 2026-10-10: a Worker, a secret or a DID holds one). The owner or a member lets a Worker the owner deployed call the methods in a \`scope\`, until a time or until it is revoked. The Worker names the delegation on a call it makes:
 
@@ -24840,13 +24840,15 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     // A chain under a delegation with a daily amount: refused when what it has spent, with this, is over the amount.
     // Its count is written after the account has paid, so a call the account refused is not in it. The cost of that
     // order: calls made at the same moment can each read the count before any is written, and pass the amount.
-    const held = origin.d ? await settings.get("delegation/" + origin.d) : null, capped = held && Number.isFinite(held.daily);
-    if (capped) {
-      const { spent } = fold(await rows.get(spendKey(today(), "delegation/" + held.id)));
-      if (spent + u > micro(held.daily)) return fail(c, 402, "OutOfCredits", `${target} costs ${money(usd(u))}. Delegation ${held.name} has spent ${money(usd(spent))} of ${money(held.daily)} today`);
+    // One made under another counts against that one's amount too, so making children does not make more to spend.
+    const held = origin.d ? await settings.get("delegation/" + origin.d) : null, above = held && held.parent ? await settings.get("delegation/" + held.parent) : null;
+    const capped = [held, above].filter((d) => d && Number.isFinite(d.daily));
+    for (const d of capped) {
+      const { spent } = fold(await rows.get(spendKey(today(), "delegation/" + d.id)));
+      if (spent + u > micro(d.daily)) return fail(c, 402, "OutOfCredits", `${target} costs ${money(usd(u))}. Delegation ${d.name} has spent ${money(usd(spent))} of ${money(d.daily)} today`);
     }
     const got = await charge(account, u, allowance, { m: target, c: c.get("who").caller, o: origin.caller, v: origin.via || "" });
-    if (got.ok && capped) await rows.append(spendKey(today(), "delegation/" + held.id), { t: Date.now(), i: crypto.randomUUID().slice(0, 13), u, A: Number.MAX_SAFE_INTEGER, m: target }, KEEP);
+    if (got.ok) for (const d of capped) await rows.append(spendKey(today(), "delegation/" + d.id), { t: Date.now(), i: crypto.randomUUID().slice(0, 13), u, A: Number.MAX_SAFE_INTEGER, m: target }, KEEP);
     if (!got.ok)
       return fail(c, 402, "OutOfCredits", got.full
         ? `${account} has made ${CHARGES} priced calls today, which is the most for one day. The count is new at 00:00 UTC`
@@ -26164,7 +26166,7 @@ const _braincore_test_a_delegation_with_the_cap_delegate_makes_delegations_under
   const B = "com.lopecode.brain.", ADA = "did:plc:ada", end = Date.now() + 3600000;
   const hear = async (request) => (request.url.endsWith(".getInfo") ? Response.json({ name: "brain-x-shop", hash: "h", calls: [] }) : Response.json({ ok: true }));
   const rig = await coreRig({ workers: { shop: hear } }), kernel = rig.as("kernel", "");
-  await rig.deployer("service.register", { worker: "brain-x-shop", role: "recipe", paths: [], secrets: [], hash: "h", keyHash: await sha256("shop-key"), methods: { [B + "shop.receive"]: { type: "procedure", who: "anyone" }, [B + "shop.other"]: { type: "procedure", who: "anyone" } } });
+  await rig.deployer("service.register", { worker: "brain-x-shop", role: "recipe", paths: [], secrets: [], hash: "h", keyHash: await sha256("shop-key"), methods: { [B + "shop.receive"]: { type: "procedure", who: "anyone" }, [B + "shop.other"]: { type: "procedure", who: "anyone" }, [B + "shop.paid"]: { type: "procedure", who: "anyone", price: "0.04" } } });
   await kernel("people.sync", { people: [{ did: ADA }] });
   // The kernel sends a token's call with the id of its delegation.
   const sent = (id) => (m, body) => rig.as("owner", "token")(m, body, { "x-brain-delegation": id });
@@ -26188,6 +26190,12 @@ const _braincore_test_a_delegation_with_the_cap_delegate_makes_delegations_under
   // Under every method, any ordinary scope is inside; the never kind is still not.
   const wide = (await secret({ name: "wide", scope: ["*"], caps: ["delegate"] })).data;
   expect([(await under(wide.id, { name: "w1", scope: ["shop.other"] })).status, (await under(wide.id, { name: "w2", scope: ["*", "shop.*"] })).status, (await under(wide.id, { name: "w3", scope: ["secret.get"] })).status]).toEqual([200, 200, 400]);
+  // What a child spends counts against the parent's amount: a second child does not have the amount again.
+  const purse = (await secret({ name: "purse", scope: ["shop.paid"], caps: ["delegate"], daily: 0.05 })).data;
+  const c1 = (await under(purse.id, { name: "c1", scope: ["shop.paid"] })).data;
+  expect([(await sent(c1.id)("shop.paid", {})).status, (await sent(purse.id)("delegation.revoke", { id: c1.id })).data.revoked]).toEqual([200, true]);
+  const c2 = (await under(purse.id, { name: "c2", scope: ["shop.paid"] })).data;
+  expect([(await sent(c2.id)("shop.paid", {})).status, (await rig.owner("delegation.list")).data.delegations.filter((d) => ["purse", "c2"].includes(d.name)).map((d) => d.spentToday).sort()]).toEqual([402, [0, 0.04]]);
   // A member makes a token for what they may call, and may give it delegate and no other cap.
   await rig.owner("delegation.create", { name: "grant", holder: { did: ADA }, scope: ["shop.receive"] });
   const mine = (body) => rig.as(ADA)("delegation.create", { holder: { secret: true }, scope: ["shop.receive"], ...body });
@@ -26277,7 +26285,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braincore_anon_24c2d0dcfe", null, ["md"], _braincore_anon_24c2d0dcfe);
+  $def("_braincore_anon_4b1d792d50", null, ["md"], _braincore_anon_4b1d792d50);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
   $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","matches","may","neverHeld","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","scoped","MEMBER","decide"], _braincore_coreApp);
@@ -26362,7 +26370,7 @@ var Es=Object.defineProperty;var As=(e)=>e;function Ss(e,t){this[e]=As.bind(null
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainkernel_anon_8805d3e359 = function _anonymous(md) {return (md`# brain-kernel
+const _brainkernel_anon_ef7370f1b4 = function _anonymous(md) {return (md`# brain-kernel
 
 The Worker at the Brain's address. It serves the notebook, signs people in with atproto, works out who is calling, and forwards everything else to the core with that answer attached.
 
@@ -26399,9 +26407,9 @@ A person is an atproto account, named by its DID. There are two roles. The **own
 
 **Sign-in links** (added 2026-10-09). For a program with no browser, such as Claude Code on the web. \`token.link\` (procedure, owner's session) takes \`{ name, methods, minutes, hours, deploy, unattended }\` and answers \`{ name, deploy, unattended, link, until }\`; \`minutes\` (1 to 480, 480 if left out; 10 until 2026-10-10, which a session that first had to have its network opened ran past) is how long the link is good, \`hours\` (1 to 24, 8 if left out) how long its token lasts. The link is \`/auth/link?code=…\`. A GET of it answers text that says what to do and spends nothing, so a preview of a pasted link does not use it. The first POST answers \`{ name, token, methods, until, deploy, unattended }\` and deletes the link; a second answers 401. The token is one as \`token.create\` makes, with an end: it may not name \`infra.*\`, \`secret.*\`, \`token.*\`, \`grant.*\` or \`people.*\`, and \`token.list\` gives it with \`by: "link"\` until it ends. \`token.revoke\` with \`{ name }\` ends the token early, and deletes a link of that name nobody has used. A link is refused a name that a token or another link has.
 
-**A token is a delegation** (2026-10-10). \`token.create\`, and the POST of a sign-in link, make a delegation with a secret holder in the core (\`delegation.create\`), and the kernel keeps no row for it. \`token.list\` and \`token.revoke\` read and end those and nothing else: a token made before is a row here until it is first used, or tokens are next listed or revoked, or a link is made, and is then handed to the core by the hash of its secret (\`delegation.adopt\`) and is a delegation like any other. A call with such a token is sent to the core with the delegation's id, and there it is the owner's call: the owner's rules and the owner's allowance, which \`daily\` in \`token.create\` (US dollars a UTC day) caps. It is not the owner's own tab, so what it makes in a store is kept under \`d:<id>\` and not under \`token:NAME\`; a link made with \`unattended\` is the owner's tab for the methods its list names by a name or a prefix, and not for one that only \`*\` reaches. A token ends within 5 s of \`token.revoke\`, the time a core instance remembers a row. The core's limits are now a token's: at most 50 methods, and a name that no other delegation of the owner has (400 from \`token.create\`, where two tokens of one name were made before). While the core does not answer, such a token is refused with 503, on \`infra.*\` too: a sign-in link's token cannot deploy a core that is down, and the owner's session can.
+**A token is a delegation** (2026-10-10). \`token.create\`, and the POST of a sign-in link, make a delegation with a secret holder in the core (\`delegation.create\`), and the kernel keeps no row for it. \`token.list\` and \`token.revoke\` read and end those and nothing else: a token made before is a row here until it is first used, or tokens are next listed or revoked, or a link is made, and is then handed to the core by the hash of its secret (\`delegation.adopt\`) and is a delegation like any other. A call with such a token is sent to the core with the delegation's id, and there it is the call of whoever made it (the owner, for one from \`token.create\`): their rules and their allowance, which \`daily\` in \`token.create\` (US dollars a UTC day) caps. It is not the owner's own tab, so what it makes in a store is kept under \`d:<id>\` and not under \`token:NAME\`; a link made with \`unattended\` is the owner's tab for the methods its list names by a name or a prefix, and not for one that only \`*\` reaches. A token ends within 5 s of \`token.revoke\`, the time a core instance remembers a row. The core's limits are now a token's: at most 50 methods, and a name that no other delegation of the owner has (400 from \`token.create\`, where two tokens of one name were made before). With \`delegate\` among its caps (made with \`delegation.create\` in the owner's or a member's session) a token reaches \`delegation.create\`, \`list\` and \`revoke\`, and the core says what it may make; \`token.list\` marks it \`delegate: true\`. \`token.list\` shows the owner's own tokens: a member's, and one made under another, are in \`delegation.list\`. While the core does not answer, such a token is refused with 503, on \`infra.*\` too: a sign-in link's token cannot deploy a core that is down, and the owner's session can.
 
-**A grant is a delegation** (2026-10-10). \`grant.put\` makes a delegation that the DID holds, named \`grant\`, in the core, and the kernel keeps no row; \`grant.list\` and \`grant.delete\` read and end it, and \`people.remove\` ends it with the member. For each call a DID makes the kernel asks the core for that DID's grant. A grant from before is a row here until the DID next calls, grants or people are listed, or it is put again; one the core refuses (over 50 methods, or a name that is not letters and digits between dots) stays a row and gives nothing. With \`delegate\` among its caps (made with \`delegation.create\` in the owner's or a member's session) a token reaches \`delegation.create\`, \`list\` and \`revoke\`, and the core says what it may make. \`token.list\` shows the owner's own tokens: a member's, and one made under another, are in \`delegation.list\`. \`people.sync\` tells the core who is a member and no longer what each was granted.
+**A grant is a delegation** (2026-10-10). \`grant.put\` makes a delegation that the DID holds, named \`grant\`, in the core, and the kernel keeps no row; \`grant.list\` and \`grant.delete\` read and end it, and \`people.remove\` ends it with the member. For each call a DID makes the kernel asks the core for that DID's grant. A grant from before is a row here until the DID next calls, grants or people are listed, or it is put again; one the core refuses (over 50 methods, or a name that is not letters and digits between dots) stays a row and gives nothing. \`people.sync\` tells the core who is a member and no longer what each was granted.
 
 **Lists of methods** (2026-10-10). In \`token.create\` and \`token.link\` an entry of \`methods\` is a whole name or a prefix that ends \`.*\`: \`browser.*\` is every method of that service, \`*\` every method of this Brain. A name may go on after a \`/\` (\`ai.v1/chat/completions\`), and \`ai.v1/*\` is every method under \`ai.v1/\` and not \`ai.run\` (2026-10-10: the first shape check had refused every name with a \`/\`). No prefix reaches a name a token may not have (\`infra\`, \`secret\`, \`token\`, \`grant\`, \`people\`), whether it goes on with a \`.\` or a \`/\`. A grant to a DID still names whole methods.
 
@@ -26609,7 +26617,7 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
       return v.error ? { refused: v } : { caller: v.iss === config.owner ? "owner" : v.iss, via: "jwt", did: v.iss };
     }
     // A token is a delegation that the core keeps, found by the hash. The caller is who made it. Its scope is the
-    // list here, three of its caps are deploy and unattended, and the core is sent its id. One made before
+    // list here, three of its caps are deploy, unattended and delegate, and the core is sent its id. One made before
     // 2026-10-10 is a row here until it is first met, and is then handed to the core.
     const hash = await sha256(bearer), old = await rows.get("token/" + hash);
     if (old && old.until < Date.now()) return { refused: { error: "AuthRequired", message: "this token has expired" } };
@@ -26806,7 +26814,7 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   const names = (methods, nsid) => !never(nsid) && matches(methods, nsid);
   // A token is a delegation with a secret holder, in the core.
   const LINK = "sign-in link";
-  const shown = (d) => ({ name: d.name, methods: d.scope, created: d.created, id: d.id, ...(d.until ? { until: d.until } : {}), ...(d.note === LINK ? { by: "link" } : {}), ...(d.caps.includes("deploy") ? { deploy: true } : {}), ...(d.caps.includes("unattended") ? { unattended: true } : {}), ...(d.daily === null ? {} : { daily: d.daily }) });
+  const shown = (d) => ({ name: d.name, methods: d.scope, created: d.created, id: d.id, ...(d.until ? { until: d.until } : {}), ...(d.note === LINK ? { by: "link" } : {}), ...(d.caps.includes("delegate") ? { delegate: true } : {}), ...(d.caps.includes("deploy") ? { deploy: true } : {}), ...(d.caps.includes("unattended") ? { unattended: true } : {}), ...(d.daily === null ? {} : { daily: d.daily }) });
   // The owner's own: a member's token, and one made under another, are read with delegation.list.
   const tokens = async () => (await moveAll(), (await delegations()).filter((d) => d.holder && d.holder.secret && d.from === "owner" && !d.parent));
   app.get(NS + "token.list", session, async (c) => c.json({ tokens: (await tokens()).map(shown).filter((t) => !(t.until < Date.now())) }));
@@ -27317,7 +27325,7 @@ const _brainkernel_test_tokens_reach_only_their_methods = async function _test_t
   expect(JSON.stringify([...rig.sim.rows])).not.toContain(web.token);
   const listed = async () => (await rig.call("token.list", { session: rig.owner })).data.tokens.map((t) => [t.name, t.by || null]).sort();
   expect(await listed()).toEqual([["laptop", null], ["web", "link"]]);
-  expect(Math.round((web.until - Date.now()) / 60000)).toBe(60);
+  expect(Math.abs((web.until - Date.now()) / 60000 - 60)).toBeLessThan(2);
   // The token ends by itself, and so does a link nobody used.
   for (const d of rig.held.values()) if (d.note === "sign-in link") d.until = Date.now() - 1;
   expect((await rig.call("proxy.fetch", { bearer: web.token, body: {} })).data.message).toBe("this token has expired");
@@ -27440,7 +27448,7 @@ const _brainkernel_test_a_token_with_the_cap_delegate_reaches_the_delegation_met
   expect([await status("agent-secret", "delegation.list"), rig.seen.at(-1).headers["x-brain-delegation"], await status("agent-secret", "delegation.create"), await status("agent-secret", "delegation.revoke"), await status("agent-secret", "token.list"), await status("agent-secret", "grant.list")]).toEqual([200, agent.id, 200, 200, 403, 403]);
   expect([await status("plain-secret", "delegation.list"), await status("sub-secret", "delegation.create"), await status("plain-secret", "proxy.fetch")]).toEqual([403, 403, 200]);
   // token.list is the owner's own tokens: not one made under another, and not a member's.
-  expect((await rig.call("token.list", { session: rig.owner })).data.tokens.map((t) => t.name).sort()).toEqual(["agent", "plain"]);
+  expect((await rig.call("token.list", { session: rig.owner })).data.tokens.map((t) => [t.name, !!t.delegate]).sort()).toEqual([["agent", true], ["plain", false]]);
   return "delegate: three methods reach the core";
 };
 const _brainkernel_test_another_did_needs_a_grant = async function _test_another_did_needs_a_grant(kernelRig,expect) {
@@ -28020,7 +28028,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainkernel_anon_8805d3e359", null, ["md"], _brainkernel_anon_8805d3e359);
+  $def("_brainkernel_anon_ef7370f1b4", null, ["md"], _brainkernel_anon_ef7370f1b4);
   $def("_brainkernel_kernel_service", "kernel_service", ["cloudflare","kernelApp"], _brainkernel_kernel_service);
   $def("_brainkernel_kernel_announce", "kernel_announce", ["plugins","kernel_service","invalidation"], _brainkernel_kernel_announce);
   $def("_brainkernel_atcute", "atcute", ["library","FileAttachment"], _brainkernel_atcute);
@@ -74481,7 +74489,7 @@ Read this before changing, deploying or diagnosing a service of the Cloud Brain 
 | `brain_call` | one XRPC call to this Brain as the owner, e.g. `inbox.list`, `people.list`, `secret.list`, `library.list` |
 | `brain_apply` | ask the deployer to deploy one service as it is in this notebook now. The Worker carries the module's source; the page then loads it back, runs the module's `test_` cells and reports. `verdict.state` is `verified`, or `put-back` when the tests failed and the version before is running again |
 
-`brain_call` refuses `secret.get`, `token.*`, `grant.*` and `infra.*`. Secret values, access and deploys are the owner's own actions on the page.
+`brain_call` refuses `secret.get`, `token.*`, `grant.*`, `delegation.*` and `infra.*`. Secret values, access and deploys are the owner's own actions on the page.
 
 ## Checking how it is running
 
