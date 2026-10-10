@@ -36622,8 +36622,9 @@ Two things are kept apart. The **record** is every event in one order, each nami
 The tracker's code is the mechanism: the chain, and the rule that an act goes ahead only when its installed guard is true. Which states an issue has, who may move it and what a move needs are a **policy**: data, installed by an event of the same record. Built 2026-10-10; the design and what it leaves out are in \`plan/cloud-brain-issues.md\`.`);};
 const _brainissues_viewof_issuesView = function _issuesView(issuesPanel,client,session,invalidation) {return (issuesPanel({ client, owner: !!(session && session.owner), invalidation }));};
 const _brainissues_issuesView = (G, _) => G.input(_);
-const _brainissues_anon_c8ba81bd3c = function _anonymous(md,issuesStore) {return (md`The panel above is for the owner, signed in. It answers from a copy of the view that the page keeps, one for each Brain's address, in \`localStorage\` under \`${issuesStore("ADDRESS").name}\`: one \`issue.snapshot\`, then \`issue.sync\` every \`wait\` milliseconds while the tab is visible.
+const _brainissues_anon_79c0c4d7ee = function _anonymous(md,issuesStore) {return (md`The panel above is for the owner, signed in. It answers from a copy of the view that the page keeps, one for each Brain's address, in \`localStorage\` under \`${issuesStore("ADDRESS").name}\`: one \`issue.snapshot\`, then \`issue.sync\` every \`wait\` milliseconds while the tab is visible.
 
+- **For your attention**, above the filters: the open issues that wait for the owner, last changed first. One waits when it has the label \`needs-owner\` or \`security\`, is at \`awaiting-approval\`, is of kind \`security\`, or is not shown to this caller. Each row has the issue's last comment (its last event when it has none), one box, and beside it a button for each state the owner may move the issue to, **Comment**, and **− needs-owner** where it has that label. The text of the box is the reason of a move or the body of the comment, and the box is emptied when the service has taken it. A move that needs a reason is disabled until the box has text. A move the guard would refuse whatever the reason has no button there, nor has a swap, nor a move that needs refs: those are in the open issue, which the row's title opens. The last comment is one \`issue.get\` for each listed issue, asked again when the issue changes.
 - **State, Kind, Find** filter the table from the copy, with no call. Find reads the title, \`about\`, the labels and the id.
 - **A row** opens that issue: its body, its children, its events, and a button for each state it can move to and each swap its workflow lists. A button the guard would refuse is disabled, and its tooltip is the refusal. Reason and Refs are sent with a move, so a button can come alive as they are typed.
 - **Refs**: entries separated by commas. \`kind:value\` is a ref of that kind (\`commit:abc\`, \`deploy:brain-x-a@hash\`); an address (\`https://…\`) or a text with no colon is a \`url\`.
@@ -37303,7 +37304,7 @@ const _brainissues_issuesPanel = function _issuesPanel(issuesStore,htl,issueView
   if (!client || !owner) return htl.html`<i style=${muted}>Sign in as the owner to see the issues.</i>`;
   let base = store.get() || issueView(), pending = [], open = null, wait = issuesLimits.syncMs;
   const detail = new Map();
-  const note = htl.html`<span style=${muted}></span>`, policy = htl.html`<div style=${muted + ";margin-top:4px"}></div>`, list = htl.html`<div></div>`, one = htl.html`<div></div>`;
+  const note = htl.html`<span style=${muted}></span>`, policy = htl.html`<div style=${muted + ";margin-top:4px"}></div>`, list = htl.html`<div></div>`, one = htl.html`<div></div>`, attention = htl.html`<div style="margin-bottom:12px"></div>`;
   const now = () => pending.reduce((v, e) => issueApply(v, e), structuredClone(base));
   // A select whose choices come from the copy: made again when they change, keeping what was chosen.
   const chooser = (label, onInput) => {
@@ -37348,12 +37349,90 @@ const _brainissues_issuesPanel = function _issuesPanel(issuesStore,htl,issueView
       pending = pending.filter((e) => e !== local);
       if (r.event && r.event.seq === base.seq + 1) issueApply(base, r.event), store.set(base);
       else await sync();
-      detail.delete(act.id);
+      forget(act.id);
+      draw();
+      return true;
     } catch (e) {
       pending = pending.filter((x) => x !== local);
       note.textContent = `issue.${method} was refused: ${e.message}`;
+      draw();
+      return false;
     }
-    draw();
+  };
+  // An issue's events are not in the copy: issue.get, asked once for each seq of the issue and kept until it changes. One that failed is asked again at the next draw.
+  const asked = new Map();
+  const forget = (id) => (detail.delete(id), asked.delete(id));
+  const load = (i) => {
+    const got = detail.get(i.id);
+    if ((got && got.seq === i.seq) || asked.get(i.id) === i.seq) return got;
+    asked.set(i.id, i.seq);
+    client.query("issue.get", { id: i.id }).then((r) => (detail.set(i.id, { seq: i.seq, ...r }), drawOne(), drawWaiting())).catch(() => asked.delete(i.id));
+    return got;
+  };
+  // A button for each state the issue can move to, and each swap its workflow lists. One the guard refuses is disabled
+  // and its tooltip is the refusal; with `likely`, one it would refuse whatever the reason is left out.
+  const actButtons = (i, { reason = "", refs = [], swaps = true, likely = false, then = () => null } = {}) => {
+    const view = now(), wf = view.workflows[i.workflow] || { moves: [], swaps: [] };
+    const moves = [...new Set(wf.moves.filter((m) => m.from === "*" || [].concat(m.from).includes(i.state)).map((m) => m.to))].map((to) => ({ text: to, to, act: { type: "move", id: i.id, to, reason, refs }, call: ["move", { id: i.id, to, reason, refs }] }));
+    const more = swaps ? wf.swaps.map((s) => ({ text: "swap: " + s.name, act: { type: "swap", id: i.id, swap: s.name, reason }, call: ["swap", { id: i.id, swap: s.name, reason }] })) : [];
+    return [...moves, ...more].filter((b) => !likely || issueAllowed(view, by, { ...b.act, reason: reason || "a reason" }).allow).map((b) => {
+      const v = issueAllowed(view, by, b.act);
+      return Object.assign(htl.html`<button data-to=${b.to || ""} disabled=${!v.allow} onclick=${() => then(send(b.call[0], b.act, b.call[1]))}>${b.text}</button>`, { title: v.allow ? "" : v.why });
+    });
+  };
+  // issue.label with remove, as a button. Disabled where the label guard refuses, as a move's button is.
+  const unlabel = (i, l, text = "×", mark = "remove") => {
+    const act = { type: "label", id: i.id, remove: [l] }, v = issueAllowed(now(), by, act);
+    const button = Object.assign(htl.html`<button disabled=${!v.allow} style="margin-left:2px;padding:0 4px" onclick=${() => send("label", act, { id: i.id, remove: [l] })}>${text}</button>`, { title: v.allow ? "Remove the label " + l : v.why });
+    button.dataset[mark] = l;
+    return button;
+  };
+  // What waits for the owner: an open issue labelled needs-owner, at awaiting-approval, about security, or not shown.
+  const waits = (i) => !i.closed && (i.hidden || i.state === "awaiting-approval" || i.kind === "security" || (i.labels || []).some((l) => l === "needs-owner" || l === "security"));
+  // One row for each, last changed first. A row is made again only when its issue or its events changed, and the box
+  // of a row is the same element for as long as the issue waits: a poll does not take what is being typed.
+  const rows = new Map();
+  let listed = null;
+  const drawWaiting = () => {
+    const view = now(), all = Object.values(view.issues).filter(waits).sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0) || (b.seq || 0) - (a.seq || 0));
+    for (const id of [...rows.keys()]) if (!all.some((i) => i.id === id)) rows.delete(id);
+    for (const i of all) {
+      const got = i.hidden ? null : load(i), mine = pending.filter((e) => e.id === i.id);
+      const key = [i.seq, i.state, i.hidden, i.workflow, (i.labels || []).join(","), (got || {}).seq, mine.length].join("|"), had = rows.get(i.id);
+      if (had && had.key === key) continue;
+      if (i.hidden) {
+        rows.set(i.id, { key, node: htl.html`<div data-attention=${i.id} style="margin:6px 0"><code>${i.id}</code> <i style=${muted}>not shown to this caller · ${i.state} · ${i.kind}</i></div>` });
+        continue;
+      }
+      const text = (had && had.text) || htl.html`<input type="text" placeholder="A reason or a comment" style="flex:1;min-width:14em">`;
+      const acts = htl.html`<span style="display:flex;gap:6px;flex-wrap:wrap"></span>`;
+      // The box is emptied when the service took the write that carried its text. The row may have been made again
+      // since: oninput is the buttons of the row that has the box now.
+      const sent = (was) => (done) => done.then((took) => took && text.value === was && ((text.value = ""), text.oninput()));
+      const buttons = () => {
+        const line = text.value.trim();
+        acts.replaceChildren(
+          ...actButtons(i, { reason: line, swaps: false, likely: true, then: sent(text.value) }),
+          htl.html`<button data-say="comment" disabled=${!line} onclick=${() => sent(text.value)(send("comment", { type: "comment", id: i.id, body: line }, { id: i.id, body: line }))}>Comment</button>`,
+          ...(i.labels.includes("needs-owner") ? [unlabel(i, "needs-owner", "− needs-owner", "off")] : [])
+        );
+      };
+      text.oninput = buttons;
+      buttons();
+      const events = [...((got && got.events) || []), ...mine], last = events.findLast((e) => e.type === "commented") || events.at(-1);
+      rows.set(i.id, { key, text, node: htl.html`<div data-attention=${i.id} style="border-left:3px solid var(--theme-foreground-faint);padding-left:8px;margin:8px 0">
+        <a href="#" onclick=${(ev) => (ev.preventDefault(), root.show(i.id))}>${i.title}</a> <code>${i.id}</code> <span style=${muted}>${i.state} · ${i.kind} · ${i.about}${i.labels.map((l) => " · " + l)}</span>
+        ${last ? htl.html`<div style="white-space:pre-wrap;max-height:7em;overflow:auto;margin:2px 0"><span style=${muted}>${when(last.at)} ${last.by.holder || last.by.caller}${last.type === "commented" ? "" : " " + last.type}</span> ${said(last)}</div>` : ""}
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${text}${acts}</div>
+      </div>` });
+    }
+    const nodes = all.map((i) => rows.get(i.id).node);
+    if (listed && listed.length === nodes.length && nodes.every((n, k) => n === listed[k])) return;
+    listed = nodes;
+    // A box that had the caret has it again once its row is put back.
+    const doc = attention.ownerDocument, active = doc && doc.activeElement;
+    attention.replaceChildren(htl.html`<b>For your attention</b> <span style=${muted}>${nodes.length ? nodes.length : "Nothing waits for you."}</span>`, ...nodes);
+    if (active && active !== doc.activeElement && attention.contains(active)) active.focus();
   };
   const when = (ms) => new Date(ms).toLocaleString();
   const said = (e) => (e.type === "moved" ? `${e.from} → ${e.to}${e.reason ? ": " + e.reason : ""}` : e.type === "swapped" ? `to ${e.to.state}${e.swap ? " by " + e.swap : ""}` : e.type === "reviewed" ? `${e.verdict}${e.body ? ": " + e.body : ""}` : e.type === "labelled" ? [...(e.add || []).map((l) => "+" + l), ...(e.remove || []).map((l) => "-" + l)].join(" ") : e.type === "narrowed" ? (e.remove != null ? "removed guard " + e.remove : `${e.move}: ${e.guard}`) : e.type === "opened" ? e.title : e.body || "");
@@ -37368,29 +37447,16 @@ const _brainissues_issuesPanel = function _issuesPanel(issuesStore,htl,issueView
     drawn = key;
     if (!i) return one.replaceChildren();
     if (i.hidden) return one.replaceChildren(htl.html`<i style=${muted}>${i.id} is not shown to this caller.</i>`);
-    const wf = view.workflows[i.workflow] || { moves: [], swaps: [] }, got = detail.get(i.id);
-    if (!got || got.seq !== i.seq) client.query("issue.get", { id: i.id }).then((r) => (detail.set(i.id, { seq: (view.issues[i.id] || i).seq, ...r }), open === i.id && drawOne())).catch(() => null);
+    const got = load(i);
     const events = [...((got && got.events) || []), ...pending.filter((e) => e.id === i.id)];
     const reason = Inputs.text({ label: "Reason" }), refs = Inputs.text({ label: "Refs", placeholder: "commit:abc, deploy:brain-x-a@hash" }), comment = Inputs.textarea({ label: "Comment", rows: 2 }), label = Inputs.text({ label: "Label" });
     const verdict = Inputs.select(issuesLimits.verdicts, { label: "Review" }), acts = htl.html`<div style="display:flex;gap:6px;flex-wrap:wrap"></div>`;
-    const buttons = () => {
-      const moves = [...new Set(wf.moves.filter((m) => m.from === "*" || [].concat(m.from).includes(i.state)).map((m) => m.to))].map((to) => ({ text: to, act: { type: "move", id: i.id, to, reason: reason.value, refs: refsOf(refs.value) }, call: ["move", { id: i.id, to, reason: reason.value, refs: refsOf(refs.value) }] }));
-      const swaps = wf.swaps.map((s) => ({ text: "swap: " + s.name, act: { type: "swap", id: i.id, swap: s.name, reason: reason.value }, call: ["swap", { id: i.id, swap: s.name, reason: reason.value }] }));
-      acts.replaceChildren(...[...moves, ...swaps].map((b) => {
-        const v = issueAllowed(now(), by, b.act);
-        return htl.html`<button disabled=${!v.allow} title=${v.allow ? "" : v.why} onclick=${() => send(b.call[0], b.act, b.call[1])}>${b.text}</button>`;
-      }));
-    };
-    // One for each label: issue.label with remove. Disabled where the label guard refuses, as a move's button is.
-    const unlabel = (l) => {
-      const act = { type: "label", id: i.id, remove: [l] }, v = issueAllowed(view, by, act);
-      return Object.assign(htl.html`<button data-remove=${l} disabled=${!v.allow} style="margin-left:2px;padding:0 4px" onclick=${() => send("label", act, { id: i.id, remove: [l] })}>×</button>`, { title: v.allow ? "Remove the label " + l : v.why });
-    };
+    const buttons = () => acts.replaceChildren(...actButtons(i, { reason: reason.value, refs: refsOf(refs.value) }));
     reason.addEventListener("input", buttons);
     refs.addEventListener("input", buttons);
     buttons();
     one.replaceChildren(htl.html`<div style="border-top:1px solid var(--theme-foreground-faintest);margin-top:12px;padding-top:8px">
-      <b>${i.title}</b> <code>${i.id}</code> <span style=${muted}>${i.state} · ${i.kind} · ${i.about}${i.labels.map((l) => htl.html` · ${l}${unlabel(l)}`)}${i.parent ? " · child of " + i.parent : ""}</span>
+      <b>${i.title}</b> <code>${i.id}</code> <span style=${muted}>${i.state} · ${i.kind} · ${i.about}${i.labels.map((l) => htl.html` · ${l}${unlabel(i, l)}`)}${i.parent ? " · child of " + i.parent : ""}</span>
       <div style="white-space:pre-wrap;margin:6px 0">${(got && got.issue && got.issue.body) || i.body || ""}</div>
       ${kids.length ? htl.html`<div>${kids.map((k) => htl.html`<div><a href="#" onclick=${(ev) => (ev.preventDefault(), (open = k.id), drawOne())}>${k.id}</a> ${k.title || ""} <span style=${muted}>${k.state}</span></div>`)}</div>` : ""}
       <div style="margin:6px 0">${events.map((e) => htl.html`<div style=${e.pending ? muted : ""}><span style=${muted}>${when(e.at)} ${e.by.holder || e.by.caller}</span> <b>${e.type}</b> ${said(e)}${(e.refs || []).map((r) => ` [${r.kind}:${r.value}]`).join("")}</div>`)}</div>
@@ -37418,6 +37484,7 @@ const _brainissues_issuesPanel = function _issuesPanel(issuesStore,htl,issueView
     const p = view.policy;
     policy.textContent = p ? `Policy of event ${p.seq}${p.reason ? ": " + p.reason : p.seq === 1 ? ", the default." : ", installed with no reason recorded."}` : "";
     root.value = view;
+    drawWaiting();
     drawOne();
     // A cell that reads issuesView (the value) runs again: the copy changed, whoever changed it.
     root.dispatchEvent(new Event("input"));
@@ -37432,13 +37499,14 @@ const _brainissues_issuesPanel = function _issuesPanel(issuesStore,htl,issueView
     return sent;
   };
   const root = htl.html`<div>
+    ${attention}
     <div style="display:flex;gap:12px;flex-wrap:wrap">${state.slot}${kind.slot}${find}</div>
     ${list}${one}
     <details style="margin-top:12px"><summary>New issue</summary>${title}${body}${newKind.slot}${about}${parent}${Inputs.button("Open", { reduce: () => void create() })}</details>
     <div style="display:flex;gap:8px;margin-top:8px;align-items:center">${Inputs.button("Refresh", { reduce: () => sync().catch((e) => (note.textContent = "issue.sync failed: " + e.message)) })}${note}</div>
     ${policy}
   </div>`;
-  Object.assign(root, { value: base, send, sync, refsOf, show: (id) => ((open = id), drawOne()), policy, form: { title, kind: newKind, open: create }, filters: { state, kind } });
+  Object.assign(root, { value: base, send, sync, refsOf, show: (id) => ((open = id), drawOne()), policy, attention, form: { title, kind: newKind, open: create }, filters: { state, kind } });
   draw();
   const tick = () => (typeof document === "undefined" || document.visibilityState === "visible") && sync().catch((e) => (note.textContent = "issue.sync failed: " + e.message));
   // The service says how long to wait (its setting syncMs); `every` is a test's own.
@@ -38116,6 +38184,82 @@ const _brainissues_test_issues_panel_shows_the_policy_in_force = async function 
   old.end();
   return "the default policy, event 1; an install's seq and reason from issue.sync, from issue.snapshot and from the kept copy; an install with no reason is not called the default";
 };
+const _brainissues_test_issues_panel_lists_what_waits_for_the_owner = async function _test_issues_panel_lists_what_waits_for_the_owner(issuesRig,URLSearchParams,issuesPanel,Event,expect) {
+  const rig = await issuesRig();
+  await rig.owner("open", { id: "w0", title: "Nobody waits", kind: "task" });
+  await rig.owner("open", { id: "w1", title: "Asks the owner", kind: "task", labels: ["needs-owner"] });
+  await rig.a("comment", { id: "w1", body: "Two ways to do it: which?" });
+  await rig.owner("open", { id: "w2", title: "Was answered", kind: "task", labels: ["needs-owner"] });
+  await rig.owner("move", { id: "w2", to: "rejected", reason: "no" });
+  await rig.inReview("w5", { labels: ["needs-owner"] });
+  await rig.inReview("w3", { labels: ["major"] });
+  await rig.b("review", { id: "w3", verdict: "pass" });
+  await rig.b("move", { id: "w3", to: "awaiting-approval" });
+  await rig.owner("open", { id: "w4", title: "A leak", kind: "security" });
+  const ok = (r) => (r.status < 400 ? r.data : Promise.reject(new Error(r.data.message)));
+  const clientOf = (as) => ({ query: (name, params = {}) => as(name.replace("issue.", "") + "?" + new URLSearchParams(params)).then(ok), procedure: (name, body) => as(name.replace("issue.", ""), body).then(ok) });
+  const panelOf = (as, by) => {
+    let end = null;
+    const panel = issuesPanel({ client: clientOf(as), owner: true, ...(by ? { by } : {}), every: 1e9, invalidation: new Promise((r) => (end = r)), store: { get: () => null, set: () => null } });
+    return Object.assign(panel, { end });
+  };
+  const until = async (fn) => {
+    for (let n = 0; n < 300 && !fn(); n++) await new Promise((r) => setTimeout(r, 10));
+    return fn();
+  };
+  const panel = panelOf(rig.owner);
+  const rows = (p = panel) => [...p.attention.querySelectorAll("[data-attention]")];
+  const row = (id, p = panel) => rows(p).find((r) => r.dataset.attention === id);
+  const button = (id, name, value) => [...row(id).querySelectorAll("button")].find((b) => b.dataset[name] === value);
+  const type = (id, text) => {
+    const input = row(id).querySelector("input");
+    input.value = text;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const record = (id, type) => rig.db.events.map((e) => JSON.parse(e.event)).filter((e) => e.id === id && e.type === type).at(-1);
+  // With nothing in the copy the block says so.
+  expect(panel.attention.textContent).toContain("For your attention");
+  expect(panel.attention.textContent).toContain("Nothing waits");
+  await panel.sync();
+  // The open issues labelled needs-owner, at awaiting-approval or of kind security, last changed first. Not the plain
+  // task, and not the rejected one that still has the label.
+  expect(rows().map((r) => r.dataset.attention)).toEqual(["w4", "w3", "w5", "w1"]);
+  // The last comment comes with issue.get; an issue with none shows its last event.
+  expect(await until(() => row("w1").textContent.includes("Two ways to do it: which?") && row("w3").textContent.includes("in-review → awaiting-approval"))).toBe(true);
+  // The buttons are the moves the owner may make. One that needs a reason is disabled until the box has text; one no
+  // text would allow (a pass with no review) is not there.
+  expect([button("w3", "to", "done").disabled, button("w3", "to", "rejected").disabled, button("w1", "to", "triaged").disabled]).toEqual([false, true, true]);
+  expect([!!button("w5", "to", "done"), !!button("w5", "to", "in-progress"), !!button("w5", "to", "rejected")]).toEqual([false, false, true]);
+  type("w1", "Take the first way");
+  expect([button("w1", "to", "triaged").disabled, button("w1", "to", "rejected").disabled]).toEqual([false, false]);
+  // Comment sends the text of the box as issue.comment, and the box is emptied when the service has taken it.
+  button("w1", "say", "comment").click();
+  expect(await until(() => (record("w1", "commented") || {}).body === "Take the first way" && row("w1").querySelector("input").value === "" && button("w1", "say", "comment").disabled)).toBe(true);
+  expect(await until(() => row("w1").textContent.includes("Take the first way"))).toBe(true);
+  // What is typed in one row is kept when another caller's event draws that row again.
+  type("w5", "half a line");
+  await rig.a("comment", { id: "w5", body: "more from the implementer" });
+  await panel.sync();
+  expect(await until(() => row("w5").textContent.includes("more from the implementer"))).toBe(true);
+  expect(row("w5").querySelector("input").value).toBe("half a line");
+  // A move takes the text as its reason. An approved issue is closed and leaves the block.
+  type("w3", "ship it");
+  button("w3", "to", "done").click();
+  expect(await until(() => !row("w3") && JSON.parse(rig.db.view.get("w3").issue).state === "done")).toBe(true);
+  expect(record("w3", "moved")).toMatchObject({ move: "approve", to: "done", reason: "ship it" });
+  // Taking needs-owner off is one press, and the issue leaves the block.
+  button("w1", "off", "needs-owner").click();
+  expect(await until(() => !row("w1") && JSON.parse(rig.db.view.get("w1").issue).labels.length === 0)).toBe(true);
+  expect(rows().map((r) => r.dataset.attention)).toEqual(["w5", "w4"]);
+  panel.end();
+  // An issue this caller may not read is listed with no title, no box and no button.
+  const token = panelOf(rig.a, { caller: "token:a", via: "" });
+  await token.sync();
+  const hidden = row("w4", token);
+  expect([hidden.textContent.includes("A leak"), hidden.textContent.includes("not shown"), hidden.querySelectorAll("input, button").length]).toEqual([false, true, 0]);
+  token.end();
+  return "4 of 6 issues listed, last changed first; a comment, an approval with its reason and needs-owner taken off, each one press; a hidden issue has no controls";
+};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -38125,7 +38269,7 @@ export default function define(runtime, observer) {
   $def("_brainissues_anon_8ee7cebb43", null, ["md"], _brainissues_anon_8ee7cebb43);
   $def("_brainissues_viewof_issuesView", "viewof issuesView", ["issuesPanel","client","session","invalidation"], _brainissues_viewof_issuesView);
   $def("_brainissues_issuesView", "issuesView", ["Generators","viewof issuesView"], _brainissues_issuesView);
-  $def("_brainissues_anon_c8ba81bd3c", null, ["md","issuesStore"], _brainissues_anon_c8ba81bd3c);
+  $def("_brainissues_anon_79c0c4d7ee", null, ["md","issuesStore"], _brainissues_anon_79c0c4d7ee);
   $def("_brainissues_anon_a7739bf88d", null, ["md","issuesDefaultPolicy","issuesLimits"], _brainissues_anon_a7739bf88d);
   $def("_brainissues_anon_ee7e7b4cb9", null, ["md","issuesExampleText","issuesDefaultPolicy"], _brainissues_anon_ee7e7b4cb9);
   $def("_brainissues_issuesExamplePolicy", "issuesExamplePolicy", [], _brainissues_issuesExamplePolicy);
@@ -38168,6 +38312,7 @@ export default function define(runtime, observer) {
   $def("_brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer", "test_issues_panel_draws_and_applies_a_write_before_the_answer", ["issuesRig","URLSearchParams","issuesPanel","expect","Event","issuesStore"], _brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer);
   $def("_brainissues_test_issues_panel_removes_a_label", "test_issues_panel_removes_a_label", ["issuesRig","URLSearchParams","issuesPanel","expect"], _brainissues_test_issues_panel_removes_a_label);
   $def("_brainissues_test_issues_panel_shows_the_policy_in_force", "test_issues_panel_shows_the_policy_in_force", ["issuesRig","URLSearchParams","issuesPanel","expect","issuesDefaultPolicy"], _brainissues_test_issues_panel_shows_the_policy_in_force);
+  $def("_brainissues_test_issues_panel_lists_what_waits_for_the_owner", "test_issues_panel_lists_what_waits_for_the_owner", ["issuesRig","URLSearchParams","issuesPanel","Event","expect"], _brainissues_test_issues_panel_lists_what_waits_for_the_owner);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("sql", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sql", _));
@@ -75209,6 +75354,8 @@ Added 2026-10-09. `https://<host>/llms.txt` says how to call this Brain, how the
 From Claude Code on the web the environment must allow the Brain's host and hold the token in a file of mode 600 outside the repository (a link's token) or an environment variable (a standing one). Tried from there on 2026-10-10 by a session with no CLAUDE.md: it redeemed a link and deployed; what slowed it is in `spec-as-built.md`, "The button copies a briefing; a link is good for 8 hours".
 
 Since 2026-10-10 16:48 **Copy Login Link** makes a token that reads (issues, knowledge, `quota.get`) and does not deploy; the program asks for more (`/auth/ask`) and the owner answers at `/auth/request`. A link that deploys is made under Access with "link may deploy". **Copy Guest Invite** beside it is for a colleague: a name, the methods and dollars a day; the link and its token last 7 days. To make them a member, add the handle they send under People.
+
+From a checkout that holds a Brain's state file (added 2026-10-10): an agent makes a token with `brain.ts token NAME <method…>` and calls with `brain.ts curl <path> --as NAME`, in place of `--owner`. The session `brain.ts` mints from the state file is the owner's own, and a call with it reads as the owner present. The reason and what was run are in `knowledge/working-with-cloud-brain-remote-lopecode-cluster.md`, "Access from this checkout".
 
 ## Messages
 
