@@ -19467,6 +19467,9 @@ const _cloudflareiac_backend = function _backend() {
     databaseRun: async () => {
       throw new Error("database runs in brain-db, or under simulate with a sql function");
     },
+    vectors: async () => {
+      throw new Error("vectors run in a Worker, or under simulate with a vectors object");
+    },
     blobGet: async (key) => store.blobs.get(key) ?? null,
     blobPut: async (key, bytes) => (store.blobs.set(key, bytes), true),
     blobHas: async (key) => store.blobs.has(key),
@@ -19516,6 +19519,12 @@ const _cloudflareiac_sql = function _sql(platformTag,backend) {return ({
 const _cloudflareiac_database = function _database(platformTag,backend) {return ({
   [platformTag]: "database",
   batch: (list) => backend.databaseRun(list)
+});};
+const _cloudflareiac_vectors = function _vectors(platformTag,backend) {return ({
+  [platformTag]: "vectors",
+  query: (vector, options) => backend.vectors("query", vector, options),
+  upsert: (list) => backend.vectors("upsert", list),
+  deleteByIds: (ids) => backend.vectors("deleteByIds", ids)
 });};
 const _cloudflareiac_blobs = function _blobs(platformTag,backend) {return ({
   [platformTag]: "blobs",
@@ -20024,7 +20033,14 @@ const _cloudflareiac_containerImages = function _containerImages() {return ((ser
     return { name, class_name: "Box_" + name, image: i.image, instance_type: i.type || "lite", max_instances: i.max || 4, entrypoint: i.entrypoint || [], regions: i.regions || [] };
   });
 });};
-const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,notebookOnly,globalThis,acorn,acorn_walk,secretName,moduleSource,workerRuntime,containerImages,quickjsWasmText,checkedRule,partsHash) {return (async (service) => {
+const _cloudflareiac_vectorIndex = function _vectorIndex() {return ((service, refuse = (cell, why) => { throw new Error(why); }) => {
+  const v = service.options.vectors || {}, fields = Object.entries(v.metadata || {}).sort();
+  if (!/^[a-z][a-z0-9-]{0,29}$/.test(v.name || "")) refuse(service.name, "uses vectors and names no index: add vectors: { name, dimensions, metadata } to the service's options");
+  if (!(Number.isInteger(v.dimensions) && v.dimensions >= 32 && v.dimensions <= 1536)) refuse(service.name, "vectors: dimensions is a whole number from 32 to 1536");
+  if (fields.length > 10 || fields.some(([k, t]) => !/^[a-z][a-z0-9_]{0,29}$/.test(k) || !["string", "number", "boolean"].includes(t))) refuse(service.name, "vectors: metadata is 10 fields at most, each string, number or boolean");
+  return { name: v.name, dimensions: v.dimensions, metric: v.metric || "cosine", metadata: fields };
+});};
+const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,notebookOnly,globalThis,acorn,acorn_walk,secretName,moduleSource,workerRuntime,containerImages,vectorIndex,quickjsWasmText,checkedRule,partsHash) {return (async (service) => {
   // An imported name is an alias variable whose one input lives in the exporting module.
   const follow = (v) => {
     while ((v._inputs || []).length === 1 && v._inputs[0]._module && v._inputs[0]._module !== v._module)
@@ -20067,6 +20083,9 @@ const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,noteboo
     } else if (kind === "containers") {
       used.add(kind);
       ref = "__containers";
+    } else if (kind === "vectors") {
+      used.add(kind);
+      ref = "__vectors";
     } else if (kind) {
       used.add(kind);
       ref = "__rt.platform." + kind;
@@ -20145,9 +20164,14 @@ const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,noteboo
   // the service declares. The object does what the service's options.containers.object says, with its own ctx.
   const boxes = used.has("containers") ? containerImages(service, refuse) : [];
   if (boxes.length) lines.push(`import { DurableObject as __DO } from "cloudflare:workers";`, `let __env = null;`, `const __containers = { fetch: (image, id, request) => { const ns = __env && __env["BOX_" + String(image).toUpperCase()]; if (!ns) throw new Error("no container image " + image); return ns.get(ns.idFromName(id)).fetch(request); } };`);
+  // The index is written here too. The binding is read from the env of the call being answered.
+  const index = used.has("vectors") ? vectorIndex(service, refuse) : null;
+  if (index && boxes.length) refuse(service.name, "uses vectors and containers: one Worker has one of the two");
+  if (index) lines.push(`let __venv = null;`, `const __vectors = { query: (v, o) => __venv.VECTORS.query(v, o), upsert: (l) => __venv.VECTORS.upsert(l), deleteByIds: (ids) => __venv.VECTORS.deleteByIds(ids) };`);
   lines.push(`const __init = async () => {`);
   for (const c of cells) lines.push(`  const ${c.id} = await (${c.text})(${c.deps.join(", ")});`);
-  if (!boxes.length) lines.push(`  return ${rootRef};`, `};`, `export default __rt.serve(__init, ${source ? "__source" : "null"});`);
+  if (index) lines.push(`  return ${rootRef};`, `};`, `const __served = __rt.serve(__init, ${source ? "__source" : "null"});`, `export default { fetch: (request, env, ctx) => ((__venv = env), __served.fetch(request, env, ctx)), scheduled: (event, env, ctx) => ((__venv = env), __served.scheduled(event, env, ctx)) };`);
+  else if (!boxes.length) lines.push(`  return ${rootRef};`, `};`, `export default __rt.serve(__init, ${source ? "__source" : "null"});`);
   else {
     // One evaluation of the cells for the Worker and its objects. An object can be the first thing to run in an isolate:
     // it asks the Worker for its health once, which gives the wrapper the bindings.
@@ -20186,11 +20210,14 @@ const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,noteboo
     cloudflare: groups,
     // Container applications the deployer makes for this Worker, one for each image. Absent for a Worker with none.
     ...(boxes.length ? { containers: boxes } : {}),
+    // The Vectorize index the deployer makes for this Worker. Absent for a Worker with none.
+    ...(index ? { vectors: index } : {}),
     bindings: [
       // Only the kernel's and the core's named secrets are bound. A recipe reads its secrets through the core.
       ...(role === "kernel" || role === "core" || role === "deployer" ? [...secretNames].sort().map((name) => ({ type: "secret_text", name })) : []),
       ...(used.has("rows") ? [role === "deployer" ? { type: "durable_object_namespace", name: "ROWS", class_name: "Rows" } : { type: "d1", name: "SQL" }] : []),
       ...(used.has("database") ? [{ type: "d1", name: "DB", own: true }] : []),
+      ...(index ? [{ type: "vectorize", name: "VECTORS", own: true }] : []),
       ...(used.has("blobs") ? [{ type: "r2_bucket", name: "BLOBS", bucket_name: "brain-blobs" }] : []),
       ...(used.has("inbox") || used.has("xrpc") || used.has("sql") || used.has("core") || (secretNames.size && (role === "recipe" || role === "system")) ? [{ type: "service", name: "CORE", service: "brain-core" }] : []),
       ...(used.has("deployer") ? [{ type: "service", name: "DEPLOYER", service: "brain-deployer" }] : []),
@@ -20215,7 +20242,7 @@ const _cloudflareiac_moduleSource = function _moduleSource(runtime,exportModuleJ
     return null;
   }
 });};
-const _cloudflareiac_simulate = function _simulate(Response,Request,simWaits) {return (async (service, { secrets = {}, stored = {}, fetch, config = {}, info = {}, core, deployer, guard, assets, workers = {}, rows, blobs, sql, browser, containers } = {}) => {
+const _cloudflareiac_simulate = function _simulate(Response,Request,simWaits) {return (async (service, { secrets = {}, stored = {}, fetch, config = {}, info = {}, core, deployer, guard, assets, workers = {}, rows, blobs, sql, browser, containers, vectors } = {}) => {
   const emitted = await service.emit();
   const url = (text) => URL.createObjectURL(new Blob([text], { type: "text/javascript" }));
   let main = emitted.parts[0].text;
@@ -20289,6 +20316,8 @@ const _cloudflareiac_simulate = function _simulate(Response,Request,simWaits) {r
     ...(emitted.meta.role === "deployer" ? {} : { SQL: { sim: async (op, key, value) => rowsOp(op, key, value) } }),
     // No SQL engine runs in a page: a test gives sql(statement, args) => { rows, changes } and answers for its statements.
     DB: { sim: async (statement, args) => (sql ? sql(statement, args) : Promise.reject(new Error("simulate was given no sql function"))) },
+    // A test gives vectors: { query, upsert, deleteByIds }, which stand for the binding.
+    ...(vectors ? { VECTORS: vectors } : {}),
     ROWS: { idFromName: (name) => name, get: () => ({ fetch: async (request) => (({ op, key, value }) => reply({ value: rowsOp(op, key, value) }))(await request.json()) }) }
   };
   for (const [name, handler] of Object.entries(workers))
@@ -21267,6 +21296,7 @@ export default function define(runtime, observer) {
   $def("_cloudflareiac_rows", "rows", ["platformTag","backend"], _cloudflareiac_rows);
   $def("_cloudflareiac_sql", "sql", ["platformTag","backend"], _cloudflareiac_sql);
   $def("_cloudflareiac_database", "database", ["platformTag","backend"], _cloudflareiac_database);
+  $def("_cloudflareiac_vectors", "vectors", ["platformTag","backend"], _cloudflareiac_vectors);
   $def("_cloudflareiac_blobs", "blobs", ["platformTag","backend"], _cloudflareiac_blobs);
   $def("_cloudflareiac_settings", "settings", ["rows"], _cloudflareiac_settings);
   $def("_cloudflareiac_config", "config", ["platformTag","backend"], _cloudflareiac_config);
@@ -21291,7 +21321,8 @@ export default function define(runtime, observer) {
   $def("_cloudflareiac_partsHash", "partsHash", ["sha256"], _cloudflareiac_partsHash);
   $def("_cloudflareiac_asSource", "asSource", ["globalThis"], _cloudflareiac_asSource);
   $def("_cloudflareiac_containerImages", "containerImages", [], _cloudflareiac_containerImages);
-  $def("_cloudflareiac_emit", "emit", ["runtime","platformTag","libraries","notebookOnly","globalThis","acorn","acorn_walk","secretName","moduleSource","workerRuntime","containerImages","quickjsWasmText","checkedRule","partsHash"], _cloudflareiac_emit);
+  $def("_cloudflareiac_vectorIndex", "vectorIndex", [], _cloudflareiac_vectorIndex);
+  $def("_cloudflareiac_emit", "emit", ["runtime","platformTag","libraries","notebookOnly","globalThis","acorn","acorn_walk","secretName","moduleSource","workerRuntime","containerImages","vectorIndex","quickjsWasmText","checkedRule","partsHash"], _cloudflareiac_emit);
   $def("_cloudflareiac_moduleSource", "moduleSource", ["runtime","exportModuleJS"], _cloudflareiac_moduleSource);
   $def("_cloudflareiac_simulate", "simulate", ["Response","Request","simWaits"], _cloudflareiac_simulate);
   $def("_cloudflareiac_simWaits", "simWaits", [], _cloudflareiac_simWaits);
@@ -21657,6 +21688,21 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
     return id;
   };
 
+  // A Vectorize index of a Worker's own, named <script>-<name>. Its metadata indexes are made before the index is bound,
+  // so no vector is in it without them: Cloudflare does not index the metadata of a vector that was there first.
+  // Another name is another index. The one before is left, with its vectors.
+  const ownIndex = async (logical, v) => {
+    const name = actual(logical) + "-" + v.name;
+    if (await rows.get("vectors/" + name)) return name;
+    const found = await api("GET", "/vectorize/v2/indexes/" + name).catch(() => null);
+    if (!found) await api("POST", "/vectorize/v2/indexes", text({ name, config: { dimensions: v.dimensions, metric: v.metric } }), jsonType);
+    const have = found ? ((await api("GET", "/vectorize/v2/indexes/" + name + "/metadata_index/list")).metadataIndexes || []).map((i) => i.propertyName) : [];
+    for (const [propertyName, indexType] of v.metadata) if (!have.includes(propertyName)) await api("POST", "/vectorize/v2/indexes/" + name + "/metadata_index/create", text({ propertyName, indexType }), jsonType);
+    await rows.put("vectors/" + name, { dimensions: v.dimensions, metric: v.metric, metadata: v.metadata, at: Date.now() });
+    say({ at: found ? "deploy.index-found" : "deploy.index-made", target: logical, index: name, dimensions: v.dimensions });
+    return name;
+  };
+
   // Container applications: one for each image a Worker declares, named <script>-<image>, bound to that Worker's
   // Durable Object class. Made after the upload, because the class must exist. One that is no longer declared is
   // deleted. A new application has no instance ready for about 4 minutes (seen 2026-10-09).
@@ -21700,6 +21746,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
     // Every Worker's rows are in one D1 database of the Brain, made on first use. Only the deployer has a Durable Object.
     if (uses("rows")) out.push(existing.has("SQL") ? { type: "inherit", name: "SQL" } : { type: "d1", name: "SQL", id: await sqlDatabase() });
     if (uses("database")) out.push(existing.has("DB") ? { type: "inherit", name: "DB" } : { type: "d1", name: "DB", id: await ownDatabase(m.worker) });
+    if (uses("vectors")) out.push({ type: "vectorize", name: "VECTORS", index_name: await ownIndex(m.worker, m.vectors) });
     if (uses("blobs")) {
       const bucket = actual("brain-blobs");
       if (!existing.has("BLOBS")) await api("POST", "/r2/buckets", text({ name: bucket }), jsonType).catch((e) => { if (!/exist|10004/i.test(e.message)) throw e; });
@@ -21752,8 +21799,13 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
       if (clash) return `${clash} is already served by ${other.worker}`;
     }
     // Containers run as root with the open internet and are billed by the second: one service leases them to the rest.
-    const bad = m.resources.find((r) => !["rows", "blobs", "inbox", "xrpc", "assets", "sql", "browser", ...(logical === "brain-x-knowledge" ? ["database"] : []), ...(logical === "brain-x-container" ? ["containers"] : [])].includes(r));
+    const bad = m.resources.find((r) => !["rows", "blobs", "inbox", "xrpc", "assets", "sql", "browser", ...(logical === "brain-x-knowledge" ? ["database", "vectors"] : []), ...(logical === "brain-x-container" ? ["containers"] : [])].includes(r));
     if (bad) return `a recipe may not use the platform cell "${bad}"`;
+    // What the knowledge base is searched by: one index, of the size and fields the service declares.
+    const v = m.vectors;
+    if (!!v !== m.resources.includes("vectors")) return "a vector index without the platform cell vectors, or the cell without an index";
+    if (v && !(/^[a-z][a-z0-9-]{0,29}$/.test(v.name || "") && Number.isInteger(v.dimensions) && v.dimensions >= 32 && v.dimensions <= 1536 && ["cosine", "euclidean", "dot-product"].includes(v.metric) && Array.isArray(v.metadata) && v.metadata.length <= 10 && v.metadata.every((f) => Array.isArray(f) && /^[a-z][a-z0-9_]{0,29}$/.test(f[0]) && ["string", "number", "boolean"].includes(f[1]))))
+      return "the vector index is not one this deployer makes: a name, 32 to 1536 dimensions, cosine, euclidean or dot-product, 10 metadata fields at most";
     if ((m.containers || []).length && !m.resources.includes("containers")) return "container images without the platform cell containers";
     const image = (m.containers || []).find((b) => !/^[a-z][a-z0-9]{0,19}$/.test(b.name) || b.class_name !== "Box_" + b.name || !/^docker\.io\/[a-z0-9._/-]+:[A-Za-z0-9._-]+$/.test(b.image) || !TYPES.includes(b.instance_type) || !(b.max_instances >= 1 && b.max_instances <= 20));
     if (image) return `container image "${image.name}" is not one this deployer makes: docker.io/NAME:TAG, ${TYPES.join(", ")}, 1 to 20 instances`;
@@ -22646,7 +22698,7 @@ const _braindeployer_anon_34a5396163 = function _anonymous(md) {return (md`## Te
 
 The deployer runs under \`simulate\` against \`fakeCloudflare\`, a stand-in for the Cloudflare API and for the Workers it deploys. A hash added to \`fake.unhealthy\` makes that version fail its health check.`);};
 const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return (() => {
-  const scripts = new Map(), log = [], calls = [], unhealthy = new Set(), stored = {}, d1 = [], tokens = new Map(), apps = [];
+  const scripts = new Map(), log = [], calls = [], unhealthy = new Set(), stored = {}, d1 = [], tokens = new Map(), apps = [], indexes = [];
   const account = ["com.cloudflare.api.account"];
   const groups = [
     { id: "g-obs-user", name: "Workers Observability Read", scopes: ["com.cloudflare.api.user"] },
@@ -22710,6 +22762,13 @@ const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return
       d1.push({ name: JSON.parse(await request.text()).name, uuid: "d1-" + (d1.length + 1) });
       return ok(d1.at(-1));
     }
+    // Vectorize: an index by name, and its metadata indexes.
+    const vz = /^\/vectorize\/v2\/indexes(?:\/([^/]+))?(\/metadata_index\/(create|list))?$/.exec(path);
+    if (vz && !vz[1]) return indexes.push({ ...JSON.parse(await request.text()), metadata: [] }), ok(indexes.at(-1));
+    if (vz && !indexes.some((i) => i.name === vz[1])) return bad(404, "vectorize.index.not_found");
+    if (vz && vz[3] === "create") return indexes.find((i) => i.name === vz[1]).metadata.push(JSON.parse(await request.text())), ok({});
+    if (vz && vz[3] === "list") return ok({ metadataIndexes: indexes.find((i) => i.name === vz[1]).metadata });
+    if (vz) return ok(indexes.find((i) => i.name === vz[1]));
     // Account tokens: the value is given once, at the mint.
     if (path === "/tokens/permission_groups") return ok(groups);
     if (path === "/tokens" && request.method === "POST") {
@@ -22772,7 +22831,7 @@ const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return
     const s = scripts.get(name);
     return s ? bindingOf(live(s), "BRAIN_INFO").json.hash : null;
   };
-  return { fetch, scripts, log, calls, unhealthy, stored, d1, tokens, apps, running, live: (name) => live(scripts.get(name)) };
+  return { fetch, scripts, log, calls, unhealthy, stored, d1, tokens, apps, indexes, running, live: (name) => live(scripts.get(name)) };
 });};
 const _braindeployer_deployerRig = function _deployerRig(fakeCloudflare,simulate,deployer_service,partsHash,URLSearchParams) {return (async ({ acceptEmitted = true, config = {}, store } = {}) => {
   const fake = fakeCloudflare();
@@ -22890,6 +22949,30 @@ const _braindeployer_test_the_table_database_is_bound_to_brain_db_alone = async 
   const kb = Object.fromEntries(rig.fake.live("cb-x-knowledge").metadata.bindings.map((b) => [b.name, b]));
   expect([kb.DB.type, kb.DB.id, !!kb.SQL, rig.fake.d1.map((d) => d.name)]).toEqual(["d1", "d1-3", false, ["cb-sql", "cb-db", "cb-x-knowledge"]]);
   return db.DB.id;
+};
+const _braindeployer_test_the_vector_index_is_made_for_brain_x_knowledge_alone = async function _test_the_vector_index_is_made_for_brain_x_knowledge_alone(deployerRig,expect) {
+  const rig = await deployerRig();
+  await rig.recover({ workers: [await rig.made("brain-core", "core", "c1")] });
+  const index = { name: "bge-base-en-768", dimensions: 768, metric: "cosine", metadata: [["day", "number"], ["kind", "string"], ["owner", "string"]] };
+  const kb = (salt, vectors = index, worker = "brain-x-knowledge") => rig.made(worker, "recipe", salt, { resources: ["database", "vectors"], vectors });
+  // No other Worker has an index, and an index goes with the cell.
+  const no = await rig.recover({ workers: [await rig.made("brain-x-other", "recipe", "o1", { resources: ["vectors"], vectors: index }), await rig.made("brain-x-knowledge", "recipe", "p1", { resources: ["database"], vectors: index })] });
+  expect(no.results.map((r) => [r.state, r.reason])).toEqual([["refused", 'a recipe may not use the platform cell "vectors"'], ["refused", "a vector index without the platform cell vectors, or the cell without an index"]]);
+  for (const wrong of [{ dimensions: 8 }, { metric: "manhattan" }, { name: "A" }, { metadata: [["owner", "text"]] }])
+    expect((await rig.recover({ workers: [await kb("w", { ...index, ...wrong })] })).results[0].reason).toMatch(/^the vector index is not one this deployer makes/);
+  expect(rig.fake.indexes).toEqual([]);
+  // The index and its three metadata indexes are made before the upload that binds it.
+  expect((await rig.recover({ workers: [await kb("k1")] })).results[0].state).toBe("deployed");
+  expect(rig.fake.indexes).toEqual([{ name: "cb-x-knowledge-bge-base-en-768", config: { dimensions: 768, metric: "cosine" }, metadata: [{ propertyName: "day", indexType: "number" }, { propertyName: "kind", indexType: "string" }, { propertyName: "owner", indexType: "string" }] }]);
+  expect(rig.fake.live("cb-x-knowledge").metadata.bindings.find((b) => b.name === "VECTORS")).toEqual({ type: "vectorize", name: "VECTORS", index_name: "cb-x-knowledge-bge-base-en-768" });
+  const made = rig.fake.log.findIndex((l) => l.includes("metadata_index/create")), bound = rig.fake.log.findLastIndex((l) => l.includes("/workers/scripts/cb-x-knowledge"));
+  expect(made >= 0 && made < bound).toBe(true);
+  // A later version makes nothing. Another name is another index, and the first is left.
+  await rig.recover({ workers: [await kb("k2")] });
+  expect(rig.fake.indexes.length).toBe(1);
+  await rig.recover({ workers: [await kb("k3", { ...index, name: "m3-1024", dimensions: 1024 })] });
+  expect([rig.fake.indexes.map((i) => i.name), rig.fake.live("cb-x-knowledge").metadata.bindings.find((b) => b.name === "VECTORS").index_name]).toEqual([["cb-x-knowledge-bge-base-en-768", "cb-x-knowledge-m3-1024"], "cb-x-knowledge-m3-1024"]);
+  return rig.fake.indexes.length + " indexes";
 };
 const _braindeployer_test_container_images_are_applications_of_brain_x_container_alone = async function _test_container_images_are_applications_of_brain_x_container_alone(deployerRig,expect) {
   const rig = await deployerRig();
@@ -23853,6 +23936,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_test_only_the_deployer_names_the_cloudflare_token", "test_only_the_deployer_names_the_cloudflare_token", ["deployer_service","expect","deployerRig"], _braindeployer_test_only_the_deployer_names_the_cloudflare_token);
   $def("_braindeployer_test_apply_refusals", "test_apply_refusals", ["deployerRig","expect"], _braindeployer_test_apply_refusals);
   $def("_braindeployer_test_the_table_database_is_bound_to_brain_db_alone", "test_the_table_database_is_bound_to_brain_db_alone", ["deployerRig","expect"], _braindeployer_test_the_table_database_is_bound_to_brain_db_alone);
+  $def("_braindeployer_test_the_vector_index_is_made_for_brain_x_knowledge_alone", "test_the_vector_index_is_made_for_brain_x_knowledge_alone", ["deployerRig","expect"], _braindeployer_test_the_vector_index_is_made_for_brain_x_knowledge_alone);
   $def("_braindeployer_test_container_images_are_applications_of_brain_x_container_alone", "test_container_images_are_applications_of_brain_x_container_alone", ["deployerRig","expect"], _braindeployer_test_container_images_are_applications_of_brain_x_container_alone);
   $def("_braindeployer_test_a_browser_is_bound_shown_before_approval_and_not_for_a_member", "test_a_browser_is_bound_shown_before_approval_and_not_for_a_member", ["deployerRig","expect"], _braindeployer_test_a_browser_is_bound_shown_before_approval_and_not_for_a_member);
   $def("_braindeployer_test_every_upload_turns_logs_on_and_the_invocation_line_off", "test_every_upload_turns_logs_on_and_the_invocation_line_off", ["deployerRig","expect"], _braindeployer_test_every_upload_turns_logs_on_and_the_invocation_line_off);
@@ -24677,6 +24761,12 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     const line = (name, r, kind) => `- ${name}: ${kind}${r.allow ? "by its rule" : r.who || "owner"}${r.price ? ", has a price" : ""}${set.has(name) ? ", changed by the owner" : ""}`;
     const routes = (await settings.list("route/")).map((r) => r.value).filter((r) => routed(r) && r.role !== "member").sort((a, b) => (a.worker < b.worker ? -1 : 1));
     const deployed = routes.filter((r) => Object.keys(r.methods).length + r.paths.length).map((r) => [`### ${r.worker}`, ...Object.entries(r.methods).sort().map(([n, m]) => line(n, m, m.type + ", ")), ...r.paths.map((p) => line(p.path, p, "path, "))].join("\n"));
+    // Said only where a Worker declares the method: a clone with no knowledge base is told of none.
+    const holds = routes.some((r) => "com.lopecode.brain.knowledge.search" in r.methods) ? `
+## Finding what it holds
+
+- \`GET ${at}${X}knowledge.search?semantic=true&q=<the task, in words>\`: what this Brain holds that is nearest the question, as pointers (\`title\`, \`kind\`, \`url\`, \`id\`): notebook modules (\`&kind=module\`), papers, articles, notes. Search here before writing something that may exist. The owner or a token that names the method; \`knowledge.get?id=\` has an entry's text.
+` : "";
     const text = `# Cloud Brain at ${at}
 
 Cloudflare Workers that one notebook defines, deploys and operates. This file is written on each request from what is deployed here. It points at the reference and copies none of it.
@@ -24713,7 +24803,7 @@ Three calls, with no account, say what this Brain is made of:
 - \`GET ${at}${X}getSource?worker=<worker>&part=reference\`: only the documentation, as text: that Worker's methods, inputs and answers. Read this before calling a method.
 
 The shape: the kernel (\`brain\`) is this address and says who the caller is. The core (\`brain-core\`) checks the rule of each method, charges its price and passes the call to a service (\`brain-x-NAME\`). \`brain-db\` keeps every Worker's rows. The deployer, a Worker at its own address, is the only holder of a Cloudflare token: it deploys a module's source as a Worker and puts back one that fails. A service is one notebook module; its source is its definition.
-
+${holds}
 ## Making a service
 
 - A member of this Brain deploys their own: \`member.deploy\` with \`{ module, source, reason, was }\`. \`source\` is a module as \`getSource\` gives one. \`reason\` says why, in 3 to 300 characters, and is logged. \`was\` is the hash you saw running for that service, \`null\` for a new one; the deploy is refused when it is no longer that. No approval is needed. \`member.services\` lists them, \`member.remove\` takes \`{ name, reason, was }\`.
@@ -24846,6 +24936,10 @@ const _braincore_test_llms_txt_is_written_from_the_host_and_the_route_table = as
   expect(first.data).toContain("getSource?worker=<worker>&part=reference");
   // Where to begin, what getSource answers, and how a member makes a service.
   for (const said of ["service.list`: every Worker", "getInfo?worker=<worker>", "`{ worker, hash, module, text }`", "`member.deploy` with `{ module, source, reason, was }`", "`aud` `did:web:clone.example.workers.dev`"]) expect(first.data).toContain(said);
+  // The knowledge base is pointed at only once a Worker declares its search.
+  expect(first.data).not.toContain("Finding what it holds");
+  await rig.deployer("service.register", { worker: "brain-x-knowledge", role: "recipe", keyHash: "know", paths: [], secrets: [], methods: { "com.lopecode.brain.knowledge.search": { type: "query", who: "owner" } } });
+  expect(await read()).toContain("## Finding what it holds\n\n- `GET https://clone.example.workers.dev/xrpc/com.lopecode.brain.knowledge.search?semantic=true&q=<the task, in words>`");
   // Every name is whole, so it is the path: a listed name asked as listed is routed (not 501).
   expect(first.data).not.toContain("is short for");
   expect(first.data).toContain("https://clone-deployer.example.workers.dev/xrpc/com.lopecode.brain.getSource?part=reference");
@@ -30413,7 +30507,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainlibrary_anon_af288fc5bd = function _anonymous(md) {return (md`# brain-library
+const _brainlibrary_anon_9fd1311cbf = function _anonymous(md) {return (md`# brain-library
 
 Notebooks kept by a Cloud Brain and served from its address. The files are in \`brain-static\`, under \`library/\`; this Worker keeps the list, the versions and who may open each.
 
@@ -30425,8 +30519,9 @@ Notebooks kept by a Cloud Brain and served from its address. The files are in \`
 | \`library.versions\` | query, owner. \`?name=\`. The last 10 saves, newest first. |
 | \`library.setPublic\` | procedure, owner. \`{ name, public }\` |
 | \`library.delete\` | procedure, owner. \`{ name }\`. Deletes every version. |
+| \`library.index\` | procedure, owner. \`{ name }\`. Enters the module cards of the newest version again (see Module cards). \`{ name, cards }\`. |
 | \`GET /library/<name>\` | the notebook. Anyone for a public one, the owner for any. \`?v=<sha256>\` opens a kept version. |
-| Calls | \`static.put\`, \`static.get\`, \`static.delete\` |
+| Calls | \`static.put\`, \`static.get\`, \`static.delete\`, \`knowledge.put\` |
 | Storage | \`rows\`, key \`n/<name>\`: \`{ title, sha256, size, public, savedAt, versions }\`. Files at \`library/<name>/<first 16 of sha256>.html\` in \`brain-static\`. |
 
 A name is 1 to 80 of \`A-Z a-z 0-9 @ . _ -\`. The body must be a lopecode notebook: a file with a \`bootconf.json\` block. The title is the file's \`<title>\`. With \`parent\`, a put is refused with 409 unless \`parent\` is the SHA-256 of the notebook's newest version (empty for a new name), so two tabs saving one notebook do not overwrite each other unseen.
@@ -30439,7 +30534,17 @@ await client.procedure("library.put", htmlBytes, { params: { name: "notes", publ
 
 \`libraryPanel({ client, origin, owner })\` is the list as a table, with upload, public and delete for the owner.
 
-A notebook served from \`/library\` runs on the Brain's own address, so its cells call the Brain as whoever is signed in. Put only notebooks you would run as yourself.`);};
+A notebook served from \`/library\` runs on the Brain's own address, so its cells call the Brain as whoever is signed in. Put only notebooks you would run as yourself.
+
+## Module cards
+
+A put enters one entry in \`brain-x-knowledge\` for each module in the file, of kind \`module\`, so that \`knowledge.search?semantic=true&kind=module\` finds the module for a task (added 2026-10-10). A card is \`libraryCards\`' reading of the module's block: its name and heading as the title; its first prose cell, the names of its cells (tests and the halves of a \`viewof\` left out) and the modules it imports as the text. Not its source. The card's \`url\` is the notebook's address here and its \`file\` the kept file.
+
+- A module has one card, \`module:<user>:<name>\`, whichever notebook it is in. The last put of a notebook that has it writes it.
+- A block is read as a module when it is named \`@user/name\` and is not encoded. A module with an Observable id for a name (\`d/57d7…\`) has no card: 1 of the 98 modules of the Cloud Brain notebook on 2026-10-10.
+- The cards of a public notebook are public. A put of a notebook that is not leaves a card that is already public as it is, and makes a new one private.
+- \`library.setPublic\` and \`library.delete\` do not change a card. To make one private, put \`{ id, public: false }\` to \`knowledge.put\`; to remove one, \`knowledge.delete\`.
+- The put answers \`cards\`, how many were entered. When \`knowledge.put\` fails the notebook is kept all the same and \`cards\` is smaller; \`library.index\` enters them again.`);};
 const _brainlibrary_library_service = function _library_service(cloudflare,libraryApp) {return (cloudflare.Service("library", libraryApp, {
   methods: {
     // A saved notebook is served as a page that runs as whoever opens it: only the owner's own tab saves one, not a token or a turn.
@@ -30448,16 +30553,37 @@ const _brainlibrary_library_service = function _library_service(cloudflare,libra
     "com.lopecode.brain.library.list": { type: "query", who: "anyone" },
     "com.lopecode.brain.library.versions": { type: "query", who: "owner" },
     "com.lopecode.brain.library.setPublic": { type: "procedure", who: "owner" },
-    "com.lopecode.brain.library.delete": { type: "procedure", who: "owner" }
+    "com.lopecode.brain.library.delete": { type: "procedure", who: "owner" },
+    "com.lopecode.brain.library.index": { type: "procedure", who: "owner" }
   },
   paths: [{ path: "/library/*", who: "anyone" }],
-  calls: ["com.lopecode.brain.static.put", "com.lopecode.brain.static.get", "com.lopecode.brain.static.delete"]
+  calls: ["com.lopecode.brain.static.put", "com.lopecode.brain.static.get", "com.lopecode.brain.static.delete", "com.lopecode.brain.knowledge.put"]
 }));};
 const _brainlibrary_library_announce = function _library_announce(plugins,library_service,invalidation) {
   plugins.add("workers", library_service, { invalidation });
   return "announced library_service";
 };
-const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,rows,Response) {
+const _brainlibrary_libraryCards = function _libraryCards() {return ((html, { name, file, host, open = false }) =>
+  // The tag's name is joined here: written whole in a module, it would end the block the module is kept in.
+  [...html.matchAll(new RegExp("<scr" + 'ipt\\s+id="(@[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"\\s+type="text/plain"\\s+data-mime="application/javascript"\\s*>([\\s\\S]*?)</scr' + "ipt>", "g"))].map(([, module, source]) => {
+    const prose = [...source.matchAll(/\{\s*return\s*\(\s*md`((?:[^`\\]|\\[\s\S])*)`/g)].map((p) => p[1].replace(/\\([`\\$])/g, "$1"));
+    const heading = (prose.join("\n").match(/^#\s+(.+)$/m) || [])[1];
+    const cells = [...new Set([...source.matchAll(/\$def\("[^"]*", "([^"]+)"|\.variable\(observer\("([^"]+)"\)\)/g)].map((d) => d[1] || d[2]))].filter((n) => !/^(test_|viewof |mutable |initial )/.test(n));
+    const imports = [...new Set([...source.matchAll(/"module (@[^"]+)"/g)].map((d) => d[1]))];
+    const first = (prose[0] || "").replace(/^#\s+.+$/m, "").replace(/\s+/g, " ").trim();
+    return {
+      id: ("module:" + module.slice(1).toLowerCase().replace("/", ":").replace(/[^a-z0-9._:-]/g, "-")).slice(0, 100),
+      kind: "module",
+      title: (module + (heading ? ": " + heading.trim() : "")).slice(0, 500),
+      text: [first.slice(0, 900), cells.length ? "Cells: " + cells.slice(0, 60).join(", ") : "", imports.length ? "Imports: " + imports.join(", ") : ""].filter(Boolean).join("\n").slice(0, 4000),
+      url: `https://${host}/library/${name}`,
+      source: "library",
+      file,
+      method: "library.put",
+      ...(open ? { public: true } : {})
+    };
+  }));};
+const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,config,rows,Response) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.library.";
   const STATIC = "com.lopecode.brain.static.";
@@ -30471,26 +30597,45 @@ const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,rows,Response) {
   };
   const fileOf = (name, sha) => `library/${name}/${sha.slice(0, 16)}.html`;
   const drop = (name, sha) => xrpc.fetch(STATIC + "delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: fileOf(name, sha) }) });
+  // The module cards of a file, entered in the knowledge base 100 to a call. Answers how many were entered; a call
+  // that fails is not a reason to lose the notebook.
+  const enter = async (name, html, head) => {
+    const cards = libraryCards(html, { name, file: fileOf(name, head.sha256), host: config.host, open: head.public });
+    let entered = 0;
+    for (let i = 0; i < cards.length; i += 100) {
+      const r = await xrpc.fetch("com.lopecode.brain.knowledge.put", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ entries: cards.slice(i, i + 100) }) }).catch(() => null);
+      if (r && r.ok) entered += cards.slice(i, i + 100).length;
+    }
+    return entered;
+  };
   app.post(NS + "put", async (c) => {
     const name = c.req.query("name") || "";
     if (!okName(name)) return fail(c, 400, "InvalidRequest", "name");
     const bytes = new Uint8Array(await c.req.raw.arrayBuffer());
-    if (!new TextDecoder().decode(bytes).includes('id="bootconf.json"')) return fail(c, 400, "NotANotebook", "the file has no bootconf.json block");
+    const html = new TextDecoder().decode(bytes);
+    if (!html.includes('id="bootconf.json"')) return fail(c, 400, "NotANotebook", "the file has no bootconf.json block");
     const head = await rows.get("n/" + name);
     const parent = c.req.query("parent");
     if (parent != null && parent !== (head ? head.sha256 : "")) return fail(c, 409, "StaleParent", `the newest version of ${name} is ${head ? head.sha256 : "none"}`);
     const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
     const kept = await xrpc.fetch(STATIC + "put", { method: "POST", params: { path: fileOf(name, sha256), type: "text/html; charset=utf-8", public: "false" }, body: bytes });
     if (!kept.ok) return fail(c, 502, "UpstreamFailed", `static.put answered ${kept.status}`);
-    const text = new TextDecoder().decode(bytes.subarray(0, 65536));
-    const title = ((text.match(/<title>([^<]*)<\/title>/) || [])[1] || name).trim().slice(0, 200);
+    const title = ((html.slice(0, 65536).match(/<title>([^<]*)<\/title>/) || [])[1] || name).trim().slice(0, 200);
     const savedAt = Date.now();
     const versions = [{ sha256, size: bytes.length, savedAt }, ...(head ? head.versions.filter((v) => v.sha256 !== sha256) : [])];
     for (const old of versions.slice(KEEP)) await drop(name, old.sha256);
     const open = c.req.query("public");
     const next = { title, sha256, size: bytes.length, public: open != null ? open === "true" : !!(head && head.public), savedAt, versions: versions.slice(0, KEEP) };
     await rows.put("n/" + name, next);
-    return c.json({ name, title, sha256, size: next.size, public: next.public, savedAt, versions: next.versions.length });
+    return c.json({ name, title, sha256, size: next.size, public: next.public, savedAt, versions: next.versions.length, cards: await enter(name, html, next) });
+  });
+  app.post(NS + "index", async (c) => {
+    const { name } = await c.req.json().catch(() => ({}));
+    const head = okName(name) ? await rows.get("n/" + name) : null;
+    if (!head) return fail(c, 404, "NotFound", String(name));
+    const file = await xrpc.fetch(STATIC + "get", { params: { path: fileOf(name, head.sha256) } });
+    if (!file.ok) return fail(c, 502, "UpstreamFailed", `static.get answered ${file.status}`);
+    return c.json({ name, cards: await enter(name, await file.text(), head) });
   });
   app.get(NS + "list", async (c) => {
     const all = (await rows.list("n/")).map(({ key, value }) => ({ name: key.slice(2), title: value.title, sha256: value.sha256, size: value.size, public: value.public, savedAt: value.savedAt, versions: value.versions.length }));
@@ -30597,13 +30742,16 @@ const _brainlibrary_libraryPanel = function _libraryPanel(htl,Inputs,open) {retu
 });};
 const _brainlibrary_anon_be3d699220 = function _anonymous(md) {return (md`## Tests`);};
 const _brainlibrary_libraryNotebook = function _libraryNotebook() {return ((body, title = "Notes") => "<html><head><title>" + title + "</title><script id=\"bootconf.json\" type=\"text/plain\">{}</scr" + "ipt></head><body>" + body + "</body></html>");};
-const _brainlibrary_libraryRig = function _libraryRig(simulate,static_service,library_service) {return (async () => {
+const _brainlibrary_libraryRig = function _libraryRig(simulate,static_service,library_service,Response) {return (async () => {
   const stat = await simulate(static_service, {});
-  const asked = [];
+  const asked = [], cards = [], state = { down: false };
   const sim = await simulate(library_service, {
+    config: { host: "brain.example" },
     core: async (request) => {
       const url = new URL(request.url);
       asked.push(url.pathname.split(".").pop() + " " + (url.searchParams.get("path") || ""));
+      // knowledge.put as the core passes it on: the cards are kept for the test to read.
+      if (url.pathname.endsWith("knowledge.put")) return state.down ? new Response("{}", { status: 503 }) : (cards.push(...(await request.json()).entries), Response.json({}));
       return stat.fetch("https://static.internal" + url.pathname + url.search, {
         method: request.method,
         headers: { "content-type": request.headers.get("content-type") || "", "x-brain-caller": "worker:brain-x-library" },
@@ -30615,7 +30763,7 @@ const _brainlibrary_libraryRig = function _libraryRig(simulate,static_service,li
   const X = "/xrpc/com.lopecode.brain.library.";
   const put = (who, name, html, extra = "") => call(who, X + "put?name=" + encodeURIComponent(name) + extra, { method: "POST", body: html });
   const post = (who, name, input) => call(who, X + name, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
-  return { stat, sim, asked, call, put, post, X };
+  return { stat, sim, asked, cards, state, call, put, post, X };
 });};
 const _brainlibrary_test_library_keeps_and_serves_a_notebook = async function _test_library_keeps_and_serves_a_notebook(libraryRig,libraryNotebook,expect,sha256) {
   const rig = await libraryRig();
@@ -30663,6 +30811,35 @@ const _brainlibrary_test_library_public_list_and_versions = async function _test
   expect((await rig.call("anonymous", "/library/notes")).status).toBe(404);
   return "2 versions, 1 conflict, 2 files deleted";
 };
+const _brainlibrary_libraryModule = function _libraryModule() {return ((id, body) => "<scr" + `ipt id="${id}" \n  type="text/plain"\n  data-mime="application/javascript"\n>\n${body}\n</scr` + `ipt>`);};
+const _brainlibrary_test_library_enters_a_card_for_each_module = async function _test_library_enters_a_card_for_each_module(libraryRig,libraryModule,libraryNotebook,expect) {
+  const rig = await libraryRig();
+  // Joined here, so that a reader of this module's own source does not take the fixture's import for one of its own.
+  const imported = "mod" + "ule @fx/iac";
+  const boxes = libraryModule("@fx/Boxes", 'const _a = function _anonymous(md) {return (md`# Leased boxes\n\nRun code in a \\`linux\\` box.`)};\nconst _b = function _b(md) {return (md`## Tests`)};\nexport default function define(runtime, observer) {\n  $def("_a", null, ["md"], _a);\n  $def("_x", "boxPanel", ["htl"], _x);\n  $def("_v", "viewof size", [], _v);\n  $def("_s", "size", [], _s);\n  $def("_t", "test_boxes_run", [], _t);\n  main.define("' + imported + '", [], async () => 1);\n  main.define("rows", ["' + imported + '","@variable"], (_, v) => v.import("rows", _));\n}');
+  const plain = libraryModule("@fx/plain", 'const _1 = function _1(md){return(\nmd`No heading here.`\n)};\nexport default function define(runtime, observer) {\n  const main = runtime.module();\n  main.variable(observer()).define(["md"], _1);\n  main.variable(observer("draw")).define("draw", [], _2);\n}');
+  // A file attachment is not a module, whatever its name.
+  const lib = "<scr" + 'ipt id="@fx/Boxes/lib.js.gz" type="text/plain" data-mime="application/gzip" data-encoding="base64">AAAA</scr' + 'ipt>';
+  const html = libraryNotebook(boxes + plain + lib);
+  const made = await (await rig.put("owner", "fx", html)).json();
+  expect([made.cards, rig.cards.length]).toEqual([2, 2]);
+  expect(rig.cards[0]).toEqual({ id: "module:fx:boxes", kind: "module", title: "@fx/Boxes: Leased boxes", text: "Run code in a `linux` box.\nCells: boxPanel, size\nImports: @fx/iac", url: "https://brain.example/library/fx", source: "library", file: "library/fx/" + made.sha256.slice(0, 16) + ".html", method: "library.put" });
+  expect(rig.cards[1]).toMatchObject({ id: "module:fx:plain", title: "@fx/plain", text: "No heading here.\nCells: draw" });
+  // The cards of a public notebook are public; index enters them again from the kept file.
+  await rig.post("owner", "setPublic", { name: "fx", public: true });
+  expect(await (await rig.post("owner", "index", { name: "fx" })).json()).toEqual({ name: "fx", cards: 2 });
+  expect([rig.cards.length, rig.cards[2].public, rig.cards[3].public]).toEqual([4, true, true]);
+  // knowledge.put refuses: the notebook is kept, and the answer says no card was entered.
+  rig.state.down = true;
+  const again = await (await rig.put("owner", "fx", libraryNotebook(boxes, "Again"))).json();
+  expect([again.cards, again.versions, again.title]).toEqual([0, 2, "Again"]);
+  // A notebook with no module makes no call.
+  const before = rig.asked.length;
+  expect((await (await rig.put("owner", "notes", libraryNotebook("one"))).json()).cards).toBe(0);
+  expect(rig.asked.slice(before).some((a) => a.startsWith("put ") && !a.includes("library/"))).toBe(false);
+  expect((await rig.post("owner", "index", { name: "nothing" })).status).toBe(404);
+  return "2 modules, 2 cards";
+};
 const _brainlibrary_test_library_keeps_ten_versions = async function _test_library_keeps_ten_versions(libraryRig,libraryNotebook,expect) {
   const rig = await libraryRig();
   for (let i = 0; i < 12; i++) await rig.put("owner", "notes", libraryNotebook("save " + i));
@@ -30677,7 +30854,7 @@ const _brainlibrary_test_library_declares_what_it_needs = async function _test_l
   const { meta } = await library_service.emit();
   expect(meta).toMatchObject({
     worker: "brain-x-library", role: "recipe", module: "@tomlarkworthy/brain-library", resources: ["rows", "xrpc"], secrets: [],
-    calls: ["com.lopecode.brain.static.delete", "com.lopecode.brain.static.get", "com.lopecode.brain.static.put"],
+    calls: ["com.lopecode.brain.knowledge.put", "com.lopecode.brain.static.delete", "com.lopecode.brain.static.get", "com.lopecode.brain.static.put"],
     paths: [{ path: "/library/*", who: "anyone" }]
   });
   expect(meta.access["com.lopecode.brain.library.put"]).toMatchObject({ allow: "caller.session", fixed: true });
@@ -30698,16 +30875,19 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainlibrary_anon_af288fc5bd", null, ["md"], _brainlibrary_anon_af288fc5bd);
+  $def("_brainlibrary_anon_9fd1311cbf", null, ["md"], _brainlibrary_anon_9fd1311cbf);
   $def("_brainlibrary_library_service", "library_service", ["cloudflare","libraryApp"], _brainlibrary_library_service);
   $def("_brainlibrary_library_announce", "library_announce", ["plugins","library_service","invalidation"], _brainlibrary_library_announce);
-  $def("_brainlibrary_libraryApp", "libraryApp", ["hono","xrpc","rows","Response"], _brainlibrary_libraryApp);
+  $def("_brainlibrary_libraryCards", "libraryCards", [], _brainlibrary_libraryCards);
+  $def("_brainlibrary_libraryApp", "libraryApp", ["hono","xrpc","libraryCards","config","rows","Response"], _brainlibrary_libraryApp);
   $def("_brainlibrary_libraryPanel", "libraryPanel", ["htl","Inputs","open"], _brainlibrary_libraryPanel);
   $def("_brainlibrary_anon_be3d699220", null, ["md"], _brainlibrary_anon_be3d699220);
   $def("_brainlibrary_libraryNotebook", "libraryNotebook", [], _brainlibrary_libraryNotebook);
-  $def("_brainlibrary_libraryRig", "libraryRig", ["simulate","static_service","library_service"], _brainlibrary_libraryRig);
+  $def("_brainlibrary_libraryRig", "libraryRig", ["simulate","static_service","library_service","Response"], _brainlibrary_libraryRig);
   $def("_brainlibrary_test_library_keeps_and_serves_a_notebook", "test_library_keeps_and_serves_a_notebook", ["libraryRig","libraryNotebook","expect","sha256"], _brainlibrary_test_library_keeps_and_serves_a_notebook);
   $def("_brainlibrary_test_library_public_list_and_versions", "test_library_public_list_and_versions", ["libraryRig","libraryNotebook","expect"], _brainlibrary_test_library_public_list_and_versions);
+  $def("_brainlibrary_libraryModule", "libraryModule", [], _brainlibrary_libraryModule);
+  $def("_brainlibrary_test_library_enters_a_card_for_each_module", "test_library_enters_a_card_for_each_module", ["libraryRig","libraryModule","libraryNotebook","expect"], _brainlibrary_test_library_enters_a_card_for_each_module);
   $def("_brainlibrary_test_library_keeps_ten_versions", "test_library_keeps_ten_versions", ["libraryRig","libraryNotebook","expect"], _brainlibrary_test_library_keeps_ten_versions);
   $def("_brainlibrary_test_library_declares_what_it_needs", "test_library_declares_what_it_needs", ["library_service","expect"], _brainlibrary_test_library_declares_what_it_needs);
   $def("_brainlibrary_test_library_panel_lists_notebooks", "test_library_panel_lists_notebooks", ["libraryPanel","expect"], _brainlibrary_test_library_panel_lists_notebooks);
@@ -30715,6 +30895,7 @@ export default function define(runtime, observer) {
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("rows", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("rows", _));
   main.define("xrpc", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("xrpc", _));
+  main.define("config", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("config", _));
   main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
@@ -34388,33 +34569,38 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainknowledge_anon_8aa58815e2 = function _anonymous(md) {return (md`# brain-knowledge
+const _brainknowledge_anon_11b239a35a = function _anonymous(md) {return (md`# brain-knowledge
 
 What a Cloud Brain knows: one entry for each thing found, with where it was found and how it was entered. The entries are in a database of their own. No other Worker is bound to it, and it is not the database the Brain runs on.
 
-An entry holds text to search, not a file. A paper's PDF or a page's HTML stays in \`brain-static\`; the entry has its path and its SHA-256.`);};
+An entry holds text to search, not a file. A paper's PDF or a page's HTML stays in \`brain-static\`; the entry has its path and its SHA-256.
+
+An entry is found by its words, or by its meaning: each has one vector in one Vectorize index, and \`knowledge.search\` with \`semantic=true\` answers the entries nearest a question. That is how an agent finds the module, the paper or the note for a task. Added 2026-10-10; the measurements are in \`tools/cloud-brain/knowledge-vectors.md\`.`);};
 const _brainknowledge_viewof_knowledgeView = function _knowledgeView(knowledgePanel,client,session) {return (knowledgePanel({ client, owner: !!(session && session.owner) }));};
 const _brainknowledge_knowledgeView = (G, _) => G.input(_);
-const _brainknowledge_anon_dc9b1eb371 = function _anonymous(md,knowledgeLimits,knowledgeKinds) {return (md`## Methods
+const _brainknowledge_anon_63ef6e5ec5 = function _anonymous(md,knowledgeLimits,knowledgeVectors,knowledgeKinds) {return (md`## Methods
 
 | | |
 |---|---|
 | Worker | \`brain-x-knowledge\` |
-| \`knowledge.put\` | procedure. One entry, or \`{ entries: [...] }\`, ${knowledgeLimits.batch} at most. \`{ entered, changed, ids }\`. |
+| \`knowledge.put\` | procedure. One entry, or \`{ entries: [...] }\`, ${knowledgeLimits.batch} at most. \`{ entered, changed, ids, vectors }\`; \`vectors\` is how many were embedded in this call. |
 | \`knowledge.get\` | query. \`?id=\`. The entry, or 404 \`EntryNotFound\`. |
-| \`knowledge.search\` | query. \`?q=\` and the filters below, \`limit\` 1 to ${knowledgeLimits.page} (20). \`{ entries }\`, best match first, each with a \`snippet\`. |
+| \`knowledge.search\` | query. \`?q=\` and the filters below, \`limit\` 1 to ${knowledgeLimits.page} (20). \`{ entries }\`, best match first, each with a \`snippet\`. With \`semantic=true\`: by meaning (see Search by meaning). |
+| \`knowledge.embed\` | procedure. \`{ limit }\`, 1 to ${knowledgeLimits.batch} (50). Makes the vectors of entries that have none, the last entered first. \`{ embedded, left }\`. |
 | \`knowledge.list\` | query. The filters below, \`limit\` 1 to ${knowledgeLimits.page} (50), \`cursor\`. \`{ entries, cursor }\`, last entered first. |
 | \`knowledge.delete\` | procedure. \`{ id }\` or \`{ ids }\`. \`{ deleted }\`. |
-| \`knowledge.stats\` | query. \`{ entries, kinds, sources, by, limits }\`: counts, \`sources\` and \`by\` of the 100 largest, and \`knowledgeLimits\`. |
+| \`knowledge.stats\` | query. \`{ entries, vectors, kinds, sources, by, limits }\`: counts of every entry, whoever reads it; \`sources\` and \`by\` of the 100 largest; \`knowledgeLimits\`. |
 | Filters | \`source\`, \`kind\`, \`by\`, \`tag\`, and \`since\`, compared with \`at\`: milliseconds, or a date from \`YYYY-MM\` on. Four digits alone are refused, since they could be either. |
-| Storage | \`database\`: \`entries\` and its full-text index \`entries_fts\` |
+| Storage | \`database\`: \`entries\` and its full-text index \`entries_fts\`. \`vectors\`: the index \`${knowledgeVectors.name}\`, one vector an entry. |
+| Calls | \`ai.v1/embeddings\` on \`brain-x-ai\`, as this Worker |
 
 ## An entry
 
 | field | |
 |---|---|
 | \`id\` | \`a-z 0-9 . _ : -\`, 1 to ${knowledgeLimits.id} characters. Left out, it is the SHA-256 of the kind, the URL and the title. One thing has one id whoever enters it: \`arxiv:2610.08077\`. |
-| \`kind\` | ${knowledgeKinds.map((k) => "\`" + k + "\`").join(", ")} |
+| \`kind\` | a name, \`a-z 0-9 -\`, ${knowledgeLimits.source} characters at most. In use: ${knowledgeKinds.map((k) => "\`" + k + "\`").join(", ")}. A new source of entries makes up its own. |
+| \`public\` | \`true\`: anyone who may call a method reads the entry. \`false\`, or left out of a new entry: only its enterer's side does (see Who reads an entry). |
 | \`title\` | 1 to ${knowledgeLimits.title} characters |
 | \`text\` | the abstract, the summary or the finding, ${knowledgeLimits.text} characters at most. This and the title are what a search reads. |
 | \`url\` | where it was found: an \`http\` or \`https\` address that parses |
@@ -34433,35 +34619,63 @@ A put of an id that is kept changes the entry. \`by\`, \`method\` and \`at\` sta
 await client.procedure("knowledge.put", { id: "arxiv:2610.08077", kind: "paper", title: "Self-Retrospection Distillation", text: "…", url: "https://arxiv.org/abs/2610.08077", source: "arxiv", method: "manual" })
 await client.query("knowledge.search", { q: "hindsight training", kind: "paper" })
 \`\`\``);};
-const _brainknowledge_anon_80322a97fb = function _anonymous(md) {return (md`## Who can call
+const _brainknowledge_anon_f1e7908ae2 = function _anonymous(md,knowledgeVectors) {return (md`## Who can call
 
-Until the owner changes a rule: the owner and their tokens call every method. \`knowledge.put\` is also open to \`brain-x-snapshot\`, which enters the day's papers. Another Worker that enters what it finds needs a rule on \`knowledge.put\` that names it. Nothing here is public.
+Until the owner changes a rule: the owner and their tokens call every method. \`knowledge.put\` is also open to \`brain-x-snapshot\`, which enters the day's papers, and \`brain-x-library\`, which enters a card for each module of a kept notebook. Another Worker that enters what it finds needs a rule on \`knowledge.put\` that names it. No method is open to anyone else until the owner grants it or changes its rule.
 
-## Search
+## Who reads an entry
 
-\`q\` is words. Each must be in the entry, in any order; a word ending \`*\` matches by its start. The words are stemmed (SQLite FTS5, \`porter unicode61\`): \`training\` finds \`train\`. A match in the title counts four times one in the text, and one in the tags twice. Search is by words, not by meaning.
+Every entry is in one table and one index. Each has an owner: \`public\`, the Brain (the owner, their tokens and the Brain's Workers count as one), or one person. \`get\`, \`list\` and both searches answer the public entries and the caller's own, and nothing in a query changes that: the caller is the one the core names. A person who was granted \`knowledge.search\` reads the public entries; the Brain's private ones are not among their results.
+
+- Every entry from before 2026-10-10 is the Brain's and private, the kept papers among them. The owner makes one public with a put of \`{ id, public: true }\`.
+- The Brain changes and deletes any entry. A person changes and deletes what they entered, and enters only when the owner grants them \`knowledge.put\`.
+- \`knowledge.stats\` counts every entry and is the owner's.
+
+## Search by meaning
+
+\`knowledge.search?semantic=true&q=…\`. The question is embedded, Vectorize answers the nearest vectors among those the caller reads, and the answer is their entries, nearest first: each entry without its \`text\`, with a \`score\` (the cosine, 1 is the same direction). It says where a thing is (\`url\`, \`file\`, \`id\`); \`knowledge.get\` has the text.
+
+- The filters are \`kind\` and \`since\`. \`since\` is taken by the day, UTC. \`source\`, \`by\` and \`tag\` are refused: they are not fields of the index.
+- **The model** is \`${knowledgeVectors.model}\`, ${knowledgeVectors.dimensions} dimensions, and every vector is from it. It is named in the index, \`${knowledgeVectors.name}\`: another model is another index and every entry embedded again (\`knowledge.embed\`).
+- **What is embedded** is the title and the start of the text, ${knowledgeVectors.chars} characters together. There is one vector an entry, and no chunks: the end of a long text is found by words only.
+- **Embedding costs** ${knowledgeVectors.usd} USD a text, a question too, which \`brain-x-ai\` charges. On cb4 on 2026-10-10 the charge went to the account the call began with: \`quota.list\` showed the owner's 88 charges and no account for this Worker. A put by a Worker on its clock was not watched. A put embeds its entries in one call. An entry whose title, text, kind and reader are as before keeps its vector.
+- **When the embedding fails** (the allowance is spent, the model is down) the entries are kept all the same, the put answers a smaller \`vectors\`, one line \`knowledge.embed-failed\` is logged, and \`knowledge.embed\` makes the vectors later. A search by meaning then answers 502.
+- Vectorize takes a write in and answers a query from it about a minute later: three writes on cb4 were in the index's count 41 to 63 s after they were sent (2026-10-10). A search in that minute does not find the new entry; a search by words does.
+
+## Search by words
+
+\`q\` is words. Each must be in the entry, in any order; a word ending \`*\` matches by its start. The words are stemmed (SQLite FTS5, \`porter unicode61\`): \`training\` finds \`train\`. A match in the title counts four times one in the text, and one in the tags twice.
 
 ## Limits
 
 - The text of a PDF is not read. A paper is found by its title and its abstract.
 - Cloudflare does not export a D1 database that has a virtual table, and \`entries_fts\` is one. To export: drop \`entries_fts\`, export, and make it again from \`entries\`. Not run.
 - An entry does not say whether its \`file\` is still kept. Deleting the file leaves the entry.
+- \`knowledge.embed\` takes the last entered first. Entries whose embedding fails each time stay first in its way.
+- A module of a notebook has a card only when it is named \`@user/name\` (see brain-library).
+- A vector whose delete failed stays in the index (\`knowledge.vector-kept\` in the log). No search answers it, since its entry is gone.
 - Two puts of one id at the same moment: the second to read may not see the first's tags.`);};
-const _brainknowledge_knowledge_service = function _knowledge_service(cloudflare,knowledgeApp) {return (cloudflare.Service("knowledge", knowledgeApp, {
+const _brainknowledge_knowledge_service = function _knowledge_service(cloudflare,knowledgeApp,knowledgeVectors) {return (cloudflare.Service("knowledge", knowledgeApp, {
   methods: {
-    "com.lopecode.brain.knowledge.put": { type: "procedure", who: "worker:brain-x-snapshot" },
+    // The two Workers that enter what they find: the day's papers, and a card for each module of a kept notebook.
+    "com.lopecode.brain.knowledge.put": { type: "procedure", allow: 'caller.trusted || caller.worker in ["brain-x-snapshot", "brain-x-library"]' },
     "com.lopecode.brain.knowledge.get": { type: "query", who: "owner" },
     "com.lopecode.brain.knowledge.search": { type: "query", who: "owner" },
     "com.lopecode.brain.knowledge.list": { type: "query", who: "owner" },
     "com.lopecode.brain.knowledge.delete": { type: "procedure", who: "owner" },
-    "com.lopecode.brain.knowledge.stats": { type: "query", who: "owner" }
-  }
+    "com.lopecode.brain.knowledge.stats": { type: "query", who: "owner" },
+    "com.lopecode.brain.knowledge.embed": { type: "procedure", who: "owner" }
+  },
+  calls: ["com.lopecode.brain.ai.v1/embeddings"],
+  vectors: { name: knowledgeVectors.name, dimensions: knowledgeVectors.dimensions, metadata: { owner: "string", kind: "string", day: "number" } }
 }));};
 const _brainknowledge_knowledge_announce = function _knowledge_announce(plugins,knowledge_service,invalidation) {
   plugins.add("workers", knowledge_service, { invalidation });
   return "announced knowledge_service";
 };
-const _brainknowledge_knowledgeKinds = function _knowledgeKinds() {return (["paper", "article", "post", "finding", "note", "other"]);};
+const _brainknowledge_knowledgeKinds = function _knowledgeKinds() {return (["paper", "article", "post", "finding", "note", "module", "other"]);};
+const _brainknowledge_knowledgeVectors = function _knowledgeVectors() {return ({ name: "bge-base-en-768", model: "@cf/baai/bge-base-en-v1.5", dimensions: 768, chars: 1500, usd: 0.00005, ask: "Represent this sentence for searching relevant passages: " });};
+const _brainknowledge_knowledgeTenant = function _knowledgeTenant(sha256) {return (async (who) => (who === "owner" || who === "deployer" || /^token:/.test(who || "") || /^worker:brain-(?!m-)/.test(who || "") ? "owner" : /^did:/.test(who || "") ? (await sha256(who)).slice(0, 32) : ""));};
 const _brainknowledge_knowledgeLimits = function _knowledgeLimits() {return ({ batch: 100, page: 100, id: 100, title: 500, text: 16000, url: 2000, source: 40, published: 40, file: 200, method: 100, cites: 50, tags: 16 });};
 const _brainknowledge_knowledgePatterns = function _knowledgePatterns() {return ({ id: /^[a-z0-9][a-z0-9._:-]*$/, name: /^[a-z0-9-]+$/ });};
 const _brainknowledge_knowledgeSchema = function _knowledgeSchema() {return ([
@@ -34469,20 +34683,34 @@ const _brainknowledge_knowledgeSchema = function _knowledgeSchema() {return ([
   "CREATE INDEX IF NOT EXISTS entries_newest ON entries (at, id)",
   "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(title, text, tags, tokenize = 'porter unicode61')"
 ]);};
+const _brainknowledge_knowledgeColumns = function _knowledgeColumns() {return ([
+  ["owner", "ALTER TABLE entries ADD COLUMN owner TEXT NOT NULL DEFAULT 'owner'"],
+  ["vid", "ALTER TABLE entries ADD COLUMN vid TEXT"],
+  ["vid", "CREATE INDEX IF NOT EXISTS entries_vid ON entries (vid)"]
+]);};
 const _brainknowledge_knowledgeSql = function _knowledgeSql() {
-  const COLS = "e.id AS id, e.kind AS kind, e.title AS title, e.text AS text, e.url AS url, e.source AS source, e.published AS published, e.file AS file, e.sha256 AS sha256, e.entered_by AS entered_by, e.method AS method, e.at AS at, e.upd_by AS upd_by, e.upd_method AS upd_method, e.upd_at AS upd_at, e.cites AS cites, e.tags AS tags";
+  const COLS = "e.id AS id, e.kind AS kind, e.title AS title, e.text AS text, e.url AS url, e.source AS source, e.published AS published, e.file AS file, e.sha256 AS sha256, e.entered_by AS entered_by, e.method AS method, e.at AS at, e.upd_by AS upd_by, e.upd_method AS upd_method, e.upd_at AS upd_at, e.cites AS cites, e.tags AS tags, e.owner AS owner, e.vid AS vid";
   // ?1 source, ?2 kind, ?3 who entered it, ?4 since, ?5 a LIKE pattern for one tag. An empty text is no filter.
-  const FILTER = "(?1 = '' OR e.source = ?1) AND (?2 = '' OR e.kind = ?2) AND (?3 = '' OR e.entered_by = ?3) AND e.at >= ?4 AND (?5 = '' OR e.tags LIKE ?5)";
+  // ?6 is the caller (knowledgeTenant): an entry is read when it is public or the caller's.
+  const MINE = "(e.owner = 'public' OR e.owner = ?6)";
+  const FILTER = "(?1 = '' OR e.source = ?1) AND (?2 = '' OR e.kind = ?2) AND (?3 = '' OR e.entered_by = ?3) AND e.at >= ?4 AND (?5 = '' OR e.tags LIKE ?5) AND " + MINE;
   return {
     get: `SELECT ${COLS} FROM entries e WHERE e.id = ?1`,
     // A put of a kept id leaves entered_by, method and at as they were. ?15 is the method this put gave, null when none.
-    put: "INSERT INTO entries (id, kind, title, text, url, source, published, file, sha256, entered_by, method, at, cites, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, title = excluded.title, text = excluded.text, url = excluded.url, source = excluded.source, published = excluded.published, file = excluded.file, sha256 = excluded.sha256, cites = excluded.cites, tags = excluded.tags, upd_by = excluded.entered_by, upd_method = ?15, upd_at = excluded.at",
+    // ?16 owner. ?17 the vector the entry keeps: null when what the vector is made from has changed.
+    put: "INSERT INTO entries (id, kind, title, text, url, source, published, file, sha256, entered_by, method, at, cites, tags, owner, vid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17) ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, title = excluded.title, text = excluded.text, url = excluded.url, source = excluded.source, published = excluded.published, file = excluded.file, sha256 = excluded.sha256, cites = excluded.cites, tags = excluded.tags, owner = excluded.owner, vid = excluded.vid, upd_by = excluded.entered_by, upd_method = ?15, upd_at = excluded.at",
+    columns: "SELECT name FROM pragma_table_info('entries')",
+    vector: "UPDATE entries SET vid = ?2 WHERE id = ?1",
+    // The entries of the vectors a query found, by vector id, and again only those the caller reads.
+    near: `SELECT ${COLS} FROM entries e WHERE e.vid IN (SELECT value FROM json_each(?1)) AND (e.owner = 'public' OR e.owner = ?2)`,
+    bare: `SELECT ${COLS} FROM entries e WHERE e.vid IS NULL ORDER BY e.at DESC, e.id DESC LIMIT CAST(?1 AS INTEGER)`,
+    bareCount: "SELECT COUNT(*) AS n FROM entries WHERE vid IS NULL",
     ftsDrop: "DELETE FROM entries_fts WHERE rowid = (SELECT n FROM entries WHERE id = ?1)",
     ftsAdd: "INSERT INTO entries_fts (rowid, title, text, tags) SELECT n, title, text, tags FROM entries WHERE id = ?1",
     drop: "DELETE FROM entries WHERE id = ?1",
     // D1 binds a number as a float: the limit is cast.
-    list: `SELECT ${COLS} FROM entries e WHERE ${FILTER} AND (e.at < ?6 OR (e.at = ?6 AND e.id < ?7)) ORDER BY e.at DESC, e.id DESC LIMIT CAST(?8 AS INTEGER)`,
-    search: `SELECT ${COLS}, snippet(entries_fts, -1, '[', ']', ' … ', 24) AS snippet FROM entries_fts JOIN entries e ON e.n = entries_fts.rowid WHERE entries_fts MATCH ?6 AND ${FILTER} ORDER BY bm25(entries_fts, 4.0, 1.0, 2.0) LIMIT CAST(?7 AS INTEGER)`,
+    list: `SELECT ${COLS} FROM entries e WHERE ${FILTER} AND (e.at < ?7 OR (e.at = ?7 AND e.id < ?8)) ORDER BY e.at DESC, e.id DESC LIMIT CAST(?9 AS INTEGER)`,
+    search: `SELECT ${COLS}, snippet(entries_fts, -1, '[', ']', ' … ', 24) AS snippet FROM entries_fts JOIN entries e ON e.n = entries_fts.rowid WHERE entries_fts MATCH ?7 AND ${FILTER} ORDER BY bm25(entries_fts, 4.0, 1.0, 2.0) LIMIT CAST(?8 AS INTEGER)`,
     total: "SELECT COUNT(*) AS n FROM entries",
     byKind: "SELECT kind AS name, COUNT(*) AS n FROM entries GROUP BY kind ORDER BY n DESC",
     bySource: "SELECT COALESCE(source, '') AS name, COUNT(*) AS n FROM entries GROUP BY source ORDER BY n DESC LIMIT 100",
@@ -34497,7 +34725,7 @@ const _brainknowledge_knowledgeMatch = function _knowledgeMatch() {return ((q) =
     .slice(0, 20)
     .map(([w, start]) => `"${w}"` + (start ? "*" : ""))
     .join(" "));};
-const _brainknowledge_knowledgeEntry = function _knowledgeEntry(knowledgeLimits,knowledgePatterns,knowledgeKinds,sha256) {return (async (given, kept = null) => {
+const _brainknowledge_knowledgeEntry = function _knowledgeEntry(knowledgeLimits,knowledgePatterns,sha256) {return (async (given, kept = null) => {
   const L = knowledgeLimits, e = given;
   if (!e || typeof e !== "object" || Array.isArray(e)) return { error: "an entry is an object" };
   const text = (k, max, { need = false, pattern = null } = {}) => {
@@ -34516,7 +34744,8 @@ const _brainknowledge_knowledgeEntry = function _knowledgeEntry(knowledgeLimits,
   };
   const out = {};
   const fields = [
-    ["kind", () => ((k) => (knowledgeKinds.includes(k) ? { value: k } : { error: "kind: one of " + knowledgeKinds.join(", ") }))(e.kind == null && kept ? kept.kind : e.kind)],
+    ["kind", () => ((k) => (typeof k === "string" && NAME.test(k) && k.length <= L.source ? { value: k } : { error: `kind: ${NAME.source}, ${L.source} characters at most` }))(e.kind == null && kept ? kept.kind : e.kind)],
+    ["public", () => (e.public == null ? { value: !!(kept && kept.public) } : typeof e.public === "boolean" ? { value: e.public } : { error: "public: true or false" })],
     ["title", () => text("title", L.title, { need: true })],
     ["text", () => ((r) => (r.error ? r : { value: r.value || "" }))(text("text", L.text))],
     ["url", () => ((r) => (r.error || !r.value || parses(r.value) ? r : { error: "url: not an address that parses" }))(text("url", L.url, { pattern: /^https?:\/\/\S+$/ }))],
@@ -34537,13 +34766,19 @@ const _brainknowledge_knowledgeEntry = function _knowledgeEntry(knowledgeLimits,
   out.id = e.id != null ? e.id : await sha256([out.kind, out.url || "", out.title].join("\n"));
   return { entry: out };
 });};
-const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits,knowledgeSql,database,knowledgeSchema,knowledgePatterns,knowledgeKinds,knowledgeEntry,knowledgeMatch) {
+const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits,knowledgeSql,knowledgeVectors,database,knowledgeSchema,knowledgeColumns,knowledgeTenant,sha256,xrpc,vectors,log,knowledgePatterns,knowledgeEntry,knowledgeMatch) {
   const app = new hono.Hono();
-  const NS = "/xrpc/com.lopecode.brain.knowledge.", L = knowledgeLimits, S = knowledgeSql;
+  const NS = "/xrpc/com.lopecode.brain.knowledge.", L = knowledgeLimits, S = knowledgeSql, V = knowledgeVectors;
   const fail = (c, status, error, message) => c.json({ error, message }, status);
   let ready = null;
+  // The tables, then the columns a table made before 2026-10-10 lacks.
   const schema = () =>
-    (ready ??= database.batch(knowledgeSchema.map((s) => [s])).catch((e) => {
+    (ready ??= (async () => {
+      await database.batch(knowledgeSchema.map((s) => [s]));
+      const have = (await database.batch([[S.columns]]))[0].rows.map((r) => r.name);
+      const add = knowledgeColumns.filter(([name]) => !have.includes(name)).map(([, statement]) => [statement]);
+      if (add.length) await database.batch(add);
+    })().catch((e) => {
       ready = null;
       throw e;
     }));
@@ -34551,19 +34786,48 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
   const json = (t) => { try { return JSON.parse(t); } catch { return []; } };
   const view = (r) => ({
     id: r.id, kind: r.kind, title: r.title, text: r.text, url: r.url, source: r.source, published: r.published, file: r.file, sha256: r.sha256,
-    by: r.entered_by, method: r.method, at: r.at, changed: r.upd_at ? { by: r.upd_by, method: r.upd_method, at: r.upd_at } : null, cites: json(r.cites), tags: json(r.tags),
+    by: r.entered_by, method: r.method, at: r.at, changed: r.upd_at ? { by: r.upd_by, method: r.upd_method, at: r.upd_at } : null, cites: json(r.cites), tags: json(r.tags), public: r.owner === "public",
     ...(r.snippet !== undefined ? { snippet: r.snippet } : {})
   });
-  // The filters of search and list, as the five arguments of FILTER.
-  const filters = (c) => {
+  // The core named the caller. Nothing in a body or a query says who calls.
+  const tenantOf = (c) => knowledgeTenant(c.req.header("x-brain-caller") || "anonymous");
+  const reads = (r, tenant) => r.owner === "public" || (!!tenant && r.owner === tenant);
+  // An entry is changed by the Brain itself, or by the person who entered it.
+  const changes = async (r, tenant) => tenant === "owner" || (!!tenant && (await knowledgeTenant(r.entered_by)) === tenant);
+  // Vectorize takes an id of 64 bytes; an entry's id may be 100.
+  const vidOf = async (id) => (id.length <= 64 ? id : await sha256(id));
+  // 20261010: a number, so that $gte compares it as a date does.
+  const dayOf = (at) => Number(new Date(at).toISOString().slice(0, 10).replaceAll("-", ""));
+  const embedded = async (texts) => {
+    const r = await xrpc.fetch("com.lopecode.brain.ai.v1/embeddings", { method: "POST", params: { usd: (V.usd * texts.length).toFixed(6) }, headers: { "content-type": "application/json" }, body: JSON.stringify({ model: V.model, input: texts }) });
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j || !Array.isArray(j.data) || j.data.length !== texts.length) throw new Error("ai.v1/embeddings answered " + r.status + " " + String((j && (j.message || j.error)) || "").slice(0, 120));
+    return j.data.sort((a, b) => a.index - b.index).map((d) => d.embedding);
+  };
+  // One vector for each row, from its title and the start of its text. A failure is logged and the rows keep no
+  // vector: they are entered all the same, found by words, and knowledge.embed makes their vectors later.
+  const index = async (rows) => {
+    if (!rows.length) return 0;
+    try {
+      const values = await embedded(rows.map((r) => (r.title + "\n\n" + r.text).slice(0, V.chars)));
+      const vids = await Promise.all(rows.map((r) => vidOf(r.id)));
+      await vectors.upsert(rows.map((r, i) => ({ id: vids[i], values: values[i], metadata: { owner: r.owner, kind: r.kind, day: dayOf(r.at) } })));
+      await run(rows.map((r, i) => [S.vector, r.id, vids[i]]));
+      return rows.length;
+    } catch (e) {
+      log({ at: "knowledge.embed-failed", entries: rows.length, error: String((e && e.message) || e).slice(0, 200) });
+      return 0;
+    }
+  };
+  // The filters of search and list, as the six arguments of FILTER. The sixth is the caller.
+  const filters = (c, tenant) => {
     const q = (k) => c.req.query(k) || "", since = q("since");
     // Four digits could be a year or 2026 ms, so they are neither.
     const at = since === "" ? 0 : /^\d{4}$/.test(since) ? NaN : /^\d{1,16}$/.test(since) ? Number(since) : /^\d{4}-\d{2}/.test(since) ? Date.parse(since) : NaN;
     if (!Number.isFinite(at)) return { error: "since: milliseconds, or a date from YYYY-MM on" };
-    for (const k of ["source", "tag"]) if (q(k) && !(knowledgePatterns.name.test(q(k)) && q(k).length <= L.source)) return { error: k + ": a-z 0-9 -" };
-    if (q("kind") && !knowledgeKinds.includes(q("kind"))) return { error: "kind: one of " + knowledgeKinds.join(", ") };
+    for (const k of ["source", "tag", "kind"]) if (q(k) && !(knowledgePatterns.name.test(q(k)) && q(k).length <= L.source)) return { error: k + ": a-z 0-9 -" };
     if (q("by").length > 300) return { error: "by" };
-    return { args: [q("source"), q("kind"), q("by"), at, q("tag") ? `%"${q("tag")}"%` : ""] };
+    return { args: [q("source"), q("kind"), q("by"), at, q("tag") ? `%"${q("tag")}"%` : "", tenant] };
   };
   const limitOf = (c, usual) => {
     const n = c.req.query("limit") == null ? usual : Number(c.req.query("limit"));
@@ -34574,8 +34838,8 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
     const b = await c.req.json().catch(() => null);
     const given = b && Array.isArray(b.entries) ? b.entries : b && typeof b === "object" ? [b] : null;
     if (!given || !given.length || given.length > L.batch) return fail(c, 400, "InvalidRequest", `one entry, or { entries } of 1 to ${L.batch}`);
-    // The core named the caller. Nothing in the body says who enters.
-    const by = c.req.header("x-brain-caller") || "anonymous", now = Date.now();
+    const by = c.req.header("x-brain-caller") || "anonymous", tenant = await knowledgeTenant(by), now = Date.now();
+    if (!tenant) return fail(c, 403, "Forbidden", "an entry is entered by the Brain or by a person");
     // What is kept under the ids given, so that a field left out keeps its value. An entry with no id is asked by the id it will get.
     const first = [];
     for (const [i, e] of given.entries()) {
@@ -34584,38 +34848,62 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
       first.push(r.entry ? r.entry.id : e && typeof e.id === "string" && e.id.length <= L.id && knowledgePatterns.id.test(e.id) ? e.id : null);
       if (!first[i]) return fail(c, 400, "InvalidRequest", `entry ${i + 1}: ${r.error}`);
     }
-    const was = new Map();
+    const was = new Map(), rows = new Map();
     const got = await run([...new Set(first)].map((id) => [S.get, id]));
-    for (const r of got) if (r.rows[0]) was.set(r.rows[0].id, view(r.rows[0]));
+    for (const r of got) if (r.rows[0]) (rows.set(r.rows[0].id, r.rows[0]), was.set(r.rows[0].id, view(r.rows[0])));
+    for (const r of rows.values()) if (!(await changes(r, tenant))) return fail(c, 403, "Forbidden", `${r.id.slice(0, 40)} was entered by another`);
     const entries = [], seen = new Map();
     for (const [i, e] of given.entries()) {
       // The same id twice in one call: the second is a change of the first.
-      const kept = seen.get(first[i]) || was.get(first[i]) || null;
+      const kept = seen.get(first[i]) || was.get(first[i]) || null, old = rows.get(first[i]);
       const r = await knowledgeEntry({ ...e, id: first[i] }, kept);
       if (r.error) return fail(c, 400, "InvalidRequest", `entry ${i + 1}: ${r.error}`);
+      // A private entry is its first enterer's.
+      const owner = r.entry.public ? "public" : await knowledgeTenant(old ? old.entered_by : by);
+      // The vector is kept while what it was made from, and who reads it, are the same.
+      const vid = old && old.vid && !seen.has(first[i]) && old.title === r.entry.title && old.text === r.entry.text && old.kind === r.entry.kind && old.owner === owner ? old.vid : null;
       seen.set(first[i], r.entry);
       // said: the method this put gave. A change that gives none is recorded with none, not with the first enterer's.
-      entries.push({ ...r.entry, said: e.method == null || e.method === "" ? null : r.entry.method });
+      entries.push({ ...r.entry, said: e.method == null || e.method === "" ? null : r.entry.method, owner, vid, at: old ? old.at : now });
     }
-    const row = (e) => [S.put, e.id, e.kind, e.title, e.text, e.url, e.source, e.published, e.file, e.sha256, by, e.method, now, JSON.stringify(e.cites), JSON.stringify(e.tags), e.said];
+    const row = (e) => [S.put, e.id, e.kind, e.title, e.text, e.url, e.source, e.published, e.file, e.sha256, by, e.method, now, JSON.stringify(e.cites), JSON.stringify(e.tags), e.said, e.owner, e.vid];
     // One transaction for each 20 entries: the full-text row goes, the entry is written, its full-text row is made again.
     for (let i = 0; i < entries.length; i += 20) await run(entries.slice(i, i + 20).flatMap((e) => [[S.ftsDrop, e.id], row(e), [S.ftsAdd, e.id]]));
     const ids = [...new Set(first)], changed = ids.filter((id) => was.has(id)).length;
-    return c.json({ entered: ids.length - changed, changed, ids });
+    // The last entry of each id is the one kept, and the one a vector is made for.
+    const last = [...new Map(entries.map((e) => [e.id, e])).values()];
+    return c.json({ entered: ids.length - changed, changed, ids, vectors: await index(last.filter((e) => !e.vid)) });
   });
   app.get(NS + "get", async (c) => {
     const id = c.req.query("id") || "";
     const r = (await run([[S.get, id]]))[0].rows[0];
-    return r ? c.json(view(r)) : fail(c, 404, "EntryNotFound", id.slice(0, 100));
+    return r && reads(r, await tenantOf(c)) ? c.json(view(r)) : fail(c, 404, "EntryNotFound", id.slice(0, 100));
   });
   app.get(NS + "search", async (c) => {
-    const match = knowledgeMatch(c.req.query("q")), f = filters(c), limit = limitOf(c, 20);
-    if (!match) return fail(c, 400, "InvalidRequest", "q: words to find");
+    const tenant = await tenantOf(c), f = filters(c, tenant), limit = limitOf(c, 20), q = (c.req.query("q") || "").trim();
     if (f.error || !limit) return fail(c, 400, "InvalidRequest", f.error || `limit: 1 to ${L.page}`);
-    return c.json({ entries: (await run([[S.search, ...f.args, match, limit]]))[0].rows.map(view) });
+    if (c.req.query("semantic") !== "true") {
+      const match = knowledgeMatch(q);
+      if (!match) return fail(c, 400, "InvalidRequest", "q: words to find");
+      return c.json({ entries: (await run([[S.search, ...f.args, match, limit]]))[0].rows.map(view) });
+    }
+    // By meaning: the question as a vector, the nearest vectors the caller reads, and the entries of those.
+    if (!q || q.length > 1000) return fail(c, 400, "InvalidRequest", "q: what to find, 1000 characters at most");
+    if (["source", "by", "tag"].some((k) => c.req.query(k))) return fail(c, 400, "InvalidRequest", "semantic: the filters are kind and since");
+    let found;
+    try {
+      // The caller's entries and the public ones: set here, from who the core says calls, and by nothing in the query.
+      const filter = { owner: tenant ? { $in: ["public", tenant] } : "public", ...(f.args[1] ? { kind: f.args[1] } : {}), ...(f.args[3] ? { day: { $gte: dayOf(f.args[3]) } } : {}) };
+      found = await vectors.query((await embedded([V.ask + q]))[0], { topK: limit, returnValues: false, returnMetadata: "none", filter });
+    } catch (e) {
+      return fail(c, 502, "UpstreamFailed", String((e && e.message) || e).slice(0, 200));
+    }
+    const near = new Map((await run([[S.near, JSON.stringify(found.matches.map((m) => m.id)), tenant]]))[0].rows.map((r) => [r.vid, r]));
+    // Where each is, not what it says: knowledge.get has the text.
+    return c.json({ entries: found.matches.filter((m) => near.has(m.id)).map((m) => (({ text, ...e }) => ({ ...e, score: m.score }))(view(near.get(m.id)))) });
   });
   app.get(NS + "list", async (c) => {
-    const f = filters(c), limit = limitOf(c, 50), cursor = c.req.query("cursor"), at = cursor == null ? null : /^(\d{1,16})::(.{1,100})$/.exec(cursor);
+    const f = filters(c, await tenantOf(c)), limit = limitOf(c, 50), cursor = c.req.query("cursor"), at = cursor == null ? null : /^(\d{1,16})::(.{1,100})$/.exec(cursor);
     if (f.error || !limit || (cursor != null && !at)) return fail(c, 400, "InvalidRequest", f.error || (limit ? "cursor" : `limit: 1 to ${L.page}`));
     const found = (await run([[S.list, ...f.args, at ? Number(at[1]) : Number.MAX_SAFE_INTEGER, at ? at[2] : "", limit]]))[0].rows;
     const last = found.at(-1);
@@ -34625,14 +34913,28 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
     const b = (await c.req.json().catch(() => null)) || {};
     const ids = Array.isArray(b.ids) ? b.ids : typeof b.id === "string" ? [b.id] : null;
     if (!ids || !ids.length || ids.length > L.batch || !ids.every((id) => typeof id === "string" && id.length <= L.id)) return fail(c, 400, "InvalidRequest", `id, or ids of 1 to ${L.batch}`);
-    const done = await run([...new Set(ids)].flatMap((id) => [[S.ftsDrop, id], [S.drop, id]]));
+    const tenant = await tenantOf(c), mine = [];
+    for (const r of await run([...new Set(ids)].map((id) => [S.get, id]))) if (r.rows[0] && (await changes(r.rows[0], tenant))) mine.push(r.rows[0]);
+    if (!mine.length) return c.json({ deleted: 0 });
+    // The vectors first. One that stays behind is found by no search: a search answers with entries.
+    const vids = mine.filter((r) => r.vid).map((r) => r.vid);
+    if (vids.length) await vectors.deleteByIds(vids).catch((e) => log({ at: "knowledge.vector-kept", vectors: vids.length, error: String((e && e.message) || e).slice(0, 200) }));
+    const done = await run(mine.flatMap((r) => [[S.ftsDrop, r.id], [S.drop, r.id]]));
     // Every second answer is the entry's own row: the full-text table counts its inner rows.
     return c.json({ deleted: done.reduce((n, r, i) => n + (i % 2 ? r.changes || 0 : 0), 0) });
   });
   app.get(NS + "stats", async (c) => {
-    const [total, kinds, sources, who] = await run([[S.total], [S.byKind], [S.bySource], [S.byWho]]);
+    const [total, kinds, sources, who, bare] = await run([[S.total], [S.byKind], [S.bySource], [S.byWho], [S.bareCount]]);
     const counts = (r) => Object.fromEntries(r.rows.map((x) => [x.name, Number(x.n)]));
-    return c.json({ entries: Number(total.rows[0].n) || 0, kinds: counts(kinds), sources: counts(sources), by: counts(who), limits: L });
+    const entries = Number(total.rows[0].n) || 0;
+    return c.json({ entries, vectors: entries - (Number(bare.rows[0].n) || 0), kinds: counts(kinds), sources: counts(sources), by: counts(who), limits: L });
+  });
+  // Vectors for the entries that have none: those from before 2026-10-10, and those whose embedding failed.
+  app.post(NS + "embed", async (c) => {
+    const b = (await c.req.json().catch(() => null)) || {}, n = b.limit == null ? 50 : b.limit;
+    if (!(Number.isInteger(n) && n >= 1 && n <= L.batch)) return fail(c, 400, "InvalidRequest", `limit: 1 to ${L.batch}`);
+    const made = await index((await run([[S.bare, n]]))[0].rows);
+    return c.json({ embedded: made, left: Number((await run([[S.bareCount]]))[0].rows[0].n) || 0 });
   });
   return app;
 };
@@ -34642,16 +34944,17 @@ const _brainknowledge_knowledgePanel = function _knowledgePanel(htl,Inputs,knowl
   const box = htl.html`<div></div>`, note = htl.html`<div style="${muted};margin:6px 0"></div>`;
   const q = Inputs.text({ label: "Find", placeholder: "words", width: "24em", submit: "Search" });
   const kind = Inputs.select(["", ...knowledgeKinds], { label: "Kind", format: (k) => k || "any" });
-  const el = Object.assign(htl.html`<div>${q}${kind}${note}${box}</div>`, { value: [] });
+  const meaning = Inputs.toggle({ label: "By meaning" });
+  const el = Object.assign(htl.html`<div>${q}${kind}${meaning}${note}${box}</div>`, { value: [] });
   const link = (u) => (u ? htl.html`<a href=${u} target="_blank" rel="noopener">${((x) => { try { return new URL(x).hostname; } catch { return x; } })(u)}</a>` : "");
   const draw = async () => {
     const params = { ...(kind.value ? { kind: kind.value } : {}) };
-    const [found, stats] = await Promise.all([q.value ? client.query("knowledge.search", { ...params, q: q.value }) : client.query("knowledge.list", { ...params, limit: 50 }), client.query("knowledge.stats")]);
+    const [found, stats] = await Promise.all([q.value ? client.query("knowledge.search", { ...params, q: q.value, ...(meaning.value ? { semantic: "true" } : {}) }) : client.query("knowledge.list", { ...params, limit: 50 }), client.query("knowledge.stats")]);
     el.value = found.entries;
     note.textContent = `${stats.entries} entries. ` + (q.value ? `${found.entries.length} found.` : "The last entered:");
     box.replaceChildren(
       found.entries.length
-        ? Inputs.table(found.entries.map((e) => ({ kind: e.kind, title: e.title, found: e.snippet || e.text.slice(0, 160), source: e.source || "", url: e.url, file: e.file || "", by: e.by, method: e.method, entered: new Date(e.at) })), { layout: "auto", format: { url: link, entered: (d) => d.toISOString().slice(0, 16).replace("T", " ") } })
+        ? Inputs.table(found.entries.map((e) => ({ kind: e.kind, title: e.title, found: e.snippet || (e.text || "").slice(0, 160) || (e.score != null ? "score " + e.score.toFixed(2) : ""), source: e.source || "", url: e.url, file: e.file || "", by: e.by, method: e.method, entered: new Date(e.at) })), { layout: "auto", format: { url: link, entered: (d) => d.toISOString().slice(0, 16).replace("T", " ") } })
         : htl.html`<i style=${muted}>Nothing.</i>`
     );
     // The value cell reads el on its own input event. load listens on q and kind, not on el, so this starts no second draw.
@@ -34660,37 +34963,46 @@ const _brainknowledge_knowledgePanel = function _knowledgePanel(htl,Inputs,knowl
   el.load = () => draw().catch((e) => void (note.textContent = "knowledge failed: " + ((e && e.message) || e)));
   q.addEventListener("input", el.load);
   kind.addEventListener("input", el.load);
+  meaning.addEventListener("input", el.load);
   el.ready = el.load();
   return el;
 });};
-const _brainknowledge_anon_c91f4dad24 = function _anonymous(md) {return (md`## Tests
+const _brainknowledge_anon_b7fe66e8cf = function _anonymous(md) {return (md`## Tests
 
-No SQL engine runs in a page. \`knowledgeFakeSql\` answers for the statements of \`knowledgeSql\` from one map, and refuses any other statement. Its search finds a word as written, with no stemming and no ranking. The statements, stemming and the snippet ran on a D1 database on 2026-10-09.`);};
-const _brainknowledge_knowledgeFakeSql = function _knowledgeFakeSql(knowledgeSql,knowledgeSchema) {return (() => {
+No SQL engine runs in a page. \`knowledgeFakeSql\` answers for the statements of \`knowledgeSql\` from one map, and refuses any other statement. Its search finds a word as written, with no stemming and no ranking. The statements, stemming and the snippet ran on a D1 database on 2026-10-09.
+
+Nor does Vectorize or a model. \`knowledgeFakeVectors\` is the binding as a map, and the rig's embedding of a text is a count of its words. The index, the model and the filter ran on cb4 on 2026-10-10.`);};
+const _brainknowledge_knowledgeFakeSql = function _knowledgeFakeSql(knowledgeSql,knowledgeSchema,knowledgeColumns) {return (() => {
   const entries = new Map(), fts = new Map(), seen = [];
   let n = 0;
   const S = knowledgeSql;
-  const pass = (e, [source, kind, by, since, tag]) => (!source || e.source === source) && (!kind || e.kind === kind) && (!by || e.entered_by === by) && e.at >= since && (!tag || e.tags.includes(tag.slice(1, -1)));
+  const pass = (e, [source, kind, by, since, tag, tenant]) => (!source || e.source === source) && (!kind || e.kind === kind) && (!by || e.entered_by === by) && e.at >= since && (!tag || e.tags.includes(tag.slice(1, -1))) && (e.owner === "public" || e.owner === tenant);
   const newest = (a, b) => b.at - a.at || (a.id < b.id ? 1 : -1);
   const cols = ({ n: _, ...e }) => e;
   const run = async (statement, a) => {
     seen.push(statement);
-    if (knowledgeSchema.includes(statement)) return { rows: [], changes: 0 };
+    if (knowledgeSchema.includes(statement) || knowledgeColumns.some(([, s]) => s === statement)) return { rows: [], changes: 0 };
+    // A table from before 2026-10-10: it has neither column, and both are added.
+    if (statement === S.columns) return { rows: seen.some((s) => s === knowledgeColumns[0][1]) ? [{ name: "owner" }, { name: "vid" }] : [], changes: 0 };
     if (statement === S.get) return { rows: entries.has(a[0]) ? [cols(entries.get(a[0]))] : [], changes: 0 };
     if (statement === S.put) {
-      const [id, kind, title, text, url, source, published, file, sha256, by, method, at, cites, tags, said] = a, was = entries.get(id);
-      entries.set(id, was ? { ...was, kind, title, text, url, source, published, file, sha256, cites, tags, upd_by: by, upd_method: said, upd_at: at } : { n: ++n, id, kind, title, text, url, source, published, file, sha256, entered_by: by, method, at, upd_by: null, upd_method: null, upd_at: null, cites, tags });
+      const [id, kind, title, text, url, source, published, file, sha256, by, method, at, cites, tags, said, owner, vid] = a, was = entries.get(id);
+      entries.set(id, was ? { ...was, kind, title, text, url, source, published, file, sha256, cites, tags, owner, vid, upd_by: by, upd_method: said, upd_at: at } : { n: ++n, id, kind, title, text, url, source, published, file, sha256, entered_by: by, method, at, upd_by: null, upd_method: null, upd_at: null, cites, tags, owner, vid });
       return { rows: [], changes: 1 };
     }
     if (statement === S.ftsDrop) return { rows: [], changes: entries.has(a[0]) && fts.delete(entries.get(a[0]).n) ? 3 : 0 };
     if (statement === S.ftsAdd) return fts.set(entries.get(a[0]).n, a[0]), { rows: [], changes: 3 };
     if (statement === S.drop) return { rows: [], changes: entries.delete(a[0]) ? 1 : 0 };
-    if (statement === S.list) return { rows: [...entries.values()].filter((e) => pass(e, a) && (e.at < a[5] || (e.at === a[5] && e.id < a[6]))).sort(newest).slice(0, a[7]).map(cols), changes: 0 };
+    if (statement === S.vector) return (entries.get(a[0]).vid = a[1]), { rows: [], changes: 1 };
+    if (statement === S.near) return { rows: [...entries.values()].filter((e) => JSON.parse(a[0]).includes(e.vid) && (e.owner === "public" || e.owner === a[1])).map(cols), changes: 0 };
+    if (statement === S.bare) return { rows: [...entries.values()].filter((e) => e.vid == null).sort(newest).slice(0, a[0]).map(cols), changes: 0 };
+    if (statement === S.bareCount) return { rows: [{ n: [...entries.values()].filter((e) => e.vid == null).length }], changes: 0 };
+    if (statement === S.list) return { rows: [...entries.values()].filter((e) => pass(e, a) && (e.at < a[6] || (e.at === a[6] && e.id < a[7]))).sort(newest).slice(0, a[8]).map(cols), changes: 0 };
     if (statement === S.search) {
-      const words = [...a[5].matchAll(/"([^"]*)"(\*?)/g)].map((m) => [m[1].toLowerCase(), !!m[2]]);
+      const words = [...a[6].matchAll(/"([^"]*)"(\*?)/g)].map((m) => [m[1].toLowerCase(), !!m[2]]);
       const has = (e, [w, start]) => `${e.title} ${e.text} ${e.tags}`.toLowerCase().split(/[^a-z0-9]+/).some((t) => (start ? t.startsWith(w) : t === w));
       // Only entries with a full-text row are found, as in the database.
-      return { rows: [...fts.values()].map((id) => entries.get(id)).filter((e) => e && pass(e, a) && words.every((w) => has(e, w))).sort(newest).slice(0, a[6]).map((e) => ({ ...cols(e), snippet: e.text.slice(0, 60) })), changes: 0 };
+      return { rows: [...fts.values()].map((id) => entries.get(id)).filter((e) => e && pass(e, a) && words.every((w) => has(e, w))).sort(newest).slice(0, a[7]).map((e) => ({ ...cols(e), snippet: e.text.slice(0, 60) })), changes: 0 };
     }
     if (statement === S.total) return { rows: [{ n: entries.size }], changes: 0 };
     const count = (key) => ({ rows: Object.entries([...entries.values()].reduce((m, e) => ({ ...m, [key(e)]: (m[key(e)] || 0) + 1 }), {})).map(([name, n]) => ({ name, n })), changes: 0 });
@@ -34701,9 +35013,29 @@ const _brainknowledge_knowledgeFakeSql = function _knowledgeFakeSql(knowledgeSql
   };
   return { run, entries, fts, seen };
 });};
-const _brainknowledge_knowledgeRig = function _knowledgeRig(knowledgeFakeSql,simulate,knowledge_service,URLSearchParams) {return (async () => {
-  const db = knowledgeFakeSql();
-  const sim = await simulate(knowledge_service, { sql: db.run });
+const _brainknowledge_knowledgeFakeVectors = function _knowledgeFakeVectors() {return (() => {
+  const held = new Map(), asked = [];
+  const cos = (a, b) => a.reduce((n, x, i) => n + x * b[i], 0) / (Math.sqrt(a.reduce((n, x) => n + x * x, 0) * b.reduce((n, x) => n + x * x, 0)) || 1);
+  const pass = (m, filter = {}) => Object.entries(filter).every(([k, want]) => (want && typeof want === "object" ? ("$in" in want ? want.$in.includes(m[k]) : m[k] >= want.$gte) : m[k] === want));
+  return {
+    held,
+    asked,
+    upsert: async (list) => (list.forEach((v) => held.set(v.id, v)), { mutationId: "m" }),
+    deleteByIds: async (ids) => (ids.forEach((id) => held.delete(id)), { mutationId: "m" }),
+    query: async (values, options) => (asked.push(options), { matches: [...held.values()].filter((v) => pass(v.metadata, options.filter)).map((v) => ({ id: v.id, score: cos(values, v.values) })).sort((a, b) => b.score - a.score).slice(0, options.topK) })
+  };
+});};
+const _brainknowledge_knowledgeRig = function _knowledgeRig(knowledgeFakeSql,knowledgeFakeVectors,knowledgeVectors,Response,simulate,knowledge_service,URLSearchParams) {return (async () => {
+  const db = knowledgeFakeSql(), index = knowledgeFakeVectors(), asked = [], state = { down: false };
+  // ai.v1/embeddings as the core would pass it on: a text is the count of its words in 64 places, with the question's prefix left out.
+  const place = (w) => [...w].reduce((n, ch) => (n * 31 + ch.charCodeAt(0)) % 64, 7);
+  const embed = (t) => t.replace(knowledgeVectors.ask, "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).reduce((v, w) => (v[place(w)]++, v), new Array(64).fill(0));
+  const core = async (request) => {
+    const url = new URL(request.url), body = await request.json();
+    asked.push({ nsid: url.pathname.replace("/xrpc/", ""), usd: url.searchParams.get("usd"), model: body.model, input: body.input });
+    return state.down ? new Response("{}", { status: 503 }) : Response.json({ data: body.input.map((t, i) => ({ index: i, embedding: embed(t) })) });
+  };
+  const sim = await simulate(knowledge_service, { sql: db.run, vectors: index, core });
   const X = "https://knowledge.internal/xrpc/com.lopecode.brain.knowledge.";
   const as = (who) => {
     const send = async (path, init = {}) => {
@@ -34713,12 +35045,12 @@ const _brainknowledge_knowledgeRig = function _knowledgeRig(knowledgeFakeSql,sim
     return { get: (name, params = {}) => send(name + "?" + new URLSearchParams(params)), post: (name, input) => send(name, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) }) };
   };
   const paper = (n, more = {}) => ({ id: "arxiv:" + n, kind: "paper", title: "Paper " + n, text: "agents learn from hindsight " + n, url: "https://arxiv.org/abs/" + n, source: "arxiv", method: "snapshot", ...more });
-  return { sim, db, as, owner: as("owner"), snapshot: as("worker:brain-x-snapshot"), paper };
+  return { sim, db, as, index, asked, state, owner: as("owner"), snapshot: as("worker:brain-x-snapshot"), member: as("did:plc:ada"), anyone: as("anonymous"), paper };
 });};
 const _brainknowledge_test_knowledge_records_who_entered_it_and_how = async function _test_knowledge_records_who_entered_it_and_how(knowledgeRig,expect) {
   const rig = await knowledgeRig();
   // The caller is the one the core names. by and at in the body are not read.
-  expect((await rig.snapshot.post("put", { ...rig.paper(1), by: "owner", at: 5 })).data).toEqual({ entered: 1, changed: 0, ids: ["arxiv:1"] });
+  expect((await rig.snapshot.post("put", { ...rig.paper(1), by: "owner", at: 5 })).data).toEqual({ entered: 1, changed: 0, ids: ["arxiv:1"], vectors: 1 });
   const first = (await rig.owner.get("get", { id: "arxiv:1" })).data;
   expect(first).toMatchObject({ id: "arxiv:1", kind: "paper", by: "worker:brain-x-snapshot", method: "snapshot", changed: null, url: "https://arxiv.org/abs/1", file: null, cites: [], tags: [] });
   expect(first.at).toBeGreaterThan(1e12);
@@ -34730,7 +35062,7 @@ const _brainknowledge_test_knowledge_records_who_entered_it_and_how = async func
   // An empty text clears a field that may be empty.
   await rig.owner.post("put", { id: "arxiv:1", published: "" });
   expect((await rig.owner.get("get", { id: "arxiv:1" })).data.published).toBe(null);
-  expect((await rig.owner.post("put", { id: "arxiv:1", file: "corpus/2026-10-09/hf-papers/1.pdf", sha256: "a".repeat(64), method: "digest:research-2026-10-09", tags: ["agents"] })).data).toEqual({ entered: 0, changed: 1, ids: ["arxiv:1"] });
+  expect((await rig.owner.post("put", { id: "arxiv:1", file: "corpus/2026-10-09/hf-papers/1.pdf", sha256: "a".repeat(64), method: "digest:research-2026-10-09", tags: ["agents"] })).data).toEqual({ entered: 0, changed: 1, ids: ["arxiv:1"], vectors: 0 });
   const second = (await rig.owner.get("get", { id: "arxiv:1" })).data;
   expect(second).toMatchObject({ by: "worker:brain-x-snapshot", method: "snapshot", at: first.at, title: "Paper 1", url: "https://arxiv.org/abs/1", file: "corpus/2026-10-09/hf-papers/1.pdf", tags: ["votes-hf-papers", "agents"] });
   expect(second.changed).toMatchObject({ by: "owner", method: "digest:research-2026-10-09" });
@@ -34759,13 +35091,70 @@ const _brainknowledge_test_knowledge_search_finds_by_word_and_filter = async fun
   expect((await o.get("search", { q: "speech" })).data.entries[0].snippet).toBeTruthy();
   // What is typed is words, never syntax of the index.
   expect([knowledgeMatch('agents AND ("hind* OR'), knowledgeMatch("  "), knowledgeMatch("a*b c*")]).toEqual(['"agents" "AND" "(hind"* "OR"', "", '"ab" "c"*']);
-  for (const params of [{}, { q: '"' }, { q: "a", limit: "0" }, { q: "a", limit: "101" }, { q: "a", kind: "book" }, { q: "a", source: "A B" }, { q: "a", since: "soon" }, { q: "a", since: "2026" }]) expect((await o.get("search", params)).status).toBe(400);
+  for (const params of [{}, { q: '"' }, { q: "a", limit: "0" }, { q: "a", limit: "101" }, { q: "a", kind: "A B" }, { q: "a", source: "A B" }, { q: "a", since: "soon" }, { q: "a", since: "2026" }]) expect((await o.get("search", params)).status).toBe(400);
   // A changed entry is found by its new words only, and a deleted one not at all.
   await o.post("put", { id: "hn:3", text: "a tiny audio model" });
   expect([await found({ q: "speech" }), await found({ q: "audio" })]).toEqual([["arxiv:2"], ["hn:3"]]);
   expect((await o.post("delete", { ids: ["hn:3", "hn:4"] })).data).toEqual({ deleted: 1 });
   expect([await found({ q: "audio" }), rig.db.fts.size, rig.db.entries.size]).toEqual([[], 2, 2]);
   return "10 searches, 8 refused";
+};
+const _brainknowledge_test_knowledge_search_by_meaning_answers_what_the_caller_reads = async function _test_knowledge_search_by_meaning_answers_what_the_caller_reads(knowledgeRig,knowledgeVectors,expect,knowledgeTenant) {
+  const rig = await knowledgeRig(), o = rig.owner, V = knowledgeVectors, q = "run code in a container";
+  const put = await o.post("put", { entries: [
+    { id: "module:fx:containers", kind: "module", title: "Leased containers", text: "run code in a linux container", url: "https://brain.example/library/fx", method: "library.put", public: true },
+    { id: "note:home", kind: "note", title: "Container notes", text: "run code in a container at home", method: "manual" },
+    rig.paper(1)
+  ] });
+  // One call for the three texts, as this Worker, for 3 times usd. Each vector says who reads it, its kind and its day.
+  expect([put.data.vectors, rig.asked.length, rig.asked[0]]).toEqual([3, 1, { nsid: "com.lopecode.brain.ai.v1/embeddings", usd: "0.000150", model: V.model, input: ["Leased containers\n\nrun code in a linux container", "Container notes\n\nrun code in a container at home", "Paper 1\n\nagents learn from hindsight 1"] }]);
+  const day = Number(new Date().toISOString().slice(0, 10).replaceAll("-", ""));
+  expect([rig.index.held.get("module:fx:containers").metadata, rig.index.held.get("note:home").metadata]).toEqual([{ owner: "public", kind: "module", day }, { owner: "owner", kind: "note", day }]);
+  const found = async (as, params = {}) => (await as.get("search", { semantic: "true", q, ...params })).data.entries.map((e) => e.id);
+  // The owner reads all three, the nearest first. The question goes to the model with the prefix its makers give.
+  expect((await found(o)).slice(0, 2).sort()).toEqual(["module:fx:containers", "note:home"]);
+  expect([rig.asked.at(-1).input, rig.asked.at(-1).usd, rig.index.asked.at(-1).filter]).toEqual([[V.ask + q], "0.000050", { owner: { $in: ["public", "owner"] } }]);
+  // A person and anyone read the public entry only. The filter is made here: nothing in the query widens it.
+  expect([await found(rig.member), await found(rig.member, { owner: "owner" }), await found(rig.anyone)]).toEqual([["module:fx:containers"], ["module:fx:containers"], ["module:fx:containers"]]);
+  expect([rig.index.asked.at(-2).filter.owner, rig.index.asked.at(-1).filter.owner]).toEqual([{ $in: ["public", await knowledgeTenant("did:plc:ada")] }, "public"]);
+  expect((await knowledgeTenant("did:plc:ada")).length).toBe(32);
+  // Search by words, list and get are held to the same.
+  expect([(await rig.member.get("search", { q: "container" })).data.entries.map((e) => e.id), (await rig.member.get("list")).data.entries.length, (await rig.member.get("get", { id: "note:home" })).status, (await rig.member.get("get", { id: "module:fx:containers" })).data.public]).toEqual([["module:fx:containers"], 1, 404, true]);
+  // kind and since go into the filter. The other filters are not fields of the index.
+  expect([await found(o, { kind: "module" }), await found(o, { since: "2999-01-01" }), rig.index.asked.at(-1).filter.day]).toEqual([["module:fx:containers"], [], { $gte: 29990101 }]);
+  for (const params of [{ q: "" }, { source: "hn" }, { tag: "x" }, { by: "owner" }, { q: "x".repeat(1001) }, { limit: "101" }]) expect((await o.get("search", { semantic: "true", q, ...params })).status).toBe(400);
+  // An answer says where an entry is, not what it says.
+  const first = (await o.get("search", { semantic: "true", q, kind: "module" })).data.entries[0];
+  expect(["text" in first, first.score > 0.5, first.url, first.title, first.public]).toEqual([false, true, "https://brain.example/library/fx", "Leased containers", true]);
+  return "3 callers, 1 public entry";
+};
+const _brainknowledge_test_knowledge_keeps_an_entry_whose_embedding_failed = async function _test_knowledge_keeps_an_entry_whose_embedding_failed(knowledgeRig,expect) {
+  const rig = await knowledgeRig(), o = rig.owner;
+  // ai.v1/embeddings refuses: the entry is kept and found by words, and a search by meaning says what failed.
+  rig.state.down = true;
+  expect((await o.post("put", rig.paper(1))).data).toEqual({ entered: 1, changed: 0, ids: ["arxiv:1"], vectors: 0 });
+  expect([(await o.get("search", { q: "hindsight" })).data.entries.length, (await o.get("search", { q: "hindsight", semantic: "true" })).status, (await o.get("stats")).data.vectors]).toEqual([1, 502, 0]);
+  expect((await o.post("embed", {})).data).toEqual({ embedded: 0, left: 1 });
+  rig.state.down = false;
+  expect([(await o.post("embed", {})).data, (await o.get("stats")).data.vectors, (await o.post("embed", { limit: 0 })).status]).toEqual([{ embedded: 1, left: 0 }, 1, 400]);
+  // A put that changes neither the title, the text, the kind nor who reads it keeps the vector: no embedding is bought.
+  const bought = rig.asked.length;
+  expect([(await o.post("put", { id: "arxiv:1", tags: ["agents"], published: "2026-10-07" })).data.vectors, rig.asked.length - bought]).toEqual([0, 0]);
+  expect([(await o.post("put", { id: "arxiv:1", text: "new words" })).data.vectors, (await o.post("put", { id: "arxiv:1", public: true })).data.vectors, rig.index.held.get("arxiv:1").metadata.owner]).toEqual([1, 1, "public"]);
+  // Private again: the entry is its first enterer's.
+  await o.post("put", { id: "arxiv:1", public: false });
+  expect(rig.index.held.get("arxiv:1").metadata.owner).toBe("owner");
+  // An id longer than Vectorize takes is kept under its hash, and found by it.
+  const long = "x".repeat(90);
+  await o.post("put", { ...rig.paper(2), id: long });
+  expect([rig.index.held.has(long), [...rig.index.held.keys()].filter((k) => k.length === 64).length, (await o.get("search", { q: "Paper 2", semantic: "true" })).data.entries[0].id]).toEqual([false, 1, long]);
+  // A person changes and deletes what they entered, not what the Brain did. Anyone enters nothing.
+  expect([(await rig.member.post("put", { id: "arxiv:1", title: "mine" })).status, (await rig.member.post("delete", { id: "arxiv:1" })).data, (await rig.anyone.post("put", rig.paper(4))).status]).toEqual([403, { deleted: 0 }, 403]);
+  await rig.member.post("put", { id: "note:ada", kind: "note", title: "Ada's note", text: "private to ada", method: "manual" });
+  expect([(await rig.member.get("get", { id: "note:ada" })).status, (await rig.as("did:plc:bob").get("get", { id: "note:ada" })).status, (await o.get("get", { id: "note:ada" })).status, (await rig.as("did:plc:bob").post("delete", { id: "note:ada" })).data.deleted]).toEqual([200, 404, 404, 0]);
+  // Deleting an entry deletes its vector.
+  expect([(await o.post("delete", { ids: ["arxiv:1", long] })).data, (await rig.member.post("delete", { id: "note:ada" })).data, rig.index.held.size]).toEqual([{ deleted: 2 }, { deleted: 1 }, 0]);
+  return "kept, then embedded";
 };
 const _brainknowledge_test_knowledge_list_pages_and_stats_count = async function _test_knowledge_list_pages_and_stats_count(knowledgeRig,expect) {
   const rig = await knowledgeRig(), o = rig.owner;
@@ -34783,13 +35172,13 @@ const _brainknowledge_test_knowledge_list_pages_and_stats_count = async function
 const _brainknowledge_test_knowledge_refuses_an_entry_it_cannot_keep = async function _test_knowledge_refuses_an_entry_it_cannot_keep(knowledgeRig,expect) {
   const rig = await knowledgeRig(), o = rig.owner, ok = rig.paper(1);
   const bad = [
-    [{ ...ok, kind: "book" }, "kind"], [{ ...ok, title: "" }, "title"], [{ ...ok, title: "x".repeat(501) }, "title"], [{ ...ok, text: "x".repeat(16001) }, "text"],
+    [{ ...ok, kind: "A Book" }, "kind"], [{ ...ok, public: "yes" }, "public"], [{ ...ok, title: "" }, "title"], [{ ...ok, title: "x".repeat(501) }, "title"], [{ ...ok, text: "x".repeat(16001) }, "text"],
     [{ ...ok, url: "ftp://x" }, "url"], [{ ...ok, url: "https://[" }, "url"], [{ ...ok, source: "Hacker News" }, "source"], [{ ...ok, method: undefined }, "method"], [{ ...ok, id: "A b" }, "id"],
     [{ ...ok, file: "a b" }, "file"], [{ ...ok, sha256: "abc" }, "sha256"], [{ ...ok, tags: ["a:b"] }, "tags"], [{ ...ok, tags: Array.from({ length: 17 }, (_, i) => "t" + i) }, "tags"], [{ ...ok, cites: "arxiv:2" }, "cites"]
   ];
   for (const [entry, field] of bad) expect([field, (await o.post("put", entry)).data.message.startsWith("entry 1: " + field)]).toEqual([field, true]);
   // One bad entry and nothing of the call is kept. More than 100 is refused.
-  expect((await o.post("put", { entries: [ok, { ...ok, id: "arxiv:2", kind: "book" }] })).data.message).toMatch(/^entry 2: kind/);
+  expect((await o.post("put", { entries: [ok, { ...ok, id: "arxiv:2", kind: "A Book" }] })).data.message).toMatch(/^entry 2: kind/);
   expect((await o.post("put", { entries: Array.from({ length: 101 }, (_, i) => rig.paper(i)) })).status).toBe(400);
   expect((await o.post("put", { entries: [] })).status).toBe(400);
   expect([rig.db.entries.size, (await o.post("delete", {})).status]).toEqual([0, 400]);
@@ -34800,15 +35189,18 @@ const _brainknowledge_test_knowledge_refuses_an_entry_it_cannot_keep = async fun
 };
 const _brainknowledge_test_knowledge_declares_its_own_database_and_who_calls = async function _test_knowledge_declares_its_own_database_and_who_calls(knowledge_service,expect,knowledgeRig,knowledgeSchema,decide,callerOf) {
   const { meta } = await knowledge_service.emit();
-  expect(meta).toMatchObject({ worker: "brain-x-knowledge", role: "recipe", module: "@tomlarkworthy/brain-knowledge", resources: ["database"], secrets: [], paths: [], calls: [] });
+  expect(meta).toMatchObject({ worker: "brain-x-knowledge", role: "recipe", module: "@tomlarkworthy/brain-knowledge", resources: ["database", "vectors", "xrpc"], secrets: [], paths: [], calls: ["com.lopecode.brain.ai.v1/embeddings"] });
+  // One index, named for its model, with the three fields a search filters by.
+  expect(meta.vectors).toEqual({ name: "bge-base-en-768", dimensions: 768, metric: "cosine", metadata: [["day", "number"], ["kind", "string"], ["owner", "string"]] });
+  expect(meta.bindings.find((b) => b.name === "VECTORS")).toEqual({ type: "vectorize", name: "VECTORS", own: true });
   // The statements a run sends are the ones knowledgeSql holds: the fake refuses any other.
   const rig = await knowledgeRig();
   await rig.owner.post("put", rig.paper(1));
   expect(rig.db.seen.slice(0, 3)).toEqual(knowledgeSchema);
-  const callers = { owner: { caller: "owner", via: "session" }, token: { caller: "token:laptop" }, snapshot: { caller: "worker:brain-x-snapshot" }, worker: { caller: "worker:brain-x-filler" }, member: { caller: "worker:brain-m-0123456789-a" }, anyone: { caller: "anonymous" } };
+  const callers = { owner: { caller: "owner", via: "session" }, token: { caller: "token:laptop" }, snapshot: { caller: "worker:brain-x-snapshot" }, library: { caller: "worker:brain-x-library" }, worker: { caller: "worker:brain-x-filler" }, member: { caller: "worker:brain-m-0123456789-a" }, anyone: { caller: "anonymous" } };
   const through = (m) => Object.entries(callers).filter(([, w]) => decide(meta.access["com.lopecode.brain.knowledge." + m], { caller: callerOf(w), request: { method: m, path: "", verb: "POST", params: {} } }).allow).map(([n]) => n).join(" ");
-  expect(through("put")).toBe("owner token snapshot");
-  for (const m of ["get", "search", "list", "delete", "stats"]) expect([m, through(m)]).toEqual([m, "owner token"]);
+  expect(through("put")).toBe("owner token snapshot library");
+  for (const m of ["get", "search", "list", "delete", "stats", "embed"]) expect([m, through(m)]).toEqual([m, "owner token"]);
   return "put: " + through("put");
 };
 const _brainknowledge_test_knowledge_panel_searches_and_lists = async function _test_knowledge_panel_searches_and_lists(knowledgePanel,expect,Event) {
@@ -34841,27 +35233,33 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainknowledge_anon_8aa58815e2", null, ["md"], _brainknowledge_anon_8aa58815e2);
+  $def("_brainknowledge_anon_11b239a35a", null, ["md"], _brainknowledge_anon_11b239a35a);
   $def("_brainknowledge_viewof_knowledgeView", "viewof knowledgeView", ["knowledgePanel","client","session"], _brainknowledge_viewof_knowledgeView);
   $def("_brainknowledge_knowledgeView", "knowledgeView", ["Generators","viewof knowledgeView"], _brainknowledge_knowledgeView);
-  $def("_brainknowledge_anon_dc9b1eb371", null, ["md","knowledgeLimits","knowledgeKinds"], _brainknowledge_anon_dc9b1eb371);
-  $def("_brainknowledge_anon_80322a97fb", null, ["md"], _brainknowledge_anon_80322a97fb);
-  $def("_brainknowledge_knowledge_service", "knowledge_service", ["cloudflare","knowledgeApp"], _brainknowledge_knowledge_service);
+  $def("_brainknowledge_anon_63ef6e5ec5", null, ["md","knowledgeLimits","knowledgeVectors","knowledgeKinds"], _brainknowledge_anon_63ef6e5ec5);
+  $def("_brainknowledge_anon_f1e7908ae2", null, ["md","knowledgeVectors"], _brainknowledge_anon_f1e7908ae2);
+  $def("_brainknowledge_knowledge_service", "knowledge_service", ["cloudflare","knowledgeApp","knowledgeVectors"], _brainknowledge_knowledge_service);
   $def("_brainknowledge_knowledge_announce", "knowledge_announce", ["plugins","knowledge_service","invalidation"], _brainknowledge_knowledge_announce);
   $def("_brainknowledge_knowledgeKinds", "knowledgeKinds", [], _brainknowledge_knowledgeKinds);
+  $def("_brainknowledge_knowledgeVectors", "knowledgeVectors", [], _brainknowledge_knowledgeVectors);
+  $def("_brainknowledge_knowledgeTenant", "knowledgeTenant", ["sha256"], _brainknowledge_knowledgeTenant);
   $def("_brainknowledge_knowledgeLimits", "knowledgeLimits", [], _brainknowledge_knowledgeLimits);
   $def("_brainknowledge_knowledgePatterns", "knowledgePatterns", [], _brainknowledge_knowledgePatterns);
   $def("_brainknowledge_knowledgeSchema", "knowledgeSchema", [], _brainknowledge_knowledgeSchema);
+  $def("_brainknowledge_knowledgeColumns", "knowledgeColumns", [], _brainknowledge_knowledgeColumns);
   $def("_brainknowledge_knowledgeSql", "knowledgeSql", [], _brainknowledge_knowledgeSql);
   $def("_brainknowledge_knowledgeMatch", "knowledgeMatch", [], _brainknowledge_knowledgeMatch);
-  $def("_brainknowledge_knowledgeEntry", "knowledgeEntry", ["knowledgeLimits","knowledgePatterns","knowledgeKinds","sha256"], _brainknowledge_knowledgeEntry);
-  $def("_brainknowledge_knowledgeApp", "knowledgeApp", ["hono","knowledgeLimits","knowledgeSql","database","knowledgeSchema","knowledgePatterns","knowledgeKinds","knowledgeEntry","knowledgeMatch"], _brainknowledge_knowledgeApp);
+  $def("_brainknowledge_knowledgeEntry", "knowledgeEntry", ["knowledgeLimits","knowledgePatterns","sha256"], _brainknowledge_knowledgeEntry);
+  $def("_brainknowledge_knowledgeApp", "knowledgeApp", ["hono","knowledgeLimits","knowledgeSql","knowledgeVectors","database","knowledgeSchema","knowledgeColumns","knowledgeTenant","sha256","xrpc","vectors","log","knowledgePatterns","knowledgeEntry","knowledgeMatch"], _brainknowledge_knowledgeApp);
   $def("_brainknowledge_knowledgePanel", "knowledgePanel", ["htl","Inputs","knowledgeKinds","Event"], _brainknowledge_knowledgePanel);
-  $def("_brainknowledge_anon_c91f4dad24", null, ["md"], _brainknowledge_anon_c91f4dad24);
-  $def("_brainknowledge_knowledgeFakeSql", "knowledgeFakeSql", ["knowledgeSql","knowledgeSchema"], _brainknowledge_knowledgeFakeSql);
-  $def("_brainknowledge_knowledgeRig", "knowledgeRig", ["knowledgeFakeSql","simulate","knowledge_service","URLSearchParams"], _brainknowledge_knowledgeRig);
+  $def("_brainknowledge_anon_b7fe66e8cf", null, ["md"], _brainknowledge_anon_b7fe66e8cf);
+  $def("_brainknowledge_knowledgeFakeSql", "knowledgeFakeSql", ["knowledgeSql","knowledgeSchema","knowledgeColumns"], _brainknowledge_knowledgeFakeSql);
+  $def("_brainknowledge_knowledgeFakeVectors", "knowledgeFakeVectors", [], _brainknowledge_knowledgeFakeVectors);
+  $def("_brainknowledge_knowledgeRig", "knowledgeRig", ["knowledgeFakeSql","knowledgeFakeVectors","knowledgeVectors","Response","simulate","knowledge_service","URLSearchParams"], _brainknowledge_knowledgeRig);
   $def("_brainknowledge_test_knowledge_records_who_entered_it_and_how", "test_knowledge_records_who_entered_it_and_how", ["knowledgeRig","expect"], _brainknowledge_test_knowledge_records_who_entered_it_and_how);
   $def("_brainknowledge_test_knowledge_search_finds_by_word_and_filter", "test_knowledge_search_finds_by_word_and_filter", ["knowledgeRig","expect","knowledgeMatch"], _brainknowledge_test_knowledge_search_finds_by_word_and_filter);
+  $def("_brainknowledge_test_knowledge_search_by_meaning_answers_what_the_caller_reads", "test_knowledge_search_by_meaning_answers_what_the_caller_reads", ["knowledgeRig","knowledgeVectors","expect","knowledgeTenant"], _brainknowledge_test_knowledge_search_by_meaning_answers_what_the_caller_reads);
+  $def("_brainknowledge_test_knowledge_keeps_an_entry_whose_embedding_failed", "test_knowledge_keeps_an_entry_whose_embedding_failed", ["knowledgeRig","expect"], _brainknowledge_test_knowledge_keeps_an_entry_whose_embedding_failed);
   $def("_brainknowledge_test_knowledge_list_pages_and_stats_count", "test_knowledge_list_pages_and_stats_count", ["knowledgeRig","expect"], _brainknowledge_test_knowledge_list_pages_and_stats_count);
   $def("_brainknowledge_test_knowledge_refuses_an_entry_it_cannot_keep", "test_knowledge_refuses_an_entry_it_cannot_keep", ["knowledgeRig","expect"], _brainknowledge_test_knowledge_refuses_an_entry_it_cannot_keep);
   $def("_brainknowledge_test_knowledge_declares_its_own_database_and_who_calls", "test_knowledge_declares_its_own_database_and_who_calls", ["knowledge_service","expect","knowledgeRig","knowledgeSchema","decide","callerOf"], _brainknowledge_test_knowledge_declares_its_own_database_and_who_calls);
@@ -34869,6 +35267,9 @@ export default function define(runtime, observer) {
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("database", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("database", _));
+  main.define("vectors", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("vectors", _));
+  main.define("xrpc", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("xrpc", _));
+  main.define("log", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("log", _));
   main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
@@ -40189,7 +40590,7 @@ One Brain, \`cb4\`, runs in one Cloudflare account. It has 17 Workers (counted 2
 | \`brain-x-static\`, \`brain-x-blob\`, \`brain-x-library\`, \`brain-x-proxy\`, \`brain-x-feed\` | one module each | Files, blobs, saved notebooks, outbound fetch, Bluesky feeds. \`brain-x-metrics\` was removed on 2026-10-09: calls are counted from the log lines. |
 | \`brain-x-whatsapp\`, \`brain-x-bluesky\` | one module each | Channels. |
 | \`brain-x-logs\` | \`brain-logs\` | The logs of this Brain's Workers, read from Cloudflare Workers Logs with Cloudflare's own query bodies. It holds a Cloudflare token with one permission, which the deployer minted for it. |
-| \`brain-x-knowledge\` | \`brain-knowledge\` | What the Brain knows: one entry per paper, page, post or finding, with where it was found, the path of its kept file, and who entered it and how. A D1 database of its own with a full-text index; no file bytes. The owner searches it; the snapshot and the digest tool enter into it. 68 entries on cb4, 2026-10-09. |
+| \`brain-x-knowledge\` | \`brain-knowledge\` | What the Brain knows: one entry per paper, page, post or finding, with where it was found, the path of its kept file, and who entered it and how. A D1 database of its own with a full-text index; no file bytes. The owner searches it; the snapshot, the digest tool and the library (a card for each module of a kept notebook) enter into it. Each entry has one vector in one Vectorize index, and \`knowledge.search?semantic=true\` answers the entries nearest a question, held to the public ones and the caller's own. 173 entries on cb4, 2026-10-10. |
 | \`brain-x-snapshot\` | \`brain-snapshot\` | Once a day, at 06:00 UTC, fetches a list of public feeds (arXiv, Hugging Face papers, lab blogs, named writers, Hacker News, Reddit, Lobsters) and keeps each as a public JSON file under \`/static/snapshot/<day>/\`. It records only: no model call, no ranking, no summary. |
 | \`brain-x-browser\` | \`brain-browser\` | Remote browsers from Cloudflare Browser Run, for each process of the Brain. A browser has a name and belongs to the caller that bought its time; a page is a tab of one browser. Browser time is bought in seconds by \`browser.extend\`. |
 | \`brain-x-container\` | \`brain-container\` | Leased Linux containers from Cloudflare Containers (built 2026-10-09). A container belongs to the caller that bought its time, has a declared image (\`node\`) and a name, and is destroyed when the time ends. \`container.extend\` buys seconds; \`exec\` runs a command; \`get\` and \`post\` are its port. The owner and the Brain's Workers only. |
@@ -40233,6 +40634,7 @@ md`### What is verified
 | A session from before the key rename is read after it. | cb4: the kernel has both bindings. | 2026-10-07 |
 | A priced call is charged to the origin's account for the UTC day, and calls made at one time do not spend past it. | cb4, scratch service, removed after: 150 calls of $0.03, 50 at one time, on $1.00: 33 passed, 117 got 402. A failed call was then given back; since the same day no charge is returned. Through 2 Workers the owner paid at each priced method. Priced p50 104 ms, free 46 ms. | 2026-10-08 |
 | The owner changes a value a service reads from \`config\` with one call and no deploy. A value set at deploy is never replaced. | cb4: \`pollMs\` 60000 on \`brain-x-inbox\`, \`inbox.poll\` 20 → 10 in 10 minutes; a member 403, no session 401, key \`owner\` 400, the kernel 404. | 2026-10-09 |
+| A question finds the module, paper or note nearest it, and a caller's search answers only what that caller reads. | cb4: 173 vectors in one index; the wanted module first for 6 of 7 questions; 0.45 to 0.55 s; a member granted the search got 73 public entries and none of the 100 private ones (\`knowledge-vectors.md\`). | 2026-10-10 |
 | \`/llms.txt\` tells a program how to call this Brain, from the host and the route table of the Brain that answers. | cb4: 6660 bytes; 101 listed names, none 501; a token made as it says called \`knowledge.search\` with curl. | 2026-10-09 |
 
 The tests of each module run in the page under \`simulate\`. A deploy is unverified until the page runs those tests from the deployed source.`
