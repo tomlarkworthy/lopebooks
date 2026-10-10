@@ -29674,6 +29674,8 @@ const _brainbluesky_blueskyRig = function _blueskyRig(Response,simulate,bluesky_
     if (request.headers.get("atproto-proxy") !== "did:web:api.bsky.chat#bsky_chat") return no(501, "MethodNotImplemented");
     const name = nsid.replace("chat.bsky.convo.", "");
     if (name === "getLog") {
+      // A test puts a promise in net.hold: the next getLog waits for it, once, so that a second poll meets the first one running.
+      if (net.hold) { const hold = net.hold; net.hold = null; await hold; }
       const after = Number(u.searchParams.get("cursor") || 0), logs = net.events.filter((e) => e.n > after).slice(0, pageSize);
       return Response.json({ cursor: String(logs.length ? logs.at(-1).n : after), logs: logs.map((e) => e.log) });
     }
@@ -29798,12 +29800,24 @@ const _brainbluesky_test_bluesky_strangers_are_limited_over_all = async function
 const _brainbluesky_test_bluesky_tick_and_poll_deliver_once = async function _test_bluesky_tick_and_poll_deliver_once(blueskyRig,expect) {
   const rig = await blueskyRig({ known: ["did:plc:ada"], pageSize: 2 });
   for (const t of ["one", "two", "three", "four", "five"]) rig.say("did:plc:ada", t);
-  // The tick and a tab's poll at the same moment: one of them reads, the other finds a poll running.
-  const [, polled] = await Promise.all([rig.tick(), rig.poll()]);
+  // The tick and a tab's poll at the same moment. Whichever takes the row busy first is kept at its first getLog
+  // until the other has answered, so the two overlap in every runtime: one reads, the other finds a poll running.
+  let open;
+  rig.net.hold = new Promise((resolve) => (open = resolve));
+  const asks = () => rig.net.asked.filter((a) => a.nsid.endsWith("getLog")).length;
+  const tick = rig.tick().then(() => "tick"), page = rig.poll();
+  const skipped = await Promise.race([tick, page.then(() => "page")]);
+  // The one that answered read nothing. The other holds the row busy and has been given no page: it is signing in
+  // (a browser) or waiting at its first getLog (bun).
+  expect([asks() <= 1, rig.sim.inbox.length, typeof rig.rows.get("busy"), rig.rows.get("polled")]).toEqual([true, 0, "number", undefined]);
+  open();
+  const [, polled] = await Promise.all([tick, page]);
+  expect(polled).toEqual(skipped === "page" ? { configured: true, skipped: "a poll is running" } : { configured: true, events: 5, taken: 5 });
+  expect([rig.rows.get("polled").by, rig.rows.get("polled").events]).toEqual([skipped === "page" ? "tick" : "page", 5]);
   expect(rig.bodies().map((b) => b[3])).toEqual(["one", "two", "three", "four", "five"]);
   expect(rig.rows.get("cursor")).toBe("5");
-  expect(rig.net.asked.filter((a) => a.nsid.endsWith("getLog")).length).toBe(4);
-  expect(polled.skipped === "a poll is running" ? "tick" : "page").toBe(rig.rows.get("polled").by);
+  expect(asks()).toBe(4);
+  expect(rig.rows.get("busy")).toBe(undefined);
   // The cursor is kept between calls: the next one asks for what follows it and finds nothing.
   rig.net.asked.length = 0;
   expect(await rig.poll()).toEqual({ configured: true, events: 0, taken: 0 });
@@ -29813,7 +29827,7 @@ const _brainbluesky_test_bluesky_tick_and_poll_deliver_once = async function _te
   expect(await rig.poll()).toEqual({ configured: true, events: 3, taken: 3 });
   expect(rig.sim.inbox.length).toBe(5);
   expect(rig.rows.get("cursor")).toBe("5");
-  return "5 messages over 3 pages, read 1.6 times, 5 entries";
+  return `5 messages over 3 pages, read 1.6 times, 5 entries; the ${skipped} found a poll running`;
 };
 const _brainbluesky_test_bluesky_reads_direct_messages_sent_after_it_started = async function _test_bluesky_reads_direct_messages_sent_after_it_started(blueskyRig,expect) {
   const rig = await blueskyRig({ known: ["did:plc:ada"] });
