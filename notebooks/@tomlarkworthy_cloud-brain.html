@@ -20748,7 +20748,7 @@ const _cloudflareiac_test_source_that_does_not_end_is_stopped_in_the_sandbox = a
   expect(await distil('export default function define(runtime, observer) { const main = runtime.module(); main.variable(observer("spin_service")).define("spin_service", [], () => { for (;;) {} }); return main; }')).toBe(stopped);
   return stopped;
 };
-const _cloudflareiac_anon_639bf372a9 = function _anonymous(md) {return (md`## Access rules
+const _cloudflareiac_anon_77c6463f10 = function _anonymous(md) {return (md`## Access rules
 
 A method or a path is open to whoever its rule says. The core decides, before it forwards.
 
@@ -20766,7 +20766,8 @@ A rule is one [CEL](https://github.com/google/cel-spec) expression, evaluated by
 |---|---|
 | \`caller.id\` | \`owner\`, \`anonymous\`, \`deployer\`, \`token:NAME\`, \`did:plc:…\`, \`worker:brain-x-NAME\` |
 | \`caller.kind\` | \`owner\`, \`anonymous\`, \`deployer\`, \`token\`, \`did\`, \`worker\` |
-| \`caller.did\`, \`caller.worker\`, \`caller.token\` | the DID, the Worker name, the token name; \`""\` for another kind |
+| \`caller.did\`, \`caller.worker\`, \`caller.token\` | the DID, the Worker name, the token name; \`""\` for another kind. \`caller.token\` is also the name of the secret a delegation is held by |
+| \`caller.delegation\`, \`caller.holder\` | for a call under a delegation: its id, and \`worker:NAME\` or \`secret:NAME\` that holds it. The caller is then who made the delegation. \`""\` otherwise |
 | \`caller.session\` | the owner in their own tab |
 | \`caller.trusted\` | the owner, or a token or granted account the kernel has checked against this method |
 | \`request.method\` | the NSID, or \`""\` for a path |
@@ -20807,18 +20808,79 @@ const _cloudflareiac_callerOf = function _callerOf() {return ((who) => {
   // "guard": what a core from before 2026-10-08 calls the deployer.
   const id = ((who && who.caller) || "anonymous").replace(/^guard$/, "deployer");
   const kind = /^(token|did|worker):/.test(id) ? id.split(":")[0] : id;
+  const via = (who && who.via) || "", holder = (who && who.holder) || "";
   return {
     id,
     kind,
     did: kind === "did" ? id : "",
     worker: kind === "worker" ? id.slice("worker:".length) : "",
-    token: kind === "token" ? id.slice("token:".length) : "",
-    // The owner in their own tab, not a token or a granted account acting for them.
-    session: id === "owner" && ((who && who.via) || "") === "session",
+    // The name of the secret a call is made with: a token's own, or the holder of a delegation.
+    token: kind === "token" ? id.slice("token:".length) : holder.startsWith("secret:") ? holder.slice("secret:".length) : "",
+    // A call under a delegation held by a secret or a Worker (plan/cloud-brain-authority.md): which, and who holds it.
+    delegation: via.startsWith("delegation:") ? via.slice("delegation:".length) : "",
+    holder,
+    // The owner in their own tab, not a token or a granted account acting for them. The core says so as `tab`;
+    // a caller built with no tab is in their tab when the via is session.
+    session: id === "owner" && (typeof (who && who.tab) === "boolean" ? who.tab : via === "session"),
     // The kernel has checked this caller against the method: the owner, a token or a granted account.
     trusted: id === "owner" || kind === "token" || kind === "did"
   };
 });};
+const _cloudflareiac_callerFrom = function _callerFrom() {return ((headers, o = "") => ({
+  caller: headers.get(`x-brain-${o}caller`.replace("origin-caller", "origin")) || "anonymous",
+  via: headers.get(`x-brain-${o}via`) || "",
+  holder: headers.get(`x-brain-${o}holder`) || "",
+  ...((t) => (t === "1" || t === "0" ? { tab: t === "1" } : {}))(headers.get(`x-brain-${o}tab`))
+}));};
+const _cloudflareiac_originFrom = function _originFrom(callerFrom) {return ((headers) => (headers.get("x-brain-origin") ? callerFrom(headers, "origin-") : callerFrom(headers)));};
+const _cloudflareiac_ownTab = function _ownTab(callerFrom) {return ((headers) => ((who) => (typeof who.tab === "boolean" ? who.tab : !/^(turn:|portal:|jwt$|delegation:)/.test(who.via)))(callerFrom(headers)));};
+const _cloudflareiac_keeperOf = function _keeperOf(callerFrom,ownTab) {return ((headers) => {
+  const who = callerFrom(headers);
+  if (who.caller === "anonymous") return who.caller;
+  if (who.via.startsWith("delegation:") && !ownTab(headers)) return "d:" + who.via.slice("delegation:".length);
+  return /^(turn:|portal:|jwt$)/.test(who.via) ? "via:" + who.caller : who.caller;
+});};
+const _cloudflareiac_matches = function _matches() {return ((patterns, nsid) => !!nsid && (patterns || []).some((m) => m === nsid || (/[./]\*$/.test(m) && nsid.startsWith(m.slice(0, -1)))));};
+const _cloudflareiac_neverHeld = function _neverHeld() {return ((nsid) => /^com\.lopecode\.brain\.(infra|secret|token|grant|people|delegation)[./]/.test(nsid || ""));};
+const _cloudflareiac_scoped = function _scoped() {return ((methods) =>
+  Array.isArray(methods) && methods.length > 0 && methods.length <= 50 && methods.every((m) => typeof m === "string" && (m === "*" || /^[A-Za-z0-9]+(\.[A-Za-z0-9]+)*(\/[A-Za-z0-9]+)*([./]\*)?$/.test(m)))
+    ? methods.map((m) => (m.startsWith("com.") ? m : "com.lopecode.brain." + m))
+    : null);};
+const _cloudflareiac_MEMBER = function _MEMBER() {return (["inbox.reply", "member.whoami", "member.services", "member.deploy", "member.remove", "member.modules", "static.put", "static.get", "static.list", "static.tag", "static.setPublic", "static.delete", "blob.upload", "blob.get", "blob.info", "blob.list", "blob.tag", "blob.delete", "portal.token", "portal.modules", "quota.get", "delegation.create", "delegation.list", "delegation.revoke"].map((m) => "com.lopecode.brain." + m));};
+const _cloudflareiac_may = function _may(MEMBER,matches) {return (({ member, grant }, nsid) => !!nsid && ((!!member && (MEMBER.includes(nsid) || nsid.startsWith("com.lopecode.brain.m."))) || matches(grant, nsid)));};
+const _cloudflareiac_test_one_matcher_and_the_callers_own_tab = function _test_one_matcher_and_the_callers_own_tab(expect,matches,may,keeperOf,ownTab,callerOf,callerFrom,originFrom) {
+  const h = (o) => new Headers(o);
+  // A list: whole names, and prefixes that end .* or /*. Not a part of a name.
+  const list = ["a.b.one", "a.c.*", "a.v1/*"];
+  expect(["a.b.one", "a.b.two", "a.c.x", "a.c.x.y", "a.cx", "a.v1/chat/x", "a.v1", ""].map((m) => matches(list, m))).toEqual([true, false, true, true, false, true, false, false]);
+  expect([matches(null, "a"), matches(["com.lopecode.brain.*"], "com.lopecode.brain.x.y")]).toEqual([false, true]);
+  // A member, a member with a grant, a DID with only a grant, nobody.
+  const B = "com.lopecode.brain.";
+  expect([may({ member: true }, B + "blob.get"), may({ member: true }, B + "m.0a.x"), may({ member: true }, B + "library.list"), may({ member: true, grant: [B + "library.list"] }, B + "library.list"), may({ grant: [B + "library.list"] }, B + "blob.get"), may({}, B + "blob.get"), may({ member: true }, null)]).toEqual([true, true, false, true, false, false, false]);
+  // keeperOf against the test four services had before it (brain-browser, 2026-10-10), on every caller there is today.
+  const before = (by, via) => (by !== "anonymous" && /^(turn:|portal:|jwt$)/.test(via) ? "via:" + by : by);
+  const today = [["owner", "session"], ["owner", "turn:7"], ["owner", "portal:ab"], ["owner", "jwt"], ["owner", ""], ["did:plc:a", "session"], ["did:plc:a", "turn:7"], ["did:plc:a", "jwt"], ["did:plc:a", "worker:brain-m-0a-x"], ["token:a", "token"], ["worker:brain-x-a", ""], ["deployer", ""], ["anonymous", ""], ["anonymous", "jwt"]];
+  for (const [by, via] of today) expect([by, via, keeperOf(h({ "x-brain-caller": by, "x-brain-via": via }))]).toEqual([by, via, before(by, via)]);
+  // ownTab against the test blob and static had: the owner by a turn, a portal or a PDS is not in their tab.
+  for (const [by, via] of today) expect([by, via, ownTab(h({ "x-brain-caller": by, "x-brain-via": via }))]).toEqual([by, via, !/^(turn:|portal:|jwt$)/.test(via)]);
+  // The one new case: a call under a delegation is not the caller's tab and keeps what it makes under the delegation.
+  const d = { "x-brain-caller": "owner", "x-brain-via": "delegation:0a1b2c3d4e5f" };
+  expect([ownTab(h(d)), keeperOf(h(d))]).toEqual([false, "d:0a1b2c3d4e5f"]);
+  // The core's word, when it sends one, is what counts: a delegation with the cap session is the owner's tab.
+  expect([ownTab(h({ ...d, "x-brain-tab": "1" })), keeperOf(h({ ...d, "x-brain-tab": "1" })), ownTab(h({ "x-brain-caller": "owner", "x-brain-via": "session", "x-brain-tab": "0" }))]).toEqual([true, "owner", false]);
+  // What a rule reads. With no tab, a session is the via, as before; with one, the tab.
+  const c = (w) => ((x) => [x.id, x.session, x.token, x.holder, x.delegation])(callerOf(w));
+  expect(c({ caller: "owner", via: "session" })).toEqual(["owner", true, "", "", ""]);
+  expect(c({ caller: "owner", via: "turn:7" })).toEqual(["owner", false, "", "", ""]);
+  expect(c({ caller: "token:a", via: "token" })).toEqual(["token:a", false, "a", "", ""]);
+  expect(c(callerFrom(h({ ...d, "x-brain-holder": "secret:laptop" })))).toEqual(["owner", false, "laptop", "secret:laptop", "0a1b2c3d4e5f"]);
+  expect(c(callerFrom(h({ ...d, "x-brain-tab": "1" })))).toEqual(["owner", true, "", "", "0a1b2c3d4e5f"]);
+  expect(c({ caller: "did:plc:a", via: "session", tab: true })).toEqual(["did:plc:a", false, "", "", ""]);
+  // The origin has headers of its own, and is the caller when the core names none.
+  const o = h({ "x-brain-caller": "worker:brain-x-a", "x-brain-origin": "owner", "x-brain-origin-via": "delegation:ff", "x-brain-origin-tab": "0", "x-brain-origin-holder": "worker:brain-x-topic" });
+  expect([originFrom(o), originFrom(h({ "x-brain-caller": "owner", "x-brain-via": "session" }))]).toEqual([{ caller: "owner", via: "delegation:ff", holder: "worker:brain-x-topic", tab: false }, { caller: "owner", via: "session", holder: "" }]);
+  return "one matcher; the keeper and the tab as before, and one new case";
+};
 const _cloudflareiac_decide = function _decide(ruleExpression,cel) {
   const parsed = new Map();
   return (rule, context) => {
@@ -21344,11 +21406,21 @@ export default function define(runtime, observer) {
   $def("_cloudflareiac_distilIn", "distilIn", ["globalThis"], _cloudflareiac_distilIn);
   $def("_cloudflareiac_test_distils_in_quickjs_to_the_same_hash", "test_distils_in_quickjs_to_the_same_hash", ["distillerData","exportModuleJS","quickjsLib","quickjs","distilIn","fx_service","expect"], _cloudflareiac_test_distils_in_quickjs_to_the_same_hash);
   $def("_cloudflareiac_test_source_that_does_not_end_is_stopped_in_the_sandbox", "test_source_that_does_not_end_is_stopped_in_the_sandbox", ["quickjsLib","quickjs","distilIn","distillerData","expect"], _cloudflareiac_test_source_that_does_not_end_is_stopped_in_the_sandbox);
-  $def("_cloudflareiac_anon_639bf372a9", null, ["md"], _cloudflareiac_anon_639bf372a9);
+  $def("_cloudflareiac_anon_77c6463f10", null, ["md"], _cloudflareiac_anon_77c6463f10);
   $def("_cloudflareiac_cel", "cel", ["library","FileAttachment"], _cloudflareiac_cel);
   $def("_cloudflareiac_checkedRule", "checkedRule", ["cel"], _cloudflareiac_checkedRule);
   $def("_cloudflareiac_ruleExpression", "ruleExpression", [], _cloudflareiac_ruleExpression);
   $def("_cloudflareiac_callerOf", "callerOf", [], _cloudflareiac_callerOf);
+  $def("_cloudflareiac_callerFrom", "callerFrom", [], _cloudflareiac_callerFrom);
+  $def("_cloudflareiac_originFrom", "originFrom", ["callerFrom"], _cloudflareiac_originFrom);
+  $def("_cloudflareiac_ownTab", "ownTab", ["callerFrom"], _cloudflareiac_ownTab);
+  $def("_cloudflareiac_keeperOf", "keeperOf", ["callerFrom","ownTab"], _cloudflareiac_keeperOf);
+  $def("_cloudflareiac_matches", "matches", [], _cloudflareiac_matches);
+  $def("_cloudflareiac_neverHeld", "neverHeld", [], _cloudflareiac_neverHeld);
+  $def("_cloudflareiac_scoped", "scoped", [], _cloudflareiac_scoped);
+  $def("_cloudflareiac_MEMBER", "MEMBER", [], _cloudflareiac_MEMBER);
+  $def("_cloudflareiac_may", "may", ["MEMBER","matches"], _cloudflareiac_may);
+  $def("_cloudflareiac_test_one_matcher_and_the_callers_own_tab", "test_one_matcher_and_the_callers_own_tab", ["expect","matches","may","keeperOf","ownTab","callerOf","callerFrom","originFrom"], _cloudflareiac_test_one_matcher_and_the_callers_own_tab);
   $def("_cloudflareiac_decide", "decide", ["ruleExpression","cel"], _cloudflareiac_decide);
   $def("_cloudflareiac_fx_app", "fx_app", ["hono","inbox","secrets","fx_double","fixtureTriple","fx_base","rows"], _cloudflareiac_fx_app);
   $def("_cloudflareiac_fx_plain", "fx_plain", ["cloudflare","Response"], _cloudflareiac_fx_plain);
@@ -24109,7 +24181,7 @@ const _braincore_core_announce = function _core_announce(plugins,core_service,in
   plugins.add("workers", core_service, { invalidation });
   return "announced core_service";
 };
-const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,workers,Request,deployer,ruleExpression,checkedRule,callerOf,cel,Response,decide) {
+const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,matches,may,neverHeld,workers,Request,deployer,ruleExpression,checkedRule,callerOf,cel,Response,scoped,MEMBER,decide) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.";
   const fail = (c, status, error, message) => (c.set("error", error), c.json({ error, message }, status));
@@ -24141,6 +24213,8 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
   // made for another Worker gives nothing, and the origin is then the Worker itself. Nothing a Worker says in clear
   // is read. Signed and not kept: the core has many instances and none of them remembers a call.
   const CONTEXT_MS = 120000;
+  // Is this the caller's own tab: a person's session. A call under a delegation says so itself (who.tab).
+  const tabOf = (who) => (typeof who.tab === "boolean" ? who.tab : who.via === "session");
   const utf8 = new TextEncoder();
   const b64u = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const unb64u = (text) => Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), (ch) => ch.charCodeAt(0));
@@ -24154,7 +24228,8 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
       throw e;
     }));
   const contextFor = async (worker, origin) => {
-    const payload = b64u(utf8.encode(JSON.stringify({ o: origin.caller, v: origin.via || "", w: worker, e: Date.now() + (config.contextMs ?? CONTEXT_MS) })));
+    // t: the origin's own tab. d, n, h: the delegation the chain began under, who holds it, and how long the chain is.
+    const payload = b64u(utf8.encode(JSON.stringify({ o: origin.caller, v: origin.via || "", w: worker, e: Date.now() + (config.contextMs ?? CONTEXT_MS), t: tabOf(origin) ? 1 : 0, d: origin.d || "", n: origin.holder || "", h: origin.hops || 0 })));
     return "c1." + payload + "." + b64u(await crypto.subtle.sign("HMAC", await keyOfOrigin(), utf8.encode(payload)));
   };
   const originFrom = async (reference, worker) => {
@@ -24164,7 +24239,8 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
       // One spelling for each signature: base64url has spare bits in its last character.
       if (b64u(unb64u(m[2])) !== m[2] || !(await crypto.subtle.verify("HMAC", await keyOfOrigin(), unb64u(m[2]), utf8.encode(m[1])))) return null;
       const p = JSON.parse(new TextDecoder().decode(unb64u(m[1])));
-      return p.w === worker && p.e > Date.now() && typeof p.o === "string" ? { caller: p.o, via: p.v || "" } : null;
+      // A reference from before 2026-10-10 has no t: the tab is then the via, as it was.
+      return p.w === worker && p.e > Date.now() && typeof p.o === "string" ? { caller: p.o, via: p.v || "", tab: p.t === undefined ? p.v === "session" : !!p.t, d: p.d || "", holder: p.n || "", hops: p.h || 0 } : null;
     } catch {
       return null;
     }
@@ -24194,6 +24270,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
   // here and no others: names and decisions. Never a header, a body, a parameter's value or a secret.
   //   ray     the cf-ray of the call from the internet this one is part of; the kernel passes it on
   //   caller  who called, via how (session, or the member's Worker); origin: who started the chain
+  //   delegation, holder   the delegation this call or its chain is under, and the Worker or secret that holds it
   //   worker  the Worker the call was forwarded to, or brain-core
   //   error   the XRPC error name of an answer of 400 and above
   //   price   US dollars, when the method has a price
@@ -24207,7 +24284,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     // typed. A path by the pattern a service declared, so what a caller put in a path is not written.
     const nsid = path.startsWith(NS) ? path.slice(NS.length) : null;
     console.log({
-      at: "call", ray: (c.req.header("x-brain-ray") || "").slice(0, 64), caller: who.caller, via: who.via || "", origin: origin.caller,
+      at: "call", ray: (c.req.header("x-brain-ray") || "").slice(0, 64), caller: who.caller, via: who.via || "", origin: origin.caller, delegation: who.d || origin.d || "", holder: who.holder || origin.holder || "",
       method: nsid || c.get("path") ? nameOf(c).slice(0, 80) : "(unknown)", worker: c.get("target") || c.get("routed") || "brain-core", status, error: (await error) || null, ms: Date.now() - started,
       price: c.get("price") ?? null, rule: c.get("rule") || (status === 401 || status === 403 ? "deny" : status < 400 ? "allow" : ""), by: c.get("by") || "core"
     });
@@ -24233,9 +24310,34 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     if (!person) return fail(c, 403, "Forbidden", `${author} is not a member, so ${worker} may call nothing`);
     const route = await rows.get("route/" + worker);
     if (!route || route.off) return fail(c, 403, "Forbidden", `${worker} is switched off`);
-    if (!nsid || !(WORKER.includes(nsid) || nsid.startsWith(MEMBER_NS) || person.methods.includes(nsid))) return fail(c, 403, "Forbidden", `${worker} runs as ${author}, who has no grant for ${nsid || url.pathname}`);
+    if (!nsid || !(WORKER.includes(nsid) || nsid.startsWith(MEMBER_NS) || matches(person.methods, nsid))) return fail(c, 403, "Forbidden", `${worker} runs as ${author}, who has no grant for ${nsid || url.pathname}`);
     if (!(await spend(person))) return fail(c, 429, "RateLimitExceeded", `${author} has used today's ${quotaOf(person).calls} calls`);
     c.set("who", { caller: author, via: "worker:" + worker });
+    return null;
+  };
+  // Delegations (plan/cloud-brain-authority.md). The owner or a member lets a holder call the methods in a scope:
+  // a row delegation/<id>. A Worker that holds one names it in x-brain-as, and the call is then by who made the
+  // delegation (`from`): the caller a rule reads, the account that pays. It is not their own tab, and it begins a
+  // chain of its own: the origin of whatever the Worker was answering is not read. Allowed when the method is in the
+  // scope and `from` may call it now, read on each call through settings' 5 s of memory. Not held to the holder's
+  // own `calls`: the scope is the bound.
+  const HOPS = 8;
+  const mayNow = async (from, nsid) => {
+    if (from === "owner") return true;
+    const person = from.startsWith("did:") ? await rows.get("person/" + from) : null;
+    return !!person && may({ member: true, grant: person.methods }, nsid);
+  };
+  const asHolder = async (c, worker, id) => {
+    const url = new URL(c.req.url), nsid = url.pathname.startsWith("/xrpc/") ? url.pathname.slice("/xrpc/".length) : null;
+    const d = /^[0-9a-f]{12}$/.test(id) ? await settings.get("delegation/" + id) : null;
+    if (!d || !d.holder || d.holder.worker !== worker) return fail(c, 403, "Forbidden", `${worker} holds no such delegation`);
+    if (d.until && d.until <= clock()) return fail(c, 403, "Forbidden", `delegation ${d.name} has ended`);
+    // The holder says how long the chain is that this call goes on from. A push that causes a push is one longer.
+    const hops = Number(c.req.header("x-brain-hops") || 0);
+    if (!Number.isInteger(hops) || hops < 0 || hops >= HOPS) return fail(c, 403, "Forbidden", `a chain of calls under delegations is at most ${HOPS} long`);
+    if (!nsid || neverHeld(nsid) || !matches(d.scope, nsid)) return fail(c, 403, "Forbidden", `delegation ${d.name} does not reach ${nsid || url.pathname}`);
+    if (!(await mayNow(d.from, nsid))) return fail(c, 403, "Forbidden", `${d.from} may not call ${nsid} now, so delegation ${d.name} does not`);
+    c.set("who", { caller: d.from, via: "delegation:" + d.id, tab: false, holder: "worker:" + worker, d: d.id, hops: hops + 1 });
     return null;
   };
   // A Worker calls what its service declared in `calls`, and what a platform cell calls for it (IMPLICIT). The list is
@@ -24291,17 +24393,19 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     const started = Date.now();
     const who = await identify(c.req.raw);
     c.set("who", who);
-    const no = who.member ? await asAuthor(c, who.member) : who.caller.startsWith("worker:") ? await asDeclared(c, who.caller.slice("worker:".length)) : null;
+    // x-brain-as is read from a Worker known by its key, and not from a member's: that one runs as its author.
+    const as = !who.member && who.keyed ? c.req.header("x-brain-as") : null;
+    const no = who.member ? await asAuthor(c, who.member) : as ? await asHolder(c, who.keyed, as) : who.caller.startsWith("worker:") ? await asDeclared(c, who.caller.slice("worker:".length)) : null;
     if (no) {
       await routeOf(c);
       c.set("rule", "deny");
-      c.set("by", who.member ? "grant" : "calls");
+      c.set("by", who.member ? "grant" : as ? "delegation" : "calls");
       await say(c, started, no.status, c.get("error"));
       return no;
     }
     // Only a Worker known by its key can carry an origin. A member's Worker is checked as its author and keeps the origin too.
     const now = c.get("who");
-    c.set("origin", (who.keyed && (await originFrom(c.req.header("x-brain-context"), who.keyed))) || { caller: now.caller, via: now.via || "" });
+    c.set("origin", now.d ? now : (who.keyed && (await originFrom(c.req.header("x-brain-context"), who.keyed))) || { caller: now.caller, via: now.via || "" });
     await next();
     const done = say(c, started, c.res.status, errorOf(c, c.res)).catch(() => null);
     try {
@@ -24313,7 +24417,13 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
   const allowed = (who) => who.caller === "owner" || /^(token|did):/.test(who.caller);
   const owner = async (c, next) => (allowed(c.get("who")) ? next() : fail(c, 401, "AuthRequired", "the owner"));
   const session = async (c, next) =>
-    c.get("who").caller === "owner" && c.get("who").via === "session" ? next() : fail(c, 401, "AuthRequired", "the owner's own session");
+    c.get("who").caller === "owner" && tabOf(c.get("who")) ? next() : fail(c, 401, "AuthRequired", "the owner's own session");
+  // A person in their own session: the owner, or a member. The via is the kernel's word, so no Worker and no
+  // delegation passes, whatever it holds.
+  const inPerson = async (c, next) => {
+    const w = c.get("who");
+    return w.via === "session" && (w.caller === "owner" || (w.caller.startsWith("did:") && (await rows.get("person/" + w.caller)))) ? next() : fail(c, 401, "AuthRequired", "the owner's or a member's own session");
+  };
   const deployerOnly = async (c, next) => (c.get("who").caller === "deployer" ? next() : fail(c, 401, "AuthRequired", "the deployer"));
 
   const toDeployer = async (verdict) => {
@@ -24557,11 +24667,18 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     for (const name of [...headers.keys()]) if (name.startsWith("x-brain-")) headers.delete(name);
     headers.set("x-brain-caller", who.caller);
     if (who.via) headers.set("x-brain-via", who.via);
+    // The caller's own tab, and who holds the delegation a call is under: a store keeps what such a call makes apart.
+    headers.set("x-brain-tab", tabOf(who) ? "1" : "0");
+    if (who.holder) headers.set("x-brain-holder", who.holder);
     if (ray) headers.set("x-brain-ray", ray);
     // The origin in clear, for a Worker that decides rules of its own, and the reference it sends back on a call it makes for this one.
     const origin = c.get("origin");
     headers.set("x-brain-origin", origin.caller);
     if (origin.via) headers.set("x-brain-origin-via", origin.via);
+    headers.set("x-brain-origin-tab", tabOf(origin) ? "1" : "0");
+    if (origin.holder) headers.set("x-brain-origin-holder", origin.holder);
+    // How long the chain is. A holder that pushes on from this call sends it back, so a loop of pushes ends.
+    headers.set("x-brain-hops", String(origin.hops || 0));
     headers.set("x-brain-context", await contextFor(route.worker, origin));
     // The Worker's stored settings. Always sent, so a removed key is seen as removed.
     headers.set("x-brain-settings", encodeURIComponent(JSON.stringify(await settingsOf(route.worker))));
@@ -24651,6 +24768,12 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     if (!account) return fail(c, 402, "OutOfCredits", `${target} costs ${money(price.usd)} and ${callerOf(origin).id} has no credits`);
     if (!workers.has(route.worker.replace(/^brain-(x-)?/, ""))) return forward(route, c);
     const allowance = await allowanceOf(account, p);
+    // A chain under a delegation with a daily amount is counted under it first, in the same kind of list.
+    const held = origin.d ? await settings.get("delegation/" + origin.d) : null;
+    if (held && Number.isFinite(held.daily)) {
+      const cap = await charge("delegation/" + held.id, u, held.daily, { m: target, c: c.get("who").caller, o: origin.caller, v: origin.via || "" });
+      if (!cap.ok) return fail(c, 402, "OutOfCredits", `${target} costs ${money(usd(u))}. Delegation ${held.name} has spent ${money(usd(cap.spent))} of ${money(held.daily)} today`);
+    }
     const got = await charge(account, u, allowance, { m: target, c: c.get("who").caller, o: origin.caller, v: origin.via || "" });
     if (!got.ok)
       return fail(c, 402, "OutOfCredits", got.full
@@ -24713,7 +24836,8 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
   app.get(NS + "quota.list", owner, async (c) => {
     const p = await pricing(), day = today(), base = `spend/${day}/`;
     const set = new Map((await rows.list("quota/who/")).map(({ key, value }) => [key.slice("quota/who/".length), value]));
-    const spent = new Map((await rows.list(base)).map(({ key, value }) => [key.slice(base.length), value]));
+    // A delegation's own count is under delegation/<id>: delegation.list shows it, and it is no account.
+    const spent = new Map((await rows.list(base)).map(({ key, value }) => [key.slice(base.length), value]).filter(([who]) => !who.startsWith("delegation/")));
     // The owner, each account with an allowance of its own, and each that has spent today. One whose every charge was refused is in the ledger only.
     const accounts = [...new Set(["owner", ...set.keys(), ...spent.keys()])].sort().map((who) => {
       const daily = set.has(who) && Number.isFinite(set.get(who).daily) ? set.get(who).daily : p[kindOf(who)] ?? 0;
@@ -24765,7 +24889,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,wo
     const holds = routes.some((r) => "com.lopecode.brain.knowledge.search" in r.methods) ? `
 ## Finding what it holds
 
-- \`GET ${at}${X}knowledge.search?semantic=true&q=<the task, in words>\`: what this Brain holds that is nearest the question, as pointers (\`title\`, \`kind\`, \`url\`, \`id\`): notebook modules (\`&kind=module\`), papers, articles, notes. Search here before writing something that may exist. The owner or a token that names the method; \`knowledge.get?id=\` has an entry's text.
+- \`GET ${at}${X}knowledge.search?semantic=true&q=<the task, in words>\`: what this Brain holds that is nearest the question, as pointers (\`title\`, \`kind\`, \`url\`, \`id\`): notebook modules (\`&kind=module\`), the docs of how the notebooks and this Brain are worked on (\`&kind=doc\`), papers, articles, notes. Search here before writing something that may exist. The owner or a token that names the method; \`knowledge.get?id=\` has an entry's text.
 ` : "";
     const text = `# Cloud Brain at ${at}
 
@@ -24834,6 +24958,47 @@ ${deployed.join("\n\n")}
       if (!route || !routed(route) || route.role === "member") return fail(c, 404, "NotFound", name);
       return forward(route, c, NS + what + "?worker=" + encodeURIComponent(name) + (c.req.query("part") === "reference" ? "&part=reference" : ""));
     });
+  // Making a delegation. Only a Worker holder so far, and it has no caps: a secret holder and a DID holder are the
+  // kernel's tokens and grants until they move here.
+  app.post(NS + "delegation.create", inPerson, async (c) => {
+    const from = c.get("who").caller, b = (await c.req.json().catch(() => null)) || {};
+    const { name, holder, caps = [], until = null, daily = null, note = "" } = b, scope = scoped(b.scope);
+    if (typeof name !== "string" || !/^[a-z0-9-]{1,40}$/.test(name)) return fail(c, 400, "InvalidRequest", "name is a-z, 0-9 and -, 1 to 40 characters");
+    if (!holder || typeof holder.worker !== "string" || Object.keys(holder).length !== 1) return fail(c, 400, "InvalidRequest", "holder is { worker: NAME }");
+    // A delegation names a Worker and not its code, so the Worker is one the owner deploys.
+    const route = await rows.get("route/" + holder.worker);
+    if (!route || !["recipe", "system"].includes(route.role)) return fail(c, 400, "InvalidRequest", `${holder.worker} is not a Worker the owner deployed`);
+    if (!Array.isArray(caps) || caps.length) return fail(c, 400, "InvalidRequest", "a Worker holder has no caps");
+    if (!scope) return fail(c, 400, "InvalidRequest", "scope is 1 to 50 method names; a prefix ends .* or /*, and * is every method");
+    const no = scope.find(neverHeld);
+    if (no) return fail(c, 400, "InvalidRequest", `${no} is reached by nothing but a person's own session`);
+    if (from !== "owner") {
+      const me = await rows.get("person/" + from), ALL = "com.lopecode.brain.*";
+      const over = scope.find((m) => m !== ALL && !may({ member: true, grant: me.methods }, m) && !(/[./]\*$/.test(m) && MEMBER.some((own) => own.startsWith(m.slice(0, -1)))));
+      if (over) return fail(c, 403, "Forbidden", `${from} may not call ${over}`);
+    }
+    if (until !== null && !(Number.isInteger(until) && until > clock())) return fail(c, 400, "InvalidRequest", "until is a time in ms after now, or null");
+    if (daily !== null && !(typeof daily === "number" && Number.isFinite(daily) && daily >= 0)) return fail(c, 400, "InvalidRequest", "daily is US dollars a UTC day, or null");
+    if (typeof note !== "string" || note.length > 300) return fail(c, 400, "InvalidRequest", "note is text, at most 300 characters");
+    if ((await rows.list("delegation/")).some((r) => r.value.from === from && r.value.name === name)) return fail(c, 400, "InvalidRequest", `a delegation named ${name} exists; revoke it first`);
+    const id = [...crypto.getRandomValues(new Uint8Array(6))].map((x) => x.toString(16).padStart(2, "0")).join("");
+    const d = { id, name, from, holder: { worker: holder.worker }, scope, caps: [], until, daily, parent: null, note, created: Date.now(), by: c.get("who").via };
+    await settings.put("delegation/" + id, d);
+    return c.json(d);
+  });
+  // The owner reads every delegation, a member their own. spentToday: what was charged under it this UTC day.
+  app.get(NS + "delegation.list", inPerson, async (c) => {
+    const me = c.get("who").caller, day = today();
+    const mine = (await rows.list("delegation/")).map((r) => r.value).filter((d) => me === "owner" || d.from === me).sort((a, b) => a.created - b.created);
+    return c.json({ delegations: await Promise.all(mine.map(async (d) => ({ ...d, spentToday: usd(fold(await rows.get(spendKey(day, "delegation/" + d.id))).spent) }))) });
+  });
+  app.post(NS + "delegation.revoke", inPerson, async (c) => {
+    const me = c.get("who").caller, { id } = (await c.req.json().catch(() => null)) || {};
+    const d = typeof id === "string" && /^[0-9a-f]{12}$/.test(id) ? await rows.get("delegation/" + id) : null;
+    if (!d || (me !== "owner" && d.from !== me)) return c.json({ revoked: false });
+    await settings.delete("delegation/" + id);
+    return c.json({ revoked: true, id });
+  });
   app.all("*", async (c) => {
     const url = new URL(c.req.url), who = c.get("who");
     const { route, method, path, nsid } = await routeOf(c);
@@ -25650,7 +25815,7 @@ const _braincore_test_a_members_worker_spends_its_authors_credits = async functi
 };
 const _braincore_test_one_log_line_a_call_with_these_keys_and_no_secret = async function _test_one_log_line_a_call_with_these_keys_and_no_secret(coreRig,logged,expect) {
   const rig = await coreRig();
-  const KEYS = ["at", "by", "caller", "error", "method", "ms", "origin", "price", "ray", "rule", "status", "via", "worker"];
+  const KEYS = ["at", "by", "caller", "delegation", "error", "holder", "method", "ms", "origin", "price", "ray", "rule", "status", "via", "worker"];
   const ray = (n) => ({ "x-brain-ray": "ray-keys-" + n });
   const lines = await logged(async () => {
     // Secret-looking text in a parameter, a header, a body, a path and a method name nobody declared.
@@ -25714,6 +25879,95 @@ const _braincore_test_the_log_line_of_a_priced_call_has_its_price = async functi
   expect(mine.map((l) => [l.status, l.error, l.price, l.rule, l.by])).toEqual([[200, null, 0.25, "allow", "manifest"], [402, "OutOfCredits", 0.25, "allow", "manifest"]]);
   return "200 then 402, each with the price";
 };
+const _braincore_test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed = async function _test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed(coreRig,expect) {
+  const rig = await coreRig();
+  const ADA = "did:plc:ada", B = "com.lopecode.brain.";
+  await rig.as("kernel", "")("people.sync", { people: [{ did: ADA, methods: [B + "echo.read"] }] });
+  await rig.deployer("service.register", { worker: "brain-m-ada-notes", role: "member", author: ADA, keyHash: "ada", paths: [], secrets: [], methods: {} });
+  const make = (as, more = {}) => as("delegation.create", { name: "push", holder: { worker: "brain-x-echo" }, scope: ["echo.say"], ...more });
+  // The owner in their session. Not a turn, a PDS call, a Worker or nobody; nor a DID that is not a member.
+  const made = await make(rig.owner, { note: "orders, pushed to echo.say", daily: 0.5 });
+  expect(made.data).toMatchObject({ name: "push", from: "owner", holder: { worker: "brain-x-echo" }, scope: [B + "echo.say"], caps: [], until: null, daily: 0.5, parent: null, by: "session" });
+  expect(made.data.id).toMatch(/^[0-9a-f]{12}$/);
+  for (const as of [rig.as("owner", "turn:7"), rig.as("owner", "jwt"), rig.as("owner", "delegation:" + made.data.id), rig.worker, rig.anonymous, rig.as("did:plc:stranger")]) expect((await make(as, { name: "other" })).status).toBe(401);
+  // What is refused: a second of the name, a member's Worker, a secret or a DID holder, a cap, a part of a name, and
+  // what only a session reaches.
+  const bad = [{}, { name: "Push 2" }, { name: "a", holder: { worker: "brain-m-ada-notes" } }, { name: "a", holder: { worker: "brain-x-none" } }, { name: "a", holder: { secret: "x" } }, { name: "a", holder: { did: ADA } }, { name: "a", caps: ["session"] }, { name: "a", scope: ["ech*"] }, { name: "a", scope: [] }, { name: "a", scope: ["secret.get"] }, { name: "a", scope: ["delegation.*"] }, { name: "a", scope: ["infra.apply"] }, { name: "a", until: 5 }, { name: "a", daily: -1 }];
+  for (const more of bad) expect([JSON.stringify(more), (await make(rig.owner, more)).status]).toEqual([JSON.stringify(more), 400]);
+  // A member makes one for what they may call: the list every member has, a member's method, and their grant.
+  const ada = rig.as(ADA);
+  expect((await make(ada, { scope: ["echo.read", "blob.*", "m.0a.shop.receive", "*"] })).data).toMatchObject({ from: ADA, scope: [B + "echo.read", B + "blob.*", B + "m.0a.shop.receive", B + "*"] });
+  expect([(await make(ada, { name: "more", scope: ["echo.say"] })).status, (await make(ada, { name: "more", scope: ["echo.*"] })).status]).toEqual([403, 403]);
+  // The owner reads all, a member their own; each revokes their own, and the owner any.
+  const list = async (as) => (await as("delegation.list")).data.delegations.map((d) => [d.from, d.name, d.spentToday]).sort();
+  expect([await list(rig.owner), await list(ada)]).toEqual([[[ADA, "push", 0], ["owner", "push", 0]], [[ADA, "push", 0]]]);
+  expect((await rig.as("owner", "turn:7")("delegation.list")).status).toBe(401);
+  expect((await ada("delegation.revoke", { id: made.data.id })).data).toEqual({ revoked: false });
+  const hers = (await ada("delegation.list")).data.delegations[0].id;
+  expect([(await rig.owner("delegation.revoke", { id: hers })).data, (await rig.owner("delegation.revoke", { id: "nope" })).data, await list(ada)]).toEqual([{ revoked: true, id: hers }, { revoked: false }, []]);
+  return "made by a session, for a system Worker";
+};
+const _braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab = async function _test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab(Response,coreRig,sha256,expect) {
+  const heard = [], B = "com.lopecode.brain.", ADA = "did:plc:ada";
+  const hear = (worker) => async (request) => {
+    if (request.url.endsWith(".getInfo")) return Response.json({ name: "brain-x-" + worker, hash: "h", calls: [] });
+    heard.push({ worker, ...Object.fromEntries(["caller", "via", "tab", "holder", "origin", "origin-via", "origin-tab", "origin-holder", "hops", "context", "member"].map((h) => [h, request.headers.get("x-brain-" + h)])) });
+    return Response.json({ ok: true });
+  };
+  const config = {}, rig = await coreRig({ config, workers: { shop: hear("shop"), sink: hear("sink") } });
+  await rig.deployer("service.register", { worker: "brain-x-shop", role: "recipe", paths: [], secrets: [], hash: "h", keyHash: await sha256("shop-key"), methods: { [B + "shop.receive"]: { type: "procedure", who: "owner" }, [B + "shop.tab"]: { type: "procedure", who: "anyone", allow: "caller.session" }, [B + "shop.paid"]: { type: "procedure", who: "owner", price: "0.04" }, [B + "shop.whose"]: { type: "procedure", who: "anyone", allow: 'caller.holder == "worker:brain-x-echo" && caller.delegation != "" && caller.kind == "owner"' } } });
+  await rig.deployer("service.register", { worker: "brain-x-sink", role: "recipe", paths: [], secrets: [], hash: "h", keyHash: await sha256("sink-key"), methods: { [B + "sink.take"]: { type: "procedure", who: "anyone", allow: "origin.session" }, [B + "sink.any"]: { type: "procedure", who: "anyone" } } });
+  await rig.as("kernel", "")("people.sync", { people: [{ did: ADA, methods: [B + "shop.receive"] }] });
+  const d = (await rig.owner("delegation.create", { name: "push", holder: { worker: "brain-x-echo" }, scope: ["shop.*", "rule.put", "sink.any"], daily: 0.05 })).data;
+  const held = (id, hops) => rig.send("https://core.internal", { "x-brain-key": "echo-key", "x-brain-as": id, ...(hops === undefined ? {} : { "x-brain-hops": String(hops) }), "x-brain-caller": "did:plc:forged", "x-brain-via": "session", "x-brain-context": "c1.forged.forged" });
+  const echo = held(d.id);
+  // The call is the owner's, not in their tab, with the holder named. It begins a chain: origin is the owner too.
+  expect((await echo("shop.receive", {})).status).toBe(200);
+  expect(heard.at(-1)).toMatchObject({ worker: "shop", caller: "owner", via: "delegation:" + d.id, tab: "0", holder: "worker:brain-x-echo", origin: "owner", "origin-via": "delegation:" + d.id, "origin-tab": "0", "origin-holder": "worker:brain-x-echo", hops: "1" });
+  // A rule reads the holder and the delegation. caller.session is false, and so is the core's own session guard.
+  expect([(await echo("shop.whose", {})).status, (await echo("shop.tab", {})).status, (await echo("rule.put", { target: B + "shop.receive", allow: "true" })).status]).toEqual([200, 401, 401]);
+  // Not in the scope; never a holder's, whatever the scope; a path; another Worker with the same id; no such id.
+  const wide = (await rig.owner("delegation.create", { name: "wide", holder: { worker: "brain-x-echo" }, scope: ["*"] })).data;
+  expect([(await echo("echo.say", {})).status, (await held(wide.id)("secret.get?name=X")).status, (await held(wide.id)("delegation.list")).status, (await held(wide.id)("delegation.create", { name: "x", holder: { worker: "brain-x-echo" }, scope: ["*"] })).status, (await held(wide.id)("/hooks/echo")).status]).toEqual([403, 403, 403, 403, 403]);
+  expect([(await rig.send("https://core.internal", { "x-brain-key": "shop-key", "x-brain-as": d.id })("shop.receive", {})).status, (await held("0123456789ab")("shop.receive", {})).status, (await held("../route/brain")("shop.receive", {})).status]).toEqual([403, 403, 403]);
+  // The kernel cannot name a delegation: x-brain-as is read from a Worker's key only.
+  expect((await rig.as("anonymous", "")("shop.receive", {}, { "x-brain-as": d.id })).status).toBe(401);
+  // It is not held to the holder's own calls: the scope is the bound. Without x-brain-as the same Worker is.
+  await rig.owner("calls.setMode", { mode: "enforce" });
+  expect([(await echo("shop.receive", {})).status, (await rig.worker("shop.receive", {})).status]).toEqual([200, 403]);
+  // A Worker that answers such a call and calls on: the origin is the owner under the delegation, not in their tab,
+  // and the chain is as long as it was.
+  const on = rig.send("https://core.internal", { "x-brain-key": "shop-key", "x-brain-context": heard.at(-1).context });
+  await rig.owner("calls.setMode", { mode: "report" });
+  expect([(await on("sink.take", {})).status, (await on("sink.any", {})).status]).toEqual([401, 200]);
+  expect(heard.at(-1)).toMatchObject({ worker: "sink", caller: "worker:brain-x-shop", tab: "0", origin: "owner", "origin-via": "delegation:" + d.id, "origin-tab": "0", "origin-holder": "worker:brain-x-echo", hops: "1" });
+  // A chain from the owner's session is in their tab all the way, as before.
+  await rig.owner("shop.receive", {});
+  expect(heard.at(-1)).toMatchObject({ caller: "owner", via: "session", tab: "1", holder: null, "origin-tab": "1", hops: "0" });
+  expect((await rig.send("https://core.internal", { "x-brain-key": "shop-key", "x-brain-context": heard.at(-1).context })("sink.take", {})).status).toBe(200);
+  // A holder that pushes on says how long the chain is; the ninth is refused.
+  expect([(await held(d.id, 7)("shop.receive", {})).status, heard.at(-1).hops, (await held(d.id, 8)("shop.receive", {})).status, (await held(d.id, -1)("shop.receive", {})).status, (await held(d.id, "x")("shop.receive", {})).status]).toEqual([200, "8", 403, 403, 403]);
+  // Money: the owner pays, and the delegation's daily amount is the most it spends in a day.
+  expect([(await echo("shop.paid", {})).status, (await echo("shop.paid", {})).status]).toEqual([200, 402]);
+  expect((await rig.owner("quota.list")).data.accounts.map((a) => [a.who, a.spent])).toEqual([["owner", 0.04]]);
+  expect((await rig.owner("delegation.list")).data.delegations.map((x) => [x.name, x.spentToday]).sort()).toEqual([["push", 0.04], ["wide", 0]]);
+  // A member's: the caller is the member, and what the member may not call now, it does not reach.
+  const ada = (await rig.as(ADA)("delegation.create", { name: "mine", holder: { worker: "brain-x-echo" }, scope: ["shop.receive"] })).data;
+  expect((await held(ada.id)("shop.receive", {})).status).toBe(200);
+  expect(heard.at(-1)).toMatchObject({ caller: ADA, via: "delegation:" + ada.id, tab: "0", origin: ADA, member: "1" });
+  await rig.as("kernel", "")("people.sync", { people: [{ did: ADA, methods: [] }] });
+  expect((await held(ada.id)("shop.receive", {})).status).toBe(403);
+  await rig.as("kernel", "")("people.sync", { people: [] });
+  expect((await held(ada.id)("shop.receive", {})).status).toBe(403);
+  // Ended, and revoked: the next call is refused.
+  const brief = (await rig.owner("delegation.create", { name: "brief", holder: { worker: "brain-x-echo" }, scope: ["shop.receive"], until: Date.now() + 60000 })).data;
+  expect((await held(brief.id)("shop.receive", {})).status).toBe(200);
+  expect((await rig.owner("delegation.revoke", { id: d.id })).data.revoked).toBe(true);
+  expect([(await echo("shop.receive", {})).status, (await held(wide.id)("shop.receive", {})).status]).toEqual([403, 200]);
+  config.clockSkewMs = 120000;
+  expect([(await held(brief.id)("shop.receive", {})).status, (await held(wide.id)("shop.receive", {})).status]).toEqual([403, 200]);
+  return heard.length + " calls heard";
+};
 
 export default function define(runtime, observer) {
   const main = runtime.module();
@@ -25723,7 +25977,7 @@ export default function define(runtime, observer) {
   $def("_braincore_anon_a6f47c8e70", null, ["md"], _braincore_anon_a6f47c8e70);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
-  $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","decide"], _braincore_coreApp);
+  $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","matches","may","neverHeld","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","scoped","MEMBER","decide"], _braincore_coreApp);
   $def("_braincore_anon_cf662cd9e9", null, ["md"], _braincore_anon_cf662cd9e9);
   $def("_braincore_coreRig", "coreRig", ["simulate","core_service","Response","sha256"], _braincore_coreRig);
   $def("_braincore_test_llms_txt_is_written_from_the_host_and_the_route_table", "test_llms_txt_is_written_from_the_host_and_the_route_table", ["coreRig","expect"], _braincore_test_llms_txt_is_written_from_the_host_and_the_route_table);
@@ -25759,6 +26013,8 @@ export default function define(runtime, observer) {
   $def("_braincore_test_the_logged_method_is_named_by_what_is_declared_not_by_the_status", "test_the_logged_method_is_named_by_what_is_declared_not_by_the_status", ["coreRig","logged","expect"], _braincore_test_the_logged_method_is_named_by_what_is_declared_not_by_the_status);
   $def("_braincore_test_a_posted_body_reaches_the_service_whole", "test_a_posted_body_reaches_the_service_whole", ["coreRig","expect"], _braincore_test_a_posted_body_reaches_the_service_whole);
   $def("_braincore_test_the_log_line_of_a_priced_call_has_its_price", "test_the_log_line_of_a_priced_call_has_its_price", ["coreRig","logged","expect"], _braincore_test_the_log_line_of_a_priced_call_has_its_price);
+  $def("_braincore_test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed", "test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed", ["coreRig","expect"], _braincore_test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed);
+  $def("_braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab", "test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab", ["Response","coreRig","sha256","expect"], _braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("rows", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("rows", _));
@@ -25777,6 +26033,11 @@ export default function define(runtime, observer) {
   main.define("xrpc", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("xrpc", _));
   main.define("backend", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("backend", _));
   main.define("logged", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("logged", _));
+  main.define("matches", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("matches", _));
+  main.define("may", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("may", _));
+  main.define("MEMBER", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("MEMBER", _));
+  main.define("neverHeld", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("neverHeld", _));
+  main.define("scoped", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("scoped", _));
   main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
   main.define("expect", ["module @tomlarkworthy/jest-expect-standalone","@variable"], (_, v) => v.import("expect", _));
   main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
@@ -25968,7 +26229,7 @@ const _brainkernel_verifyServiceJwt = function _verifyServiceJwt(atcute) {return
   const ok = await atcute.verifySig(atcute.parsePublicMultikey(vm.publicKeyMultibase), b64u(s), new TextEncoder().encode(h + "." + p), { allowMalleableSig: true });
   return ok ? { iss: claims.iss.split("#")[0] } : { error: "BadJwtSignature", message: "signature does not verify" };
 });};
-const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,rows,sessionToken,turnToken,portalToken,verifyServiceJwt,sha256,atcute,core,Request,deployer) {
+const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,rows,sessionToken,turnToken,portalToken,verifyServiceJwt,sha256,matches,may,atcute,neverHeld,core,Request,deployer) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.";
   // A body of a known small size is read before it is sent on: a stream the core does not read to its end throws
@@ -25976,8 +26237,6 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   const bodyOf = async (c) => (+(c.req.header("content-length") || Infinity) <= 1e6 ? c.req.raw.arrayBuffer() : c.req.raw.body);
   const fail = (c, status, error, message) => c.json({ error, message }, status);
   app.onError((e, c) => fail(c, 500, "InternalServerError", String((e && e.message) || e)));
-  // What every member may call. Anything more is that member's grant.
-  const MEMBER = ["inbox.reply", "member.whoami", "member.services", "member.deploy", "member.remove", "member.modules", "static.put", "static.get", "static.list", "static.tag", "static.setPublic", "static.delete", "blob.upload", "blob.get", "blob.info", "blob.list", "blob.tag", "blob.delete", "portal.token", "portal.modules", "quota.get"].map((m) => "com.lopecode.brain." + m);
   // What a portal token reaches beside the methods of its author's Workers, when the viewer is that author.
   const PORTAL_OWN = ["member.whoami", "member.services", "member.deploy", "member.remove", "member.modules"].map((m) => "com.lopecode.brain." + m);
   // A method of some member's own service. Its rule, which the deployer wrote, says whether another member may call it.
@@ -26070,14 +26329,14 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
       for (const did of [who.did, ...others]) {
         if (did && did === config.owner) continue;
         const grant = did && (await rows.get("member/" + did)) ? await rows.get("grant/" + did) : null;
-        if (!(nsid && grant && grant.methods.includes(nsid))) return fail(c, 403, "Forbidden", `a turn in a room reaches inbox.reply and what everyone in the room has a grant for; ${did === who.did ? "its sender" : did || "someone who is not a member"} has none for ${nsid || path}`);
+        if (!(grant && matches(grant.methods, nsid))) return fail(c, 403, "Forbidden", `a turn in a room reaches inbox.reply and what everyone in the room has a grant for; ${did === who.did ? "its sender" : did || "someone who is not a member"} has none for ${nsid || path}`);
       }
     if (who.caller.startsWith("did:")) {
       const member = await rows.get("member/" + who.caller);
       // A turn is run for a member. Once they are removed, a token already issued stops working.
       if ((who.turn || who.portal) && !member) return fail(c, 403, "Forbidden", `${who.caller} is not a member`);
       const grant = nsid ? await rows.get("grant/" + who.caller) : null;
-      if (nsid && !(member && (MEMBER.includes(nsid) || nsid.startsWith(MEMBER_NS))) && !(grant && grant.methods.includes(nsid))) return fail(c, 403, "Forbidden", `${who.caller} has no grant for ${nsid}`);
+      if (nsid && !may({ member, grant: grant && grant.methods }, nsid)) return fail(c, 403, "Forbidden", `${who.caller} has no grant for ${nsid}`);
       // A member is still themselves when they open a file; every other page is served to them as to anyone.
       if (!nsid && !(member && path.startsWith("/static/"))) who.caller = "anonymous";
     }
@@ -26177,19 +26436,20 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   // A link made to deploy with no approval can deploy a kernel with nobody asked, so keeping the page at / from it
   // would keep nothing: it reaches infra.shell too, and finishes a deploy of the page.
   const deploys = (who) => (who.unattended ? [...DEPLOYS, "com.lopecode.brain.infra.shell"] : DEPLOYS);
-  const never = (m) => /^com\.lopecode\.brain\.(infra|secret|token|grant|people)[./]/.test(m);
+  // delegation: the record a token becomes (plan/cloud-brain-authority.md). Named here before the core has it.
+  const never = neverHeld;
   // A token's list holds whole names and prefixes: "browser.*" is every method of that service, "*" every method
   // of this Brain. No prefix reaches a name a token may not have.
   // A name may go on in segments after a / (ai.v1/chat/completions); "ai.v1/*" is every method under ai.v1/.
   const listed = (m) => /^[A-Za-z0-9]+(\.[A-Za-z0-9]+)*(\/[A-Za-z0-9]+)*([./]\*)?$/.test(m);
-  const names = (methods, nsid) => !never(nsid) && methods.some((m) => m === nsid || (/[./]\*$/.test(m) && nsid.startsWith(m.slice(0, -1))));
+  const names = (methods, nsid) => !never(nsid) && matches(methods, nsid);
   app.get(NS + "token.list", session, async (c) => c.json({ tokens: (await rows.list("token/")).map((r) => r.value).filter((t) => !(t.until < Date.now())) }));
   app.post(NS + "token.create", session, async (c) => {
     const { name, methods = [] } = await c.req.json();
     const named = methods.map(full);
     if (!/^[a-z0-9-]{1,40}$/.test(name || "")) return fail(c, 400, "InvalidRequest", "name is lower case letters, digits and -");
     if (!named.every(listed)) return fail(c, 400, "InvalidRequest", "a method is a name, or a prefix that ends .* or /* (browser.*, ai.v1/*), or *");
-    if (named.some(never)) return fail(c, 400, "InvalidRequest", "a token cannot name infra, secret, token, grant or people methods");
+    if (named.some(never)) return fail(c, 400, "InvalidRequest", "a token cannot name infra, secret, token, grant, people or delegation methods");
     const token = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
     await rows.put("token/" + (await sha256(token)), { name, methods: named, created: Date.now() });
     return c.json({ name, token });
@@ -26205,7 +26465,7 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
     const named = methods.map(full);
     if (!/^[a-z0-9-]{1,40}$/.test(name || "")) return fail(c, 400, "InvalidRequest", "name is lower case letters, digits and -");
     if (!named.every(listed)) return fail(c, 400, "InvalidRequest", "a method is a name, or a prefix that ends .* or /* (browser.*, ai.v1/*), or *");
-    if (named.some(never)) return fail(c, 400, "InvalidRequest", "a token cannot name infra, secret, token, grant or people methods");
+    if (named.some(never)) return fail(c, 400, "InvalidRequest", "a token cannot name infra, secret, token, grant, people or delegation methods");
     if (!(minutes >= 1 && minutes <= 480 && hours >= 1 && hours <= 24)) return fail(c, 400, "InvalidRequest", "minutes is 1 to 480, hours is 1 to 24");
     // What has ended is deleted here: links nobody used, and the tokens of links.
     const live = [];
@@ -26268,7 +26528,7 @@ other address): how to call, and what this Brain is made of.
     const named = methods.map(full);
     if (!/^did:(plc|web):[A-Za-z0-9.:%-]+$/.test(did || "")) return fail(c, 400, "InvalidRequest", "did");
     if (named.some((m) => m.includes("*"))) return fail(c, 400, "InvalidRequest", "a grant names whole methods; a prefix is for a token");
-    if (named.some(never) || named.some((m) => m.startsWith("com.lopecode.brain.member."))) return fail(c, 400, "InvalidRequest", "a grant cannot name infra, secret, token, grant, people or member methods");
+    if (named.some(never) || named.some((m) => m.startsWith("com.lopecode.brain.member."))) return fail(c, 400, "InvalidRequest", "a grant cannot name infra, secret, token, grant, people, delegation or member methods");
     await rows.put("grant/" + did, { did, methods: named, granted: Date.now() });
     await syncPeople();
     return c.json({ did, methods: named });
@@ -27204,7 +27464,13 @@ const _brainkernel_test_a_member_reads_their_own_spending = async function _test
   expect((await rig.call("quota.get", { session: rig.other })).status).toBe(200);
   expect([(await rig.call("quota.list", { session: rig.other })).status, (await rig.call("quota.ledger", { session: rig.other })).status, (await rig.call("quota.put", { session: rig.other, body: { who: "did:plc:other", daily: 9 } })).status]).toEqual([403, 403, 403]);
   expect(asked()).toEqual([["quota.get", "did:plc:other"]]);
-  return "quota.get only";
+  // A member makes, lists and revokes delegations: the core answers, and is told it is their own session. A token
+  // with every method is not sent on.
+  expect((await rig.call("delegation.list", { session: rig.other })).status).toBe(200);
+  expect(rig.seen.at(-1).headers).toMatchObject({ "x-brain-caller": "did:plc:other", "x-brain-via": "session" });
+  const wide = (await rig.call("token.create", { session: rig.owner, body: { name: "wide", methods: ["*"] } })).data.token;
+  expect([(await rig.call("delegation.list", { bearer: wide })).status, (await rig.call("delegation.create", { bearer: wide, body: {} })).status]).toEqual([403, 403]);
+  return "quota.get, and delegation.* in their own session";
 };
 const _brainkernel_test_a_token_is_the_callers_to_send_from_anywhere = async function _test_a_token_is_the_callers_to_send_from_anywhere(kernelRig,expect) {
   const rig = await kernelRig();
@@ -27299,7 +27565,7 @@ export default function define(runtime, observer) {
   $def("_brainkernel_turnToken", "turnToken", [], _brainkernel_turnToken);
   $def("_brainkernel_portalToken", "portalToken", [], _brainkernel_portalToken);
   $def("_brainkernel_verifyServiceJwt", "verifyServiceJwt", ["atcute"], _brainkernel_verifyServiceJwt);
-  $def("_brainkernel_kernelApp", "kernelApp", ["hono","Response","secrets","config","rows","sessionToken","turnToken","portalToken","verifyServiceJwt","sha256","atcute","core","Request","deployer"], _brainkernel_kernelApp);
+  $def("_brainkernel_kernelApp", "kernelApp", ["hono","Response","secrets","config","rows","sessionToken","turnToken","portalToken","verifyServiceJwt","sha256","matches","may","atcute","neverHeld","core","Request","deployer"], _brainkernel_kernelApp);
   $def("_brainkernel_anon_8016cc4bc1", null, ["md"], _brainkernel_anon_8016cc4bc1);
   $def("_brainkernel_kernelRig", "kernelRig", ["Response","simulate","kernel_service","sessionToken"], _brainkernel_kernelRig);
   $def("_brainkernel_test_the_signing_key_is_read_under_either_name", "test_the_signing_key_is_read_under_either_name", ["sessionToken","expect","kernelRig","portalToken","kernel_service"], _brainkernel_test_the_signing_key_is_read_under_either_name);
@@ -27343,6 +27609,9 @@ export default function define(runtime, observer) {
   main.define("library", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("library", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
+  main.define("matches", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("matches", _));
+  main.define("may", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("may", _));
+  main.define("neverHeld", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("neverHeld", _));
   main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
   main.define("expect", ["module @tomlarkworthy/jest-expect-standalone","@variable"], (_, v) => v.import("expect", _));
   main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
@@ -29250,7 +29519,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainstatic_anon_10bc324b59 = function _anonymous(md) {return (md`# brain-static
+const _brainstatic_anon_915699dce2 = function _anonymous(md) {return (md`# brain-static
 
 Files kept by a Cloud Brain and served from its address.
 
@@ -29294,7 +29563,7 @@ A recipe is the owner's code and is not checked by tag: it reads and changes wha
 
 The core sends, with each call by a person, whether they are a member, their tag grants and their limit in bytes. The limit counts every file under \`u/ID/\`, default 20 MB.
 
-Each put records its caller as the file's \`writer\`. A file is served with \`Content-Security-Policy: sandbox\`, so a browser gives it no script and no origin, unless its writer is the owner in their own session, the deployer or a recipe. The owner by a turn, a portal or a PDS call is the writer \`owner by turn\` (\`portal\`, \`jwt\`): its file is sandboxed, its \`type\` is not taken, and it does not write under \`shell/\` or \`library/\`. A token's file and a member's are sandboxed, and so is the owner's file once either has written it, until the owner puts it again. A file kept before \`writer\` (2026-10-09) is sandboxed unless it is under \`shell/\`.
+Each put records its caller as the file's \`writer\`. A file is served with \`Content-Security-Policy: sandbox\`, so a browser gives it no script and no origin, unless its writer is the owner in their own session, the deployer or a recipe. The owner by a turn, a portal or a PDS call is the writer \`owner by turn\` (\`portal\`, \`jwt\`), and the owner under a delegation \`owner by d:<id>\`: its file is sandboxed, its \`type\` is not taken, and it does not write under \`shell/\` or \`library/\`. A token's file and a member's are sandboxed, and so is the owner's file once either has written it, until the owner puts it again. A file kept before \`writer\` (2026-10-09) is sandboxed unless it is under \`shell/\`.
 
 ## Where a file goes
 
@@ -29345,7 +29614,7 @@ const _brainstatic_staticTypes = function _staticTypes() {return ({
   wasm: "application/wasm",
   pdf: "application/pdf"
 });};
-const _brainstatic_staticApp = function _staticApp(hono,config,sha256,rows,Response,blobs,staticTypes,CompressionStream) {
+const _brainstatic_staticApp = function _staticApp(hono,config,sha256,ownTab,rows,Response,blobs,staticTypes,CompressionStream) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.static.";
   const MAX = 50 * 1024 * 1024;
@@ -29395,7 +29664,7 @@ const _brainstatic_staticApp = function _staticApp(hono,config,sha256,rows,Respo
   // The folder a caller is kept out of, if any.
   const KEPT = { "shell/": ["owner", "deployer", "guard"], "library/": ["owner", "worker:brain-x-library"] };
   // The owner's turn, portal or PDS call has the caller `owner` and is not the owner's own tab: it is named apart, so it is not vouched for.
-  const writerOf = (c) => ((who, via) => (who === "owner" && /^(turn:|portal:|jwt$)/.test(via) ? "owner by " + via.split(":")[0] : who))(c.req.header("x-brain-caller") || "", c.req.header("x-brain-via") || "");
+  const writerOf = (c) => ((who, via) => (who === "owner" && !ownTab(c.req.raw.headers) ? "owner by " + (via.startsWith("delegation:") ? "d:" + via.slice("delegation:".length) : via.split(":")[0]) : who))(c.req.header("x-brain-caller") || "", c.req.header("x-brain-via") || "");
   const kept = (c, path) => Object.keys(KEPT).find((dir) => path.startsWith(dir) && !KEPT[dir].includes(writerOf(c)));
   // Whose bytes and type the owner vouches for: the owner's own, the deployer's shell, and a recipe's, which is the owner's code. Not a token's.
   const trusts = (who) => ["owner", "deployer", "guard"].includes(who) || who.startsWith("worker:brain-x-");
@@ -29739,8 +30008,9 @@ const _brainstatic_test_the_owner_by_a_turn_is_not_the_owner_as_a_writer = async
   const rig = await staticRig();
   const page = "<script>1<\/script>";
   const got = async (path) => ((r) => [r.headers.get("content-type"), (r.headers.get("content-security-policy") || "").startsWith("sandbox")])(await rig.call("owner", "/static/" + path));
-  // A turn, a portal and a PDS call of the owner: stored, sandboxed, and the type each names is not taken.
-  for (const via of ["turn:7", "portal:did:plc:ada", "jwt"]) {
+  // A turn, a portal, a PDS call of the owner and a call under a delegation: stored, sandboxed, and the type each
+  // names is not taken.
+  for (const via of ["turn:7", "portal:did:plc:ada", "jwt", "delegation:0a1b"]) {
     expect((await rig.put("owner by " + via, "site/t.txt", page, "&type=text/html")).status).toBe(200);
     expect(await got("site/t.txt")).toEqual(["text/plain; charset=utf-8", true]);
     expect((await rig.put("owner by " + via, "shell/index.html", page)).status).toBe(403);
@@ -29831,11 +30101,11 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainstatic_anon_10bc324b59", null, ["md"], _brainstatic_anon_10bc324b59);
+  $def("_brainstatic_anon_915699dce2", null, ["md"], _brainstatic_anon_915699dce2);
   $def("_brainstatic_static_service", "static_service", ["cloudflare","staticApp"], _brainstatic_static_service);
   $def("_brainstatic_static_announce", "static_announce", ["plugins","static_service","invalidation"], _brainstatic_static_announce);
   $def("_brainstatic_staticTypes", "staticTypes", [], _brainstatic_staticTypes);
-  $def("_brainstatic_staticApp", "staticApp", ["hono","config","sha256","rows","Response","blobs","staticTypes","CompressionStream"], _brainstatic_staticApp);
+  $def("_brainstatic_staticApp", "staticApp", ["hono","config","sha256","ownTab","rows","Response","blobs","staticTypes","CompressionStream"], _brainstatic_staticApp);
   $def("_brainstatic_anon_be3d699220", null, ["md"], _brainstatic_anon_be3d699220);
   $def("_brainstatic_staticRig", "staticRig", ["simulate","static_service"], _brainstatic_staticRig);
   $def("_brainstatic_test_static_put_get_list_delete", "test_static_put_get_list_delete", ["staticRig","expect","sha256"], _brainstatic_test_static_put_get_list_delete);
@@ -29859,6 +30129,7 @@ export default function define(runtime, observer) {
   main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
+  main.define("ownTab", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("ownTab", _));
   main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
   main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
   main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
@@ -29870,7 +30141,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainblob_anon_43384eb3ef = function _anonymous(md) {return (md`# brain-blob
+const _brainblob_anon_10f004d04e = function _anonymous(md) {return (md`# brain-blob
 
 Bytes kept by a Cloud Brain under the address of their content, in the shapes an atproto PDS uses for blobs. There are no paths: \`brain-static\` keeps files by path and is a separate store.
 
@@ -29905,7 +30176,7 @@ Who may read or change a blob is decided from its tags, by the rules of \`brain-
 
 | tag | set by | meaning |
 |---|---|---|
-| \`by:<did>\` | this Worker, from the caller | an uploader. Their bytes count against their limit. The owner's uploads, and a recipe's, carry the owner's; a token's carry \`by:token:<name>\`, and the owner's by a turn, a portal or a PDS call \`by:owner:turn\` (\`portal\`, \`jwt\`), which does not set a type that is served as a page. The first one in the list set the type. |
+| \`by:<did>\` | this Worker, from the caller | an uploader. Their bytes count against their limit. The owner's uploads, and a recipe's, carry the owner's; a token's carry \`by:token:<name>\`, and the owner's by a turn, a portal or a PDS call \`by:owner:turn\` (\`portal\`, \`jwt\`) and the owner's under a delegation \`by:d:<id>\`, neither of which sets a type that is served as a page. The first one in the list set the type. |
 | \`worker:<name>\` | this Worker, when a Worker uploaded | a member's Worker calls as its author, so its blob carries both. |
 | \`public\` | whoever may change the blob | anyone reads it. |
 | \`members\` | whoever may change the blob | any current member reads it. |
@@ -30013,7 +30284,7 @@ const _brainblob_blobSql = function _blobSql() {return ({
   listTag:
     "SELECT e.cid AS cid, e.mime AS mime, e.size AS size, e.created AS created, e.tags AS tags FROM blob_tags t JOIN blob_entries e ON e.cid = t.cid WHERE t.tag = ?1 AND t.cid > ?2 AND e.mime LIKE ?3 ORDER BY t.cid LIMIT CAST(?4 AS INTEGER)"
 });};
-const _brainblob_blobApp = function _blobApp(hono,config,blobSchema,sql,blobSql,sha256,blobMime,blobCid,blobs,blobTextual,blobActive,Response) {
+const _brainblob_blobApp = function _blobApp(hono,config,blobSchema,sql,blobSql,ownTab,sha256,blobMime,blobCid,blobs,blobTextual,blobActive,Response) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.blob.";
   const MAX = 50 * 1024 * 1024, USER = /^[a-z0-9-]{1,40}$/, MAX_TAGS = 8;
@@ -30041,8 +30312,9 @@ const _brainblob_blobApp = function _blobApp(hono,config,blobSchema,sql,blobSql,
   const me = async (c) => {
     const who = c.req.header("x-brain-caller") || "anonymous", via = c.req.header("x-brain-via") || "";
     // own: a caller whose type the owner vouches for. A token reaches every blob, and its uploads are its own, not the owner's.
-    // The owner's turn, portal or PDS call is not the owner's own tab: its bytes are stamped apart and are not vouched for.
-    if (who === "owner" && /^(turn:|portal:|jwt$)/.test(c.req.header("x-brain-via") || "")) return { all: true, stamp: ["by:owner:" + (c.req.header("x-brain-via") || "").split(":")[0]] };
+    // The owner's turn, portal or PDS call, or a call under a delegation, is not the owner's own tab: its bytes are
+    // stamped apart and are not vouched for.
+    if (who === "owner" && !ownTab(c.req.raw.headers)) return { all: true, stamp: [via.startsWith("delegation:") ? "by:d:" + via.slice("delegation:".length) : "by:owner:" + via.split(":")[0]] };
     if (who === "owner") return { all: true, own: true, stamp: [ownerTag()] };
     if (who.startsWith("token:")) return { all: true, stamp: ["by:" + who] };
     if (who.startsWith("did:")) {
@@ -30452,6 +30724,9 @@ const _brainblob_test_blob_bytes_are_served_as_a_page_only_when_the_owner_set_th
   // The owner by a turn is not the owner as an uploader: the same as a token's.
   const turned = await (await rig.upload({ "x-brain-caller": "owner", "x-brain-via": "turn:7" }, "<p>four</p>", "text/html", "?public=true")).json();
   expect([turned.tags, await served(turned.blob.ref.$link)]).toEqual([["by:owner:turn", "public"], page]);
+  // Nor is the owner under a delegation: the stamp names the delegation.
+  const held = await (await rig.upload({ "x-brain-caller": "owner", "x-brain-via": "delegation:0a1b" }, "<p>five</p>", "text/html", "?public=true")).json();
+  expect([held.tags, await served(held.blob.ref.$link)]).toEqual([["by:d:0a1b", "public"], page]);
   return "3 blobs: a person's, the owner's and a token's";
 };
 const _brainblob_test_blob_declares_what_it_needs = async function _test_blob_declares_what_it_needs(blob_service,expect) {
@@ -30466,7 +30741,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainblob_anon_43384eb3ef", null, ["md"], _brainblob_anon_43384eb3ef);
+  $def("_brainblob_anon_10f004d04e", null, ["md"], _brainblob_anon_10f004d04e);
   $def("_brainblob_blob_service", "blob_service", ["cloudflare","blobApp"], _brainblob_blob_service);
   $def("_brainblob_blob_announce", "blob_announce", ["plugins","blob_service","invalidation"], _brainblob_blob_announce);
   $def("_brainblob_blobCid", "blobCid", [], _brainblob_blobCid);
@@ -30476,7 +30751,7 @@ export default function define(runtime, observer) {
   $def("_brainblob_blobActive", "blobActive", [], _brainblob_blobActive);
   $def("_brainblob_blobSchema", "blobSchema", [], _brainblob_blobSchema);
   $def("_brainblob_blobSql", "blobSql", [], _brainblob_blobSql);
-  $def("_brainblob_blobApp", "blobApp", ["hono","config","blobSchema","sql","blobSql","sha256","blobMime","blobCid","blobs","blobTextual","blobActive","Response"], _brainblob_blobApp);
+  $def("_brainblob_blobApp", "blobApp", ["hono","config","blobSchema","sql","blobSql","ownTab","sha256","blobMime","blobCid","blobs","blobTextual","blobActive","Response"], _brainblob_blobApp);
   $def("_brainblob_anon_81bee1a613", null, ["md"], _brainblob_anon_81bee1a613);
   $def("_brainblob_blobFakeSql", "blobFakeSql", ["blobSql","blobSchema"], _brainblob_blobFakeSql);
   $def("_brainblob_blobRig", "blobRig", ["blobFakeSql","simulate","blob_service","sha256"], _brainblob_blobRig);
@@ -30496,6 +30771,7 @@ export default function define(runtime, observer) {
   main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
+  main.define("ownTab", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("ownTab", _));
   main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
   main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
   main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
@@ -30507,7 +30783,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainlibrary_anon_f495fe4219 = function _anonymous(md) {return (md`# brain-library
+const _brainlibrary_anon_6fb3681e07 = function _anonymous(md) {return (md`# brain-library
 
 Notebooks kept by a Cloud Brain and served from its address. The files are in \`brain-static\`, under \`library/\`; this Worker keeps the list, the versions and who may open each.
 
@@ -30517,11 +30793,11 @@ Notebooks kept by a Cloud Brain and served from its address. The files are in \`
 | \`library.put\` | procedure, the owner's own session; a token or a turn is refused, because the file is served as a page. \`?name=\`, optional \`public=true\` and \`parent=<sha256>\`; the body is the notebook's HTML file. |
 | \`library.list\` | query, anyone. The owner gets every notebook, anyone else the public ones; a member granted the method is anyone else. |
 | \`library.versions\` | query, owner. \`?name=\`. The last 10 saves, newest first. |
-| \`library.setPublic\` | procedure, owner. \`{ name, public }\` |
-| \`library.delete\` | procedure, owner. \`{ name }\`. Deletes every version. |
-| \`library.index\` | procedure, owner. \`{ name }\`. Writes the module cards of the newest version again, from its kept file (see Module cards). \`{ name, cards, stale }\`. With \`rebuild: false\` it does what a put does: enters the cards that are missing and marks the ones that differ. |
+| \`library.setPublic\` | procedure, owner. \`{ name, public }\`. The cards made from the notebook are read by whoever reads it (see Module cards). \`{ name, public, cards, stale }\` |
+| \`library.delete\` | procedure, owner. \`{ name }\`. Deletes every version, and the cards made from the notebook: \`{ deleted, versions, cards }\`. With \`sha256\`, one kept version that is not the newest, and no card. |
+| \`library.index\` | procedure, owner. \`{ name }\`. Writes the module cards of the newest version again, from its kept file (see Module cards). \`{ name, cards, stale }\`. With \`rebuild: false\` it does what a put does: enters the cards that are missing and marks the ones that differ. With \`modules\`, 1 to 100 names \`@user/name\`, only those modules' cards are written, and a name the notebook does not have is passed over. |
 | \`GET /library/<name>\` | the notebook. Anyone for a public one, the owner for any. \`?v=<sha256>\` opens a kept version. |
-| Calls | \`static.put\`, \`static.get\`, \`static.delete\`, \`knowledge.put\` |
+| Calls | \`static.put\`, \`static.get\`, \`static.delete\`, \`knowledge.put\`, \`knowledge.delete\` |
 | Storage | \`rows\`, key \`n/<name>\`: \`{ title, sha256, size, public, savedAt, versions }\`. Files at \`library/<name>/<first 16 of sha256>.html\` in \`brain-static\`. |
 
 A name is 1 to 80 of \`A-Z a-z 0-9 @ . _ -\`. The body must be a lopecode notebook: a file with a \`bootconf.json\` block. The title is the file's \`<title>\`. With \`parent\`, a put is refused with 409 unless \`parent\` is the SHA-256 of the notebook's newest version (empty for a new name), so two tabs saving one notebook do not overwrite each other unseen.
@@ -30545,16 +30821,18 @@ A put does not write a card that is kept (since 2026-10-10 10:30 CEST; before, e
 - A card is made from one notebook, the one its \`url\` names. When a put of that notebook has another block for the module, the card gets \`staleSince\`, the time of that put. It is still found, with its old words, and every answer that has the card has the date.
 - \`staleSince\` is the first put that differed. Later changes do not move it. A put that has the card's own block again clears it.
 - \`knowledge.list?kind=module&stale=true\` lists the cards that differ, the longest so first; \`libraryPanel\` says how many. The put answers \`stale\`, how many of the notebook's own cards differ after it.
-- \`library.index { name }\` is the only thing that writes a kept card: it reads the notebook's kept file, writes each of its modules' cards and embeds the ones whose words changed. It also takes a card that was made from another notebook, which is how a module's card is moved to the notebook that is its home. A notebook that is not public does not take a public card.
+- \`library.index { name }\` is the only thing that writes a kept card: it reads the notebook's kept file, writes each of its modules' cards and embeds the ones whose words changed. It also takes a card that was made from another notebook, which is how a module's card is moved to the notebook that is its home: \`{ name, modules: ["@user/name"] }\` takes that one card and leaves the notebook's others where they are (added 2026-10-10; before, two notebooks that each had the other's module could not both be given their own). A notebook that is not public does not take a public card.
 - A copy of the module in another notebook marks nothing: most modules are in many notebooks and the copies differ. How many copies differ from a card is not counted.
 - A card from before the hash was kept takes it at the next put or \`index { rebuild: false }\` of its notebook, when its \`file\` is the file that is kept; when it is not, the card is marked.
 
 - A module has one card, \`module:<user>:<name>\`, whichever notebook it is in. The first put of a notebook that has the module enters it. After that only \`library.index\` writes it.
 - The file is read block by block from the top, and a block is a module when it is named \`@user/name\` and is JavaScript that is not encoded. Of the 100 modules \`lope-reader\` lists in the Cloud Brain notebook on 2026-10-10, 96 have a card. The four without are named another way: \`es-module-shims@2.6.2\`, \`@observablehq/runtime@6.0.0\`, \`@observablehq/inspector@5.0.1\` and the Observable id \`d/57d79353bac56631\`. 71 of 75 in \`quick_start\`, the same four left out.
-- The cards of a public notebook are public, and say what that notebook's copy of the module says. A put of a notebook that is not public sends its cards with \`unlessPublic\`: \`brain-x-knowledge\` leaves a card that is public whole (its words and its address stay those of the public notebook) and enters the others private. Until 2026-10-10 10:00 CEST such a put kept the card public and wrote the private copy's words and address into it.
+- A card is read by whoever reads the notebook it was made from: public for a public notebook, the Brain's for one that is not. That is set when the card is entered or written by \`library.index\`, and a put, \`library.setPublic\` and \`index { rebuild: false }\` set it again on the cards made from that notebook. A notebook made private takes its cards with it, though a public notebook may have the module too; \`library.index\` of that one gives the module a public card again. A re-read costs one embedding a card, since the vector says who reads it.
+- A put of a notebook that is not public sends its cards with \`unlessPublic\`: \`brain-x-knowledge\` leaves a public card made from another notebook whole (its words and its address stay the public notebook's) and enters only the cards that are missing, private. Until 2026-10-10 10:00 CEST such a put kept the card public and wrote the private copy's words and address into it.
 - A module that is in a private notebook only, then in a public one: the card stays private and the private notebook's, until \`library.index\` of the public notebook makes it public with the public copy's words. Nothing makes it private again but a put of \`{ id, public: false }\`.
-- A module whose prose is headings alone has a card of its cell names: 3 of the 99 cards on cb4 (\`bootloader\`, \`observable-runtime-v6\`, \`blank-notebook\`). Reading the first prose cell alone left 16 of 100 so, until 2026-10-10.
-- \`library.setPublic\` and \`library.delete\` do not change a card. To make one private, put \`{ id, public: false }\` to \`knowledge.put\`; to remove one, \`knowledge.delete\`.
+- A module whose prose is headings alone has a card of its cell names: 51 of the 400 cards on cb4 on 2026-10-10 at 08:59 UTC, after each card was written from its module's home (47 before; 3 of 99 when two notebooks were kept). Reading the first prose cell alone left 16 of 100 so, until 2026-10-10.
+- A file that has two blocks of one name has one card, of the first: the block a page reads. None of the 254 notebook files of lopecode and lopebooks has two (read 2026-10-10).
+- \`library.delete\` deletes the cards made from the notebook's newest version (since 2026-10-10; before, they stayed and named an address that answered 404). A module another notebook has is without a card until that notebook is put or indexed. A card of a module that only an older version had stays.
 - The put answers \`cards\`, how many were entered; a card left as it was is not counted. When \`knowledge.put\` fails the notebook is kept all the same and \`cards\` is smaller; \`library.index\` with \`rebuild: false\` enters them.
 - The library keeps 10 versions of a notebook. A stale card's \`file\` may be a version that is gone.`);};
 const _brainlibrary_library_service = function _library_service(cloudflare,libraryApp) {return (cloudflare.Service("library", libraryApp, {
@@ -30569,13 +30847,14 @@ const _brainlibrary_library_service = function _library_service(cloudflare,libra
     "com.lopecode.brain.library.index": { type: "procedure", who: "owner" }
   },
   paths: [{ path: "/library/*", who: "anyone" }],
-  calls: ["com.lopecode.brain.static.put", "com.lopecode.brain.static.get", "com.lopecode.brain.static.delete", "com.lopecode.brain.knowledge.put"]
+  calls: ["com.lopecode.brain.static.put", "com.lopecode.brain.static.get", "com.lopecode.brain.static.delete", "com.lopecode.brain.knowledge.put", "com.lopecode.brain.knowledge.delete"]
 }));};
 const _brainlibrary_library_announce = function _library_announce(plugins,library_service,invalidation) {
   plugins.add("workers", library_service, { invalidation });
   return "announced library_service";
 };
-const _brainlibrary_libraryCards = function _libraryCards(sha256) {return (async (html, { name, file, host, open = false }) => {
+const _brainlibrary_libraryCardId = function _libraryCardId() {return ((module) => ("module:" + module.slice(1).toLowerCase().replace("/", ":").replace(/[^a-z0-9._:-]/g, "-")).slice(0, 100));};
+const _brainlibrary_libraryCards = function _libraryCards(libraryCardId,sha256) {return (async (html, { name, file, host, open = false }) => {
   // The tag's name is joined here: written whole in a module, it would end the block the module is kept in.
   const OPEN = "<scr" + "ipt", CLOSE = "</scr" + "ipt>", modules = [];
   // Block by block from the top, as a browser reads the file. A tag written in another block's text starts nothing:
@@ -30585,7 +30864,8 @@ const _brainlibrary_libraryCards = function _libraryCards(sha256) {return (async
     if (gt < 0) break;
     const close = html.indexOf(CLOSE, gt), end = close < 0 ? html.length : close;
     const m = /^\S+\s+id="(@[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)"\s+type="text\/plain"\s+data-mime="application\/javascript"\s*>$/.exec(html.slice(at, gt + 1));
-    if (m) modules.push([m[1], html.slice(gt + 1, end)]);
+    // The first block of a name is the one a page reads.
+    if (m && !modules.some(([name]) => name === m[1])) modules.push([m[1], html.slice(gt + 1, end)]);
     i = end + CLOSE.length;
   }
   return Promise.all(modules.map(async ([module, source]) => {
@@ -30596,7 +30876,7 @@ const _brainlibrary_libraryCards = function _libraryCards(sha256) {return (async
     // The first prose cell that says something once its headings are gone: many modules open with a cell that is the heading alone.
     const first = prose.map((p) => p.replace(/^#+\s+.+$/gm, "").replace(/\s+/g, " ").trim()).find(Boolean) || "";
     return {
-      id: ("module:" + module.slice(1).toLowerCase().replace("/", ":").replace(/[^a-z0-9._:-]/g, "-")).slice(0, 100),
+      id: libraryCardId(module),
       kind: "module",
       title: (module + (heading ? ": " + heading.trim() : "")).slice(0, 500),
       text: [first.slice(0, 900), cells.length ? "Cells: " + cells.slice(0, 60).join(", ") : "", imports.length ? "Imports: " + imports.join(", ") : ""].filter(Boolean).join("\n").slice(0, 4000),
@@ -30611,7 +30891,7 @@ const _brainlibrary_libraryCards = function _libraryCards(sha256) {return (async
     };
   }));
 });};
-const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,config,rows,Response) {
+const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,config,rows,libraryCardId,Response) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.library.";
   const STATIC = "com.lopecode.brain.static.";
@@ -30633,9 +30913,10 @@ const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,con
   // this notebook now differ from it. A call that fails is not a reason to lose the notebook.
   // rebuild: every card is written from this file (library.index). Otherwise a card that is kept is left as it is, and
   // one made from this notebook is marked when its module's block is no longer the one it was made from.
-  const enter = async (name, html, head, rebuild) => {
+  // only: the ids of the cards to send, when not all.
+  const enter = async (name, html, head, rebuild, only = null) => {
     const file = fileOf(name, head.sha256), now = Date.now();
-    const cards = await libraryCards(html, { name, file, host: config.host, open: head.public });
+    const cards = (await libraryCards(html, { name, file, host: config.host, open: head.public })).filter((c) => !only || only.has(c.id));
     let entered = 0, stale = 0;
     for (let i = 0; i < cards.length; i += 100) {
       const some = cards.slice(i, i + 100), mine = new Map(some.map((c) => [c.id, c]));
@@ -30645,10 +30926,13 @@ const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,con
       for (const k of said.kept || []) {
         // A card made from another notebook says nothing of this one, and this one nothing of it.
         if (k.url !== mine.get(k.id).url) continue;
-        const same = k.sha256 ? k.sha256 === mine.get(k.id).sha256 : k.file === file;
+        const same = k.sha256 ? k.sha256 === mine.get(k.id).sha256 : k.file === file, mark = {};
         // A card from before 2026-10-10 has no hash: it takes this one when it was made from this very file.
-        if (same && (k.staleSince || !k.sha256)) marks.push({ id: k.id, sha256: mine.get(k.id).sha256, staleSince: 0 });
-        if (!same && !k.staleSince) marks.push({ id: k.id, staleSince: now });
+        if (same && (k.staleSince || !k.sha256)) Object.assign(mark, { sha256: mine.get(k.id).sha256, staleSince: 0 });
+        if (!same && !k.staleSince) mark.staleSince = now;
+        // Whoever reads the notebook reads the cards made from it.
+        if (!!k.public !== !!head.public) mark.public = !!head.public;
+        if (Object.keys(mark).length) marks.push({ id: k.id, ...mark });
         if (!same) stale++;
       }
       if (marks.length) await known(marks);
@@ -30677,12 +30961,13 @@ const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,con
     return c.json({ name, title, sha256, size: next.size, public: next.public, savedAt, versions: next.versions.length, ...(await enter(name, html, next, false)) });
   });
   app.post(NS + "index", async (c) => {
-    const { name, rebuild } = await c.req.json().catch(() => ({}));
+    const { name, rebuild, modules } = await c.req.json().catch(() => ({}));
     const head = okName(name) ? await rows.get("n/" + name) : null;
     if (!head) return fail(c, 404, "NotFound", String(name));
+    if (modules != null && !(Array.isArray(modules) && modules.length >= 1 && modules.length <= 100 && modules.every((m) => typeof m === "string" && /^@[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(m)))) return fail(c, 400, "InvalidRequest", "modules: 1 to 100 names, @user/name");
     const file = await xrpc.fetch(STATIC + "get", { params: { path: fileOf(name, head.sha256) } });
     if (!file.ok) return fail(c, 502, "UpstreamFailed", `static.get answered ${file.status}`);
-    return c.json({ name, ...(await enter(name, await file.text(), head, rebuild !== false)) });
+    return c.json({ name, ...(await enter(name, await file.text(), head, rebuild !== false, modules ? new Set(modules.map(libraryCardId)) : null)) });
   });
   app.get(NS + "list", async (c) => {
     const all = (await rows.list("n/")).map(({ key, value }) => ({ name: key.slice(2), title: value.title, sha256: value.sha256, size: value.size, public: value.public, savedAt: value.savedAt, versions: value.versions.length }));
@@ -30696,16 +30981,35 @@ const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,con
     const { name, public: open } = await c.req.json().catch(() => ({}));
     const head = okName(name) ? await rows.get("n/" + name) : null;
     if (!head) return fail(c, 404, "NotFound", String(name));
-    await rows.put("n/" + name, { ...head, public: !!open });
-    return c.json({ name, public: !!open });
+    // The file first: its cards are set to the notebook's reader, as a put would set them.
+    const file = await xrpc.fetch(STATIC + "get", { params: { path: fileOf(name, head.sha256) } });
+    if (!file.ok) return fail(c, 502, "UpstreamFailed", `static.get answered ${file.status}`);
+    const next = { ...head, public: !!open };
+    await rows.put("n/" + name, next);
+    return c.json({ name, public: !!open, ...(await enter(name, await file.text(), next, false)) });
   });
   app.post(NS + "delete", async (c) => {
-    const { name } = await c.req.json().catch(() => ({}));
+    const { name, sha256: one } = await c.req.json().catch(() => ({}));
     const head = okName(name) ? await rows.get("n/" + name) : null;
     if (!head) return c.json({ deleted: false });
+    // One kept version that is not the newest: its file goes, the notebook and its cards stay.
+    if (one != null) {
+      if (one === head.sha256 || !head.versions.some((v) => v.sha256 === one)) return fail(c, 400, "InvalidRequest", "sha256: a kept version that is not the newest");
+      await drop(name, one);
+      await rows.put("n/" + name, { ...head, versions: head.versions.filter((v) => v.sha256 !== one) });
+      return c.json({ deleted: true, versions: 1, cards: 0 });
+    }
+    // The cards made from it go with it: their address would answer 404.
+    const file = await xrpc.fetch(STATIC + "get", { params: { path: fileOf(name, head.sha256) } });
+    const ids = file.ok ? (await libraryCards(await file.text(), { name, file: "", host: config.host })).map((card) => card.id) : [];
+    let cards = 0;
+    for (let i = 0; i < ids.length; i += 100) {
+      const r = await xrpc.fetch("com.lopecode.brain.knowledge.delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: ids.slice(i, i + 100), url: `https://${config.host}/library/${name}` }) }).catch(() => null);
+      cards += (r && r.ok && (await r.json().catch(() => null)) || { deleted: 0 }).deleted;
+    }
     for (const v of head.versions) await drop(name, v.sha256);
     await rows.delete("n/" + name);
-    return c.json({ deleted: true, versions: head.versions.length });
+    return c.json({ deleted: true, versions: head.versions.length, cards });
   });
   app.get("/library/:name{.+}", async (c) => {
     const name = c.req.param("name");
@@ -30800,8 +31104,8 @@ const _brainlibrary_libraryRig = function _libraryRig(simulate,static_service,Re
     const ids = [], kept = [];
     for (const { ifAbsent, unlessPublic, ...e } of sent) {
       const was = kb.get(e.id);
-      if (unlessPublic && was && was.public) continue;
-      if (ifAbsent && was) { kept.push({ id: was.id, url: was.url, file: was.file, sha256: was.sha256 || null, staleSince: was.staleSince || null, public: !!was.public }); continue; }
+      if (ifAbsent && was) kept.push({ id: was.id, url: was.url, file: was.file, sha256: was.sha256 || null, staleSince: was.staleSince || null, public: !!was.public });
+      if ((unlessPublic && was && was.public) || (ifAbsent && was)) continue;
       kb.set(e.id, { ...was, ...e, staleSince: e.staleSince == null ? (was && was.staleSince) || null : e.staleSince || null });
       ids.push(e.id);
     }
@@ -30814,6 +31118,8 @@ const _brainlibrary_libraryRig = function _libraryRig(simulate,static_service,Re
       asked.push(url.pathname.split(".").pop() + " " + (url.searchParams.get("path") || ""));
       // knowledge.put as the core passes it on: the cards are kept for the test to read.
       if (url.pathname.endsWith("knowledge.put")) return state.down ? new Response("{}", { status: 503 }) : knowledge((await request.json()).entries);
+      // knowledge.delete with url: only the entries made from that address.
+      if (url.pathname.endsWith("knowledge.delete")) return (({ ids, url: from }) => Response.json({ deleted: ids.filter((id) => kb.has(id) && kb.get(id).url === from && kb.delete(id)).length }))(await request.json());
       return stat.fetch("https://static.internal" + url.pathname + url.search, {
         method: request.method,
         headers: { "content-type": request.headers.get("content-type") || "", "x-brain-caller": "worker:brain-x-library" },
@@ -30852,7 +31158,7 @@ const _brainlibrary_test_library_public_list_and_versions = async function _test
   await rig.put("owner", "private", libraryNotebook("p", "Private"));
   const list = async (who) => (await (await rig.call(who, rig.X + "list")).json()).notebooks.map((n) => n.name + (n.public ? " public" : ""));
   expect(await list("anonymous")).toEqual([]);
-  expect(await (await rig.post("owner", "setPublic", { name: "notes", public: true })).json()).toEqual({ name: "notes", public: true });
+  expect(await (await rig.post("owner", "setPublic", { name: "notes", public: true })).json()).toEqual({ name: "notes", public: true, cards: 0, stale: 0 });
   expect(await list("anonymous")).toEqual(["notes public"]);
   expect(await list("owner")).toEqual(["notes public", "private"]);
   // A person granted library.list is anyone here: the public ones, and no notebook that is not.
@@ -30868,7 +31174,10 @@ const _brainlibrary_test_library_public_list_and_versions = async function _test
   expect((await rig.call("anonymous", "/library/notes?v=" + "0".repeat(64))).status).toBe(404);
   expect((await (await rig.call("owner", rig.X + "versions?name=notes")).json()).versions.map((v) => v.sha256)).toEqual([v2.sha256, v1.sha256]);
   // Deleting removes every version's file.
-  expect(await (await rig.post("owner", "delete", { name: "notes" })).json()).toEqual({ deleted: true, versions: 2 });
+  // One version that is not the newest goes alone; the newest does not.
+  expect([(await rig.post("owner", "delete", { name: "notes", sha256: v2.sha256 })).status, await (await rig.post("owner", "delete", { name: "notes", sha256: v1.sha256 })).json(), (await rig.call("anonymous", "/library/notes?v=" + v1.sha256)).status, (await rig.call("anonymous", "/library/notes")).status]).toEqual([400, { deleted: true, versions: 1, cards: 0 }, 404, 200]);
+  await rig.put("owner", "notes", one, "&parent=" + v2.sha256);
+  expect(await (await rig.post("owner", "delete", { name: "notes" })).json()).toEqual({ deleted: true, versions: 2, cards: 0 });
   expect([...rig.stat.blobs.keys()].length).toBe(1);
   expect((await rig.call("anonymous", "/library/notes")).status).toBe(404);
   return "2 versions, 1 conflict, 2 files deleted";
@@ -30890,9 +31199,12 @@ const _brainlibrary_test_library_enters_a_card_for_each_module = async function 
   expect(rig.cards[0]).toEqual({ id: "module:fx:boxes", kind: "module", title: "@fx/Boxes: Leased boxes", text: "Run code in a `linux` box.\nCells: boxPanel, size\nImports: @fx/iac", url: "https://brain.example/library/fx", source: "library", file: "library/fx/" + made.sha256.slice(0, 16) + ".html", sha256: await sha256(boxes.slice(boxes.indexOf(">") + 1, boxes.lastIndexOf("</scr"))), method: "library.put", unlessPublic: true, ifAbsent: true });
   expect(rig.cards[1]).toMatchObject({ id: "module:fx:plain", title: "@fx/plain", text: "No heading here.\nCells: draw" });
   // The cards of a public notebook are public; index enters them again from the kept file.
+  // Made public, the two cards are made public: asked for with ifAbsent, then one put of { id, public } each.
   await rig.post("owner", "setPublic", { name: "fx", public: true });
+  expect(rig.cards.slice(4)).toEqual([{ id: "module:fx:boxes", public: true }, { id: "module:fx:plain", public: true }]);
+  const at = rig.cards.length;
   expect(await (await rig.post("owner", "index", { name: "fx" })).json()).toEqual({ name: "fx", cards: 2, stale: 0 });
-  expect([rig.cards.length, rig.cards[2].public, rig.cards[3].public, "unlessPublic" in rig.cards[2], "ifAbsent" in rig.cards[2]]).toEqual([4, true, true, false, false]);
+  expect([rig.cards.length - at, rig.cards[at].public, rig.cards[at + 1].public, "unlessPublic" in rig.cards[at], "ifAbsent" in rig.cards[at]]).toEqual([2, true, true, false, false]);
   // knowledge.put refuses: the notebook is kept, and the answer says no card was entered.
   rig.state.down = true;
   const again = await (await rig.put("owner", "fx", libraryNotebook(boxes, "Again"))).json();
@@ -30938,6 +31250,39 @@ const _brainlibrary_test_library_says_when_a_card_no_longer_matches_its_notebook
   expect([(await (await rig.post("owner", "index", { name: "copy" })).json()).cards, card().url, card().text]).toEqual([1, "https://brain.example/library/copy", "elsewhere"]);
   return "stale, same date, fresh, rebuilt, taken over";
 };
+const _brainlibrary_test_library_cards_follow_their_notebook = async function _test_library_cards_follow_their_notebook(libraryRig,libraryModule,libraryNotebook,expect) {
+  const rig = await libraryRig();
+  const mod = (id, prose) => libraryModule(id, 'const _a = function _a(md) {return (md`# ' + id + '\n\n' + prose + '`)};\nexport default function define(runtime, observer) {\n  $def("_a", null, ["md"], _a);\n}');
+  const card = (id) => rig.kb.get("module:fx:" + id);
+  const index = async (input) => (({ cards, stale }) => [cards, stale])(await (await rig.post("owner", "index", input)).json());
+  // Two notebooks that each have the other's module: one name of modules gives each its own card.
+  await rig.put("owner", "a", libraryNotebook(mod("@fx/a", "a at home") + mod("@fx/b", "b as a has it")), "&public=true");
+  await rig.put("owner", "b", libraryNotebook(mod("@fx/b", "b at home") + mod("@fx/a", "a as b has it")), "&public=true");
+  expect([card("a").text, card("b").text]).toEqual(["a at home", "b as a has it"]);
+  expect([await index({ name: "b", modules: ["@fx/b", "@fx/none"] }), card("a").url, card("b").url, card("b").text]).toEqual([[1, 0], "https://brain.example/library/a", "https://brain.example/library/b", "b at home"]);
+  for (const modules of [[], "@fx/b", ["fx/b"], Array.from({ length: 101 }, () => "@fx/b")]) expect((await rig.post("owner", "index", { name: "b", modules })).status).toBe(400);
+  // A notebook with one name twice has the card of its first block, and that card is not marked by the second.
+  expect((({ cards, stale }) => [cards, stale])(await (await rig.put("owner", "twice", libraryNotebook(mod("@fx/c", "first") + mod("@fx/c", "second")))).json())).toEqual([1, 0]);
+  expect(card("c").text).toBe("first");
+  // Made private: the cards made from it are the Brain's, the other notebook's card stays public.
+  expect(await (await rig.post("owner", "setPublic", { name: "a", public: false })).json()).toEqual({ name: "a", public: false, cards: 0, stale: 0 });
+  expect([card("a").public, card("b").public]).toEqual([false, true]);
+  // A change to it while private marks its card; a public card of another notebook is left.
+  expect((({ cards, stale }) => [cards, stale])(await (await rig.put("owner", "a", libraryNotebook(mod("@fx/a", "a, changed") + mod("@fx/b", "b, changed in a")))).json())).toEqual([0, 1]);
+  expect([card("a").staleSince > 1e12, card("a").text, card("b").staleSince || null, card("b").text]).toEqual([true, "a at home", null, "b at home"]);
+  // A card that is public while its notebook is not (the owner's own put): the put still marks it, and takes it back.
+  await rig.post("owner", "index", { name: "a" });
+  card("a").public = true;
+  expect((({ cards, stale }) => [cards, stale])(await (await rig.put("owner", "a", libraryNotebook(mod("@fx/a", "a, changed again")))).json())).toEqual([0, 1]);
+  expect([card("a").public, card("a").staleSince > 1e12]).toEqual([false, true]);
+  // Public again, and the cards with it.
+  await rig.post("owner", "setPublic", { name: "a", public: true });
+  expect(card("a").public).toBe(true);
+  // Deleted: the cards made from it go, the other notebook's stay.
+  expect(await (await rig.post("owner", "delete", { name: "a" })).json()).toMatchObject({ deleted: true, cards: 1 });
+  expect([rig.kb.has("module:fx:a"), rig.kb.has("module:fx:b")]).toEqual([false, true]);
+  return "one card moved, private with its notebook, deleted with it";
+};
 const _brainlibrary_test_library_keeps_ten_versions = async function _test_library_keeps_ten_versions(libraryRig,libraryNotebook,expect) {
   const rig = await libraryRig();
   for (let i = 0; i < 12; i++) await rig.put("owner", "notes", libraryNotebook("save " + i));
@@ -30952,7 +31297,7 @@ const _brainlibrary_test_library_declares_what_it_needs = async function _test_l
   const { meta } = await library_service.emit();
   expect(meta).toMatchObject({
     worker: "brain-x-library", role: "recipe", module: "@tomlarkworthy/brain-library", resources: ["rows", "xrpc"], secrets: [],
-    calls: ["com.lopecode.brain.knowledge.put", "com.lopecode.brain.static.delete", "com.lopecode.brain.static.get", "com.lopecode.brain.static.put"],
+    calls: ["com.lopecode.brain.knowledge.delete", "com.lopecode.brain.knowledge.put", "com.lopecode.brain.static.delete", "com.lopecode.brain.static.get", "com.lopecode.brain.static.put"],
     paths: [{ path: "/library/*", who: "anyone" }]
   });
   expect(meta.access["com.lopecode.brain.library.put"]).toMatchObject({ allow: "caller.session", fixed: true });
@@ -30974,11 +31319,12 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainlibrary_anon_f495fe4219", null, ["md"], _brainlibrary_anon_f495fe4219);
+  $def("_brainlibrary_anon_6fb3681e07", null, ["md"], _brainlibrary_anon_6fb3681e07);
   $def("_brainlibrary_library_service", "library_service", ["cloudflare","libraryApp"], _brainlibrary_library_service);
   $def("_brainlibrary_library_announce", "library_announce", ["plugins","library_service","invalidation"], _brainlibrary_library_announce);
-  $def("_brainlibrary_libraryCards", "libraryCards", ["sha256"], _brainlibrary_libraryCards);
-  $def("_brainlibrary_libraryApp", "libraryApp", ["hono","xrpc","libraryCards","config","rows","Response"], _brainlibrary_libraryApp);
+  $def("_brainlibrary_libraryCardId", "libraryCardId", [], _brainlibrary_libraryCardId);
+  $def("_brainlibrary_libraryCards", "libraryCards", ["libraryCardId","sha256"], _brainlibrary_libraryCards);
+  $def("_brainlibrary_libraryApp", "libraryApp", ["hono","xrpc","libraryCards","config","rows","libraryCardId","Response"], _brainlibrary_libraryApp);
   $def("_brainlibrary_libraryPanel", "libraryPanel", ["htl","Inputs","open"], _brainlibrary_libraryPanel);
   $def("_brainlibrary_anon_be3d699220", null, ["md"], _brainlibrary_anon_be3d699220);
   $def("_brainlibrary_libraryNotebook", "libraryNotebook", [], _brainlibrary_libraryNotebook);
@@ -30988,6 +31334,7 @@ export default function define(runtime, observer) {
   $def("_brainlibrary_libraryModule", "libraryModule", [], _brainlibrary_libraryModule);
   $def("_brainlibrary_test_library_enters_a_card_for_each_module", "test_library_enters_a_card_for_each_module", ["libraryRig","libraryModule","libraryNotebook","expect","sha256"], _brainlibrary_test_library_enters_a_card_for_each_module);
   $def("_brainlibrary_test_library_says_when_a_card_no_longer_matches_its_notebook", "test_library_says_when_a_card_no_longer_matches_its_notebook", ["libraryRig","libraryNotebook","libraryModule","expect"], _brainlibrary_test_library_says_when_a_card_no_longer_matches_its_notebook);
+  $def("_brainlibrary_test_library_cards_follow_their_notebook", "test_library_cards_follow_their_notebook", ["libraryRig","libraryModule","libraryNotebook","expect"], _brainlibrary_test_library_cards_follow_their_notebook);
   $def("_brainlibrary_test_library_keeps_ten_versions", "test_library_keeps_ten_versions", ["libraryRig","libraryNotebook","expect"], _brainlibrary_test_library_keeps_ten_versions);
   $def("_brainlibrary_test_library_declares_what_it_needs", "test_library_declares_what_it_needs", ["library_service","expect"], _brainlibrary_test_library_declares_what_it_needs);
   $def("_brainlibrary_test_library_panel_lists_notebooks", "test_library_panel_lists_notebooks", ["libraryPanel","expect"], _brainlibrary_test_library_panel_lists_notebooks);
@@ -31832,11 +32179,11 @@ brain-x-wscdp   by its own key: 101 through the core, Browser.getVersion "Chrome
 bought 20 s, +30 s by extend while connected -> the socket closed 13.3 s after the new paidUntil
 \`\`\`
 `);};
-const _brainbrowser_anon_b4cd611899 = function _anonymous(md) {return (md`## Many browsers, each with tabs
+const _brainbrowser_anon_3fe1777c2b = function _anonymous(md) {return (md`## Many browsers, each with tabs
 
 A browser is the pair of its owner and its name. The owner is the caller that the core names (\`x-brain-caller\`): \`owner\`, \`token:NAME\`, a member's DID, or \`worker:brain-x-NAME\`. The service does not read an owner from a parameter, thus a caller cannot name the browser of a different caller. A member's Worker calls as its author, so the two share browsers.
 
-How the caller arrived also counts (\`x-brain-via\`). A call with \`turn:<entry>\`, \`jwt\` or \`portal:<id>\` is not the person's own tab, and its owner is \`via:<caller>\`: rows under \`b/via:<caller>/\`. All turns, PDS calls and portals of one caller share that owner. A person's own session, a token and a Worker keep the caller's name. The reason is that a page in a person's browser can hold that person's session: \`brain.ts page up\` puts the owner's in the browser \`brain\`, and a turn of the owner has the caller \`owner\`. Until 2026-10-09 the turn reached that page with \`eval\`. \`maxPerOwner\` counts the two owners apart, so a turn cannot use up the browsers of the session. \`all\` lists both and \`end\` closes either; \`liveView\` reaches the session's own only. Each browser is one Browser Run session: its own memory, its own \`paidUntil\`, its own end.
+How the caller arrived also counts (\`x-brain-via\`). A call with \`turn:<entry>\`, \`jwt\` or \`portal:<id>\` is not the person's own tab, and its owner is \`via:<caller>\`: rows under \`b/via:<caller>/\`. All turns, PDS calls and portals of one caller share that owner. A call under a delegation (\`delegation:<id>\`) has the owner \`d:<id>\`, apart from the person's and from every other delegation's. A person's own session, a token and a Worker keep the caller's name. The reason is that a page in a person's browser can hold that person's session: \`brain.ts page up\` puts the owner's in the browser \`brain\`, and a turn of the owner has the caller \`owner\`. Until 2026-10-09 the turn reached that page with \`eval\`. \`maxPerOwner\` counts the two owners apart, so a turn cannot use up the browsers of the session. \`all\` lists both and \`end\` closes either; \`liveView\` reaches the session's own only. Each browser is one Browser Run session: its own memory, its own \`paidUntil\`, its own end.
 
 Who owns and who pays are different. A Worker that calls in a chain the owner started owns the browser, and the core charges the owner, who is the origin of the chain. Until 2026-10-08 19:38 CEST the service had one browser for all callers; it changed because "each browser will be owned by another process, so this one thing has to serve the whole cluster" (Tom, 2026-10-08).
 
@@ -32581,7 +32928,7 @@ const _brainbrowser_browserOps = function _browserOps(browserLimits,rows,browser
     }
   };
 };
-const _brainbrowser_browserApp = function _browserApp(hono,Response,browserOps) {
+const _brainbrowser_browserApp = function _browserApp(hono,Response,keeperOf,browserOps) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.browser.";
   // The core names the caller and who started the chain. This service records them and decides nothing.
@@ -32600,9 +32947,10 @@ const _brainbrowser_browserApp = function _browserApp(hono,Response,browserOps) 
       throw e;
     }
   };
-  // Who owns the browser. A call that is not the person's own tab (an LLM turn, a PDS JWT, a portal) owns browsers apart from
-  // that person's, because a page in a person's browser can hold their session. The core names no caller via:….
-  const who = (c) => (by(c) !== "anonymous" && /^(turn:|portal:|jwt$)/.test(c.req.header("x-brain-via") || "") ? "via:" + by(c) : by(c));
+  // Who owns the browser. A call that is not the person's own tab (an LLM turn, a PDS JWT, a portal, a call under a
+  // delegation) owns browsers apart from that person's, because a page in a person's browser can hold their session.
+  // The core names no caller via:… or d:….
+  const who = (c) => keeperOf(c.req.raw.headers);
   // The browser is the one the caller owns under the name in `browser`, in the query string or in the body. "default" when absent.
   const mine = (c, q = {}) => browserOps.one(who(c), c.req.query("browser") || q.browser || "default");
   const post = (m) => app.post(NS + m, answer(async (c) => ((q) => mine(c, q)[m](q, by(c), origin(c)))(await body(c))));
@@ -33328,8 +33676,9 @@ const _brainbrowser_test_browser_a_turn_does_not_reach_the_browsers_of_its_calle
   await session.post("open", { name: "brain", url: A });
   await session.post("eval", { name: "brain", expression: 'localStorage.setItem("brain_session", "secret")' });
   expect([rig.keys("page/"), (await session.post("eval", { name: "brain", expression: kept })).data.value]).toEqual([["page/brain"], "secret"]);
-  // A turn of the owner, a call through a PDS and a portal have the caller owner, and a different owner of browsers.
-  for (const via of ["turn:7", "jwt", "portal:p1"]) {
+  // A turn of the owner, a call through a PDS, a portal and a call under a delegation have the caller owner, and a
+  // different owner of browsers.
+  for (const via of ["turn:7", "jwt", "portal:p1", "delegation:0a1b"]) {
     const other = rig.as("owner", "owner", via);
     const got = [(await other.get("list")).data, (await other.get("status", { name: "brain" })).status, (await other.post("eval", { name: "brain", expression: kept })).data.error, (await other.get("text", { name: "brain" })).data.error, (await other.post("close", { name: "brain" })).status, (await other.post("close", { all: true })).data];
     expect([via, ...got]).toEqual([via, { pages: [] }, 404, "NoTime", "NoTime", 404, { closed: [], browser: "default" }]);
@@ -33363,6 +33712,10 @@ const _brainbrowser_test_browser_a_turn_does_not_reach_the_browsers_of_its_calle
   rig.setPaid(-1, V);
   await rig.tick();
   expect([rig.fake.sessions.size, rig.keys("browser/", V), rig.keys("browser/").length, (await turn.get("status", { name: "again" })).data.closed]).toEqual([1, [], 1, "time ran out"]);
+  // The browser of a call under a delegation is kept under the delegation.
+  const heldAs = rig.as("owner", "owner", "delegation:0a1b");
+  await heldAs.post("extend", {}, { seconds: 60 });
+  expect([rig.keys("browser/", "d:0a1b/default").length, (await heldAs.get("status")).data.owner]).toEqual([1, "d:0a1b"]);
   return "turn, jwt and portal: browsers of via:owner; the session's page was not reached";
 };
 const _brainbrowser_test_browser_cdp_is_the_socket_of_the_callers_own_browser = async function _test_browser_cdp_is_the_socket_of_the_callers_own_browser(browserRig,expect) {
@@ -33432,7 +33785,7 @@ export default function define(runtime, observer) {
   $def("_brainbrowser_browserView", "browserView", ["Generators","viewof browserView"], _brainbrowser_browserView);
   $def("_brainbrowser_anon_1e3a694491", null, ["md"], _brainbrowser_anon_1e3a694491);
   $def("_brainbrowser_anon_c762a2d6b6", null, ["md"], _brainbrowser_anon_c762a2d6b6);
-  $def("_brainbrowser_anon_b4cd611899", null, ["md"], _brainbrowser_anon_b4cd611899);
+  $def("_brainbrowser_anon_3fe1777c2b", null, ["md"], _brainbrowser_anon_3fe1777c2b);
   $def("_brainbrowser_anon_da27ada941", null, ["md"], _brainbrowser_anon_da27ada941);
   $def("_brainbrowser_anon_16e8ef55eb", null, ["md"], _brainbrowser_anon_16e8ef55eb);
   $def("_brainbrowser_anon_e22e028673", null, ["md"], _brainbrowser_anon_e22e028673);
@@ -33446,7 +33799,7 @@ export default function define(runtime, observer) {
   $def("_brainbrowser_browserSeconds", "browserSeconds", ["browserLimits"], _brainbrowser_browserSeconds);
   $def("_brainbrowser_browserPrice", "browserPrice", ["browserLimits"], _brainbrowser_browserPrice);
   $def("_brainbrowser_browserOps", "browserOps", ["browserLimits","rows","browser","log","browserCdp","browserHook","browserRefusal","browserSeconds"], _brainbrowser_browserOps);
-  $def("_brainbrowser_browserApp", "browserApp", ["hono","Response","browserOps"], _brainbrowser_browserApp);
+  $def("_brainbrowser_browserApp", "browserApp", ["hono","Response","keeperOf","browserOps"], _brainbrowser_browserApp);
   $def("_brainbrowser_browserPanel", "browserPanel", ["htl","Inputs","browserLimits"], _brainbrowser_browserPanel);
   $def("_brainbrowser_anon_52b23e694b", null, ["md"], _brainbrowser_anon_52b23e694b);
   $def("_brainbrowser_browserFake", "browserFake", ["Response"], _brainbrowser_browserFake);
@@ -33477,6 +33830,7 @@ export default function define(runtime, observer) {
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
   main.define("callerOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerOf", _));
+  main.define("keeperOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("keeperOf", _));
   main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
   main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
   main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
@@ -34678,7 +35032,7 @@ An entry holds text to search, not a file. A paper's PDF or a page's HTML stays 
 An entry is found by its words, or by its meaning: each has one vector in one Vectorize index, and \`knowledge.search\` with \`semantic=true\` answers the entries nearest a question. That is how an agent finds the module, the paper or the note for a task. Added 2026-10-10; the measurements are in \`tools/cloud-brain/knowledge-vectors.md\`.`);};
 const _brainknowledge_viewof_knowledgeView = function _knowledgeView(knowledgePanel,client,session) {return (knowledgePanel({ client, owner: !!(session && session.owner) }));};
 const _brainknowledge_knowledgeView = (G, _) => G.input(_);
-const _brainknowledge_anon_34f08f7bfe = function _anonymous(md,knowledgeLimits,knowledgeVectors,knowledgeKinds) {return (md`## Methods
+const _brainknowledge_anon_14aaabdb6a = function _anonymous(md,knowledgeLimits,knowledgeVectors,knowledgeKinds) {return (md`## Methods
 
 | | |
 |---|---|
@@ -34688,7 +35042,7 @@ const _brainknowledge_anon_34f08f7bfe = function _anonymous(md,knowledgeLimits,k
 | \`knowledge.search\` | query. \`?q=\` and the filters below, \`limit\` 1 to ${knowledgeLimits.page} (20). \`{ entries }\`, best match first, each with a \`snippet\`. With \`semantic=true\`: by meaning (see Search by meaning). |
 | \`knowledge.embed\` | procedure. \`{ limit }\`, 1 to ${knowledgeLimits.batch} (50). Makes the vectors of entries that have none, the last entered first. \`{ embedded, left }\`. |
 | \`knowledge.list\` | query. The filters below, \`limit\` 1 to ${knowledgeLimits.page} (50), \`cursor\`. \`{ entries, cursor }\`, last entered first. With \`stale=true\`: the entries that have a \`staleSince\`, the longest stale first, one page and no cursor. |
-| \`knowledge.delete\` | procedure. \`{ id }\` or \`{ ids }\`. \`{ deleted }\`. |
+| \`knowledge.delete\` | procedure. \`{ id }\` or \`{ ids }\`. \`{ deleted }\`. With \`url\`, only those of the ids whose \`url\` is that one: a writer deletes what was made from an address and leaves an entry that has since been made from another. |
 | \`knowledge.stats\` | query. \`{ entries, vectors, kinds, sources, by, limits }\`: counts of every entry, whoever reads it; \`sources\` and \`by\` of the 100 largest; \`knowledgeLimits\`. |
 | Filters | \`source\`, \`kind\`, \`by\`, \`tag\`, and \`since\`, compared with \`at\`: milliseconds, or a date from \`YYYY-MM\` on. Four digits alone are refused, since they could be either. |
 | Storage | \`database\`: \`entries\` and its full-text index \`entries_fts\`. \`vectors\`: the index \`${knowledgeVectors.name}\`, one vector an entry. |
@@ -34712,9 +35066,10 @@ const _brainknowledge_anon_34f08f7bfe = function _anonymous(md,knowledgeLimits,k
 | \`tags\` | \`a-z 0-9 -\`, ${knowledgeLimits.source} characters each, ${knowledgeLimits.tags} at most |
 | \`by\`, \`at\` | who entered it and when. Set here from the caller the core names (\`owner\`, \`token:NAME\`, \`worker:brain-x-NAME\`, a DID); a value in the body is not read. |
 | \`staleSince\` | \`null\`, or when what the entry was made from was first seen to differ from it, in milliseconds. Whoever enters the entry sets it; a put of \`{ id, staleSince: 0 }\` clears it. Nothing here looks at a source. An entry that has one is still found and answered, with the date. |
-| \`changed\` | \`null\`, or \`{ by, method, at }\` of the last put after the first. Its \`method\` is the one that put gave, \`null\` when it gave none. |
+| \`changed\` | \`null\`, or \`{ by, method, at }\` of the last put after the first, whatever it changed: a put of \`staleSince\` or of a \`sha256\` alone counts. Its \`method\` is the one that put gave, \`null\` when it gave none. |
+| \`wordsAt\` | when the title or the text was last written, in milliseconds. \`changed.at\` does not say that: every one of the 400 module cards on cb4 had a \`changed.at\` of 2026-10-10 08:30 to 08:33 UTC after a pass that gave each its hash and wrote no word. For an entry whose words were last written before 2026-10-10 11:02 CEST it is when the entry was first entered. |
 
-With \`unlessPublic: true\`, an entry whose kept copy is public is left as it is and counted in the answer's \`skipped\`; \`brain-x-library\` sends it with the cards of a notebook that is not public, so that a card anyone reads is not written over from a file they cannot open.
+With \`unlessPublic: true\`, an entry whose kept copy is public is left as it is and counted in the answer's \`skipped\` (and is in \`kept\` too when the entry has \`ifAbsent\`); \`brain-x-library\` sends it with the cards of a notebook that is not public, so that a card anyone reads is not written over from a file they cannot open.
 
 With \`ifAbsent: true\`, an entry that is kept is left whole, whoever reads it, and the answer's \`kept\` has its \`{ id, url, file, sha256, staleSince, public }\`: what a writer needs to tell whether its source has moved on, without writing the entry again (added 2026-10-10 for the module cards, see brain-library).
 
@@ -34724,9 +35079,9 @@ A put of an id that is kept changes the entry. \`by\`, \`method\` and \`at\` sta
 await client.procedure("knowledge.put", { id: "arxiv:2610.08077", kind: "paper", title: "Self-Retrospection Distillation", text: "…", url: "https://arxiv.org/abs/2610.08077", source: "arxiv", method: "manual" })
 await client.query("knowledge.search", { q: "hindsight training", kind: "paper" })
 \`\`\``);};
-const _brainknowledge_anon_482211c3b0 = function _anonymous(md,knowledgeVectors) {return (md`## Who can call
+const _brainknowledge_anon_a6603bb94a = function _anonymous(md,knowledgeVectors) {return (md`## Who can call
 
-Until the owner changes a rule: the owner and their tokens call every method. \`knowledge.put\` is also open to \`brain-x-snapshot\`, which enters the day's papers, and \`brain-x-library\`, which enters a card for each module of a kept notebook. Another Worker that enters what it finds needs a rule on \`knowledge.put\` that names it. No method is open to anyone else until the owner grants it or changes its rule.
+Until the owner changes a rule: the owner and their tokens call every method. \`knowledge.put\` is also open to \`brain-x-snapshot\`, which enters the day's papers, and \`brain-x-library\`, which enters a card for each module of a kept notebook. \`knowledge.delete\` is open to \`brain-x-library\`, which deletes the cards of a notebook it deletes (since 2026-10-10). Another Worker that enters what it finds needs a rule on \`knowledge.put\` that names it. No method is open to anyone else until the owner grants it or changes its rule.
 
 ## Who reads an entry
 
@@ -34768,7 +35123,8 @@ const _brainknowledge_knowledge_service = function _knowledge_service(cloudflare
     "com.lopecode.brain.knowledge.get": { type: "query", who: "owner" },
     "com.lopecode.brain.knowledge.search": { type: "query", who: "owner" },
     "com.lopecode.brain.knowledge.list": { type: "query", who: "owner" },
-    "com.lopecode.brain.knowledge.delete": { type: "procedure", who: "owner" },
+    // The library deletes the cards of a notebook that is deleted.
+    "com.lopecode.brain.knowledge.delete": { type: "procedure", allow: 'caller.trusted || caller.worker == "brain-x-library"' },
     "com.lopecode.brain.knowledge.stats": { type: "query", who: "owner" },
     "com.lopecode.brain.knowledge.embed": { type: "procedure", who: "owner" }
   },
@@ -34779,7 +35135,7 @@ const _brainknowledge_knowledge_announce = function _knowledge_announce(plugins,
   plugins.add("workers", knowledge_service, { invalidation });
   return "announced knowledge_service";
 };
-const _brainknowledge_knowledgeKinds = function _knowledgeKinds() {return (["paper", "article", "post", "finding", "note", "module", "other"]);};
+const _brainknowledge_knowledgeKinds = function _knowledgeKinds() {return (["paper", "article", "post", "finding", "note", "module", "doc", "other"]);};
 const _brainknowledge_knowledgeVectors = function _knowledgeVectors() {return ({ name: "bge-base-en-768", model: "@cf/baai/bge-base-en-v1.5", dimensions: 768, chars: 1500, usd: 0.00005, ask: "Represent this sentence for searching relevant passages: " });};
 const _brainknowledge_knowledgeTenant = function _knowledgeTenant(sha256) {return (async (who) => (who === "owner" || who === "deployer" || /^token:/.test(who || "") || /^worker:brain-(?!m-)/.test(who || "") ? "owner" : /^did:/.test(who || "") ? (await sha256(who)).slice(0, 32) : ""));};
 const _brainknowledge_knowledgeLimits = function _knowledgeLimits() {return ({ batch: 100, page: 100, id: 100, title: 500, text: 16000, url: 2000, source: 40, published: 40, file: 200, method: 100, cites: 50, tags: 16 });};
@@ -34794,10 +35150,12 @@ const _brainknowledge_knowledgeColumns = function _knowledgeColumns() {return ([
   ["vid", "ALTER TABLE entries ADD COLUMN vid TEXT"],
   ["vid", "CREATE INDEX IF NOT EXISTS entries_vid ON entries (vid)"],
   // When what the entry was made from was first seen to differ from it. null: not known to differ.
-  ["stale_at", "ALTER TABLE entries ADD COLUMN stale_at INTEGER"]
+  ["stale_at", "ALTER TABLE entries ADD COLUMN stale_at INTEGER"],
+  // When the title or the text was last written. null: not since the column was added (2026-10-10).
+  ["words_at", "ALTER TABLE entries ADD COLUMN words_at INTEGER"]
 ]);};
 const _brainknowledge_knowledgeSql = function _knowledgeSql() {
-  const COLS = "e.id AS id, e.kind AS kind, e.title AS title, e.text AS text, e.url AS url, e.source AS source, e.published AS published, e.file AS file, e.sha256 AS sha256, e.entered_by AS entered_by, e.method AS method, e.at AS at, e.upd_by AS upd_by, e.upd_method AS upd_method, e.upd_at AS upd_at, e.cites AS cites, e.tags AS tags, e.owner AS owner, e.vid AS vid, e.stale_at AS stale_at";
+  const COLS = "e.id AS id, e.kind AS kind, e.title AS title, e.text AS text, e.url AS url, e.source AS source, e.published AS published, e.file AS file, e.sha256 AS sha256, e.entered_by AS entered_by, e.method AS method, e.at AS at, e.upd_by AS upd_by, e.upd_method AS upd_method, e.upd_at AS upd_at, e.cites AS cites, e.tags AS tags, e.owner AS owner, e.vid AS vid, e.stale_at AS stale_at, e.words_at AS words_at";
   // ?1 source, ?2 kind, ?3 who entered it, ?4 since, ?5 a LIKE pattern for one tag. An empty text is no filter.
   // ?6 is the caller (knowledgeTenant): an entry is read when it is public or the caller's.
   const MINE = "(e.owner = 'public' OR e.owner = ?6)";
@@ -34806,7 +35164,8 @@ const _brainknowledge_knowledgeSql = function _knowledgeSql() {
     get: `SELECT ${COLS} FROM entries e WHERE e.id = ?1`,
     // A put of a kept id leaves entered_by, method and at as they were. ?15 is the method this put gave, null when none.
     // ?16 owner. ?17 the vector the entry keeps: null when what the vector is made from has changed. ?18 stale since.
-    put: "INSERT INTO entries (id, kind, title, text, url, source, published, file, sha256, entered_by, method, at, cites, tags, owner, vid, stale_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18) ON CONFLICT (id) DO UPDATE SET stale_at = excluded.stale_at, kind = excluded.kind, title = excluded.title, text = excluded.text, url = excluded.url, source = excluded.source, published = excluded.published, file = excluded.file, sha256 = excluded.sha256, cites = excluded.cites, tags = excluded.tags, owner = excluded.owner, vid = excluded.vid, upd_by = excluded.entered_by, upd_method = ?15, upd_at = excluded.at",
+    // ?19 when the title or the text was last written.
+    put: "INSERT INTO entries (id, kind, title, text, url, source, published, file, sha256, entered_by, method, at, cites, tags, owner, vid, stale_at, words_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?19) ON CONFLICT (id) DO UPDATE SET stale_at = excluded.stale_at, words_at = excluded.words_at, kind = excluded.kind, title = excluded.title, text = excluded.text, url = excluded.url, source = excluded.source, published = excluded.published, file = excluded.file, sha256 = excluded.sha256, cites = excluded.cites, tags = excluded.tags, owner = excluded.owner, vid = excluded.vid, upd_by = excluded.entered_by, upd_method = ?15, upd_at = excluded.at",
     columns: "SELECT name FROM pragma_table_info('entries')",
     vector: "UPDATE entries SET vid = ?2 WHERE id = ?1",
     // The entries of the vectors a query found, by vector id, and again only those the caller reads.
@@ -34898,7 +35257,7 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
   const json = (t) => { try { return JSON.parse(t); } catch { return []; } };
   const view = (r) => ({
     id: r.id, kind: r.kind, title: r.title, text: r.text, url: r.url, source: r.source, published: r.published, file: r.file, sha256: r.sha256,
-    by: r.entered_by, method: r.method, at: r.at, changed: r.upd_at ? { by: r.upd_by, method: r.upd_method, at: r.upd_at } : null, cites: json(r.cites), tags: json(r.tags), public: r.owner === "public", staleSince: r.stale_at || null,
+    by: r.entered_by, method: r.method, at: r.at, changed: r.upd_at ? { by: r.upd_by, method: r.upd_method, at: r.upd_at } : null, cites: json(r.cites), tags: json(r.tags), public: r.owner === "public", staleSince: r.stale_at || null, wordsAt: r.words_at || r.at,
     ...(r.snippet !== undefined ? { snippet: r.snippet } : {})
   });
   // The core named the caller. Nothing in a body or a query says who calls.
@@ -34971,20 +35330,25 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
       // The same id twice in one call: the second is a change of the first.
       const kept = seen.get(first[i]) || was.get(first[i]) || null, old = rows.get(first[i]);
       // unlessPublic: what anyone reads is not written over by a copy that not everyone may read.
+      // ifAbsent: an entry that is kept is left whole, and the answer says what it was made from. That holds for one
+      // unlessPublic leaves too: its writer still has to see that its source has moved on.
+      const whole = e.ifAbsent === true && kept ? { id: kept.id, url: kept.url, file: kept.file, sha256: kept.sha256, staleSince: kept.staleSince, public: kept.public } : null;
+      if (whole) left.push(whole);
       if (e.unlessPublic === true && kept && kept.public) { skipped++; continue; }
-      // ifAbsent: an entry that is kept is left whole, and the answer says what it was made from.
-      if (e.ifAbsent === true && kept) { left.push({ id: kept.id, url: kept.url, file: kept.file, sha256: kept.sha256, staleSince: kept.staleSince, public: kept.public }); continue; }
+      if (whole) continue;
       const r = await knowledgeEntry({ ...e, id: first[i] }, kept);
       if (r.error) return fail(c, 400, "InvalidRequest", `entry ${i + 1}: ${r.error}`);
       // A private entry is its first enterer's.
       const owner = r.entry.public ? "public" : await knowledgeTenant(old ? old.entered_by : by);
       // The vector is kept while what it was made from, and who reads it, are the same.
       const vid = old && old.vid && !seen.has(first[i]) && old.title === r.entry.title && old.text === r.entry.text && old.kind === r.entry.kind && old.owner === owner ? old.vid : null;
+      // The words are as old as their last writing: a mark, a tag or a hash does not make them newer.
+      const wordsAt = old && !seen.has(first[i]) && old.title === r.entry.title && old.text === r.entry.text ? old.words_at || old.at : now;
       seen.set(first[i], r.entry);
       // said: the method this put gave. A change that gives none is recorded with none, not with the first enterer's.
-      entries.push({ ...r.entry, said: e.method == null || e.method === "" ? null : r.entry.method, owner, vid, at: old ? old.at : now });
+      entries.push({ ...r.entry, said: e.method == null || e.method === "" ? null : r.entry.method, owner, vid, wordsAt, at: old ? old.at : now });
     }
-    const row = (e) => [S.put, e.id, e.kind, e.title, e.text, e.url, e.source, e.published, e.file, e.sha256, by, e.method, now, JSON.stringify(e.cites), JSON.stringify(e.tags), e.said, e.owner, e.vid, e.staleSince];
+    const row = (e) => [S.put, e.id, e.kind, e.title, e.text, e.url, e.source, e.published, e.file, e.sha256, by, e.method, now, JSON.stringify(e.cites), JSON.stringify(e.tags), e.said, e.owner, e.vid, e.staleSince, e.wordsAt];
     // One transaction for each 20 entries: the full-text row goes, the entry is written, its full-text row is made again.
     for (let i = 0; i < entries.length; i += 20) await run(entries.slice(i, i + 20).flatMap((e) => [[S.ftsDrop, e.id], row(e), [S.ftsAdd, e.id]]));
     const ids = [...new Set(entries.map((e) => e.id))], changed = ids.filter((id) => was.has(id)).length;
@@ -35033,7 +35397,8 @@ const _brainknowledge_knowledgeApp = function _knowledgeApp(hono,knowledgeLimits
     const ids = Array.isArray(b.ids) ? b.ids : typeof b.id === "string" ? [b.id] : null;
     if (!ids || !ids.length || ids.length > L.batch || !ids.every((id) => typeof id === "string" && id.length <= L.id)) return fail(c, 400, "InvalidRequest", `id, or ids of 1 to ${L.batch}`);
     const tenant = await tenantOf(c), mine = [];
-    for (const r of await run([...new Set(ids)].map((id) => [S.get, id]))) if (r.rows[0] && (await changes(r.rows[0], tenant))) mine.push(r.rows[0]);
+    // url: only what was made from that address.
+    for (const r of await run([...new Set(ids)].map((id) => [S.get, id]))) if (r.rows[0] && (b.url == null || r.rows[0].url === b.url) && (await changes(r.rows[0], tenant))) mine.push(r.rows[0]);
     if (!mine.length) return c.json({ deleted: 0 });
     // The vectors first. One that stays behind is found by no search: a search answers with entries.
     const vids = mine.filter((r) => r.vid).map((r) => r.vid);
@@ -35102,11 +35467,11 @@ const _brainknowledge_knowledgeFakeSql = function _knowledgeFakeSql(knowledgeSql
     seen.push(statement);
     if (knowledgeSchema.includes(statement) || knowledgeColumns.some(([, s]) => s === statement)) return { rows: [], changes: 0 };
     // A table from before 2026-10-10: it has neither column, and both are added.
-    if (statement === S.columns) return { rows: seen.some((s) => s === knowledgeColumns[0][1]) ? [{ name: "owner" }, { name: "vid" }, { name: "stale_at" }] : [], changes: 0 };
+    if (statement === S.columns) return { rows: seen.some((s) => s === knowledgeColumns[0][1]) ? [{ name: "owner" }, { name: "vid" }, { name: "stale_at" }, { name: "words_at" }] : [], changes: 0 };
     if (statement === S.get) return { rows: entries.has(a[0]) ? [cols(entries.get(a[0]))] : [], changes: 0 };
     if (statement === S.put) {
-      const [id, kind, title, text, url, source, published, file, sha256, by, method, at, cites, tags, said, owner, vid, stale_at] = a, was = entries.get(id);
-      entries.set(id, was ? { ...was, kind, title, text, url, source, published, file, sha256, cites, tags, owner, vid, stale_at, upd_by: by, upd_method: said, upd_at: at } : { n: ++n, id, kind, title, text, url, source, published, file, sha256, entered_by: by, method, at, upd_by: null, upd_method: null, upd_at: null, cites, tags, owner, vid, stale_at });
+      const [id, kind, title, text, url, source, published, file, sha256, by, method, at, cites, tags, said, owner, vid, stale_at, words_at] = a, was = entries.get(id);
+      entries.set(id, was ? { ...was, kind, title, text, url, source, published, file, sha256, cites, tags, owner, vid, stale_at, words_at, upd_by: by, upd_method: said, upd_at: at } : { n: ++n, id, kind, title, text, url, source, published, file, sha256, entered_by: by, method, at, upd_by: null, upd_method: null, upd_at: null, cites, tags, owner, vid, stale_at, words_at });
       return { rows: [], changes: 1 };
     }
     if (statement === S.ftsDrop) return { rows: [], changes: entries.has(a[0]) && fts.delete(entries.get(a[0]).n) ? 3 : 0 };
@@ -35276,6 +35641,17 @@ const _brainknowledge_test_knowledge_says_since_when_an_entry_differs_from_its_s
   // 0 says it is as its source again.
   await o.post("put", { id: "arxiv:2", staleSince: 0 });
   expect(await stale()).toEqual([["arxiv:1", 5000]]);
+  // A mark is a put, so changed.at moves with it; the words are as old as they were.
+  const marked = (await o.get("get", { id: "arxiv:1" })).data;
+  expect([marked.wordsAt, marked.changed.at > marked.wordsAt || marked.changed.at === marked.at]).toEqual([marked.at, true]);
+  await new Promise((r) => setTimeout(r, 3));
+  await o.post("put", { id: "arxiv:1", text: "other words" });
+  expect((await o.get("get", { id: "arxiv:1" })).data.wordsAt).toBeGreaterThan(marked.wordsAt);
+  // unlessPublic leaves a public entry, and with ifAbsent still says what it was made from.
+  await o.post("put", { id: "arxiv:2", public: true });
+  expect((await o.post("put", { ...rig.paper(2), title: "Private copy", unlessPublic: true, ifAbsent: true })).data).toMatchObject({ entered: 0, ids: [], skipped: 1, kept: [{ id: "arxiv:2", public: true }] });
+  // A delete with url takes only what was made from that address.
+  expect([(await o.post("delete", { ids: ["arxiv:1", "arxiv:2"], url: "https://arxiv.org/abs/2" })).data, (await o.get("get", { id: "arxiv:1" })).status]).toEqual([{ deleted: 1 }, 200]);
   expect([(await o.post("put", { id: "arxiv:1", staleSince: -1 })).status, (await o.get("list", { stale: "true", cursor: "1::a" })).status, (await rig.member.get("list", { stale: "true" })).data.entries]).toEqual([400, 400, []]);
   return "kept whole, 2 stale, 1 cleared";
 };
@@ -35351,7 +35727,8 @@ const _brainknowledge_test_knowledge_declares_its_own_database_and_who_calls = a
   const callers = { owner: { caller: "owner", via: "session" }, token: { caller: "token:laptop" }, snapshot: { caller: "worker:brain-x-snapshot" }, library: { caller: "worker:brain-x-library" }, worker: { caller: "worker:brain-x-filler" }, member: { caller: "worker:brain-m-0123456789-a" }, anyone: { caller: "anonymous" } };
   const through = (m) => Object.entries(callers).filter(([, w]) => decide(meta.access["com.lopecode.brain.knowledge." + m], { caller: callerOf(w), request: { method: m, path: "", verb: "POST", params: {} } }).allow).map(([n]) => n).join(" ");
   expect(through("put")).toBe("owner token snapshot library");
-  for (const m of ["get", "search", "list", "delete", "stats", "embed"]) expect([m, through(m)]).toEqual([m, "owner token"]);
+  expect(through("delete")).toBe("owner token library");
+  for (const m of ["get", "search", "list", "stats", "embed"]) expect([m, through(m)]).toEqual([m, "owner token"]);
   return "put: " + through("put");
 };
 const _brainknowledge_test_knowledge_panel_searches_and_lists = async function _test_knowledge_panel_searches_and_lists(knowledgePanel,expect,Event) {
@@ -35387,8 +35764,8 @@ export default function define(runtime, observer) {
   $def("_brainknowledge_anon_11b239a35a", null, ["md"], _brainknowledge_anon_11b239a35a);
   $def("_brainknowledge_viewof_knowledgeView", "viewof knowledgeView", ["knowledgePanel","client","session"], _brainknowledge_viewof_knowledgeView);
   $def("_brainknowledge_knowledgeView", "knowledgeView", ["Generators","viewof knowledgeView"], _brainknowledge_knowledgeView);
-  $def("_brainknowledge_anon_34f08f7bfe", null, ["md","knowledgeLimits","knowledgeVectors","knowledgeKinds"], _brainknowledge_anon_34f08f7bfe);
-  $def("_brainknowledge_anon_482211c3b0", null, ["md","knowledgeVectors"], _brainknowledge_anon_482211c3b0);
+  $def("_brainknowledge_anon_14aaabdb6a", null, ["md","knowledgeLimits","knowledgeVectors","knowledgeKinds"], _brainknowledge_anon_14aaabdb6a);
+  $def("_brainknowledge_anon_a6603bb94a", null, ["md","knowledgeVectors"], _brainknowledge_anon_a6603bb94a);
   $def("_brainknowledge_knowledge_service", "knowledge_service", ["cloudflare","knowledgeApp","knowledgeVectors"], _brainknowledge_knowledge_service);
   $def("_brainknowledge_knowledge_announce", "knowledge_announce", ["plugins","knowledge_service","invalidation"], _brainknowledge_knowledge_announce);
   $def("_brainknowledge_knowledgeKinds", "knowledgeKinds", [], _brainknowledge_knowledgeKinds);
@@ -35501,11 +35878,11 @@ Each image is one container application of the Cloudflare account, which the dep
 To add an image, add it to \`containerImageList\`, remove the Worker and deploy it again: Cloudflare takes a new Durable Object class only with the upload of a script, and the deployer refuses the change on a Worker that runs. Removing the Worker deletes its applications and ends each container.
 
 Not here: an image that runs a lopecode notebook. It has to be built and pushed with Docker, one time, to Docker Hub or to Cloudflare's registry.`);};
-const _braincontainer_anon_a8580f8cea = function _anonymous(md) {return (md`## Who can call, and what it costs
+const _braincontainer_anon_177c08dcfe = function _anonymous(md) {return (md`## Who can call, and what it costs
 
 \`extend\`, \`exec\`, \`get\`, \`post\`, \`status\` and \`stop\` are \`who: "workers"\`: the owner, a token or an account the owner gave the method, and a Worker of this Brain that names the method in its \`calls\`. A member has none of them. \`all\`, \`end\` and \`settings\` are for the owner's own session, and the owner cannot put a different rule.
 
-A container is the triple of its owner, its image and its name. The owner is the caller the core names. A call made for a person that is not their own tab (a turn, a PDS call, a portal) owns containers as \`via:<caller>\`, as in \`brain-browser\`.
+A container is the triple of its owner, its image and its name. The owner is the caller the core names. A call made for a person that is not their own tab (a turn, a PDS call, a portal) owns containers as \`via:<caller>\`, and a call under a delegation as \`d:<id>\`, as in \`brain-browser\`.
 
 The price of \`extend\` is \`seconds\` times the rate of the image, which is Cloudflare's price for the instance type at full use, rounded: lite is $0.000002015 a second from the three prices and the list charges $0.000002 ([pricing](https://developers.cloudflare.com/containers/pricing/), read 2026-10-09: memory $0.0000025 a GiB-second, CPU $0.000020 a vCPU-second, disk $0.00000007 a GB-second). Time that is bought is not given back: not when the container is stopped, and not when it never started.
 
@@ -35793,7 +36170,7 @@ const _braincontainer_containerOps = function _containerOps(containerLimits,cont
     }
   };
 };
-const _braincontainer_containerApp = function _containerApp(hono,Response,containerOps) {
+const _braincontainer_containerApp = function _containerApp(hono,Response,keeperOf,containerOps) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.container.";
   // The core names the caller. This service records it and decides nothing.
@@ -35813,7 +36190,7 @@ const _braincontainer_containerApp = function _containerApp(hono,Response,contai
     }
   };
   // Who owns the container: the caller, or via:<caller> for a call that is not that person's own tab (see brain-browser).
-  const who = (c) => (by(c) !== "anonymous" && /^(turn:|portal:|jwt$)/.test(c.req.header("x-brain-via") || "") ? "via:" + by(c) : by(c));
+  const who = (c) => keeperOf(c.req.raw.headers);
   // The price and a rule read the query string as the core does: of a name given two times, the last. The core
   // refuses such a call; this service reads the same one all the same.
   const last = (c, name) => new URL(c.req.url).searchParams.getAll(name).pop();
@@ -36115,7 +36492,9 @@ const _braincontainer_test_container_each_caller_has_its_own_and_a_caller_names_
   await rig.owner.post("extend", {}, { seconds: 60 });
   await reader.post("extend", {}, { seconds: 60 });
   await turn.post("extend", {}, { seconds: 60, container: "job" });
-  expect([...rig.sim.boxes.keys()].sort()).toEqual(["node/owner/default", "node/via:owner/job", "node/worker:brain-x-reader/default"]);
+  // A call under a delegation keeps its containers under the delegation, not the owner.
+  await rig.as("owner", "delegation:0a1b").post("extend", {}, { seconds: 60, container: "held" });
+  expect([...rig.sim.boxes.keys()].sort()).toEqual(["node/d:0a1b/held", "node/owner/default", "node/via:owner/job", "node/worker:brain-x-reader/default"]);
   // A caller reaches its own container by the same name, and no parameter names another owner's.
   await reader.post("exec", { cmd: ["id"] });
   expect([rig.fake.of("worker:brain-x-reader/default").execs.filter((e) => e[0] === "id").length, rig.fake.of().execs.filter((e) => e[0] === "id").length]).toEqual([1, 0]);
@@ -36126,7 +36505,7 @@ const _braincontainer_test_container_each_caller_has_its_own_and_a_caller_names_
   for (const image of ["docker.io/library/alpine:3", "Node", "other"]) expect([image, (await rig.owner.post("extend", {}, { seconds: 60, image })).data.message]).toEqual([image, "image: one of node"]);
   for (const container of ["a/b", "-a", "x".repeat(41)]) expect((await rig.owner.post("extend", {}, { seconds: 60, container })).status).toBe(400);
   // The owner's own session sees each container, and ends any one.
-  expect((await rig.owner.get("all")).data.containers.map((c) => [c.owner, c.container, c.up])).toEqual([["owner", "default", true], ["via:owner", "job", true], ["worker:brain-x-reader", "default", true]]);
+  expect((await rig.owner.get("all")).data.containers.map((c) => [c.owner, c.container, c.up])).toEqual([["d:0a1b", "held", true], ["owner", "default", true], ["via:owner", "job", true], ["worker:brain-x-reader", "default", true]]);
   await rig.owner.post("end", { owner: "worker:brain-x-reader", image: "node", container: "default" });
   expect(rig.fake.of("worker:brain-x-reader/default").running).toBe(false);
   // The limits count containers with time left. One that has time is extended at the limit.
@@ -36186,7 +36565,7 @@ export default function define(runtime, observer) {
   $def("_braincontainer_anon_5c2a2cd1b5", null, ["md"], _braincontainer_anon_5c2a2cd1b5);
   $def("_braincontainer_anon_f754e66d7b", null, ["md"], _braincontainer_anon_f754e66d7b);
   $def("_braincontainer_anon_1b2e4fb60d", null, ["md"], _braincontainer_anon_1b2e4fb60d);
-  $def("_braincontainer_anon_a8580f8cea", null, ["md"], _braincontainer_anon_a8580f8cea);
+  $def("_braincontainer_anon_177c08dcfe", null, ["md"], _braincontainer_anon_177c08dcfe);
   $def("_braincontainer_anon_58355c85d1", null, ["md"], _braincontainer_anon_58355c85d1);
   $def("_braincontainer_anon_7b8977c2e9", null, ["md","containerMeasured"], _braincontainer_anon_7b8977c2e9);
   $def("_braincontainer_containerMeasured", "containerMeasured", [], _braincontainer_containerMeasured);
@@ -36198,7 +36577,7 @@ export default function define(runtime, observer) {
   $def("_braincontainer_containerPrice", "containerPrice", ["containerLimits","containerImageList"], _braincontainer_containerPrice);
   $def("_braincontainer_containerBox", "containerBox", ["containerLimits","Response","Request"], _braincontainer_containerBox);
   $def("_braincontainer_containerOps", "containerOps", ["containerLimits","containerImageList","rows","containers","Request","containerSeconds"], _braincontainer_containerOps);
-  $def("_braincontainer_containerApp", "containerApp", ["hono","Response","containerOps"], _braincontainer_containerApp);
+  $def("_braincontainer_containerApp", "containerApp", ["hono","Response","keeperOf","containerOps"], _braincontainer_containerApp);
   $def("_braincontainer_containerPanel", "containerPanel", ["htl","Inputs","containerImageList","containerLimits","Event"], _braincontainer_containerPanel);
   $def("_braincontainer_anon_83cbdb0376", null, ["md"], _braincontainer_anon_83cbdb0376);
   $def("_braincontainer_containerFake", "containerFake", [], _braincontainer_containerFake);
@@ -36219,6 +36598,7 @@ export default function define(runtime, observer) {
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
   main.define("callerOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerOf", _));
+  main.define("keeperOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("keeperOf", _));
   main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
   main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
   main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
@@ -38885,15 +39265,15 @@ const _braindb_db_announce = function _db_announce(plugins,db_service,invalidati
   plugins.add("workers", db_service, { invalidation });
   return "announced db_service";
 };
-const _braindb_dbApp = function _dbApp(hono,callerOf,settings,decide,rows,checkedRule,sqlSelfTest,database,sqlMaster,sqlSignature,sqlNeeds,sqlShape,sqlPrefix) {
+const _braindb_dbApp = function _dbApp(hono,callerFrom,callerOf,originFrom,settings,decide,rows,checkedRule,sqlSelfTest,database,sqlMaster,sqlSignature,sqlNeeds,sqlShape,sqlPrefix) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.db.";
   const MAX = 100000;
   const fail = (c, status, error, message) => c.json({ error, message }, status);
   const named = (s) => typeof s === "string" && /^[A-Za-z0-9_.-]{1,60}$/.test(s);
-  const who = (c) => ({ caller: c.req.header("x-brain-caller") || "anonymous", via: c.req.header("x-brain-via") || "" });
+  const who = (c) => callerFrom(c.req.raw.headers);
   // Who started the chain of calls this one is part of, as the core names them. With no name it is the caller.
-  const origin = (c) => callerOf(c.req.header("x-brain-origin") ? { caller: c.req.header("x-brain-origin"), via: c.req.header("x-brain-origin-via") || "" } : who(c));
+  const origin = (c) => callerOf(originFrom(c.req.raw.headers));
   // The table's rule, else the database's "*", else the owner and their tokens.
   const OWNER = { allow: 'caller.kind in ["owner", "token"]' };
   const ruleFor = async (db, table) => (await settings.get(`rule/${db}/${table}`)) || (await settings.get(`rule/${db}/*`)) || OWNER;
@@ -38963,7 +39343,7 @@ const _braindb_dbApp = function _dbApp(hono,callerOf,settings,decide,rows,checke
   });
   app.post(NS + "setRule", async (c) => {
     const me = who(c);
-    if (me.caller !== "owner" || me.via !== "session") return fail(c, 401, "AuthRequired", "the owner's own session");
+    if (!callerOf(me).session) return fail(c, 401, "AuthRequired", "the owner's own session");
     const { db, table, allow = null } = await c.req.json().catch(() => ({}));
     if (!named(db) || !(table === "*" || named(table))) return fail(c, 400, "InvalidRequest", "db, and a table or *");
     if (allow === null) return c.json({ db, table, allow: null, deleted: !!(await settings.delete(`rule/${db}/${table}`)) });
@@ -39067,7 +39447,7 @@ const _braindb_dbApp = function _dbApp(hono,callerOf,settings,decide,rows,checke
   });
   app.post(NS + "sqlGrant", async (c) => {
     const me = who(c);
-    if (me.caller !== "owner" || me.via !== "session") return fail(c, 401, "AuthRequired", "the owner's own session");
+    if (!callerOf(me).session) return fail(c, 401, "AuthRequired", "the owner's own session");
     const { table, allow = null } = await c.req.json().catch(() => ({}));
     if (typeof table !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,99}$/.test(table)) return fail(c, 400, "InvalidRequest", "table");
     const key = "sqlrule/" + table.toLowerCase();
@@ -39425,6 +39805,9 @@ const _braindb_test_a_secret_is_copied_to_a_new_name_and_its_value_is_in_no_answ
   const S = "/xrpc/com.lopecode.brain.secret.", VALUE = "made-up-value-7f3a";
   const copy = (as, from, to) => as(S + "copy", { from, to });
   const turn = rig.as("owner", "turn:4");
+  // The owner under a delegation is not the owner's own session: not for a copy, a table's rule or a rule for SQL.
+  const heldAs = rig.as("owner", "delegation:0a1b");
+  expect([(await copy(heldAs, "WA_TOKEN", "HELD")).status, (await heldAs("setRule", { db: "site", table: "posts", allow: "true" })).status, (await heldAs("sqlGrant", { table: "library_docs", allow: "true" })).status]).toEqual([401, 401, 401]);
   await rig.owner(S + "put", { name: "WA_TOKEN", value: VALUE });
   await rig.owner(S + "setRule", { name: "WA_TOKEN", allow: 'caller.worker == "brain-x-whatsapp"' });
   await rig.owner(S + "put", { name: "PLAIN", value: "other-made-up" });
@@ -39655,7 +40038,7 @@ export default function define(runtime, observer) {
   $def("_braindb_anon_baa1b425c1", null, ["md"], _braindb_anon_baa1b425c1);
   $def("_braindb_db_service", "db_service", ["cloudflare","dbApp"], _braindb_db_service);
   $def("_braindb_db_announce", "db_announce", ["plugins","db_service","invalidation"], _braindb_db_announce);
-  $def("_braindb_dbApp", "dbApp", ["hono","callerOf","settings","decide","rows","checkedRule","sqlSelfTest","database","sqlMaster","sqlSignature","sqlNeeds","sqlShape","sqlPrefix"], _braindb_dbApp);
+  $def("_braindb_dbApp", "dbApp", ["hono","callerFrom","callerOf","originFrom","settings","decide","rows","checkedRule","sqlSelfTest","database","sqlMaster","sqlSignature","sqlNeeds","sqlShape","sqlPrefix"], _braindb_dbApp);
   $def("_braindb_sqlMaster", "sqlMaster", [], _braindb_sqlMaster);
   $def("_braindb_sqlOpcodes", "sqlOpcodes", [], _braindb_sqlOpcodes);
   $def("_braindb_sqlShape", "sqlShape", [], _braindb_sqlShape);
@@ -39687,6 +40070,8 @@ export default function define(runtime, observer) {
   main.define("settings", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("settings", _));
   main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
   main.define("callerOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerOf", _));
+  main.define("callerFrom", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerFrom", _));
+  main.define("originFrom", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("originFrom", _));
   main.define("checkedRule", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("checkedRule", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("module @tomlarkworthy/cloud-brain", [], async () => runtime.module((await import("/@tomlarkworthy/cloud-brain.js?v=4")).default));
@@ -40787,6 +41172,7 @@ md`### What is verified
 | A priced call is charged to the origin's account for the UTC day, and calls made at one time do not spend past it. | cb4, scratch service, removed after: 150 calls of $0.03, 50 at one time, on $1.00: 33 passed, 117 got 402. A failed call was then given back; since the same day no charge is returned. Through 2 Workers the owner paid at each priced method. Priced p50 104 ms, free 46 ms. | 2026-10-08 |
 | The owner changes a value a service reads from \`config\` with one call and no deploy. A value set at deploy is never replaced. | cb4: \`pollMs\` 60000 on \`brain-x-inbox\`, \`inbox.poll\` 20 → 10 in 10 minutes; a member 403, no session 401, key \`owner\` 400, the kernel 404. | 2026-10-09 |
 | A question finds the module, paper or note nearest it, and a caller's search answers only what that caller reads. | cb4: 172 vectors in one index; the wanted module first for 5 of 7 questions (6 before the cards took later prose, 2026-10-10); 0.45 to 0.55 s; a member granted the search got 73 public entries and none of the 100 private ones (\`knowledge-vectors.md\`). | 2026-10-10 |
+| A module's card is not written again when its notebook is put; it says since when the notebook's copy differs, and the owner indexes it. | cb4: 400 cards given their hash, their words left as they were, 0 stale; a scratch module changed twice: \`staleSince\` set once, $0 charged, old card still found; \`library.index\` cleared it for $0.00005. | 2026-10-10 |
 | \`/llms.txt\` tells a program how to call this Brain, from the host and the route table of the Brain that answers. | cb4: 6660 bytes; 101 listed names, none 501; a token made as it says called \`knowledge.search\` with curl. | 2026-10-09 |
 
 The tests of each module run in the page under \`simulate\`. A deploy is unverified until the page runs those tests from the deployed source.`
