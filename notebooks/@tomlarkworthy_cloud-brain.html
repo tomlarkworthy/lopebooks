@@ -9475,12 +9475,11 @@ The page a Brain serves at \`/\` is a shell: lopecode, this module, and no servi
 **Session.** The page holds who is signed in as a token in this origin's \`localStorage\` (\`brain_session\`) and sends it as \`Authorization: Bearer\` on every call; no cookie is involved. \`brainClient\` is the client that does so.
 
 **Portals.** A member's module is listed in the table below and is not added to this page. **Open** shows it in a frame: \`<iframe sandbox="allow-scripts">\`, full width and 480px high, whose document is this same shell file with one script added. The frame has its own origin (\`null\`), its own runtime and no storage. Chromium does not run it while it is off screen, so opening one scrolls to it. The page asks the kernel for a portal token (\`portal.token { author }\`, 10 minutes, renewed every 4) and posts it to the frame; the frame asks \`portal.modules\` for that member's modules, adds them to its own runtime and shows the module's cells, with this module in a second tab. The token names the viewer and reaches only that member's Workers, so code in the frame can call its own service as whoever is looking and nothing else of theirs. In a frame, \`brainClient\` is also the global \`brainClient\`, which is how a member's cell calls its service: \`brainClient.query(brainPortal.methods + "list")\`. Opened by its own author, the frame's tab has **Deploy**, which sends the module as it now stands in the frame to \`member.deploy\`.`);};
-const _brainshell_brainBoot = async function _brainBoot(brainOrigin,md,brainModules,brainPortal,runtime,joinModules,htl,Inputs,brainClient,exportModuleJS,openPortal,brainWho,portalServices) {
+const _brainshell_brainBoot = function _brainBoot(brainOrigin,md,brainModules,brainPortal,brainJoined,htl,Inputs,brainClient,exportModuleJS,brainPortals,openPortal,brainWho,linkTo,navigate,portalServices) {
   if (!brainOrigin) return md`This copy was opened from a file. It holds its modules itself.`;
   if (brainModules.error) return md`The modules of this ${brainPortal ? "portal" : "Brain"} could not be read: ${brainModules.error}.`;
-  const had = brainModules.modules.filter((m) => runtime.mains.has(m.module)).map((m) => m.module);
-  const joined = await joinModules(brainModules.modules);
-  const row = (m) => `| \`${m.module}\` | ${m.worker} | \`${String(m.hash || "").slice(0, 12)}\` | ${joined.includes(m.module) ? "loaded" : had.includes(m.module) ? "in this file" : "not loaded"} |`;
+  const joined = brainJoined;
+  const row = (m) => `| \`${m.module}\` | ${m.worker} | \`${String(m.hash || "").slice(0, 12)}\` | ${joined.includes(m.module) ? "loaded" : "not loaded"} |`;
   if (brainPortal) {
     const note = htl.html`<span style="color:var(--theme-foreground-muted)"></span>`;
     const why = htl.html`<input placeholder="Reason for the change" maxlength="300" style="font:inherit;min-width:16em">`;
@@ -9507,8 +9506,7 @@ ${brainModules.modules.map(row).join("\n")}
 
 ${brainPortal.viewer === brainPortal.author ? htl.html`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${why}${deploy}${note}</div>` : ""}`;
   }
-  const frames = htl.html`<div></div>`;
-  const open = new Map();
+  const { frames, open } = brainPortals;
   const portal = (s) =>
     Inputs.button("Open", {
       reduce: () => {
@@ -9521,9 +9519,10 @@ ${brainPortal.viewer === brainPortal.author ? htl.html`<div style="display:flex;
       }
     });
   const tr = (module, worker, hash, last) => htl.html`<tr><td><code>${module}</code></td><td>${worker}</td><td><code>${String(hash || "").slice(0, 12)}</code></td><td>${last}</td></tr>`;
-  const state = (m) => (joined.includes(m.module) ? "loaded" : had.includes(m.module) ? "in this file" : "not loaded");
+  // A module is added when the layout names it. This link names it: a tab beside the ones already open.
+  const state = (m) => (joined.includes(m.module) ? "loaded" : htl.html`<a href=${linkTo(m.module, { onObservable: false })} onclick=${(e) => (e.preventDefault(), navigate(e.currentTarget.getAttribute("href")))}>open</a>`);
   return htl.html`<div>
-    <p>${joined.length} of ${brainModules.modules.length} modules loaded from this Brain's Workers, distilled by deployer <code>${String(brainModules.distiller || "").slice(0, 12)}</code>.${portalServices.length ? ` ${portalServices.length} of a member's, each opened as a portal: a frame with its own runtime.` : ""}</p>
+    <p>${joined.length} of ${brainModules.modules.length} modules of this Brain's Workers are on this page. One is added when the layout names it. Distilled by deployer <code>${String(brainModules.distiller || "").slice(0, 12)}</code>.${portalServices.length ? ` ${portalServices.length} of a member's, each opened as a portal: a frame with its own runtime.` : ""}</p>
     <table>
       <thead><tr><th>module</th><th>Worker</th><th>hash</th><th></th></tr></thead>
       <tbody>${brainModules.modules.map((m) => tr(m.module, m.worker, m.hash, state(m)))}${portalServices.map((s) => tr(s.module, s.worker, s.hash, portal(s)))}</tbody>
@@ -9531,7 +9530,92 @@ ${brainPortal.viewer === brainPortal.author ? htl.html`<div style="display:flex;
     ${frames}
   </div>`;
 };
-const _brainshell_anon_3b32f33ec5 = function _anonymous(md) {return (md`## Reference
+const _brainshell_brainPortals = function _brainPortals(htl) {return ({ frames: htl.html`<div></div>`, open: new Map() });};
+const _brainshell_viewModules = function _viewModules(listModules) {return ((hash) => {
+  const view = String(hash || "").replace(/^#/, "").split("&").find((p) => p.startsWith("view="));
+  if (!view) return [];
+  try {
+    return [...listModules(decodeURIComponent(view)).keys()];
+  } catch {
+    return [];
+  }
+});};
+const _brainshell_brainWanted = function _brainWanted(brainOrigin,brainPortal,brainModules,Generators,viewModules,location,addEventListener,removeEventListener) {return (!brainOrigin || brainPortal || brainModules.error
+  ? []
+  : Generators.observe((notify) => {
+      let last = null;
+      const say = () => {
+        const names = viewModules(location.hash).filter((n) => brainModules.modules.some((m) => m.module === n));
+        if (names.join(" ") !== last) notify(((last = names.join(" ")), names));
+      };
+      say();
+      addEventListener("hashchange", say);
+      addEventListener("popstate", say);
+      return () => (removeEventListener("hashchange", say), removeEventListener("popstate", say));
+    }));};
+const _brainshell_importsOfText = function _importsOfText(acorn) {return ((text) => {
+  const out = new Set();
+  const walk = (n) => {
+    if (n.type === "ImportExpression" && n.source.type === "Literal" && String(n.source.value).startsWith("/@")) out.add(String(n.source.value).slice(1).replace(/\.js(\?.*)?$/, ""));
+    for (const k in n) {
+      const v = n[k];
+      if (Array.isArray(v)) v.forEach((c) => c && typeof c.type === "string" && walk(c));
+      else if (v && typeof v.type === "string") walk(v);
+    }
+  };
+  walk(acorn.parse(text, { ecmaVersion: "latest", sourceType: "module" }));
+  return [...out];
+});};
+const _brainshell_closureOf = function _closureOf(importsOfText) {return ((names, list) => {
+  const by = new Map(list.map((m) => [m.module, m])), seen = new Map();
+  const add = (name) => {
+    const m = by.get(name);
+    if (!m || seen.has(name)) return;
+    seen.set(name, m);
+    importsOfText(m.text).forEach(add);
+  };
+  names.forEach(add);
+  return [...seen.values()];
+});};
+const _brainshell_brainJoined = async function _brainJoined(brainOrigin,brainModules,brainPortal,joinModules,closureOf,brainWanted,runtime) {
+  if (!brainOrigin || brainModules.error) return [];
+  const all = brainModules.modules;
+  if (brainPortal) await joinModules(all);
+  else await joinModules(closureOf(brainWanted, all), { mains: brainWanted });
+  return all.filter((m) => runtime.mains.has(m.module)).map((m) => m.module);
+};
+const _brainshell_verifyModule = function _verifyModule(brainClient,runtime,globalThis) {return (async ({ worker, module, hash }, { client = brainClient, rt = runtime, limit = 30000, settle = 30000, wait = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) => {
+  const began = Date.now(), mod = rt.mains.get(module);
+  if (!mod) return { worker, module, hash, none: "the module is not on the page" };
+  const isTest = (v) => /^test_/.test(v._name || "");
+  const names = [...rt._variables].filter((v) => v._module === mod && isTest(v)).map((v) => v._name);
+  const failed = [];
+  await Promise.all(
+    names.map((name) =>
+      Promise.race([mod.value(name), new Promise((_, no) => setTimeout(() => no(new Error(`no result in ${limit / 1000} s`)), limit))]).catch((e) => failed.push({ name, message: String((e && e.message) || e).slice(0, 300) }))
+    )
+  );
+  // What the Worker says it runs has to be what was loaded and tested. A new version takes some seconds to reach
+  // every place Cloudflare answers from, so the version before may answer first.
+  let running = null;
+  for (const until = Date.now() + settle; ; await wait(1500)) {
+    running = await client.query("getInfo", { worker }).then((i) => i.hash, () => null);
+    if (running === hash || Date.now() >= until) break;
+  }
+  if (running !== hash) failed.push({ name: "the Worker reports the hash that was loaded", message: `loaded ${String(hash).slice(0, 12)}, running ${String(running).slice(0, 12)}` });
+  const otherTestsRan = [...rt._variables].filter((v) => v._module !== mod && isTest(v) && v._version > 0 && v._value !== undefined).length;
+  return { worker, module, hash, ok: failed.length === 0, tests: names.length, failed, otherTestsRan, ms: Date.now() - began, heapMB: globalThis.performance && performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1e6) : null };
+});};
+const _brainshell_brainVerdict = async function _brainVerdict(location,brainOrigin,brainPortal,globalThis,brainModules,brainJoined,verifyModule) {
+  const worker = decodeURIComponent((String(location.hash).replace(/^#/, "").split("&").find((p) => p.startsWith("verify=")) || "").slice(7));
+  if (!worker || !brainOrigin || brainPortal) return null;
+  const say = (verdict) => (globalThis.__brainVerdict = verdict);
+  if (brainModules.error) return say({ worker, none: "the modules of this Brain could not be read: " + brainModules.error });
+  const m = brainModules.modules.find((x) => x.worker === worker && brainJoined.includes(x.module));
+  if (!m) return say({ worker, none: "no module of this Worker is in the layout" });
+  return say(await verifyModule(m).catch((e) => ({ worker, module: m.module, hash: m.hash, none: String((e && e.message) || e) })));
+};
+const _brainshell_anon_c9018b54db = function _anonymous(md) {return (md`## Reference
 
 | | |
 |---|---|
@@ -9543,7 +9627,12 @@ const _brainshell_anon_3b32f33ec5 = function _anonymous(md) {return (md`## Refer
 | \`portalHtml(shell, { base, author, id, module, viewer })\` | The shell file as a portal's document: the layout is the member's module then this one, and a first script waits for the token from the page that framed it. |
 | \`openPortal(service, { client, base })\` | The frame for one row of \`member.services\`, kept supplied with a token. |
 | \`brainModules\` | What the deployer answers at \`infra.getModules\`: \`{ distiller, modules: [{ module, worker, hash, text, files }] }\`. Public. |
-| \`joinModules(list)\` | Adds each module to the page as a main: its source and files as script blocks, then its definition, once. A module the page already has is left alone. |
+| \`joinModules(list, { mains })\` | Adds each module's source and files to the page as script blocks, and each one named in \`mains\` (all of them when not given) as a main, once. A module that was added as source and imported since becomes a main as it is. A module the file holds is left alone. |
+| \`viewModules(hash)\` | The modules a layout names. |
+| \`brainWanted\` | The Brain's modules the layout names now. |
+| \`brainJoined\` | The Brain's modules on this page: \`brainWanted\` joined, with the source of what they import. |
+| \`verifyModule({ worker, module, hash })\` | Runs the module's \`test_\` cells, 30 s each, and checks the Worker reports that hash: \`{ worker, module, hash, ok, tests, failed, otherTestsRan, ms, heapMB }\`, or \`{ none }\` when the module is not on the page. |
+| \`brainVerdict\` | With \`&verify=brain-x-NAME\` in the address, \`verifyModule\` of that Worker's module in the layout, also at \`window.__brainVerdict\`. Sent nowhere. |
 | \`shellOf(html, modules)\` | A notebook file without those modules, their files, or their places in the layout. |
 
 A module joins before any of its cells exists, so the page names it; an \`import\` of it from any other module, the shell's or a Brain's, reaches this one copy.`);};
@@ -9586,7 +9675,10 @@ const _brainshell_brainModules = function _brainModules(brainOrigin,brainPortal,
       async (r) => (r.ok ? r.json() : { error: "the deployer answered " + r.status, modules: [] }),
       (e) => ({ error: String((e && e.message) || e), modules: [] })
     ));};
-const _brainshell_joinModules = function _joinModules(runtime,createModule,globalThis) {return (async (list, { doc = document, rt = runtime } = {}) => {
+const _brainshell_joinModules = function _joinModules(runtime,createModule,globalThis) {
+  // One at a time: a join stands in for the runtime's module() while it runs.
+  let queue = Promise.resolve();
+  const join = async (list, { doc = document, rt = runtime, mains = null } = {}) => {
   const mimeOf = (name) => (/\.js$/.test(name) ? "text/javascript" : /\.json$/.test(name) ? "application/json" : "text/plain");
   const block = (id, mime, text) => {
     if (doc.getElementById(id)) return false;
@@ -9594,12 +9686,15 @@ const _brainshell_joinModules = function _joinModules(runtime,createModule,globa
     s.type = "text/plain";
     s.id = id;
     s.setAttribute("data-mime", mime);
+    s.setAttribute("data-brain", "");
     s.textContent = text;
     doc.head.appendChild(s);
     return true;
   };
-  const fresh = list.filter((m) => !(rt.mains && rt.mains.has(m.module)) && !doc.getElementById(m.module));
-  for (const m of fresh) {
+  // A module whose block the file itself holds is left alone. One whose block a join added is this Brain's.
+  const ours = list.filter((m) => !(rt.mains && rt.mains.has(m.module)) && ((b) => !b || b.hasAttribute("data-brain"))(doc.getElementById(m.module)));
+  const fresh = ours.filter((m) => !mains || mains.includes(m.module));
+  for (const m of ours) {
     // A module reads its files while it is defined, so each one it names has a block, empty when none was sent.
     const names = /new Map\(\[([^\]]*)\]\.map\(\(name\)/.exec(m.text);
     for (const name of names ? JSON.parse("[" + names[1] + "]") : []) block(m.module + "/" + encodeURIComponent(name), mimeOf(name), (m.files || {})[name] ?? "");
@@ -9613,6 +9708,14 @@ const _brainshell_joinModules = function _joinModules(runtime,createModule,globa
   const plain = rt.module;
   const make = (m, define) => {
     pending.delete(m.module);
+    // Added as source by a join before this one and imported since: the runtime has it. It becomes a main as it is.
+    const had = rt._modules.get(define);
+    if (had) {
+      had._name = m.module;
+      (rt.mains || (rt.mains = new Map())).set(m.module, had);
+      joined.push(m.module);
+      return had;
+    }
     const mod = createModule(m.module, rt);
     // The runtime keeps one module per definition: an import of this module from anywhere gets this one.
     rt._modules.set(define, mod);
@@ -9642,7 +9745,9 @@ const _brainshell_joinModules = function _joinModules(runtime,createModule,globa
     delete rt.module;
   }
   return joined;
-});};
+  };
+  return (list, options) => (queue = queue.then(() => join(list, options), () => join(list, options)));
+};
 const _brainshell_brainWho = async function _brainWho(brainOrigin,brainPortal,brainClient,brainSession) {
   if (!brainOrigin || brainPortal) return { signedIn: false };
   const ask = () => brainClient.fetch("/auth/session");
@@ -9769,6 +9874,93 @@ const _brainshell_test_openPortal_frames_the_shell_and_answers_ready_with_a_toke
     frame.close();
   }
 };
+const _brainshell_test_viewModules_reads_the_modules_a_layout_names = function _test_viewModules_reads_the_modules_a_layout_names(expect,viewModules) {
+  expect(viewModules("#view=C100(S70(@a/b,@c/d),S30(@e/f))&cc=LOPE-1-X&verify=brain-x-b")).toEqual(["@a/b", "@c/d", "@e/f"]);
+  expect(viewModules("#view=" + encodeURIComponent("C100(S100(@a/b))"))).toEqual(["@a/b"]);
+  expect([viewModules("#cc=LOPE-1-X"), viewModules(""), viewModules(null)]).toEqual([[], [], []]);
+  return "3 named, none with no view";
+};
+const _brainshell_test_closureOf_is_the_named_modules_and_what_they_import = function _test_closureOf_is_the_named_modules_and_what_they_import(expect,importsOfText,closureOf) {
+  const text = (...imports) => `export default function define(runtime, observer) {\n  const main = runtime.module();\n${imports.map((i) => `  main.define("module ${i}", async () => runtime.module((await import("/${i}.js?v=4")).default));`).join("\n")}\n  main.variable(observer("note")).define("note", [], () => 'import("/@t/quoted.js?v=4") in a string is not an import');\n  return main;\n}`;
+  const list = [{ module: "@t/a", text: text("@t/b", "@other/lib") }, { module: "@t/b", text: text("@t/c") }, { module: "@t/c", text: text("@t/a") }, { module: "@t/d", text: text() }, { module: "@t/quoted", text: text() }];
+  expect(importsOfText(list[0].text)).toEqual(["@t/b", "@other/lib"]);
+  // A module the list does not hold is somebody else's to supply; a loop of imports ends.
+  expect(closureOf(["@t/a"], list).map((m) => m.module)).toEqual(["@t/a", "@t/b", "@t/c"]);
+  expect(closureOf(["@t/d", "@t/none"], list).map((m) => m.module)).toEqual(["@t/d"]);
+  return "3 of 5";
+};
+const _brainshell_test_page_loads_only_the_modules_in_view = async function _test_page_loads_only_the_modules_in_view(expect,joinModules,closureOf,runtime) {
+  const tag = "@test/view-" + Math.random().toString(36).slice(2, 8), a = tag + "a", b = tag + "b", c = tag + "c";
+  const text = (cells, from = null) => `export default function define(runtime, observer) {
+  const main = runtime.module();
+${from ? `  main.define("module ${from}", async () => runtime.module((await import("/${from}.js?v=4")).default));\n  main.define("token", ["module ${from}", "@variable"], (_, v) => v.import("token", _));` : ""}
+${cells}
+  return main;
+}`;
+  const list = [
+    { module: a, text: text(`  main.variable(observer("got")).define("got", ["token"], (token) => token);`, b) },
+    { module: b, text: text(`  main.variable(observer("token")).define("token", [], () => ({}));\n  main.variable(observer("test_b")).define("test_b", [], () => "ran");`) },
+    { module: c, text: text(`  main.variable(observer("test_c")).define("test_c", [], () => "ran");`) }
+  ];
+  try {
+    expect(await joinModules(closureOf([a], list), { mains: [a] })).toEqual([a]);
+    expect([a, b, c].map((id) => !!document.getElementById(id))).toEqual([true, true, false]);
+    expect([a, b, c].map((id) => runtime.mains.has(id))).toEqual([true, false, false]);
+    const token = await runtime.mains.get(a).value("got");
+    // Nothing asked for the test of the module that was only imported.
+    expect([...runtime._variables].filter((v) => v._name === "test_b" && v._version > 0).length).toBe(0);
+    // Opened later, it is the module the first one imported, not a second copy.
+    expect(await joinModules(closureOf([b], list), { mains: [b] })).toEqual([b]);
+    expect(await runtime.mains.get(b).value("token")).toBe(token);
+    expect(await joinModules(closureOf([a, b], list), { mains: [a, b] })).toEqual([]);
+    return "1 main, 1 imported, 1 not on the page";
+  } finally {
+    for (const id of [a, b, c]) {
+      const mod = runtime.mains.get(id);
+      if (mod) for (const v of [...runtime._variables]) if (v._module === mod) v.delete();
+      runtime.mains.delete(id);
+      document.getElementById(id)?.remove();
+    }
+  }
+};
+const _brainshell_test_verifyModule_runs_the_tests_and_checks_the_hash = async function _test_verifyModule_runs_the_tests_and_checks_the_hash(expect,joinModules,verifyModule,runtime) {
+  const name = "@test/verify-" + Math.random().toString(36).slice(2, 8), none = name + "n";
+  const text = (cells) => `export default function define(runtime, observer) {\n  const main = runtime.module();\n${cells}\n  return main;\n}`;
+  const cells = `  main.variable(observer("test_passes")).define("test_passes", [], () => "ok");
+  main.variable(observer("test_throws")).define("test_throws", [], () => { throw new Error("broken"); });
+  main.variable(observer("test_hangs")).define("test_hangs", [], () => new Promise(() => {}));
+  main.variable(observer("not_a_test")).define("not_a_test", [], () => { throw new Error("not run"); });`;
+  const says = (hash) => ({ query: async (method, input) => (expect([method, input]).toEqual(["getInfo", { worker: "brain-x-t" }]), { hash }) });
+  // The limit is short for the cell that never answers, and long enough for the others on a page that is busy.
+  const quick = { limit: 2000, settle: 0, wait: async () => {} };
+  try {
+    await joinModules([{ module: name, text: text(cells) }, { module: none, text: text(`  main.variable(observer("x")).define("x", [], () => 1);`) }]);
+    const v = await verifyModule({ worker: "brain-x-t", module: name, hash: "h1" }, { ...quick, client: says("h1") });
+    expect(v).toMatchObject({ worker: "brain-x-t", module: name, hash: "h1", ok: false, tests: 3 });
+    expect(v.failed.map((f) => f.name).sort()).toEqual(["test_hangs", "test_throws"]);
+    expect(v.failed.find((f) => f.name === "test_throws").message).toBe("broken");
+    expect(v.failed.find((f) => f.name === "test_hangs").message).toBe("no result in 2 s");
+    // R13: nothing to fail is a pass, when the Worker runs what was loaded.
+    expect(await verifyModule({ worker: "brain-x-t", module: none, hash: "h1" }, { ...quick, client: says("h1") })).toMatchObject({ ok: true, tests: 0, failed: [] });
+    // Another version answering is a failure, named.
+    const stale = await verifyModule({ worker: "brain-x-t", module: none, hash: "h2" }, { ...quick, client: says("h1") });
+    expect([stale.ok, stale.tests, stale.failed]).toEqual([false, 0, [{ name: "the Worker reports the hash that was loaded", message: "loaded h2, running h1" }]]);
+    // The version before may answer first: it is asked again until the time is up.
+    let asked = 0;
+    const late = { query: async () => ({ hash: ++asked < 3 ? "h1" : "h2" }) };
+    expect((await verifyModule({ worker: "brain-x-t", module: none, hash: "h2" }, { ...quick, settle: 5000, client: late })).ok).toBe(true);
+    expect(asked).toBe(3);
+    expect(await verifyModule({ worker: "brain-x-t", module: "@test/not-here", hash: "h1" }, { ...quick, client: says("h1") })).toEqual({ worker: "brain-x-t", module: "@test/not-here", hash: "h1", none: "the module is not on the page" });
+    return "3 tests, 2 failed; none is a pass";
+  } finally {
+    for (const id of [name, none]) {
+      const mod = runtime.mains.get(id);
+      if (mod) for (const v of [...runtime._variables]) if (v._module === mod) v.delete();
+      runtime.mains.delete(id);
+      document.getElementById(id)?.remove();
+    }
+  }
+};
 const _brainshell_test_brainSession_sends_what_this_origin_keeps = async function _test_brainSession_sends_what_this_origin_keeps(brainSession,expect) {
   const headers = await brainSession.headers();
   const kept = brainSession.get();
@@ -9828,8 +10020,16 @@ export default function define(runtime, observer) {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
   $def("_brainshell_anon_dc937ee71a", null, ["md"], _brainshell_anon_dc937ee71a);
-  $def("_brainshell_brainBoot", "brainBoot", ["brainOrigin","md","brainModules","brainPortal","runtime","joinModules","htl","Inputs","brainClient","exportModuleJS","openPortal","brainWho","portalServices"], _brainshell_brainBoot);
-  $def("_brainshell_anon_3b32f33ec5", null, ["md"], _brainshell_anon_3b32f33ec5);
+  $def("_brainshell_brainBoot", "brainBoot", ["brainOrigin","md","brainModules","brainPortal","brainJoined","htl","Inputs","brainClient","exportModuleJS","brainPortals","openPortal","brainWho","linkTo","navigate","portalServices"], _brainshell_brainBoot);
+  $def("_brainshell_brainPortals", "brainPortals", ["htl"], _brainshell_brainPortals);
+  $def("_brainshell_viewModules", "viewModules", ["listModules"], _brainshell_viewModules);
+  $def("_brainshell_brainWanted", "brainWanted", ["brainOrigin","brainPortal","brainModules","Generators","viewModules","location","addEventListener","removeEventListener"], _brainshell_brainWanted);
+  $def("_brainshell_importsOfText", "importsOfText", ["acorn"], _brainshell_importsOfText);
+  $def("_brainshell_closureOf", "closureOf", ["importsOfText"], _brainshell_closureOf);
+  $def("_brainshell_brainJoined", "brainJoined", ["brainOrigin","brainModules","brainPortal","joinModules","closureOf","brainWanted","runtime"], _brainshell_brainJoined);
+  $def("_brainshell_verifyModule", "verifyModule", ["brainClient","runtime","globalThis"], _brainshell_verifyModule);
+  $def("_brainshell_brainVerdict", "brainVerdict", ["location","brainOrigin","brainPortal","globalThis","brainModules","brainJoined","verifyModule"], _brainshell_brainVerdict);
+  $def("_brainshell_anon_c9018b54db", null, ["md"], _brainshell_anon_c9018b54db);
   $def("_brainshell_brainPortal", "brainPortal", ["globalThis"], _brainshell_brainPortal);
   $def("_brainshell_brainOrigin", "brainOrigin", ["brainPortal","location"], _brainshell_brainOrigin);
   $def("_brainshell_brainSession", "brainSession", ["brainPortal","globalThis"], _brainshell_brainSession);
@@ -9845,6 +10045,10 @@ export default function define(runtime, observer) {
   $def("_brainshell_test_shellOf_cuts_the_modules_their_files_and_their_mains", "test_shellOf_cuts_the_modules_their_files_and_their_mains", ["shellOf","expect"], _brainshell_test_shellOf_cuts_the_modules_their_files_and_their_mains);
   $def("_brainshell_test_portalHtml_adds_one_script_first_and_shows_the_module", "test_portalHtml_adds_one_script_first_and_shows_the_module", ["portalHtml","expect"], _brainshell_test_portalHtml_adds_one_script_first_and_shows_the_module);
   $def("_brainshell_test_openPortal_frames_the_shell_and_answers_ready_with_a_token", "test_openPortal_frames_the_shell_and_answers_ready_with_a_token", ["openPortal","Response","expect"], _brainshell_test_openPortal_frames_the_shell_and_answers_ready_with_a_token);
+  $def("_brainshell_test_viewModules_reads_the_modules_a_layout_names", "test_viewModules_reads_the_modules_a_layout_names", ["expect","viewModules"], _brainshell_test_viewModules_reads_the_modules_a_layout_names);
+  $def("_brainshell_test_closureOf_is_the_named_modules_and_what_they_import", "test_closureOf_is_the_named_modules_and_what_they_import", ["expect","importsOfText","closureOf"], _brainshell_test_closureOf_is_the_named_modules_and_what_they_import);
+  $def("_brainshell_test_page_loads_only_the_modules_in_view", "test_page_loads_only_the_modules_in_view", ["expect","joinModules","closureOf","runtime"], _brainshell_test_page_loads_only_the_modules_in_view);
+  $def("_brainshell_test_verifyModule_runs_the_tests_and_checks_the_hash", "test_verifyModule_runs_the_tests_and_checks_the_hash", ["expect","joinModules","verifyModule","runtime"], _brainshell_test_verifyModule_runs_the_tests_and_checks_the_hash);
   $def("_brainshell_test_brainSession_sends_what_this_origin_keeps", "test_brainSession_sends_what_this_origin_keeps", ["brainSession","expect"], _brainshell_test_brainSession_sends_what_this_origin_keeps);
   $def("_brainshell_test_joinModules_adds_a_module_once_and_imports_reach_it", "test_joinModules_adds_a_module_once_and_imports_reach_it", ["expect","joinModules","runtime","globalThis","MutationObserver"], _brainshell_test_joinModules_adds_a_module_once_and_imports_reach_it);
   main.define("module @tomlarkworthy/runtime-sdk", [], async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
@@ -9852,6 +10056,12 @@ export default function define(runtime, observer) {
   main.define("createModule", ["module @tomlarkworthy/runtime-sdk","@variable"], (_, v) => v.import("createModule", _));
   main.define("module @tomlarkworthy/xrpc-client", [], async () => runtime.module((await import("/@tomlarkworthy/xrpc-client.js?v=4")).default));
   main.define("xrpcClient", ["module @tomlarkworthy/xrpc-client","@variable"], (_, v) => v.import("xrpcClient", _));
+  main.define("module @tomlarkworthy/acorn-8-11-3", [], async () => runtime.module((await import("/@tomlarkworthy/acorn-8-11-3.js?v=4")).default));
+  main.define("acorn", ["module @tomlarkworthy/acorn-8-11-3","@variable"], (_, v) => v.import("acorn", _));
+  main.define("module @tomlarkworthy/lopepage-urls", [], async () => runtime.module((await import("/@tomlarkworthy/lopepage-urls.js?v=4")).default));
+  main.define("listModules", ["module @tomlarkworthy/lopepage-urls","@variable"], (_, v) => v.import("listModules", _));
+  main.define("linkTo", ["module @tomlarkworthy/lopepage-urls","@variable"], (_, v) => v.import("linkTo", _));
+  main.define("navigate", ["module @tomlarkworthy/lopepage-urls","@variable"], (_, v) => v.import("navigate", _));
   main.define("module @tomlarkworthy/exporter-3", [], async () => runtime.module((await import("/@tomlarkworthy/exporter-3.js?v=4")).default));
   main.define("exportModuleJS", ["module @tomlarkworthy/exporter-3","@variable"], (_, v) => v.import("exportModuleJS", _));
   main.define("module @tomlarkworthy/jest-expect-standalone", [], async () => runtime.module((await import("/@tomlarkworthy/jest-expect-standalone.js?v=4")).default));
@@ -40832,8 +41042,16 @@ const _cloudbrain_assistantLine = function _assistantLine(htl,brain,inboxPump) {
   !brain ? "" : inboxPump.error ? "Inbox: " + inboxPump.error : inboxPump.answering ? "Answering messages in this tab." : "Standing by. Another tab is answering."
 }${brain && inboxPump.waiting ? ` ${inboxPump.waiting} waiting` : ""}</div>`);};
 const _cloudbrain_anon_30d783050d = function _anonymous(md) {return (md`## Services`);};
-const _cloudbrain_viewof_services = function _services(serviceList,declaredWorkers,brain,moduleLink) {return (serviceList({ services: declaredWorkers, brain, moduleLink }));};
+const _cloudbrain_viewof_services = function _services(serviceList,declaredWorkers,notLoaded,registered,brainJoined,brain,moduleLink) {return (serviceList({ services: [...declaredWorkers, ...notLoaded(registered, brainJoined)], brain, moduleLink }));};
 const _cloudbrain_services = (G, _) => G.input(_);
+const _cloudbrain_registered = function _registered(client) {return (client ? client.query("service.list").then((r) => r.services, () => []) : []);};
+const _cloudbrain_notLoaded = function _notLoaded() {return ((registry, joined) =>
+  registry
+    .filter((r) => r.hash && r.module && !joined.includes(r.module))
+    .map((r) => ({
+      name: r.worker,
+      emit: async () => ({ name: r.worker, hash: r.hash, meta: { worker: r.worker, role: r.role, module: r.module || null, methods: Object.keys(r.methods || {}), calls: [], paths: (r.paths || []).map((p) => (typeof p === "string" ? { path: p } : p)), secrets: r.secrets || [] } })
+    })));};
 const _cloudbrain_moduleLink = function _moduleLink(htl,linkTo,navigate) {return ((module, label) => htl.html`<a href=${linkTo(module, { onObservable: false })} title=${module} onclick=${(e) => (e.preventDefault(), navigate(e.currentTarget.getAttribute("href")))}>${label}</a>`);};
 const _cloudbrain_probation = async function _probation(assembled,brain,htl,invalidation,press,location) {
   // Read after the page has run the tests and reported: a pass ends a probation.
@@ -41174,7 +41392,7 @@ const _cloudbrain_installPanel = function _installPanel(field,htl,press,seedSour
 };
 const _cloudbrain_session = function _session(brainOrigin,brainWho) {return (brainOrigin ? brainWho : { signedIn: false, local: true });};
 const _cloudbrain_client = function _client(brainClient) {return (brainClient);};
-const _cloudbrain_brain = function _brain(session,brainDeployer,client,fromBrain,asSource,verifyService) {return (session.owner
+const _cloudbrain_brain = function _brain(session,brainDeployer,client,fromBrain,asSource,loadService) {return (session.owner
   ? {
       deployerUrl: brainDeployer,
       state: () => client.query("infra.getState"),
@@ -41184,14 +41402,13 @@ const _cloudbrain_brain = function _brain(session,brainDeployer,client,fromBrain
         const l = fromBrain[emitted.meta.module];
         return l && emitted.source && emitted.source.text === l.baseline ? l.hash : null;
       },
-      // A deploy is not finished when the deployer says deployed: the page then loads the module back from the Worker,
-      // runs its tests and tells the core, which marks the version verified or has the deployer put the old one back.
+      // The page judges no deploy. It loads the module back from the Worker, so its copy is what now runs.
       // was: the hash the caller saw running, null for no Worker. The deployer refuses when it is no longer that.
       apply: async (emitted, { force = false, reason, was } = {}) => {
         const out = await client.procedure("infra.apply", { workers: [{ ...asSource(emitted), force, was }], reason });
         // The deployer's answer is what was deployed. A hash other than this page's is said, not hidden.
         for (const r of out.results) if (r.hash && r.hash !== emitted.hash) r.note = `the deployer distilled ${r.hash.slice(0, 12)}; this page made ${emitted.hash.slice(0, 12)}`;
-        for (const r of out.results) if (r.state === "deployed" || r.state === "probation") r.verdict = await verifyService(r.worker, { expect: r.hash }).catch((e) => ({ state: "not verified", reason: String((e && e.message) || e) }));
+        for (const r of out.results) if (r.state === "deployed" || r.state === "probation") await loadService(r.worker, { expect: r.hash }).catch(() => null);
         return out;
       },
       confirm: () => client.procedure("infra.confirm", {})
@@ -41274,45 +41491,21 @@ const _cloudbrain_loadService = function _loadService(client,exportModuleJS,appl
   fromBrain[s.module] = { worker, hash: s.hash, baseline: (await exportModuleJS(s.module)).source };
   return { worker, module: s.module, hash: s.hash, state };
 });};
-const _cloudbrain_verifyService = function _verifyService(loadService,runtime,client,session) {return (async (worker, { report = true, expect = null } = {}) => {
+const _cloudbrain_verifyService = function _verifyService(loadService,verifyModule,client) {return (async (worker, { expect = null } = {}) => {
   const loaded = await loadService(worker, { expect });
   if (!loaded.module) return { worker, state: "no source" };
   if (loaded.state === "not applied") return { worker, state: "not verified", reason: loaded.reason };
-  const mod = runtime.mains.get(loaded.module) || [...runtime._variables].find((v) => v._name === "module " + loaded.module)?._value;
-  const names = [...runtime._variables].filter((v) => v._module === mod && /^test_/.test(v._name || "")).map((v) => v._name);
-  const tests = [];
-  for (const name of names) {
-    try {
-      await Promise.race([mod.value(name), new Promise((_, no) => setTimeout(() => no(new Error("no result in 30 s")), 30000))]);
-      tests.push({ name, ok: true });
-    } catch (e) {
-      tests.push({ name, ok: false, message: String((e && e.message) || e).slice(0, 300) });
-    }
-  }
-  // What the Worker says it is running has to be what was loaded and tested.
-  const info = await client.query("getInfo", { worker }).catch(() => null);
-  if (!info || info.hash !== loaded.hash) tests.push({ name: "the Worker reports the hash that was loaded", ok: false, message: `loaded ${String(loaded.hash).slice(0, 12)}, running ${String(info && info.hash).slice(0, 12)}` });
-  const failed = tests.filter((x) => !x.ok);
-  const result = { worker, module: loaded.module, hash: loaded.hash, ok: failed.length === 0, tests: tests.length, failed };
-  if (!report || !session.owner) return result;
-  // The core is a Worker too: straight after its own deploy the version before may answer, and not know this hash.
-  const send = () => client.procedure("deploy.report", { worker, hash: loaded.hash, ok: result.ok, tests, reason: failed.map((f) => `${f.name}: ${f.message}`).join("; ") });
-  let said = null;
-  for (let i = 0; !said; i++) {
-    try {
-      said = await send();
-    } catch (e) {
-      if (i >= 8 || !/is not running/.test(String(e && e.message))) throw e;
-      await new Promise((r) => setTimeout(r, 2000));
-    }
-  }
-  return { ...result, state: said.state, previous: said.previous || null };
+  return verifyModule({ worker, module: loaded.module, hash: loaded.hash }, { client });
 });};
-const _cloudbrain_assembled = async function _assembled(client,session,verifyService,loadService) {
+const _cloudbrain_assembled = async function _assembled(client,brainJoined,session,verifyService,loadService) {
   if (!client) return [];
   const { services: registry } = await client.query("service.list").catch(() => ({ services: [] }));
   const out = [];
   for (const r of registry) {
+    if (!r.module || !brainJoined.includes(r.module)) {
+      out.push({ worker: r.worker, module: r.module || null, state: "not loaded" });
+      continue;
+    }
     try {
       out.push(session.owner ? await verifyService(r.worker, { expect: r.hash }) : await loadService(r.worker, { expect: r.hash }));
     } catch (e) {
@@ -41322,7 +41515,7 @@ const _cloudbrain_assembled = async function _assembled(client,session,verifySer
   return out;
 };
 const _cloudbrain_assembledRefresh = function _assembledRefresh($0,assembled,brain) {
-  $0.tests = Object.fromEntries(assembled.map((a) => [a.worker, a.tests != null ? `${a.tests - a.failed.length}/${a.tests}${a.failed.length ? ": " + a.failed.map((f) => f.name).join(", ") : ""}` : a.state === "not loaded" || a.reason ? `${a.state}: ${a.reason || ""}` : ""]));
+  $0.tests = Object.fromEntries(assembled.map((a) => [a.worker, a.tests != null ? `${a.tests - a.failed.length}/${a.tests}${a.failed.length ? ": " + a.failed.map((f) => f.name).join(", ") : ""}` : a.none || a.reason ? `${a.state || "not run"}: ${a.none || a.reason}` : a.state === "not loaded" ? "not loaded" : ""]));
   if (!brain) return "no owner session";
   $0.refresh();
   return "refreshed";
@@ -41692,9 +41885,31 @@ const _cloudbrain_test_turn_tool_calls_as_the_sender_or_not_at_all = async funct
   expect(turnPrompt({ role: "owner", channel: "whatsapp" }).startsWith(assistantPrompt)).toBe(true);
   return "2 calls made, 2 refused";
 };
+const _cloudbrain_test_a_worker_whose_module_is_not_loaded_is_listed_as_what_runs = async function _test_a_worker_whose_module_is_not_loaded_is_listed_as_what_runs(notLoaded,expect,serviceRows) {
+  const registry = [
+    { worker: "brain-x-a", role: "recipe", module: "@t/a", hash: "ha", methods: { "com.lopecode.brain.a.get": {} }, paths: ["/a/"], secrets: ["K"] },
+    { worker: "brain-x-b", role: "recipe", module: "@t/b", hash: "hb", methods: {}, paths: [] },
+    { worker: "brain-x-gone", module: "@t/gone", hash: null }
+  ];
+  const rows = notLoaded(registry, ["@t/b"]);
+  expect(rows.map((r) => r.name)).toEqual(["brain-x-a"]);
+  const emitted = await rows[0].emit();
+  expect(emitted).toEqual({ name: "brain-x-a", hash: "ha", meta: { worker: "brain-x-a", role: "recipe", module: "@t/a", methods: ["com.lopecode.brain.a.get"], calls: [], paths: [{ path: "/a/" }], secrets: ["K"] } });
+  // In the table it is in sync with what runs: there is nothing to apply for a module nobody has opened.
+  const [row] = serviceRows([emitted], { workers: [{ worker: "brain-x-a", hash: "ha" }] }, { "brain-x-a": "ha" }, {});
+  expect([row.state, row.module, row.methods, row.paths]).toEqual(["in sync", "@t/a", ["com.lopecode.brain.a.get"], ["/a/"]]);
+  return "1 stand-in of 3";
+};
+const _cloudbrain_test_page_sends_no_report = function _test_page_sends_no_report(runtime,expect) {
+  const mine = [...runtime._variables].filter((v) => v._module === runtime.mains.get("@tomlarkworthy/cloud-brain") && typeof v._definition === "function");
+  expect(mine.length).toBeGreaterThan(50);
+  const naming = mine.filter((v) => v._name !== "test_page_sends_no_report" && String(v._definition).includes("deploy" + ".report")).map((v) => v._name);
+  expect(naming).toEqual([]);
+  return mine.length + " cells, none names the report";
+};
 const _cloudbrain_notebookHtml = function _notebookHtml(location,exportToHTML,runtime) {return (async () => {
   // The layout is kept; a pairing token and other one-time parameters are not.
-  const drop = new Set(["cc", "open", "close", "filesync", "from", "focus"]);
+  const drop = new Set(["cc", "open", "close", "filesync", "from", "focus", "verify"]);
   const kept = String(location.hash || "").replace(/^#/, "").split("&").filter(Boolean).filter((p) => !drop.has(p.split("=")[0]));
   // No prerender: it bakes the open panes into the page as HTML, links carrying this tab's pairing token among them.
   return (await exportToHTML({ mains: new Map(runtime.mains), runtime, options: { hash: kept.length ? "#" + kept.join("&") : "", prerender: false } })).source;
@@ -41888,8 +42103,10 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_assistant", "assistant", ["Generators","viewof assistant"], _cloudbrain_assistant);
   $def("_cloudbrain_assistantLine", "assistantLine", ["htl","brain","inboxPump"], _cloudbrain_assistantLine);
   $def("_cloudbrain_anon_30d783050d", null, ["md"], _cloudbrain_anon_30d783050d);
-  $def("_cloudbrain_viewof_services", "viewof services", ["serviceList","declaredWorkers","brain","moduleLink"], _cloudbrain_viewof_services);
+  $def("_cloudbrain_viewof_services", "viewof services", ["serviceList","declaredWorkers","notLoaded","registered","brainJoined","brain","moduleLink"], _cloudbrain_viewof_services);
   $def("_cloudbrain_services", "services", ["Generators","viewof services"], _cloudbrain_services);
+  $def("_cloudbrain_registered", "registered", ["client"], _cloudbrain_registered);
+  $def("_cloudbrain_notLoaded", "notLoaded", [], _cloudbrain_notLoaded);
   $def("_cloudbrain_moduleLink", "moduleLink", ["htl","linkTo","navigate"], _cloudbrain_moduleLink);
   $def("_cloudbrain_probation", "probation", ["assembled","brain","htl","invalidation","press","location"], _cloudbrain_probation);
   $def("_cloudbrain_anon_d98158477c", null, ["md"], _cloudbrain_anon_d98158477c);
@@ -41911,7 +42128,7 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_installPanel", "installPanel", ["field","htl","press","seedSource","notebookHtml","installBrain"], _cloudbrain_installPanel);
   $def("_cloudbrain_session", "session", ["brainOrigin","brainWho"], _cloudbrain_session);
   $def("_cloudbrain_client", "client", ["brainClient"], _cloudbrain_client);
-  $def("_cloudbrain_brain", "brain", ["session","brainDeployer","client","fromBrain","asSource","verifyService"], _cloudbrain_brain);
+  $def("_cloudbrain_brain", "brain", ["session","brainDeployer","client","fromBrain","asSource","loadService"], _cloudbrain_brain);
   $def("_cloudbrain_page_service", "page_service", ["cloudflare","xrpc","Response"], _cloudbrain_page_service);
   $def("_cloudbrain_page_announce", "page_announce", ["plugins","page_service","invalidation"], _cloudbrain_page_announce);
   $def("_cloudbrain_test_an_imported_service_names_the_module_it_is_written_in", "test_an_imported_service_names_the_module_it_is_written_in", ["core_service","kernel_service","deployer_service","expect"], _cloudbrain_test_an_imported_service_names_the_module_it_is_written_in);
@@ -41919,8 +42136,8 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_fromBrain", "fromBrain", [], _cloudbrain_fromBrain);
   $def("_cloudbrain_applySource", "applySource", ["jbApply","runtime","probeDefine","createModule"], _cloudbrain_applySource);
   $def("_cloudbrain_loadService", "loadService", ["client","exportModuleJS","applySource","runtime","fromBrain"], _cloudbrain_loadService);
-  $def("_cloudbrain_verifyService", "verifyService", ["loadService","runtime","client","session"], _cloudbrain_verifyService);
-  $def("_cloudbrain_assembled", "assembled", ["client","session","verifyService","loadService"], _cloudbrain_assembled);
+  $def("_cloudbrain_verifyService", "verifyService", ["loadService","verifyModule","client"], _cloudbrain_verifyService);
+  $def("_cloudbrain_assembled", "assembled", ["client","brainJoined","session","verifyService","loadService"], _cloudbrain_assembled);
   $def("_cloudbrain_assembledRefresh", "assembledRefresh", ["viewof services","assembled","brain"], _cloudbrain_assembledRefresh);
   $def("_cloudbrain_platformWiring", "platformWiring", ["brain","backend","client","brainOrigin"], _cloudbrain_platformWiring);
   $def("_cloudbrain_field", "field", ["Inputs"], _cloudbrain_field);
@@ -41953,12 +42170,15 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_test_turn_for_someone_not_added_runs_nothing", "test_turn_for_someone_not_added_runs_nothing", ["turnRig","expect","conversationTurn"], _cloudbrain_test_turn_for_someone_not_added_runs_nothing);
   $def("_cloudbrain_test_turn_in_a_room_has_one_session_and_names_who_wrote", "test_turn_in_a_room_has_one_session_and_names_who_wrote", ["expect","turnKey","turnText","turnPrompt","assistantPrompt","turnRig","conversationTurn"], _cloudbrain_test_turn_in_a_room_has_one_session_and_names_who_wrote);
   $def("_cloudbrain_test_turn_tool_calls_as_the_sender_or_not_at_all", "test_turn_tool_calls_as_the_sender_or_not_at_all", ["turnTool","expect","turnPrompt","assistantPrompt"], _cloudbrain_test_turn_tool_calls_as_the_sender_or_not_at_all);
+  $def("_cloudbrain_test_a_worker_whose_module_is_not_loaded_is_listed_as_what_runs", "test_a_worker_whose_module_is_not_loaded_is_listed_as_what_runs", ["notLoaded","expect","serviceRows"], _cloudbrain_test_a_worker_whose_module_is_not_loaded_is_listed_as_what_runs);
+  $def("_cloudbrain_test_page_sends_no_report", "test_page_sends_no_report", ["runtime","expect"], _cloudbrain_test_page_sends_no_report);
   $def("_cloudbrain_notebookHtml", "notebookHtml", ["location","exportToHTML","runtime"], _cloudbrain_notebookHtml);
   $def("_cloudbrain_installBrain", "installBrain", ["deployer_service","wrapperFlags","FormData","asSource","core_service","kernel_service","static_service","page_service","shellOf","notebookHtml"], _cloudbrain_installBrain);
   $def("_cloudbrain_test_install_order_and_where_the_token_goes", "test_install_order_and_where_the_token_goes", ["Response","installBrain","expect"], _cloudbrain_test_install_order_and_where_the_token_goes);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("declaredWorkers", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("declaredWorkers", _));
   main.define("serviceList", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("serviceList", _));
+  main.define("serviceRows", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("serviceRows", _));
   main.define("backend", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("backend", _));
   main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
   main.define("seedSource", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("seedSource", _));
@@ -41987,6 +42207,8 @@ export default function define(runtime, observer) {
   main.define("brainWho", ["module @tomlarkworthy/brain-shell","@variable"], (_, v) => v.import("brainWho", _));
   main.define("brainModules", ["module @tomlarkworthy/brain-shell","@variable"], (_, v) => v.import("brainModules", _));
   main.define("brainDeployer", ["module @tomlarkworthy/brain-shell","@variable"], (_, v) => v.import("brainDeployer", _));
+  main.define("brainJoined", ["module @tomlarkworthy/brain-shell","@variable"], (_, v) => v.import("brainJoined", _));
+  main.define("verifyModule", ["module @tomlarkworthy/brain-shell","@variable"], (_, v) => v.import("verifyModule", _));
   main.define("module @tomlarkworthy/robocoop-5", [], async () => runtime.module((await import("/@tomlarkworthy/robocoop-5.js?v=4")).default));
   main.define("robocoop5", ["module @tomlarkworthy/robocoop-5","@variable"], (_, v) => v.import("robocoop5", _));
   main.define("defaultWatches", ["module @tomlarkworthy/robocoop-5","@variable"], (_, v) => v.import("defaultWatches", _));
