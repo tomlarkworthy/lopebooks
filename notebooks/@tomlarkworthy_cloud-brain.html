@@ -24889,6 +24889,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
   app.get(NS + "quota.ledger", owner, async (c) => {
     const day = c.req.query("day") || today(), who = c.req.query("who");
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return fail(c, 400, "InvalidRequest", "day is YYYY-MM-DD");
+    if (who && !isAccount(who)) return fail(c, 400, "InvalidRequest", "who is owner, did:…, token:NAME or worker:NAME");
     const base = `spend/${day}/`;
     // Not the delegations' own counts: each of those charges is in its account's list too.
     const lists = who ? [[who, await rows.get(base + who)]] : (await rows.list(base)).map(({ key, value }) => [key.slice(base.length), value]).filter(([w]) => !w.startsWith("delegation/"));
@@ -26090,7 +26091,7 @@ var Es=Object.defineProperty;var As=(e)=>e;function Ss(e,t){this[e]=As.bind(null
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainkernel_anon_d006aa0492 = function _anonymous(md) {return (md`# brain-kernel
+const _brainkernel_anon_d29fcff05b = function _anonymous(md) {return (md`# brain-kernel
 
 The Worker at the Brain's address. It serves the notebook, signs people in with atproto, works out who is calling, and forwards everything else to the core with that answer attached.
 
@@ -26113,7 +26114,7 @@ A person is an atproto account, named by its DID. There are two roles. The **own
 |---|---|
 | \`people.list\` | query, owner. \`{ people }\`: each \`{ did, handle, role, name, addresses, methods }\`. \`role\` is \`owner\`, \`member\` or \`null\` (linked an address, not added). |
 | \`people.put\` | procedure, owner's session. \`{ did, name, services, quota, tags }\` makes that DID a member; a field left out keeps what it was. \`services: false\` stops their deploys. \`quota\` is \`{ workers, bytes, calls, deploys }\`; \`deploys\` is calls of \`member.deploy\` an hour. \`tags\` is \`[{ tag, access: "read" | "write" }]\`, the file tags they may read or change beside their own. |
-| \`people.remove\` | procedure, owner's session. \`{ did }\` removes the member, their grant and their addresses, and has the deployer delete their Workers. Their files stay, for the owner. |
+| \`people.remove\` | procedure, owner's session. \`{ did }\` removes the member, their grant, their addresses and the delegations they made, and has the deployer delete their Workers. Their files stay, for the owner. |
 | \`member.deploy\`, \`member.remove\`, \`member.modules\` | procedure, a member. Passed to the deployer with the caller's DID as the author; the owner is refused and deploys with \`infra.apply\`. \`member.deploy\` takes \`{ module, source, reason, was }\` and \`member.remove\` \`{ name, reason, was }\`: \`reason\` is 3 to 300 characters and is logged, \`was\` is the hash the caller saw running, \`null\` for no Worker. |
 | \`people.link\` | procedure, owner's session. \`{ channel, address, did }\` binds an address without the sign-in below. |
 | \`people.unlink\` | procedure, owner's session. \`{ channel, address }\` |
@@ -27590,7 +27591,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainkernel_anon_d006aa0492", null, ["md"], _brainkernel_anon_d006aa0492);
+  $def("_brainkernel_anon_d29fcff05b", null, ["md"], _brainkernel_anon_d29fcff05b);
   $def("_brainkernel_kernel_service", "kernel_service", ["cloudflare","kernelApp"], _brainkernel_kernel_service);
   $def("_brainkernel_kernel_announce", "kernel_announce", ["plugins","kernel_service","invalidation"], _brainkernel_kernel_announce);
   $def("_brainkernel_atcute", "atcute", ["library","FileAttachment"], _brainkernel_atcute);
@@ -33612,14 +33613,17 @@ const _brainbrowser_test_browser_tick_makes_rows_and_sessions_agree = async func
   // Browser time that was used is counted once for the browser, and not for each tab.
   // Measured as a difference: the seconds this test has itself run are in the day's count, and they were what a
   // bound of 100 to 110 failed on (111, 2026-10-10).
-  const usedBefore = (await rig.owner.get("status")).data.usage.usedSeconds;
+  // Each bound is widened by the seconds that passed between its two reads: a live browser's time goes on counting.
+  const secs = (t) => (Date.now() - t) / 1000;
+  const t1 = Date.now(), usedBefore = (await rig.owner.get("status")).data.usage.usedSeconds;
   const row = rig.rows.get(rig.keys("browser/")[0]);
   rig.rows.set(rig.keys("browser/")[0], { ...row, counted: row.counted - 100000 });
   const total = (await rig.owner.get("status")).data.usage.usedSeconds, used = total - usedBefore;
-  expect(used >= 99 && used <= 102 ? "about 100" : used).toBe("about 100");
+  expect(used >= 99 && used <= 101 + 2 * secs(t1) ? "about 100" : used).toBe("about 100");
+  const t2 = Date.now();
   await rig.tick();
   const after = (await rig.owner.get("status")).data.usage.usedSeconds;
-  expect(after - total >= 0 && after - total <= 1 ? "the same" : [total, after]).toBe("the same");
+  expect(after - total >= 0 && after - total <= 1 + 2 * secs(t2) ? "the same" : [total, after]).toBe("the same");
   return "another Worker's session kept; a dead start, a second browser, a dead browser and a dead tab handled";
 };
 const _brainbrowser_test_browser_that_stops_answering_is_closed = async function _test_browser_that_stops_answering_is_closed(browserRig,expect) {
@@ -33655,7 +33659,7 @@ const _brainbrowser_test_browser_each_caller_has_its_own_browsers = async functi
   const rig = await browserRig({ paid: 0 }), A = "https://a.example/";
   const reader = rig.as("worker:brain-x-reader", "owner"), R = "worker:brain-x-reader/default";
   // Bought time runs down by the clock while the test runs: what is left is the amount less the seconds the test
-  // has taken so far, however slow the machine. A fixed tolerance failed on a slow run (96 for 100, 2026-10-10).
+  // has taken so far, as in test_browser_time_is_bought_by_extend_alone.
   const began = Date.now(), near = (got, want) => (got <= want + 1 && got >= want - 2 - (Date.now() - began) / 1000 ? want : got);
   // Two callers, the same browser name: two browsers, each with its own time and its own pages.
   expect([(await rig.owner.post("extend", {}, { seconds: 100 })).data.cold, (await reader.post("extend", {}, { seconds: 50 })).data.cold]).toEqual([true, true]);
