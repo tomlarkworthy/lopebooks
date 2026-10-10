@@ -24075,7 +24075,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braincore_anon_677ccf0566 = function _anonymous(md) {return (md`# brain-core
+const _braincore_anon_6b1e985ec5 = function _anonymous(md) {return (md`# brain-core
 
 The Worker every other Worker is bound to. It routes a method or a path to the Worker of the service that declared it, and keeps what must last: the notebook-side rows, the route table and the rules the owner sets.
 
@@ -24114,7 +24114,7 @@ It answers bindings only. A caller is who the kernel says it is, and the kernel 
 | \`quota.list\`, \`quota.ledger\` | query, owner. Each account's day, and the charges of one day (\`?day=&who=&limit=\`) with totals by account and by method. |
 | \`quota.put\`, \`quota.setDefaults\` | procedure, the owner's own session. \`{ who, daily }\`, and \`{ owner, member, worker, token, perCall, keepDays }\`. \`null\` is the default again. |
 | \`delegation.create\` | procedure, the owner's or a member's own session. \`{ name, holder: { worker }, scope, until, daily, note }\` → the record, with its \`id\`. With \`holder: { secret: true }\` and \`caps\` (the owner only) the answer has \`secret\`, once: a token. The kernel's \`token.create\` and a sign-in link make these. |
-| \`delegation.resolve\`, \`delegation.adopt\` | procedures, the kernel. \`{ sha256 }\` of a secret → \`{ delegation }\` or null; and a token from before 2026-10-10, handed over by its hash. |
+| \`delegation.resolve\`, \`delegation.adopt\` | procedures, the kernel. \`{ sha256 }\` of a secret, or \`{ did }\` for that DID's grant → \`{ delegation }\` or null; and a token from before 2026-10-10, handed over by its hash. |
 | \`delegation.list\`, \`delegation.revoke\` | query and procedure, the same callers. The owner reads and revokes any, a member their own. \`{ id }\`. |
 
 **Delegations** (design: \`plan/cloud-brain-authority.md\`; built 2026-10-10 for a Worker holder only). The owner or a member lets a Worker the owner deployed call the methods in a \`scope\`, until a time or until it is revoked. The Worker names the delegation on a call it makes:
@@ -24129,7 +24129,8 @@ xrpc.fetch("com.lopecode.brain.m.0a1b.shop.receive", { method: "POST", headers: 
 - It begins a chain of its own: the origin is the maker, and the origin of whatever the Worker was answering is not read. \`x-brain-hops\` says how long the chain already is; the core adds one, sends it on with each forwarded call, and refuses a chain over 8.
 - \`daily\` is the most the chain may spend in a UTC day, counted beside the maker's own allowance. \`delegation.list\` shows \`spentToday\`. Calls made at the same moment can pass it by the price of those calls; the maker's allowance is exact.
 - A member's delegations are deleted when the member is removed.
-- A secret holder (a token made from 2026-10-10) sends the secret to the kernel as \`Authorization: Bearer\`. Its calls are the owner's: the owner's rules and allowance, \`caller.holder\` is \`secret:NAME\` and \`caller.token\` is \`NAME\`. It is the owner's own tab only with the cap \`session\`, and then only for a method the scope names by its name or a prefix: \`*\` alone does not reach \`rule.put\`, \`config.set\` or any method whose rule is \`caller.session\`. When a call is not the owner's tab, what it makes in a store is kept under \`d:<id>\`. \`deploy\` and \`unattended\` are read by the kernel for \`infra.*\`.
+- **A grant is a delegation with a DID holder** (2026-10-10): \`{ name: "grant", holder: { did }, scope }\`, the owner's alone to make, one for a DID, whole method names only. It is the kernel's \`grant.put\`. A call by that DID says nothing of it: the caller is the DID, in a session, through a PDS or in a turn as before, and the grant is part of what that DID may call.
+- A secret holder (a token) sends the secret to the kernel as \`Authorization: Bearer\`. Its calls are the owner's: the owner's rules and allowance, \`caller.holder\` is \`secret:NAME\` and \`caller.token\` is \`NAME\`. It is the owner's own tab only with the cap \`session\`, and then only for a method the scope names by its name or a prefix: \`*\` alone does not reach \`rule.put\`, \`config.set\` or any method whose rule is \`caller.session\`. When a call is not the owner's tab, what it makes in a store is kept under \`d:<id>\`. \`deploy\` and \`unattended\` are read by the kernel for \`infra.*\`.
 - A holder that takes a delegation's id from a caller must check that the caller made it (\`from\`). An id is not a secret.
 
 **Origin.** A rule reads \`caller\`, who made the call, and \`origin\`, who started the chain of calls it is part of. The two have the same fields. For a call from outside they are equal. When a Worker makes a call while it answers one, \`caller\` is the Worker and \`origin\` is the origin of the call it answers. A call a Worker makes by its own schedule has the Worker as \`origin\`. For a member's Worker \`caller\` is its author, and so is \`origin\` when it answers nobody.
@@ -24322,6 +24323,12 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
   const today = () => new Date(clock()).toISOString().slice(0, 10);
   // Calls into and out of one member's Workers, counted per UTC day.
   const spend = async (person) => (await rows.increment(`mcalls/${person.did}/${today()}`)) <= quotaOf(person).calls;
+  // What the owner granted a DID: the scope of the one delegation that DID holds. From a kernel of before
+  // 2026-10-10 the grant comes with people.sync instead, in the person's row.
+  const grantOf = async (did, person) => {
+    const id = await settings.get("holder/did/" + did), d = id ? await settings.get("delegation/" + id) : null;
+    return d && !(d.until && d.until <= clock()) ? d.scope : (person && person.methods) || [];
+  };
   const asAuthor = async (c, { worker, author }) => {
     const url = new URL(c.req.url);
     const nsid = url.pathname.startsWith("/xrpc/") ? url.pathname.slice("/xrpc/".length) : null;
@@ -24329,7 +24336,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
     if (!person) return fail(c, 403, "Forbidden", `${author} is not a member, so ${worker} may call nothing`);
     const route = await rows.get("route/" + worker);
     if (!route || route.off) return fail(c, 403, "Forbidden", `${worker} is switched off`);
-    if (!nsid || !(WORKER.includes(nsid) || nsid.startsWith(MEMBER_NS) || matches(person.methods, nsid))) return fail(c, 403, "Forbidden", `${worker} runs as ${author}, who has no grant for ${nsid || url.pathname}`);
+    if (!nsid || !(WORKER.includes(nsid) || nsid.startsWith(MEMBER_NS) || matches(await grantOf(author, person), nsid))) return fail(c, 403, "Forbidden", `${worker} runs as ${author}, who has no grant for ${nsid || url.pathname}`);
     if (!(await spend(person))) return fail(c, 429, "RateLimitExceeded", `${author} has used today's ${quotaOf(person).calls} calls`);
     c.set("who", { caller: author, via: "worker:" + worker });
     return null;
@@ -24344,7 +24351,7 @@ const _braincore_coreApp = function _coreApp(hono,sha256,rows,config,settings,ma
   const mayNow = async (from, nsid) => {
     if (from === "owner") return true;
     const person = from.startsWith("did:") ? await rows.get("person/" + from) : null;
-    return !!person && may({ member: true, grant: person.methods }, nsid);
+    return !!person && may({ member: true, grant: await grantOf(from, person) }, nsid);
   };
   // What every call under a delegation passes, whoever holds it. null when it stands.
   const stands = async (c, d) => {
@@ -25014,15 +25021,34 @@ ${deployed.join("\n\n")}
   const drop = async (d) => {
     await settings.delete("delegation/" + d.id);
     if (d.holder && d.holder.secret) await settings.delete("holder/secret/" + d.holder.secret);
+    if (d.holder && d.holder.did) await settings.delete("holder/did/" + d.holder.did);
   };
   app.post(NS + "delegation.create", inPerson, async (c) => {
     const from = c.get("who").caller, b = (await c.req.json().catch(() => null)) || {};
     const { name, holder, caps = [], until = null, daily = null, note = "" } = b;
     const one = holder && typeof holder === "object" && Object.keys(holder).length === 1, secretHeld = !!one && holder.secret === true;
+    // A grant: the owner gives another account methods, and that account calls them as itself and pays for them.
+    // A DID holds one, named grant; a second for the same DID takes the place of the first.
+    const didHeld = !!one && typeof holder.did === "string" && /^did:(plc|web):[A-Za-z0-9.:%-]+$/.test(holder.did);
+    if (didHeld) {
+      const scope = Array.isArray(b.scope) && !b.scope.length ? [] : scoped(b.scope);
+      if (from !== "owner") return fail(c, 403, "Forbidden", "a DID holder is the owner's to make: nobody else extends what another person may do");
+      if (name !== "grant" || (Array.isArray(caps) && caps.length) || until !== null || daily !== null) return fail(c, 400, "InvalidRequest", "a DID holder is { name: \"grant\", holder: { did }, scope }, with no caps, until or daily");
+      if (!scope || scope.some((m) => m.includes("*"))) return fail(c, 400, "InvalidRequest", "a grant names whole methods, at most 50; a prefix is for a token");
+      const no = scope.find((m) => neverHeld(m) || m.startsWith("com.lopecode.brain.member."));
+      if (no) return fail(c, 400, "InvalidRequest", `${no} is not granted`);
+      const was = await rows.get("holder/did/" + holder.did), old = was ? await rows.get("delegation/" + was) : null;
+      if (old) await drop(old);
+      const id = [...crypto.getRandomValues(new Uint8Array(6))].map((x) => x.toString(16).padStart(2, "0")).join("");
+      const d = { id, name: "grant", from, holder: { did: holder.did }, scope, caps: [], until: null, daily: null, parent: null, note: typeof note === "string" ? note.slice(0, 300) : "", created: Date.now(), by: c.get("who").via };
+      await settings.put("delegation/" + id, d);
+      await settings.put("holder/did/" + holder.did, id);
+      return c.json(d);
+    }
     // A token may name no method: a sign-in link made only to deploy.
     const scope = secretHeld && Array.isArray(b.scope) && !b.scope.length ? [] : scoped(b.scope);
     if (typeof name !== "string" || !/^[a-z0-9-]{1,40}$/.test(name)) return fail(c, 400, "InvalidRequest", "name is a-z, 0-9 and -, 1 to 40 characters");
-    if (!secretHeld && !(one && typeof holder.worker === "string")) return fail(c, 400, "InvalidRequest", "holder is { worker: NAME } or { secret: true }");
+    if (!secretHeld && !(one && typeof holder.worker === "string")) return fail(c, 400, "InvalidRequest", "holder is { worker: NAME }, { secret: true } or { did }");
     if (secretHeld && from !== "owner") return fail(c, 403, "Forbidden", "a secret holder is the owner's to make");
     // A delegation names a Worker and not its code, so the Worker is one the owner deploys.
     const route = secretHeld ? null : await rows.get("route/" + holder.worker);
@@ -25036,14 +25062,15 @@ ${deployed.join("\n\n")}
     if (no) return fail(c, 400, "InvalidRequest", `${no} is not reached under a delegation`);
     if (from !== "owner") {
       const me = await rows.get("person/" + from), ALL = "com.lopecode.brain.*";
-      const over = scope.find((m) => m !== ALL && !may({ member: true, grant: me.methods }, m) && !(/[./]\*$/.test(m) && MEMBER.some((own) => own.startsWith(m.slice(0, -1)))));
+      const granted = await grantOf(from, me);
+      const over = scope.find((m) => m !== ALL && !may({ member: true, grant: granted }, m) && !(/[./]\*$/.test(m) && MEMBER.some((own) => own.startsWith(m.slice(0, -1)))));
       if (over) return fail(c, 403, "Forbidden", `${from} may not call ${over}`);
     }
     if (until !== null && !(Number.isInteger(until) && until > clock())) return fail(c, 400, "InvalidRequest", "until is a time in ms after now, or null");
     if (daily !== null && !(typeof daily === "number" && Number.isFinite(daily) && daily >= 0)) return fail(c, 400, "InvalidRequest", "daily is US dollars a UTC day, or null");
     if (typeof note !== "string" || note.length > 300) return fail(c, 400, "InvalidRequest", "note is text, at most 300 characters");
-    // What has ended goes when its maker makes another.
-    const mine = (await rows.list("delegation/")).map((r) => r.value).filter((o) => o.from === from), live = [];
+    // What has ended goes when its maker makes another. A grant has the one name for every DID, and is not counted.
+    const mine = (await rows.list("delegation/")).map((r) => r.value).filter((o) => o.from === from && !o.holder.did), live = [];
     for (const o of mine) o.until && o.until <= clock() ? await drop(o) : live.push(o.name);
     if (live.includes(name)) return fail(c, 400, "InvalidRequest", `a delegation named ${name} exists; revoke it first`);
     const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -25068,7 +25095,8 @@ ${deployed.join("\n\n")}
     return c.json({ revoked: true, id });
   });
   // A token from before 2026-10-10 was a row of the kernel, which has the hash of its secret and not the secret.
-  // The kernel hands each over once. A name one of the owner's delegations has is kept apart by the new id.
+  // The kernel hands each over. The id is the start of the hash, so two hand-overs of one token at the same moment
+  // write the one row. The name is kept as it was: two old tokens could have one name, and token.revoke ends both.
   app.post(NS + "delegation.adopt", async (c) => {
     const w = c.get("who"), b = (await c.req.json().catch(() => null)) || {};
     if (!(w.kernel && w.caller === "kernel")) return fail(c, 401, "AuthRequired", "the kernel");
@@ -25076,9 +25104,8 @@ ${deployed.join("\n\n")}
     if (!ok) return fail(c, 400, "InvalidRequest", "{ sha256, name, scope, caps, until, created, note }");
     const had = await rows.get("holder/secret/" + b.sha256);
     if (had && (await rows.get("delegation/" + had))) return c.json(await rows.get("delegation/" + had));
-    const id = [...crypto.getRandomValues(new Uint8Array(6))].map((x) => x.toString(16).padStart(2, "0")).join("");
-    const taken = (await rows.list("delegation/")).some((r) => r.value.from === "owner" && r.value.name === b.name);
-    const d = { id, name: taken ? b.name.slice(0, 35) + "-" + id.slice(0, 4) : b.name, from: "owner", holder: { secret: b.sha256 }, scope: b.scope, caps: b.caps, until: Number.isInteger(b.until) ? b.until : null, daily: null, parent: null, note: typeof b.note === "string" ? b.note.slice(0, 300) : "", created: Number.isInteger(b.created) ? b.created : Date.now(), by: "moved" };
+    const id = b.sha256.slice(0, 12);
+    const d = { id, name: b.name, from: "owner", holder: { secret: b.sha256 }, scope: b.scope, caps: b.caps, until: Number.isInteger(b.until) ? b.until : null, daily: null, parent: null, note: typeof b.note === "string" ? b.note.slice(0, 300) : "", created: Number.isInteger(b.created) ? b.created : Date.now(), by: "moved" };
     await settings.put("delegation/" + id, d);
     await settings.put("holder/secret/" + b.sha256, id);
     return c.json(d);
@@ -25086,8 +25113,13 @@ ${deployed.join("\n\n")}
   // The kernel asks whose secret it was sent: it needs the scope for the routes it answers itself and the caps for
   // infra.*. The row is found by the hash, and the answer has no secret in it.
   app.post(NS + "delegation.resolve", async (c) => {
-    const w = c.get("who"), { sha256: hash } = (await c.req.json().catch(() => null)) || {};
+    const w = c.get("who"), { sha256: hash, did } = (await c.req.json().catch(() => null)) || {};
     if (!(w.kernel && w.caller === "kernel")) return fail(c, 401, "AuthRequired", "the kernel");
+    // A DID's grant. Read through the 5 s memory: the kernel asks on each call a member makes.
+    if (typeof did === "string" && did.length <= 300) {
+      const held = await settings.get("holder/did/" + did), g = held ? await settings.get("delegation/" + held) : null;
+      return c.json({ delegation: g && g.holder.did === did ? g : null });
+    }
     // Read with no memory: anyone can send a bearer nobody made, and settings would keep an entry for each.
     const id = typeof hash === "string" && /^[0-9a-f]{64}$/.test(hash) ? await rows.get("holder/secret/" + hash) : null;
     const d = id ? await settings.get("delegation/" + id) : null;
@@ -26051,11 +26083,11 @@ const _braincore_test_a_token_is_a_delegation_with_a_secret_holder_that_the_kern
   expect((await make({ name: "laptop", scope: ["*"] })).status).toBe(400);
   expect((await rig.owner("delegation.revoke", { id: t.id })).data).toEqual({ revoked: true, id: t.id });
   expect([(await kernel("delegation.resolve", { sha256: t.holder.secret })).data, (await sent(t.id)("shop.receive", {})).status, (await make({ name: "laptop", scope: ["*"] })).status]).toEqual([{ delegation: null }, 401, 200]);
-  // A token from before: the kernel hands over the hash it has. The same hash again is the same row; a name that
-  // is taken is kept apart; nobody but the kernel does it.
+  // A token from before: the kernel hands over the hash it has. The same hash again is the same row; its name is
+  // kept, though another has it; nobody but the kernel does it.
   const HASH = await sha256("made-before"), old = { sha256: HASH, name: "laptop", scope: [B + "shop.receive"], caps: ["deploy"], until: null, created: 5, note: "sign-in link" };
   const moved = (await kernel("delegation.adopt", old)).data;
-  expect([moved.name, moved.from, moved.holder, moved.caps, moved.created, moved.by, (await kernel("delegation.adopt", old)).data.id, (await kernel("delegation.resolve", { sha256: HASH })).data.delegation.id]).toEqual(["laptop-" + moved.id.slice(0, 4), "owner", { secret: HASH }, ["deploy"], 5, "moved", moved.id, moved.id]);
+  expect([moved.name, moved.from, moved.holder, moved.caps, moved.created, moved.by, (await kernel("delegation.adopt", old)).data.id, (await kernel("delegation.resolve", { sha256: HASH })).data.delegation.id]).toEqual(["laptop", "owner", { secret: HASH }, ["deploy"], 5, "moved", HASH.slice(0, 12), HASH.slice(0, 12)]);
   expect([(await sent(moved.id)("shop.receive", {})).status, (await rig.owner("delegation.adopt", old)).status, (await kernel("delegation.adopt", { ...old, caps: ["root"] })).status]).toEqual([200, 401, 400]);
   await rig.owner("delegation.revoke", { id: moved.id });
   // Ended, it is refused, and it goes when the owner makes another.
@@ -26064,6 +26096,37 @@ const _braincore_test_a_token_is_a_delegation_with_a_secret_holder_that_the_kern
   await make({ name: "next", scope: ["*"] });
   expect([(await rig.owner("delegation.list")).data.delegations.map((d) => d.name).sort(), (await kernel("delegation.resolve", { sha256: button.holder.secret })).data]).toEqual([["laptop", "next", "ship"], { delegation: null }]);
   return "a secret holder: resolved by the kernel only, the owner's call, the owner's tab with the cap session";
+};
+const _braincore_test_a_grant_is_a_delegation_that_a_did_holds = async function _test_a_grant_is_a_delegation_that_a_did_holds(Response,coreRig,sha256,expect) {
+  const B = "com.lopecode.brain.", ADA = "did:plc:ada", BO = "did:plc:bo";
+  const hear = async (request) => (request.url.endsWith(".getInfo") ? Response.json({ name: "brain-x-shop", hash: "h", calls: [] }) : Response.json({ ok: true }));
+  const rig = await coreRig({ workers: { shop: hear } }), kernel = rig.as("kernel", "");
+  await rig.deployer("service.register", { worker: "brain-x-shop", role: "recipe", paths: [], secrets: [], hash: "h", keyHash: await sha256("shop-key"), methods: { [B + "shop.receive"]: { type: "procedure", who: "anyone" }, [B + "shop.other"]: { type: "procedure", who: "anyone" } } });
+  // The kernel says who is a member, and no longer what each was granted.
+  await kernel("people.sync", { people: [{ did: ADA }] });
+  const grant = (did, scope, more) => rig.owner("delegation.create", { name: "grant", holder: { did }, scope, ...more });
+  const mine = (name) => rig.as(ADA)("delegation.create", { name, holder: { worker: "brain-x-echo" }, scope: ["shop.receive"] });
+  const held = (id) => rig.send("https://core.internal", { "x-brain-key": "echo-key", "x-brain-as": id });
+  // With no grant a member cannot delegate the method. With one they can, and the Worker's call is theirs.
+  expect((await mine("a")).status).toBe(403);
+  const g = (await grant(ADA, ["shop.receive"])).data;
+  expect([g.name, g.from, g.holder, g.scope, g.caps, (await kernel("delegation.resolve", { did: ADA })).data.delegation.id, (await kernel("delegation.resolve", { did: BO })).data]).toEqual(["grant", "owner", { did: ADA }, [B + "shop.receive"], [], g.id, { delegation: null }]);
+  const a = (await mine("a")).data;
+  expect((await held(a.id)("shop.receive", {})).status).toBe(200);
+  // A second grant takes the place of the first: one row for a DID, and what the first gave is gone.
+  const g2 = (await grant(ADA, ["shop.other"])).data;
+  expect([(await rig.owner("delegation.list")).data.delegations.filter((d) => d.holder.did).map((d) => d.id), (await held(a.id)("shop.receive", {})).status]).toEqual([[g2.id], 403]);
+  // A grant for another DID has the same name. A member does not see the owner's grant to them, and makes none.
+  expect([(await grant(BO, [])).status, (await rig.as(ADA)("delegation.list")).data.delegations.map((d) => d.name), (await rig.as(ADA)("delegation.create", { name: "grant", holder: { did: BO }, scope: ["shop.other"] })).status]).toEqual([200, ["a"], 403]);
+  // Whole names only, none of the never kind or of member.*, no caps, no end, no daily amount, and no other name.
+  expect(await Promise.all([grant(BO, ["shop.*"]), grant(BO, ["secret.get"]), grant(BO, ["member.deploy"]), grant(BO, ["shop.other"], { caps: ["session"] }), grant(BO, ["shop.other"], { until: Date.now() + 9e6 }), grant(BO, ["shop.other"], { daily: 1 }), grant(BO, ["shop.other"], { name: "other" }), grant("did:nope", ["shop.other"])].map((p) => p.then((r) => r.status)))).toEqual([400, 400, 400, 400, 400, 400, 400, 400]);
+  // Revoked, the DID has no grant. Nobody but the kernel asks.
+  await rig.owner("delegation.revoke", { id: g2.id });
+  expect([(await kernel("delegation.resolve", { did: ADA })).data, (await rig.owner("delegation.resolve", { did: ADA })).status]).toEqual([{ delegation: null }, 401]);
+  // A kernel from before sends the grant with people.sync, and it is read when the DID holds no delegation.
+  await kernel("people.sync", { people: [{ did: ADA, methods: [B + "shop.receive"] }] });
+  expect((await mine("b")).status).toBe(200);
+  return "a grant: one delegation for a DID, the owner's to make, read on each call";
 };
 const _braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab = async function _test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab(Response,coreRig,sha256,expect) {
   const heard = [], B = "com.lopecode.brain.", ADA = "did:plc:ada";
@@ -26143,7 +26206,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braincore_anon_677ccf0566", null, ["md"], _braincore_anon_677ccf0566);
+  $def("_braincore_anon_6b1e985ec5", null, ["md"], _braincore_anon_6b1e985ec5);
   $def("_braincore_core_service", "core_service", ["cloudflare","coreApp"], _braincore_core_service);
   $def("_braincore_core_announce", "core_announce", ["plugins","core_service","invalidation"], _braincore_core_announce);
   $def("_braincore_coreApp", "coreApp", ["hono","sha256","rows","config","settings","matches","may","neverHeld","workers","Request","deployer","ruleExpression","checkedRule","callerOf","cel","Response","scoped","MEMBER","decide"], _braincore_coreApp);
@@ -26184,6 +26247,7 @@ export default function define(runtime, observer) {
   $def("_braincore_test_the_log_line_of_a_priced_call_has_its_price", "test_the_log_line_of_a_priced_call_has_its_price", ["coreRig","logged","expect"], _braincore_test_the_log_line_of_a_priced_call_has_its_price);
   $def("_braincore_test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed", "test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed", ["coreRig","expect"], _braincore_test_a_delegation_is_made_in_a_persons_own_session_for_a_worker_the_owner_deployed);
   $def("_braincore_test_a_token_is_a_delegation_with_a_secret_holder_that_the_kernel_resolves", "test_a_token_is_a_delegation_with_a_secret_holder_that_the_kernel_resolves", ["Response","coreRig","sha256","expect"], _braincore_test_a_token_is_a_delegation_with_a_secret_holder_that_the_kernel_resolves);
+  $def("_braincore_test_a_grant_is_a_delegation_that_a_did_holds", "test_a_grant_is_a_delegation_that_a_did_holds", ["Response","coreRig","sha256","expect"], _braincore_test_a_grant_is_a_delegation_that_a_did_holds);
   $def("_braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab", "test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab", ["Response","coreRig","sha256","expect"], _braincore_test_a_worker_calls_under_a_delegation_as_who_made_it_and_not_in_their_tab);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
@@ -26226,7 +26290,7 @@ var Es=Object.defineProperty;var As=(e)=>e;function Ss(e,t){this[e]=As.bind(null
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainkernel_anon_0689871ea7 = function _anonymous(md) {return (md`# brain-kernel
+const _brainkernel_anon_c5f3ff0732 = function _anonymous(md) {return (md`# brain-kernel
 
 The Worker at the Brain's address. It serves the notebook, signs people in with atproto, works out who is calling, and forwards everything else to the core with that answer attached.
 
@@ -26263,7 +26327,9 @@ A person is an atproto account, named by its DID. There are two roles. The **own
 
 **Sign-in links** (added 2026-10-09). For a program with no browser, such as Claude Code on the web. \`token.link\` (procedure, owner's session) takes \`{ name, methods, minutes, hours, deploy, unattended }\` and answers \`{ name, deploy, unattended, link, until }\`; \`minutes\` (1 to 480, 480 if left out; 10 until 2026-10-10, which a session that first had to have its network opened ran past) is how long the link is good, \`hours\` (1 to 24, 8 if left out) how long its token lasts. The link is \`/auth/link?code=…\`. A GET of it answers text that says what to do and spends nothing, so a preview of a pasted link does not use it. The first POST answers \`{ name, token, methods, until, deploy, unattended }\` and deletes the link; a second answers 401. The token is one as \`token.create\` makes, with an end: it may not name \`infra.*\`, \`secret.*\`, \`token.*\`, \`grant.*\` or \`people.*\`, and \`token.list\` gives it with \`by: "link"\` until it ends. \`token.revoke\` with \`{ name }\` ends the token early, and deletes a link of that name nobody has used. A link is refused a name that a token or another link has.
 
-**A token is a delegation** (2026-10-10). \`token.create\`, and the POST of a sign-in link, make a delegation with a secret holder in the core (\`delegation.create\`), and the kernel keeps no row for it. \`token.list\` and \`token.revoke\` read and end those and nothing else: a token made before is a row here until it is first used or tokens are next listed, and is then handed to the core by the hash of its secret (\`delegation.adopt\`) and is a delegation like any other. A call with such a token is sent to the core with the delegation's id, and there it is the owner's call: the owner's rules and the owner's allowance, which \`daily\` in \`token.create\` (US dollars a UTC day) caps. It is not the owner's own tab, so what it makes in a store is kept under \`d:<id>\` and not under \`token:NAME\`; a link made with \`unattended\` is the owner's tab for the methods its list names by a name or a prefix, and not for one that only \`*\` reaches. A token ends within 5 s of \`token.revoke\`, the time a core instance remembers a row. The core's limits are now a token's: at most 50 methods, and a name that no other delegation of the owner has (400 from \`token.create\`, where two tokens of one name were made before). While the core does not answer, such a token is refused with 503, on \`infra.*\` too: a sign-in link's token cannot deploy a core that is down, and the owner's session can.
+**A token is a delegation** (2026-10-10). \`token.create\`, and the POST of a sign-in link, make a delegation with a secret holder in the core (\`delegation.create\`), and the kernel keeps no row for it. \`token.list\` and \`token.revoke\` read and end those and nothing else: a token made before is a row here until it is first used, or tokens are next listed or revoked, or a link is made, and is then handed to the core by the hash of its secret (\`delegation.adopt\`) and is a delegation like any other. A call with such a token is sent to the core with the delegation's id, and there it is the owner's call: the owner's rules and the owner's allowance, which \`daily\` in \`token.create\` (US dollars a UTC day) caps. It is not the owner's own tab, so what it makes in a store is kept under \`d:<id>\` and not under \`token:NAME\`; a link made with \`unattended\` is the owner's tab for the methods its list names by a name or a prefix, and not for one that only \`*\` reaches. A token ends within 5 s of \`token.revoke\`, the time a core instance remembers a row. The core's limits are now a token's: at most 50 methods, and a name that no other delegation of the owner has (400 from \`token.create\`, where two tokens of one name were made before). While the core does not answer, such a token is refused with 503, on \`infra.*\` too: a sign-in link's token cannot deploy a core that is down, and the owner's session can.
+
+**A grant is a delegation** (2026-10-10). \`grant.put\` makes a delegation that the DID holds, named \`grant\`, in the core, and the kernel keeps no row; \`grant.list\` and \`grant.delete\` read and end it, and \`people.remove\` ends it with the member. For each call a DID makes the kernel asks the core for that DID's grant. A grant from before is a row here until the DID next calls or grants are listed. \`people.sync\` tells the core who is a member and no longer what each was granted.
 
 **Lists of methods** (2026-10-10). In \`token.create\` and \`token.link\` an entry of \`methods\` is a whole name or a prefix that ends \`.*\`: \`browser.*\` is every method of that service, \`*\` every method of this Brain. A name may go on after a \`/\` (\`ai.v1/chat/completions\`), and \`ai.v1/*\` is every method under \`ai.v1/\` and not \`ai.run\` (2026-10-10: the first shape check had refused every name with a \`/\`). No prefix reaches a name a token may not have (\`infra\`, \`secret\`, \`token\`, \`grant\`, \`people\`), whether it goes on with a \`.\` or a \`/\`. A grant to a DID still names whole methods.
 
@@ -26467,7 +26533,7 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
       return portal ? { caller: named(portal.did), via: "portal:" + portal.id, did: portal.did, portal } : { refused: { error: "AuthRequired", message: "this portal token has expired or is not this Brain's" } };
     }
     if (bearer.split(".").length === 3) {
-      const v = await verifyServiceJwt(bearer, nsid, "did:web:" + config.host, async (did) => did === config.owner || !!(await rows.get("member/" + did)) || !!(await rows.get("grant/" + did)));
+      const v = await verifyServiceJwt(bearer, nsid, "did:web:" + config.host, async (did) => did === config.owner || !!(await rows.get("member/" + did)) || !!(await grantOf(did)));
       return v.error ? { refused: v } : { caller: v.iss === config.owner ? "owner" : v.iss, via: "jwt", did: v.iss };
     }
     // A token is a delegation that the core keeps, found by the hash. The caller is who made it. Its scope is the
@@ -26503,6 +26569,22 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   const moveAll = async () => {
     for (const r of await rows.list("token/")) r.value.until < Date.now() ? await rows.delete(r.key) : await move(r.key, r.value);
   };
+  // What the owner granted a DID: a delegation that DID holds, in the core. A grant from before 2026-10-10 is a
+  // row here until it is first read, and is then made in the core as the owner's session made it.
+  const moveGrant = async (g) => {
+    const r = await asOwnerSession("delegation.create", { name: "grant", holder: { did: g.did }, scope: g.methods });
+    if (r.status === 200) await rows.delete("grant/" + g.did);
+  };
+  const grantOf = async (did) => {
+    const old = await rows.get("grant/" + did);
+    if (old) await moveGrant(old);
+    const d = ((await coreCall({ "x-brain-caller": "kernel" }, "delegation.resolve", { did })).data || {}).delegation;
+    return d ? { did, methods: d.scope, granted: d.created } : null;
+  };
+  const grants = async () => {
+    for (const { value: g } of await rows.list("grant/")) await moveGrant(g);
+    return (await delegations()).filter((d) => d.holder && d.holder.did);
+  };
   const asOwnerSession = (method, body) => coreCall({ "x-brain-caller": "owner", "x-brain-via": "session" }, method, body);
   const delegations = async () => ((await asOwnerSession("delegation.list")).data || {}).delegations || [];
   app.use("*", async (c, next) => {
@@ -26531,14 +26613,14 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
     if (others.length && nsid !== "com.lopecode.brain.inbox.reply")
       for (const did of [who.did, ...others]) {
         if (did && did === config.owner) continue;
-        const grant = did && (await rows.get("member/" + did)) ? await rows.get("grant/" + did) : null;
+        const grant = did && (await rows.get("member/" + did)) ? await grantOf(did) : null;
         if (!(grant && matches(grant.methods, nsid))) return fail(c, 403, "Forbidden", `a turn in a room reaches inbox.reply and what everyone in the room has a grant for; ${did === who.did ? "its sender" : did || "someone who is not a member"} has none for ${nsid || path}`);
       }
     if (who.caller.startsWith("did:")) {
       const member = await rows.get("member/" + who.caller);
       // A turn is run for a member. Once they are removed, a token already issued stops working.
       if ((who.turn || who.portal) && !member) return fail(c, 403, "Forbidden", `${who.caller} is not a member`);
-      const grant = nsid ? await rows.get("grant/" + who.caller) : null;
+      const grant = nsid ? await grantOf(who.caller) : null;
       if (nsid && !may({ member, grant: grant && grant.methods }, nsid)) return fail(c, 403, "Forbidden", `${who.caller} has no grant for ${nsid}`);
       // A member is still themselves when they open a file; every other page is served to them as to anyone.
       if (!nsid && !(member && path.startsWith("/static/"))) who.caller = "anonymous";
@@ -26734,15 +26816,20 @@ other address): how to call, and what this Brain is made of.
     for (const d of await tokens()) if (d.name === name) revoked += ((await asOwnerSession("delegation.revoke", { id: d.id })).data || {}).revoked ? 1 : 0;
     return c.json({ revoked });
   });
-  app.get(NS + "grant.list", session, async (c) => c.json({ grants: (await rows.list("grant/")).map((r) => r.value) }));
+  app.get(NS + "grant.list", session, async (c) => c.json({ grants: (await grants()).map((d) => ({ did: d.holder.did, methods: d.scope, granted: d.created })) }));
   // The core checks a member's Worker as its author, and cannot ask the kernel who that is: it is told, whole, each
-  // time a member or a grant changes.
+  // time a member changes. What each was granted is the core's own row.
   const syncPeople = async () => {
     const people = [];
-    for (const { value: m } of await rows.list("member/")) people.push({ did: m.did, methods: ((await rows.get("grant/" + m.did)) || { methods: [] }).methods, quota: m.quota || null, tags: m.tags || [] });
+    for (const { value: m } of await rows.list("member/")) people.push({ did: m.did, quota: m.quota || null, tags: m.tags || [] });
     await core.fetch(new Request("https://core.internal/xrpc/com.lopecode.brain.people.sync", { method: "POST", headers: { "content-type": "application/json", "x-brain-caller": "kernel" }, body: JSON.stringify({ people }) }));
     // A channel that knows senders by DID is told the whole list too; one that is not deployed does not answer.
     for (const channel of NATIVE) await toChannel(channel, "know", { all: people.map((p) => p.did) }).catch(() => null);
+  };
+  const ungrant = async (did) => {
+    let deleted = await rows.delete("grant/" + did);
+    for (const d of await delegations()) if (d.holder && d.holder.did === did) deleted = !!((await asOwnerSession("delegation.revoke", { id: d.id })).data || {}).revoked || deleted;
+    return deleted;
   };
   app.post(NS + "grant.put", session, async (c) => {
     const { did, methods = [] } = await c.req.json();
@@ -26750,14 +26837,14 @@ other address): how to call, and what this Brain is made of.
     if (!/^did:(plc|web):[A-Za-z0-9.:%-]+$/.test(did || "")) return fail(c, 400, "InvalidRequest", "did");
     if (named.some((m) => m.includes("*"))) return fail(c, 400, "InvalidRequest", "a grant names whole methods; a prefix is for a token");
     if (named.some(never) || named.some((m) => m.startsWith("com.lopecode.brain.member."))) return fail(c, 400, "InvalidRequest", "a grant cannot name infra, secret, token, grant, people, delegation or member methods");
-    await rows.put("grant/" + did, { did, methods: named, granted: Date.now() });
-    await syncPeople();
+    await rows.delete("grant/" + did);
+    const made = await asOwnerSession("delegation.create", { name: "grant", holder: { did }, scope: named });
+    if (made.status !== 200) return c.json(made.data || { error: "UpstreamFailure", message: "the core did not answer" }, made.status);
     return c.json({ did, methods: named });
   });
   app.post(NS + "grant.delete", session, async (c) => {
-    const deleted = await rows.delete("grant/" + (await c.req.json()).did);
-    await syncPeople();
-    return c.json({ deleted });
+    const { did } = await c.req.json();
+    return c.json({ deleted: await ungrant(did) });
   });
 
   // Who is calling, then the core. Nothing the caller sent says who they are.
@@ -26794,7 +26881,7 @@ other address): how to call, and what this Brain is made of.
     if (config.owner) at(config.owner).role = "owner";
     for (const { value: m } of await rows.list("member/")) Object.assign(at(m.did), { role: "member", name: m.name || null, added: m.added, services: m.services !== false, quota: m.quota || null, tags: m.tags || [] });
     for (const { value: a } of await rows.list("address/")) at(a.did).addresses.push({ channel: a.channel, address: a.address, linked: a.linked });
-    for (const { value: g } of await rows.list("grant/")) if (people.has(g.did)) at(g.did).methods = g.methods;
+    for (const g of await grants()) if (people.has(g.holder.did)) at(g.holder.did).methods = g.scope;
     for (const p of people.values()) p.handle = await rows.get("handle/" + p.did);
     return c.json({ people: [...people.values()] });
   });
@@ -26821,7 +26908,8 @@ other address): how to call, and what this Brain is made of.
     const { did } = await c.req.json();
     if (!DID.test(did || "") || did === config.owner) return fail(c, 400, "InvalidRequest", "did");
     const removed = await rows.delete("member/" + did);
-    await rows.delete("grant/" + did);
+    // Their grant is revoked too, or a removed person would keep the methods it gave.
+    await ungrant(did);
     // From here the core refuses every call into and out of their Workers; the deployer then deletes them.
     await syncPeople();
     await deployer.fetch(new Request("https://deployer.internal/xrpc/com.lopecode.brain.member.purge", { method: "POST", headers: { "content-type": "application/json", "x-brain-caller": "owner" }, body: JSON.stringify({ author: did }) })).catch(() => null);
@@ -26995,10 +27083,16 @@ const _brainkernel_kernelRig = function _kernelRig(Response,sha256,simulate,kern
       const d = { id: hexOf(6), name: b.name, from: "owner", holder: { secret: b.sha256 }, scope: b.scope, caps: b.caps, until: b.until, daily: null, note: b.note, created: b.created };
       return (held.set(d.id, d), Response.json(d));
     }
+    if (m === "resolve" && b.did) return Response.json({ delegation: [...held.values()].find((d) => d.holder.did === b.did) || null });
+    if (m === "create" && b.holder.did) {
+      for (const [k, d] of held) if (d.holder.did === b.holder.did) held.delete(k);
+      const d = { id: hexOf(6), name: "grant", from: "owner", holder: { did: b.holder.did }, scope: b.scope, caps: [], until: null, daily: null, note: "", created: Date.now() };
+      return (held.set(d.id, d), Response.json(d));
+    }
     if (m === "resolve") return Response.json({ delegation: [...held.values()].find((d) => d.holder.secret === b.sha256) || null });
     if (m === "list") return Response.json({ delegations: [...held.values()] });
     if (m === "revoke") return Response.json({ revoked: held.delete(b.id) });
-    if ([...held.values()].some((d) => d.name === b.name && !(d.until && d.until < Date.now()))) return Response.json({ error: "InvalidRequest", message: `a delegation named ${b.name} exists; revoke it first` }, { status: 400 });
+    if ([...held.values()].some((d) => !d.holder.did && d.name === b.name && !(d.until && d.until < Date.now()))) return Response.json({ error: "InvalidRequest", message: `a delegation named ${b.name} exists; revoke it first` }, { status: 400 });
     const secret = hexOf(32), d = { id: hexOf(6), name: b.name, from: "owner", holder: { secret: await sha256(secret) }, scope: b.scope, caps: b.caps || [], until: b.until ?? null, daily: b.daily ?? null, note: b.note || "", created: Date.now() };
     held.set(d.id, d);
     return Response.json({ ...d, secret });
@@ -27221,12 +27315,14 @@ const _brainkernel_test_tokens_reach_only_their_methods = async function _test_t
   const H = "com.lopecode.brain.", rowsOf = () => [...rig.sim.rows.keys()].filter((k) => k.startsWith("token/")).length;
   rig.sim.rows.set("token/" + (await sha256("made-before")), { name: "old", methods: [H + "proxy.fetch"], created: 1 });
   rig.sim.rows.set("token/" + (await sha256("made-free")), { name: "oldfree", methods: [H + "proxy.*"], created: 2, until: Date.now() + 60000, by: "link", deploy: true, unattended: true });
+  rig.sim.rows.set("token/" + (await sha256("made-twin")), { name: "old", methods: [], created: 4 });
   rig.sim.rows.set("token/" + (await sha256("made-ended")), { name: "oldended", methods: [], created: 3, until: Date.now() - 1, by: "link" });
-  expect([(await rig.call("proxy.fetch", { bearer: "made-before", body: {} })).status, rig.seen.at(-1).headers["x-brain-caller"], rig.seen.at(-1).headers["x-brain-delegation"], (await rig.call("inbox.list", { bearer: "made-before" })).status, rowsOf()]).toEqual([200, "owner", [...rig.held.values()].find((d) => d.name === "old").id, 403, 2]);
+  expect([(await rig.call("proxy.fetch", { bearer: "made-before", body: {} })).status, rig.seen.at(-1).headers["x-brain-caller"], rig.seen.at(-1).headers["x-brain-delegation"], (await rig.call("inbox.list", { bearer: "made-before" })).status, rowsOf()]).toEqual([200, "owner", [...rig.held.values()].find((d) => d.name === "old").id, 403, 3]);
   expect((await rig.call("proxy.fetch", { bearer: "made-ended", body: {} })).data.message).toBe("this token has expired");
-  expect([(await listed()).filter((t) => t[0].startsWith("old")), rowsOf(), [...rig.held.values()].find((d) => d.name === "oldfree").caps]).toEqual([[["old", null], ["oldfree", "link"]], 0, ["deploy", "unattended", "session"]]);
+  expect([(await listed()).filter((t) => t[0].startsWith("old")), rowsOf(), [...rig.held.values()].find((d) => d.name === "oldfree").caps]).toEqual([[["old", null], ["old", null], ["oldfree", "link"]], 0, ["deploy", "unattended", "session"]]);
   expect([(await rig.call("infra.shell", { bearer: "made-free", body: "<p>page</p>" })).status, rig.toDeployer.at(-1).headers["x-brain-unattended"]]).toEqual([200, "token:oldfree"]);
-  expect([(await rig.call("token.revoke", { session: rig.owner, body: { name: "old" } })).data, (await rig.call("proxy.fetch", { bearer: "made-before", body: {} })).status]).toEqual([{ revoked: 1 }, 401]);
+  // Two tokens from before could have one name. Each keeps it, and token.revoke ends both, as it did.
+  expect([(await rig.call("token.revoke", { session: rig.owner, body: { name: "old" } })).data, (await rig.call("proxy.fetch", { bearer: "made-before", body: {} })).status, (await rig.call("proxy.fetch", { bearer: "made-twin", body: {} })).status]).toEqual([{ revoked: 2 }, 401, 401]);
   const every = (await rig.call("token.create", { session: rig.owner, body: { name: "every", methods: ["*"] } })).data.token;
   expect((await rig.call("inbox.list", { bearer: every })).status).toBe(200);
   for (const m of ["secret.get", "token.list", "infra.getState", "people.list"]) expect((await rig.call(m, { bearer: every })).status).toBe(403);
@@ -27259,6 +27355,15 @@ const _brainkernel_test_another_did_needs_a_grant = async function _test_another
   await rig.call("/notebooks/x", { session: rig.other });
   expect(rig.seen.at(-1).headers["x-brain-caller"]).toBe("anonymous");
   expect((await rig.call("grant.put", { session: rig.other, body: { did: "did:plc:other", methods: ["inbox.list"] } })).status).toBe(403);
+  // The grant is a delegation that the DID holds, in the core; the kernel keeps no row. A second takes its place.
+  const grantsOf = () => [...rig.held.values()].filter((d) => d.holder.did === "did:plc:other").map((d) => d.scope);
+  expect([grantsOf(), [...rig.sim.rows.keys()].filter((k) => k.startsWith("grant/")), (await rig.call("grant.list", { session: rig.owner })).data.grants.map((g) => [g.did, g.methods])]).toEqual([[["com.lopecode.brain.index.search"]], [], [["did:plc:other", ["com.lopecode.brain.index.search"]]]]);
+  await rig.call("grant.put", { session: rig.owner, body: { did: "did:plc:other", methods: ["inbox.list"] } });
+  expect([grantsOf(), (await rig.call("index.search", { session: rig.other })).status, (await rig.call("inbox.list", { session: rig.other })).status]).toEqual([[["com.lopecode.brain.inbox.list"]], 403, 200]);
+  expect([(await rig.call("grant.delete", { session: rig.owner, body: { did: "did:plc:other" } })).data, (await rig.call("inbox.list", { session: rig.other })).status, (await rig.call("grant.delete", { session: rig.owner, body: { did: "did:plc:other" } })).data]).toEqual([{ deleted: true }, 403, { deleted: false }]);
+  // A grant from before 2026-10-10 is a row here until the DID next calls, and is then made in the core.
+  rig.sim.rows.set("grant/did:plc:other", { did: "did:plc:other", methods: ["com.lopecode.brain.index.search"], granted: 1 });
+  expect([(await rig.call("index.search", { session: rig.other })).status, rig.sim.rows.has("grant/did:plc:other"), grantsOf()]).toEqual([200, false, [["com.lopecode.brain.index.search"]]]);
   return "403 until granted";
 };
 const _brainkernel_peopleCore = function _peopleCore(Response) {return (() => {
@@ -27430,7 +27535,8 @@ const _brainkernel_test_people_are_the_owners_to_change = async function _test_p
   const { people } = (await rig.call("people.list", { session: rig.owner })).data;
   expect(people.map((p) => [p.did, p.role, p.addresses.map((a) => a.address).join(), p.methods.length])).toEqual([["did:plc:owner", "owner", "+100", 0], ["did:plc:new", "member", "did:plc:new,+500", 1], ["did:plc:other", "member", "+200", 0], ["did:plc:guest", null, "+300", 0]]);
   expect((await rig.call("people.remove", { session: rig.owner, body: { did: "did:plc:new" } })).data).toEqual({ removed: true });
-  expect(["member/did:plc:new", "grant/did:plc:new", "address/loop/+500"].map((k) => rig.sim.rows.has(k))).toEqual([false, false, false]);
+  // The grant goes with the member: it is a delegation in the core, and is revoked there.
+  expect([...["member/did:plc:new", "address/loop/+500"].map((k) => rig.sim.rows.has(k)), [...rig.held.values()].filter((d) => d.holder.did === "did:plc:new").length]).toEqual([false, false, 0]);
   expect(rig.known.has("+500")).toBe(false);
   expect((await rig.call("people.remove", { session: rig.owner, body: { did: "did:plc:owner" } })).status).toBe(400);
   for (const kind of ["token.create", "grant.put"])
@@ -27675,7 +27781,7 @@ const _brainkernel_test_a_member_reaches_their_own_services_and_the_deployer_hea
   // The core was told who is a member, with the kernel's own name for itself.
   const sync = rig.seen.filter((s) => s.url.endsWith(".people.sync")).at(-1);
   expect(sync.headers["x-brain-caller"]).toBe("kernel");
-  expect(JSON.parse(sync.body)).toEqual({ people: [{ did: "did:plc:other", methods: [], quota: { workers: 5 }, tags: [{ tag: "family", access: "read" }] }] });
+  expect(JSON.parse(sync.body)).toEqual({ people: [{ did: "did:plc:other", quota: { workers: 5 }, tags: [{ tag: "family", access: "read" }] }] });
   expect((await rig.call("member.deploy", { session: rig.other, body })).status).toBe(200);
   const heard = rig.toDeployer.at(-1);
   expect(heard.url).toBe("https://deployer.internal/xrpc/com.lopecode.brain.member.deploy");
@@ -27815,7 +27921,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainkernel_anon_0689871ea7", null, ["md"], _brainkernel_anon_0689871ea7);
+  $def("_brainkernel_anon_c5f3ff0732", null, ["md"], _brainkernel_anon_c5f3ff0732);
   $def("_brainkernel_kernel_service", "kernel_service", ["cloudflare","kernelApp"], _brainkernel_kernel_service);
   $def("_brainkernel_kernel_announce", "kernel_announce", ["plugins","kernel_service","invalidation"], _brainkernel_kernel_announce);
   $def("_brainkernel_atcute", "atcute", ["library","FileAttachment"], _brainkernel_atcute);
@@ -36096,7 +36202,16 @@ Two things are kept apart. The **record** is every event in one order, each nami
 The tracker's code is the mechanism: the chain, and the rule that an act goes ahead only when its installed guard is true. Which states an issue has, who may move it and what a move needs are a **policy**: data, installed by an event of the same record. Built 2026-10-10; the design and what it leaves out are in \`plan/cloud-brain-issues.md\`.`);};
 const _brainissues_viewof_issuesView = function _issuesView(issuesPanel,client,session,invalidation) {return (issuesPanel({ client, owner: !!(session && session.owner), invalidation }));};
 const _brainissues_issuesView = (G, _) => G.input(_);
-const _brainissues_anon_ee2e3578ea = function _anonymous(md,issuesDefaultPolicy,issuesLimits) {return (md`## Methods
+const _brainissues_anon_e384082822 = function _anonymous(md,issuesStore) {return (md`The panel above is for the owner, signed in. It answers from a copy of the view that the page keeps, one for each Brain's address, in \`localStorage\` under \`${issuesStore("ADDRESS").name}\`: one \`issue.snapshot\`, then \`issue.sync\` every \`wait\` milliseconds while the tab is visible.
+
+- **State, Kind, Find** filter the table from the copy, with no call. Find reads the title, \`about\`, the labels and the id.
+- **A row** opens that issue: its body, its children, its events, and a button for each state it can move to and each swap its workflow lists. A button the guard would refuse is disabled, and its tooltip is the refusal. Reason and Refs are sent with a move, so a button can come alive as they are typed.
+- **Refs**: entries separated by commas. \`kind:value\` is a ref of that kind (\`commit:abc\`, \`deploy:brain-x-a@hash\`); an address (\`https://…\`) or a text with no colon is a \`url\`.
+- **New issue** opens one with an id the page makes. **Refresh** asks for the events since the copy now.
+- A write is drawn before the service answers, and withdrawn with the refusal if it refuses.
+
+\`issuesPanel({ client, owner, by, store, every, invalidation })\`: \`by\` is who the page judges guards as (the owner's session if left out); \`store\` is \`{ get, set }\` in place of \`localStorage\`; \`every\` is a poll interval that overrides the service's; \`invalidation\` stops the poll. Its value is the view, and it sends \`input\` when the view changes.`);};
+const _brainissues_anon_0f99c186d0 = function _anonymous(md,issuesDefaultPolicy,issuesLimits) {return (md`## Methods
 
 | | |
 |---|---|
@@ -36108,14 +36223,14 @@ const _brainissues_anon_ee2e3578ea = function _anonymous(md,issuesDefaultPolicy,
 | \`issue.move\` | procedure. \`{ key, id, to, reason, refs }\`. \`to\` is a state. Approval and revert are moves. |
 | \`issue.swap\` | procedure. \`{ key, id, swap, reason }\`: a swap the issue's workflow lists. \`{ key, id, workflow, state, reason }\`: any other, the owner present. |
 | \`issue.narrow\` | procedure. \`{ key, id, move, guard, reason }\` adds a guard to one move of one issue. \`{ key, id, remove, reason }\` removes guard number \`remove\`, the owner present. |
-| \`issue.install\` | procedure, the owner present. \`{ key, policy, migrate }\`. \`migrate\`: \`{ HASH: { workflow, states: { old: new } } }\` moves the open issues of workflow \`HASH\`, each with its own event. A \`migrate\` that names a workflow the policy lacks, or would land an issue in a state its new workflow lacks, is refused with 400 before the policy is written. \`{ seq, hashes, moved }\` |
+| \`issue.install\` | procedure, the owner present. \`{ key, policy, migrate }\`. \`migrate\`: \`{ HASH: { workflow, states: { old: new } } }\` moves the open issues of workflow \`HASH\`, each with its own event, keyed \`policy/<seq>/<id>\`. A \`migrate\` that names a workflow the policy lacks, or would land an issue in a state its new workflow lacks, is refused with 400 before the policy is written. The issues are read again once the policy is written, and each again before its own event: one opened on \`HASH\` meanwhile is moved, and one closed or moved meanwhile is left where it is. \`{ seq, hashes, moved, left }\`; \`left\` is \`[{ id, why }]\` of those not moved. A \`key\` that a policy event holds answers that event with \`duplicate: true\` and moves nothing: a migration cut short is finished by the owner's own swaps. A \`key\` another kind of event holds is 400. |
 | \`issue.policy\` | query. \`{ policy, workflows }\` in force; \`?hash=\` one workflow, an older one too. |
 | \`issue.snapshot\` | query. \`{ seq, head, wait, policy, workflows, issues }\`: the whole view at \`seq\`. The \`body\` of a closed issue is left out (\`bodyLeftOut\`). An issue the caller may not read is \`{ id, kind, state, closed, parent, hidden: true }\`, here and in \`issue.list\` and \`issue.get\`. |
 | \`issue.sync\` | query. \`?after=<seq>&head=<hash>&limit=${issuesLimits.syncPage}\`. \`{ seq, wait, events }\`: the events after \`after\`, and the milliseconds the page waits before it asks again. An event of an issue the caller may not read is \`{ seq, id, type, at, hash, hidden: true, issue }\`. \`reset: true\` and no events when \`after\` is past the record's head, or \`head\` is not the hash of event \`after\`: the caller's copy is of another record, and it starts again from a snapshot. |
 | Settings | \`syncMs\` (${issuesLimits.syncMs}): what \`issue.sync\` and \`issue.snapshot\` answer as \`wait\`. Changed with \`config.set\` on the core, no deploy. |
 | \`issue.get\` | query. \`?id=\`. \`{ issue, children, events }\` |
 | \`issue.list\` | query. \`?state=&kind=&about=&parent=&label=&limit=100\`. \`{ issues }\`, last changed first. |
-| \`issue.verify\` | query. \`?after=<seq>\`. Checks \`seq\`, \`prev\`, \`hash\` and \`sig\` of each event after \`after\`. \`{ ok, seq, head, checked }\`, or \`{ ok: false, seq, why }\` at the first that fails. With \`guards=true\` it starts at 1 and also judges each event against the workflow in force when it was written. |
+| \`issue.verify\` | query. \`?after=<seq>\`. Checks \`seq\`, \`prev\`, \`hash\` and \`sig\` of each event after \`after\`. \`{ ok, seq, head, checked, guards }\`, or \`{ ok: false, seq, why, checked }\` at the first that fails; \`checked\` is how many passed. With \`guards=true\` it starts at 1 and also judges each event against the workflow in force when it was written. |
 | \`issue.key\` | query, anyone. \`{ alg: "Ed25519", key }\`: the public key, a JWK. |
 | \`issue.rebuild\` | procedure, the owner present. Makes the view again from the record. \`{ seq, issues }\` |
 | Storage | \`sql\`: \`issues_events\` (the record), \`issues_view\`, \`issues_meta\` (the policy and every workflow by hash) |
@@ -36142,7 +36257,7 @@ sig             Ed25519 signature of hash
 \`\`\`
 
 A changed or removed event breaks \`prev\` of each one after it. What the chain does not show: the last events removed, or a whole new record written by whoever holds the key and the database. Nothing outside the Brain holds the head (Tom, 2026-10-10: a signed chain only).`);};
-const _brainissues_anon_42c47be6f5 = function _anonymous(md,issuesExampleText,issuesDefaultPolicy) {return (md`## A policy
+const _brainissues_anon_ee7e7b4cb9 = function _anonymous(md,issuesExampleText,issuesDefaultPolicy) {return (md`## A policy
 
 \`\`\`js
 ${issuesExampleText}
@@ -36164,9 +36279,9 @@ That is the cell \`issuesExamplePolicy\`, and \`issue.install\` takes it as it i
 
 Every fact is in the record, so \`issue.verify?guards=true\` can judge every event again.
 
-**Fixed in the code**, whatever the policy says: a caller the \`read\` guard refuses does nothing to the issue and is answered 404; installing a policy, a swap the workflow does not list, removing a guard of an issue and \`issue.rebuild\` need the owner present. The first write into an empty record, when it is not itself an \`issue.install\`, installs \`issuesDefaultPolicy\` as event 1, by this Worker (an owner who installs first writes event 1 themselves, and the default is never written). That is the one policy written without the owner, and it cannot be written again: a record with events and no policy in its view answers 503 \`ViewLost\` until \`issue.rebuild\`.
+**Fixed in the code**, whatever the policy says: a caller the \`read\` guard refuses does nothing to the issue, opens no child of it, and is answered 404; installing a policy, a swap the workflow does not list, removing a guard of an issue and \`issue.rebuild\` need the owner present. The first write into an empty record, when it is not itself an \`issue.install\` and the default policy allows it, installs \`issuesDefaultPolicy\` as event 1, by this Worker. A first write the default would refuse is refused and writes nothing, and an owner who installs first writes event 1 themselves: the default is then never written. That is the one policy written without the owner, and it cannot be written again: a record with events and no policy in its view answers 503 \`ViewLost\` until \`issue.rebuild\`.
 
-**Present is not exact yet.** A sign-in link's token made with \`unattended\` reaches a service as \`owner\` via \`session\` (\`plan/cloud-brain-authority.md\`, read 2026-10-10). Until that token has its own via, it passes \`caller.present\` unless the core sends \`x-brain-tab: 0\` for it.
+**Who is present.** No token is. Every token's call reaches a service as \`owner\` via \`delegation:<id>\`, the token of a sign-in link made with \`unattended\` among them: its cap \`session\` sets \`x-brain-tab\` and leaves the via as it is, and \`caller.present\` needs the via \`session\`. Read 2026-10-10 in the source cb4 runs (kernel \`fbc1a80ce059\`, core \`b68bebad811f\`); not tried with a link's token. What passes with nobody at a keyboard is a session minted from a Brain's state file (\`brain.ts curl --owner\`): 13 of the first 16 events on cb4 were made that way.
 
 ## The default policy
 
@@ -36252,8 +36367,8 @@ const _brainissues_issuesSql = function _issuesSql() {return ({
   one: "SELECT event FROM issues_events WHERE seq = ?1",
   meta: "SELECT k, v FROM issues_meta",
   putMeta: "REPLACE INTO issues_meta (k, v) VALUES (?1, ?2)",
-  // The issue, its children, and a second id (the parent of an issue being opened).
-  near: "SELECT issue FROM issues_view WHERE id = ?1 OR parent = ?1 OR id = ?2",
+  // The issue and its children, and the same of a second id (the parent of an issue being opened).
+  near: "SELECT issue FROM issues_view WHERE id = ?1 OR parent = ?1 OR id = ?2 OR parent = ?2",
   all: "SELECT issue FROM issues_view",
   putIssue: "REPLACE INTO issues_view (id, state, kind, about, parent, workflow, closed, updated, issue) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
   onWorkflow: "SELECT issue FROM issues_view WHERE workflow = ?1 AND closed = 0",
@@ -36334,7 +36449,9 @@ const _brainissues_issueAllowed = function _issueAllowed(issueCaller,decide,issu
     const hash = issueAt(view.policy.names, issueAt(view.policy.kinds, act.kind)), wf = issueAt(view.workflows, hash);
     if (!wf) return no("no workflow for the kind " + act.kind);
     if (issueAt(view.issues, act.id)) return no("an issue has this id");
-    if (act.parent && !issueAt(view.issues, act.parent)) return no("no such parent", true);
+    // A parent the caller may not read is no parent: a child holds its parent back from ready and from review.
+    const p = act.parent ? issueAt(view.issues, act.parent) : null;
+    if (act.parent && (!p || p.hidden || !test((issueAt(view.workflows, p.workflow) || {}).read, facts(p)))) return no("no such parent", true);
     const issue = facts({ id: act.id, kind: act.kind, about: act.about, state: wf.start, labels: act.labels || [], parent: act.parent, opener: caller.actor, by: {}, reviews: [] });
     return test(wf.open, issue) ? { allow: true, workflow: hash, state: wf.start } : no("the workflow's open guard refuses");
   }
@@ -36357,6 +36474,8 @@ const _brainissues_issueAllowed = function _issueAllowed(issueCaller,decide,issu
     return held ? no(`this issue's guard ${own(held).n} on ${held.name} refuses`) : no(`the guard of ${from.map((m) => m.name).join(", ")} refuses`);
   }
   if (act.type === "swap") {
+    // A swap that says where it takes the issue from is refused when the issue is elsewhere by now.
+    if (act.from && (act.from.workflow !== i.workflow || act.from.state !== i.state)) return no("the issue is no longer where this swap takes it from");
     if (act.swap) {
       const s = wf.swaps.find((s) => s.name === act.swap);
       if (!s) return no("the workflow lists no swap " + act.swap);
@@ -36493,7 +36612,7 @@ const _brainissues_issueAct = function _issueAct(issuesLimits,checkedRule) {retu
   }
   return { type, id, move: name(b.move, "move", true), guard, reason };
 });};
-const _brainissues_issuesApp = function _issuesApp(hono,issuesSql,issuesLimits,issuesSchema,sql,secrets,issueKeys,config,callerFrom,originFrom,issueView,issueActor,issuePolicyAct,issuesDefaultPolicy,issueAllowed,issueEvent,sha256,issueCanon,issueApply,issueAct,issueCaller,issueAt,issueCheck,issueReplay) {
+const _brainissues_issuesApp = function _issuesApp(hono,issuesSql,issuesLimits,issuesSchema,sql,secrets,issueKeys,config,callerFrom,originFrom,issueView,issueAllowed,issueActor,issuePolicyAct,issuesDefaultPolicy,issueApply,issueEvent,sha256,issueCanon,issueAct,issueCaller,issueAt,issueCheck,issueReplay) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.issue.", S = issuesSql, L = issuesLimits, J = JSON.parse;
   const refuse = (status, code, message) => Object.assign(new Error(message), { status, code });
@@ -36528,6 +36647,12 @@ const _brainissues_issuesApp = function _issuesApp(hono,issuesSql,issuesLimits,i
   const issueRow = (i) => [S.putIssue, i.id, i.state, i.kind, i.about, i.parent, i.workflow, i.closed ? 1 : 0, i.updated_at, JSON.stringify(i)];
   // One event more. The insert is of seq = head + 1, the table's key: of two writers at one head one fails, reads the
   // head again and writes after the other. The view's row is written in the same transaction.
+  // The act with its id, and the verdict that lets it through. A refusal is thrown.
+  const judge = (view, by, given) => {
+    const act = given.type === "open" && !given.id ? { ...given, id: "i" + (view.seq + 1) } : given, verdict = issueAllowed(view, by, act);
+    if (!verdict.allow) throw refuse(verdict.missing ? 404 : 403, verdict.missing ? "NotFound" : "Refused", verdict.why);
+    return [act, verdict];
+  };
   const append = async (ctx, key, given) => {
     if (typeof key !== "string" || !key || key.length > L.key) throw refuse(400, "InvalidRequest", `key: text, ${L.key} characters at most`);
     const sign = await signer();
@@ -36539,12 +36664,13 @@ const _brainissues_issuesApp = function _issuesApp(hono,issuesSql,issuesLimits,i
       // The default policy is written only into an empty record. A record with no policy in its view has lost the view.
       if (!view.policy && view.seq) throw refuse(503, "ViewLost", "the view has no policy: issue.rebuild makes it again from the record");
       if (!view.policy && given.type !== "policy") {
-        await append({ by: { caller: "worker:brain-x-issues", via: "" }, origin: ctx.origin, ray: ctx.ray }, "policy/default", await issuePolicyAct(issuesDefaultPolicy));
+        // Judged first against the default as it would stand: a write it refuses leaves the record empty.
+        const first = await issuePolicyAct(issuesDefaultPolicy);
+        judge(issueApply(issueView(), { seq: 1, hash: "", type: "policy", policy: first.policy, hashes: first.hashes }), ctx.by, given);
+        await append({ by: { caller: "worker:brain-x-issues", via: "" }, origin: ctx.origin, ray: ctx.ray }, "policy/default", first);
         continue;
       }
-      const seq = view.seq + 1, act = given.type === "open" && !given.id ? { ...given, id: "i" + seq } : given;
-      const verdict = issueAllowed(view, ctx.by, act);
-      if (!verdict.allow) throw refuse(verdict.missing ? 404 : 403, verdict.missing ? "NotFound" : "Refused", verdict.why);
+      const seq = view.seq + 1, [act, verdict] = judge(view, ctx.by, given);
       const e = { seq, key, ...issueEvent(view, act, verdict), by: ctx.by, origin: ctx.origin, ray: ctx.ray, at: Date.now(), prev: view.head };
       e.hash = await sha256(issueCanon(e));
       e.sig = await sign.sign(e.hash);
@@ -36575,25 +36701,35 @@ const _brainissues_issuesApp = function _issuesApp(hono,issuesSql,issuesLimits,i
   app.post(NS + "install", run(async (c, b) => {
     const ctx = who(c);
     if (!issueCaller(ctx.by).present) throw refuse(403, "Refused", "the owner, present");
-    const act = await issuePolicyAct(b.policy), plan = [];
-    // Every issue a migrate would move is given its landing place before the policy is written: a policy is not left
-    // installed with its migration half done.
+    const act = await issuePolicyAct(b.policy), migrate = Object.entries(b.migrate && typeof b.migrate === "object" ? b.migrate : {});
     await schema();
-    for (const [old, to] of Object.entries(b.migrate && typeof b.migrate === "object" ? b.migrate : {})) {
-      const target = to && issueAt(act.policy.workflows, to.workflow);
-      if (!target) throw refuse(400, "InvalidRequest", `migrate ${old}: the policy has no workflow ${to && to.workflow}`);
-      for (const row of (await sql.exec(S.onWorkflow, old)).rows) {
-        const i = J(row.issue), state = issueAt(to.states, i.state) || i.state;
-        if (!target.states.includes(state)) throw refuse(400, "InvalidRequest", `migrate ${old}: ${i.id} is ${i.state}, and ${to.workflow} has no state ${state}`);
-        plan.push({ id: i.id, workflow: to.workflow, state });
+    // The open issues of each workflow a migrate names, and where each lands. `left`: null, and one that cannot land
+    // is a 400; a list, and it is put there with why.
+    const planned = async (left) => {
+      const plan = [];
+      for (const [old, to] of migrate) {
+        const target = to && issueAt(act.policy.workflows, to.workflow);
+        if (!target) throw refuse(400, "InvalidRequest", `migrate ${old}: the policy has no workflow ${to && to.workflow}`);
+        for (const row of (await sql.exec(S.onWorkflow, old)).rows) {
+          const i = J(row.issue), state = issueAt(to.states, i.state) || i.state, why = target.states.includes(state) ? null : `${i.id} is ${i.state}, and ${to.workflow} has no state ${state}`;
+          if (why && !left) throw refuse(400, "InvalidRequest", `migrate ${old}: ${why}`);
+          why ? left.push({ id: i.id, why }) : plan.push({ id: i.id, from: { workflow: old, state: i.state }, workflow: act.hashes[to.workflow], state });
+        }
       }
+      return plan;
+    };
+    // Checked whole before the policy is written: a policy is not left installed with a migration that cannot land.
+    await planned(null);
+    const r = await append(ctx, b.key, act), moved = [], left = [];
+    if (r.event.type !== "policy") throw refuse(400, "InvalidRequest", "key: another event has this key");
+    if (r.duplicate) return { seq: r.event.seq, hashes: r.event.hashes, moved, duplicate: true };
+    // Read again now that the policy is written, so an issue opened on an old workflow meanwhile is moved too. Each
+    // swap says where it takes its issue from: one closed or moved since is refused and left where it is.
+    for (const m of await planned(left)) {
+      const swap = await append(ctx, `policy/${r.event.seq}/${m.id}`, { type: "swap", id: m.id, from: m.from, workflow: m.workflow, state: m.state, reason: "policy " + r.event.seq, policy: r.event.seq }).catch((e) => (e && e.status ? { why: e.message } : Promise.reject(e)));
+      swap.why || swap.duplicate ? left.push({ id: m.id, why: swap.why || "another event has the key of its swap" }) : moved.push(m.id);
     }
-    const r = await append(ctx, b.key, act), moved = [];
-    for (const m of plan) {
-      await append(ctx, `${b.key}/${m.id}`.slice(0, L.key), { type: "swap", id: m.id, workflow: m.workflow, state: m.state, reason: "policy " + r.event.seq, policy: r.event.seq });
-      moved.push(m.id);
-    }
-    return { seq: r.event.seq, hashes: r.event.hashes, moved, ...(r.duplicate ? { duplicate: true } : {}) };
+    return { seq: r.event.seq, hashes: r.event.hashes, moved, ...(left.length ? { left } : {}) };
   }));
   // What a caller is shown of an issue its workflow's read guard refuses.
   const shown = (view, by, i) => (issueAllowed(view, by, { type: "read", id: i.id }).allow ? i : { id: i.id, kind: i.kind, state: i.state, closed: i.closed, parent: i.parent, hidden: true });
@@ -36806,7 +36942,7 @@ const _brainissues_issuesPanel = function _issuesPanel(issuesStore,htl,issueView
     if (!note.textContent.includes("refused")) note.textContent = `${all.length} issues at event ${view.seq}${pending.length ? `, ${pending.length} being sent` : ""}.`;
     root.value = view;
     drawOne();
-    // A cell that reads viewof issuesView runs again: the copy changed, whoever changed it.
+    // A cell that reads issuesView (the value) runs again: the copy changed, whoever changed it.
     root.dispatchEvent(new Event("input"));
   };
   find.addEventListener("input", () => draw());
@@ -36860,7 +36996,7 @@ const _brainissues_issuesFakeSql = function _issuesFakeSql(issuesSql,issuesSchem
     if (statement === S.one) return row(events.filter((e) => e.seq === a[0]).map((e) => ({ event: e.event })));
     if (statement === S.meta) return row([...meta].map(([k, v]) => ({ k, v })));
     if (statement === S.putMeta) return meta.set(a[0], a[1]), row([], 1);
-    if (statement === S.near) return row([...view.values()].filter((r) => r.id === a[0] || r.parent === a[0] || r.id === a[1]).map((r) => ({ issue: r.issue })));
+    if (statement === S.near) return row([...view.values()].filter((r) => r.id === a[0] || r.parent === a[0] || r.id === a[1] || (a[1] && r.parent === a[1])).map((r) => ({ issue: r.issue })));
     if (statement === S.all) return row([...view.values()].map((r) => ({ issue: r.issue })));
     if (statement === S.putIssue) return view.set(a[0], { id: a[0], parent: a[4], workflow: a[5], closed: a[6], issue: a[8] }), row([], 1);
     if (statement === S.onWorkflow) return row([...view.values()].filter((r) => r.workflow === a[0] && !r.closed).map((r) => ({ issue: r.issue })));
@@ -37086,6 +37222,8 @@ const _brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates = a
   const events = rig.db.events.length;
   expect((await rig.owner("install", { policy, migrate: { [was.feedback]: { workflow: "nope" } } })).status).toBe(400);
   expect((await rig.owner("install", { policy, migrate: { [was.feedback]: { workflow: "feedback" } } })).data).toEqual({ error: "InvalidRequest", message: `migrate ${was.feedback}: f1 is open, and feedback has no state open` });
+  // Nor under a key that another kind of event holds (k1 is the key f1 was opened with).
+  expect((await rig.owner("install", { key: "k1", policy })).data).toEqual({ error: "InvalidRequest", message: "key: another event has this key" });
   expect([rig.db.events.length, (await rig.owner("policy")).data.policy.names]).toEqual([events, was]);
   const nothing = await rig.sim.fetch("https://issues.internal/xrpc/com.lopecode.brain.issue.install", { method: "POST", headers: { "x-brain-caller": "owner", "x-brain-via": "session", "content-type": "application/json" }, body: "null" });
   expect(nothing.status).toBe(400);
@@ -37127,7 +37265,15 @@ const _brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates = a
   await rig.a("open", { id: "e1", title: "From the example", kind: "bug", labels: ["security"] });
   expect((await rig.a("swap", { id: "e1", swap: "escalate" })).data.event.to).toEqual({ workflow: example.hashes.security, state: "open" });
   expect((await rig.owner("verify?guards=true")).data).toMatchObject({ ok: true });
-  return "installed by the owner present; 4 policies and 2 migrations refused; 1 open issue migrated; the example installs";
+  // A first write that the default policy would refuse writes nothing, the default included; the owner's install is then event 1.
+  const empty = await issuesRig();
+  expect((await empty.a("comment", { id: "nope", body: "x" })).status).toBe(404);
+  expect((await empty.owner("open", { title: "x", kind: "nope" })).status).toBe(403);
+  expect((await empty.owner("open", { title: "x", kind: "task", parent: "nope" })).status).toBe(404);
+  expect(empty.db.events.length).toBe(0);
+  expect((await empty.owner("install", { policy: issuesExamplePolicy })).data.seq).toBe(1);
+  expect(empty.db.events.map((e) => JSON.parse(e.event).by.caller)).toEqual(["owner"]);
+  return "installed by the owner present; 4 policies and 3 installs refused; 1 open issue migrated; the example installs; a refused first write leaves the record empty";
 };
 const _brainissues_test_issues_hidden_from_who_may_not_read = async function _test_issues_hidden_from_who_may_not_read(issuesRig,expect) {
   const rig = await issuesRig();
@@ -37152,6 +37298,10 @@ const _brainissues_test_issues_hidden_from_who_may_not_read = async function _te
   const guessed = (await rig.b("comment", { key: "said", id: "pub", body: "x" })).data;
   expect(guessed).toEqual({ id: "sec", seq: 4, duplicate: true });
   expect((await rig.a("comment", { key: "said", id: "sec", body: "again" })).data.event.body).toContain("3 May");
+  // Nor does it open a child of it, which would hold the issue back from ready. Its opener does.
+  expect((await rig.b("open", { title: "Me too", kind: "bug", parent: "sec" })).data).toEqual({ error: "NotFound", message: "no such parent" });
+  expect((await rig.worker("open", { title: "Me too", kind: "bug", parent: "sec" })).status).toBe(404);
+  expect((await rig.a("open", { id: "kid", title: "A part of it", kind: "bug", parent: "sec" })).status).toBe(200);
   // A token of the owner is not the owner present: it reads the security issue it opened and no other.
   const d1 = rig.as("owner", "delegation:d1", { "x-brain-holder": "secret", "x-brain-tab": "0" });
   expect((await d1("get?id=sec")).data.issue).toEqual(stub);
@@ -37179,6 +37329,38 @@ const _brainissues_test_issues_rebuild_and_replay_judge_the_record = async funct
   expect((await rig.owner("verify")).data).toMatchObject({ ok: true, seq: forged.seq });
   expect((await rig.owner("verify?guards=true")).data).toEqual({ ok: false, seq: forged.seq, why: "the guard of pass refuses", checked: forged.seq - 1 });
   return "the view made again equals the view kept; a forged pass is named";
+};
+const _brainissues_test_issues_migrate_moves_what_is_still_there = async function _test_issues_migrate_moves_what_is_still_there(issuesRig,issueApply,issueView,issuesLimits,expect) {
+  const rig = await issuesRig();
+  for (const id of ["aaaaaaaaaa1", "aaaaaaaaaa2", "gone"]) await rig.owner("open", { id, title: id, kind: "feedback" });
+  const { policy: was, workflows: flows } = (await rig.owner("policy")).data, old = was.names.feedback;
+  const flow = { states: ["new", "closed"], start: "new", closed: ["closed"], read: "true", open: "true", comment: "true", label: "true", review: "false", narrow: "false", moves: [{ name: "close", from: "new", to: "closed", guard: "true" }], swaps: [] };
+  const policy = { kinds: { feedback: "feedback" }, workflows: { feedback: flow } };
+  // Another writer, past the service, with its row of the view: what a second caller does while an install runs.
+  const other = async (fields) => {
+    const e = await rig.forge(fields, { caller: "owner", via: "session" }), row = rig.db.view.get(e.id);
+    const i = issueApply({ ...issueView(), workflows: flows, issues: row ? { [e.id]: JSON.parse(row.issue) } : {} }, e).issues[e.id];
+    rig.db.view.set(i.id, { id: i.id, parent: i.parent, workflow: i.workflow, closed: i.closed ? 1 : 0, issue: JSON.stringify(i) });
+  };
+  // As the policy is written, "late" is opened on the old workflow. As the first swap is written, "gone" is closed.
+  rig.db.hooks.push(
+    () => other({ id: "late", type: "opened", workflow: old, title: "late", body: "", kind: "feedback", about: "brain", parent: null, labels: [], state: "open" }),
+    () => null,
+    () => other({ id: "gone", type: "moved", workflow: old, move: "close", from: "open", to: "closed", reason: "", refs: [] })
+  );
+  // A key at the limit: the swaps are keyed from the policy's seq, so two ids alike to their last letter are two events.
+  const installed = (await rig.owner("install", { key: "k".repeat(issuesLimits.key - 8), policy, migrate: { [old]: { workflow: "feedback", states: { open: "new" } } } })).data;
+  expect(installed).toMatchObject({ moved: ["aaaaaaaaaa1", "aaaaaaaaaa2", "late"], left: [{ id: "gone", why: "the issue is no longer where this swap takes it from" }] });
+  const now = Object.fromEntries((await rig.owner("list")).data.issues.map((i) => [i.id, [i.state, i.workflow === installed.hashes.feedback, i.closed]]));
+  expect(now).toEqual({ aaaaaaaaaa1: ["new", true, false], aaaaaaaaaa2: ["new", true, false], late: ["new", true, false], gone: ["closed", false, true] });
+  const swaps = rig.db.events.map((e) => JSON.parse(e.event)).filter((e) => e.type === "swapped");
+  expect(swaps.map((e) => e.key)).toEqual(["aaaaaaaaaa1", "aaaaaaaaaa2", "late"].map((id) => `policy/${installed.seq}/${id}`));
+  expect(swaps[0].from).toEqual({ workflow: old, state: "open" });
+  // A swap written past the service that names another place than the issue was in is named by the replay.
+  expect((await rig.owner("verify?guards=true")).data).toMatchObject({ ok: true });
+  const forged = await rig.forge({ id: "late", type: "swapped", workflow: installed.hashes.feedback, swap: null, from: { workflow: installed.hashes.feedback, state: "closed" }, to: { workflow: installed.hashes.feedback, state: "new" }, reason: "" }, { caller: "owner", via: "session" });
+  expect((await rig.owner("verify?guards=true")).data).toMatchObject({ ok: false, seq: forged.seq, why: "the issue is no longer where this swap takes it from" });
+  return "3 moved, 1 closed meanwhile and left; 1 opened meanwhile and moved";
 };
 const _brainissues_test_issues_declares_what_it_needs = async function _test_issues_declares_what_it_needs(issues_service,expect,decide,callerOf,issuePolicyAct,issuesDefaultPolicy,simulate,issuesFakeSql) {
   const { meta } = await issues_service.emit();
@@ -37280,8 +37462,9 @@ export default function define(runtime, observer) {
   $def("_brainissues_anon_8ee7cebb43", null, ["md"], _brainissues_anon_8ee7cebb43);
   $def("_brainissues_viewof_issuesView", "viewof issuesView", ["issuesPanel","client","session","invalidation"], _brainissues_viewof_issuesView);
   $def("_brainissues_issuesView", "issuesView", ["Generators","viewof issuesView"], _brainissues_issuesView);
-  $def("_brainissues_anon_ee2e3578ea", null, ["md","issuesDefaultPolicy","issuesLimits"], _brainissues_anon_ee2e3578ea);
-  $def("_brainissues_anon_42c47be6f5", null, ["md","issuesExampleText","issuesDefaultPolicy"], _brainissues_anon_42c47be6f5);
+  $def("_brainissues_anon_e384082822", null, ["md","issuesStore"], _brainissues_anon_e384082822);
+  $def("_brainissues_anon_0f99c186d0", null, ["md","issuesDefaultPolicy","issuesLimits"], _brainissues_anon_0f99c186d0);
+  $def("_brainissues_anon_ee7e7b4cb9", null, ["md","issuesExampleText","issuesDefaultPolicy"], _brainissues_anon_ee7e7b4cb9);
   $def("_brainissues_issuesExamplePolicy", "issuesExamplePolicy", [], _brainissues_issuesExamplePolicy);
   $def("_brainissues_issuesExampleText", "issuesExampleText", ["issuesExamplePolicy"], _brainissues_issuesExampleText);
   $def("_brainissues_issues_service", "issues_service", ["cloudflare","issuesApp"], _brainissues_issues_service);
@@ -37303,7 +37486,7 @@ export default function define(runtime, observer) {
   $def("_brainissues_issueCheck", "issueCheck", ["sha256","issueCanon"], _brainissues_issueCheck);
   $def("_brainissues_issuePolicyAct", "issuePolicyAct", ["issuesLimits","checkedRule","issueAt","sha256","issueCanon"], _brainissues_issuePolicyAct);
   $def("_brainissues_issueAct", "issueAct", ["issuesLimits","checkedRule"], _brainissues_issueAct);
-  $def("_brainissues_issuesApp", "issuesApp", ["hono","issuesSql","issuesLimits","issuesSchema","sql","secrets","issueKeys","config","callerFrom","originFrom","issueView","issueActor","issuePolicyAct","issuesDefaultPolicy","issueAllowed","issueEvent","sha256","issueCanon","issueApply","issueAct","issueCaller","issueAt","issueCheck","issueReplay"], _brainissues_issuesApp);
+  $def("_brainissues_issuesApp", "issuesApp", ["hono","issuesSql","issuesLimits","issuesSchema","sql","secrets","issueKeys","config","callerFrom","originFrom","issueView","issueAllowed","issueActor","issuePolicyAct","issuesDefaultPolicy","issueApply","issueEvent","sha256","issueCanon","issueAct","issueCaller","issueAt","issueCheck","issueReplay"], _brainissues_issuesApp);
   $def("_brainissues_issuesStore", "issuesStore", ["localStorage"], _brainissues_issuesStore);
   $def("_brainissues_issuesPanel", "issuesPanel", ["issuesStore","htl","issueView","issuesLimits","issueApply","structuredClone","Inputs","issueAllowed","issueEvent","Event"], _brainissues_issuesPanel);
   $def("_brainissues_anon_d3f0b4f807", null, ["md"], _brainissues_anon_d3f0b4f807);
@@ -37316,6 +37499,7 @@ export default function define(runtime, observer) {
   $def("_brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates", "test_issues_policy_is_installed_by_the_owner_and_migrates", ["issuesRig","expect","issuePolicyAct","issuesDefaultPolicy","issuesExamplePolicy","issuesExampleText"], _brainissues_test_issues_policy_is_installed_by_the_owner_and_migrates);
   $def("_brainissues_test_issues_hidden_from_who_may_not_read", "test_issues_hidden_from_who_may_not_read", ["issuesRig","expect"], _brainissues_test_issues_hidden_from_who_may_not_read);
   $def("_brainissues_test_issues_rebuild_and_replay_judge_the_record", "test_issues_rebuild_and_replay_judge_the_record", ["issuesRig","expect"], _brainissues_test_issues_rebuild_and_replay_judge_the_record);
+  $def("_brainissues_test_issues_migrate_moves_what_is_still_there", "test_issues_migrate_moves_what_is_still_there", ["issuesRig","issueApply","issueView","issuesLimits","expect"], _brainissues_test_issues_migrate_moves_what_is_still_there);
   $def("_brainissues_test_issues_declares_what_it_needs", "test_issues_declares_what_it_needs", ["issues_service","expect","decide","callerOf","issuePolicyAct","issuesDefaultPolicy","simulate","issuesFakeSql"], _brainissues_test_issues_declares_what_it_needs);
   $def("_brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer", "test_issues_panel_draws_and_applies_a_write_before_the_answer", ["issuesRig","URLSearchParams","issuesPanel","expect","Event","issuesStore"], _brainissues_test_issues_panel_draws_and_applies_a_write_before_the_answer);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
@@ -40332,7 +40516,7 @@ const _cloudbraindocs_architecture = function _architecture(htl) {
     ${arrow(272, 256, 568, 256, "deploys, checks health with each Worker's key", true)}
   </svg>`;
 };
-const _cloudbraindocs_anon_e01ec5a36d = function _anonymous(md) {return (md`## Who is calling
+const _cloudbraindocs_anon_e4cec453e5 = function _anonymous(md) {return (md`## Who is calling
 
 The kernel identifies the caller, in this order. No header from a caller can set the result.
 
@@ -40342,8 +40526,7 @@ The kernel identifies the caller, in this order. No header from a caller can set
 | a turn token | the DID of the person whose message the turn answers | \`turn:ENTRY\` |
 | a portal token | the viewer's DID | \`portal:ID\` |
 | a JWT that an atproto key signed (a PDS forwards a call) | \`owner\`, or the DID | \`jwt\` |
-| a token that the owner made, from 2026-10-10 | \`owner\`, with \`caller.delegation\` and \`caller.holder == "secret:NAME"\` and \`caller.token == "NAME"\`; not the owner's tab, unless a sign-in link made with \`unattended\` made it and its list names the method by a name or a prefix, not by \`*\` alone | \`delegation:ID\` |
-| a token that the owner made before 2026-10-10 | \`token:NAME\` | \`token\` |
+| a token that the owner made | \`owner\`, with \`caller.delegation\` and \`caller.holder == "secret:NAME"\` and \`caller.token == "NAME"\`; not the owner's tab, unless a sign-in link made with \`unattended\` made it and its list names the method by a name or a prefix, not by \`*\` alone | \`delegation:ID\` |
 | none of these | \`anonymous\` | |
 
 The deployer gives each Worker a random key at deploy and tells the core the key's hash. A call to the core over a binding has the caller's key. Only the kernel's key can name a caller. Any other key makes the caller \`worker:NAME\`, whatever headers the Worker sent.
@@ -40502,7 +40685,7 @@ export default function define(runtime, observer) {
   $def("_cloudbraindocs_anon_84a07460df", null, ["md","mod"], _cloudbraindocs_anon_84a07460df);
   $def("_cloudbraindocs_anon_92129ed458", null, ["md","architecture","mod"], _cloudbraindocs_anon_92129ed458);
   $def("_cloudbraindocs_architecture", "architecture", ["htl"], _cloudbraindocs_architecture);
-  $def("_cloudbraindocs_anon_e01ec5a36d", null, ["md"], _cloudbraindocs_anon_e01ec5a36d);
+  $def("_cloudbraindocs_anon_e4cec453e5", null, ["md"], _cloudbraindocs_anon_e4cec453e5);
   $def("_cloudbraindocs_anon_9ebf4ee571", null, ["md","mod"], _cloudbraindocs_anon_9ebf4ee571);
   $def("_cloudbraindocs_anon_dfb6c07db0", null, ["md","mod"], _cloudbraindocs_anon_dfb6c07db0);
   $def("_cloudbraindocs_anon_79afaaa51f", null, ["md","mod"], _cloudbraindocs_anon_79afaaa51f);
