@@ -9602,6 +9602,8 @@ const _brainshell_verifyModule = function _verifyModule(brainClient,runtime,glob
     running = await client.query("getInfo", { worker }).then((i) => i.hash, () => null);
     if (running === hash || Date.now() >= until) break;
   }
+  // No answer is not a verdict on this version: the Worker's health is the deployer's own check.
+  if (running == null) return { worker, module, hash, none: "the Worker did not say what it runs" };
   if (running !== hash) failed.push({ name: "the Worker reports the hash that was loaded", message: `loaded ${String(hash).slice(0, 12)}, running ${String(running).slice(0, 12)}` });
   const otherTestsRan = [...rt._variables].filter((v) => v._module !== mod && isTest(v) && v._version > 0 && v._value !== undefined).length;
   return { worker, module, hash, ok: failed.length === 0, tests: names.length, failed, otherTestsRan, ms: Date.now() - began, heapMB: globalThis.performance && performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1e6) : null };
@@ -9945,6 +9947,8 @@ const _brainshell_test_verifyModule_runs_the_tests_and_checks_the_hash = async f
     // Another version answering is a failure, named.
     const stale = await verifyModule({ worker: "brain-x-t", module: none, hash: "h2" }, { ...quick, client: says("h1") });
     expect([stale.ok, stale.tests, stale.failed]).toEqual([false, 0, [{ name: "the Worker reports the hash that was loaded", message: "loaded h2, running h1" }]]);
+    // No answer about what runs is no verdict.
+    expect(await verifyModule({ worker: "brain-x-t", module: none, hash: "h1" }, { ...quick, client: { query: async () => { throw new Error("NotFound"); } } })).toEqual({ worker: "brain-x-t", module: none, hash: "h1", none: "the Worker did not say what it runs" });
     // The version before may answer first: it is asked again until the time is up.
     let asked = 0;
     const late = { query: async () => ({ hash: ++asked < 3 ? "h1" : "h2" }) };
@@ -21766,7 +21770,7 @@ A sign-in link made to deploy with no approval (\`token.link\` with \`unattended
 Every change says why. \`infra.apply\` (unless \`dry\`), \`infra.redistil\` with \`apply\`, a roll back on the page, \`member.deploy\` and \`member.remove\` take \`reason\`, 3 to 300 characters, and are refused without one (400 \`InvalidRequest\`, or \`refused\` for a member). The reason is logged before anything is done, as \`deploy.reason\` with \`reason\`, \`by\` (\`owner\`, \`recovery key\`, the member's DID, or \`token:NAME\` for a sign-in link made to deploy with no approval) and \`targets\`. Added 2026-10-09.
 
 The deployer writes a line for each step of a deploy with the \`log\` cell: \`deploy.uploaded\`, \`deploy.deployed\`, \`deploy.probation\`, \`deploy.confirmed\`, \`deploy.unhealthy\` with what the last health check answered, \`deploy.put-back\` with the reason, \`deploy.refused\`, \`deploy.waiting\`, \`deploy.removed\`, \`deploy.failing\`, \`deploy.logs-on\`, \`deploy.verify\`, \`deploy.verified\`, \`deploy.failed\`, \`deploy.verify.none\`, \`deploy.verify.stale\`, \`deploy.over-unverified\`, \`token.mint\`, \`token.roll\`, \`token.delete\`, \`token.mint-failed\`. A member's deploy writes \`deploy.deployed\` and \`deploy.put-back\`. The \`reason\` of a put-back can be Cloudflare's own text about the code that was sent; it is not text a caller of a method sent.`);};
-const _braindeployer_anon_cceafa2739 = function _anonymous(md) {return (md`## A deploy is verified by the deployer
+const _braindeployer_anon_cc66ae52c4 = function _anonymous(md) {return (md`## A deploy is verified by the deployer
 
 Written 2026-10-10 from \`plan/specs/deploy-verification.html\`. Before it, the owner's open page ran every Worker's tests and reported to the core, so a verdict depended on which tab was open and on what else that page had loaded.
 
@@ -21778,7 +21782,9 @@ After the deploy, inside the same \`infra.apply\`, the deployer buys 120 s of br
 BRAIN/#view=C100(S100(MODULE,@tomlarkworthy/brain-shell))&verify=WORKER
 ~~~
 
-The page has no session. It loads that module and what it imports, runs its \`test_\` cells, and leaves \`{ worker, module, hash, ok, tests, failed: [{ name, message }], otherTestsRan, ms }\` at \`window.__brainVerdict\` (brain-shell, \`brainVerdict\`). The run waits for that value up to 100 s. The kernel is not run this way, and a Worker that names no module has nothing to open.
+The page has no session. It loads that module and what it imports, runs its \`test_\` cells, and leaves \`{ worker, module, hash, ok, tests, failed: [{ name, message }], otherTestsRan, ms }\` at \`window.__brainVerdict\` (brain-shell, \`brainVerdict\`). The run waits for that value up to 100 s. brain-shell is in the layout beside the module because the cell that judges is there; no other module of the Brain is loaded.
+
+The kernel is not run this way, because it serves the page of the run, and a Worker that names no module has nothing to open. Both stay on probation after a deploy: their next deploy is refused, and they are put back at 10 minutes, unless \`infra.confirm\` names them.
 
 | the run gave | the deployer | the result's \`state\` | log line |
 |---|---|---|---|
@@ -21792,10 +21798,10 @@ A Worker left on probation is put back by the tick when 10 minutes have passed (
 
 While a Worker is on probation a second deploy or a removal of it is refused: \`NAME is HASH12 and not verified yet: its tests are running, and it is put back at HH:MM:SS if they have not passed. Deploy again after that.\` (UTC). Other Workers in the same call go on. Two ways past it:
 
-- \`infra.confirm { worker }\` keeps one Worker by hand. With no \`worker\` it answers 400: a confirm of everything would keep every unverified Worker with no test run.
+- \`infra.confirm { worker }\` keeps one Worker by hand. With no \`worker\` it answers 400: a confirm of everything would keep every unverified Worker with no test run. The token of a sign-in link made to deploy is answered 403: it would keep its own deploy.
 - \`overUnverified: true\` in the body of an \`infra.apply\` signed with the recovery key deploys over it, and writes \`deploy.over-unverified\`. It is for when what verifies is itself broken. The key alone does not do it, because \`brain.ts apply\` signs every call with the key; the CLI's flag is \`--over-unverified\`.
 
-Not measured on a Brain yet. On 2026-10-10 the page half was run in a local Chrome against cb4's address with the built modules substituted (\`tools/scratch/cloud-brain-experiments/verify-page/shell-check.ts\`): brain-x-issues, 19 tests, a verdict about 2.4 s after load. The deployer half is tested with a faked browser only.`);};
+Not measured on a Brain yet. On 2026-10-10 the page half was run in a local Chrome against cb4's address with the built modules substituted (\`tools/scratch/cloud-brain-experiments/verify-page/shell-check.ts\`, \`BUILT='*' ONLY=verify\`), once for each of the 19 Workers cb4 runs other than the kernel: 19 pass, 3 to 34 tests each, a verdict 1.4 to 2.6 s after load for 17, 7.0 s for brain-x-bluesky and 11.8 s for brain-x-browser. The deployer half is tested with a faked browser only.`);};
 const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log,Response,URLSearchParams,sha256,FormData,partsHash,deployerAllows,wrapperFlags,deployerDistil,nextKernelState) {
   const text = (v) => JSON.stringify(v);
   const jsonType = { "content-type": "application/json" };
@@ -22371,13 +22377,14 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
       }
       const change = async (rec) => {
       const results = [];
-      const held = dry ? null : await unverified(logical, { recovery, over: overUnverified === true });
-      if (held) return { ...base, state: "refused", reason: held };
+      let held = null;
       if (rec && rec.hash === w.hash && rec.state === "deployed" && !w.force && !(typeof w.asset === "string" && (await sha256(w.asset)).slice(0, 32) !== rec.assetHash)) {
         // Deployed before the deployer kept source: keep it now, since it is the source of what is running.
         if (typeof w.source === "string" && !(await rows.get("source/" + w.module))) await rows.put("source/" + w.module, { text: w.source, files: w.files || {}, cell: w.cell || null, worker: logical, hash: w.hash, at: Date.now(), prev: null });
         results.push({ ...base, state: "unchanged" });
       }
+      // Not while the version that runs is unverified. After "unchanged": the same version again changes nothing.
+      else if (!dry && (held = await unverified(logical, { recovery, over: overUnverified === true }))) results.push({ ...base, state: "refused", reason: held });
       // A service that declares Cloudflare permissions is held for the owner also when deploys need no approval.
       else if ((approval || (w.meta.cloudflare || []).length) && !free && !(await approvedOver(w.hash, rec))) {
         const m = w.meta;
@@ -23013,6 +23020,8 @@ const _braindeployer_deployerFn = function _deployerFn(deployerOps,Response,depl
     if (config.replacedBy && request.method === "POST") return json({ error: "Replaced", message: "this deployer was replaced by " + config.replacedBy, deployer: config.replacedBy }, 409);
     if (method === "getState" && request.method === "GET") return json(await deployerOps.state());
     if (method === "apply" && request.method === "POST") return ((out) => json(out, out.error ? 400 : 200))(await deployerOps.apply(await request.json(), { recovery, by }));
+    // Not for a sign-in link's token: it would keep its own deploy with no test run.
+    if (method === "confirm" && request.method === "POST" && by) return json({ error: "Forbidden", message: "a sign-in link does not confirm a deploy: the owner's session or the recovery key" }, 403);
     if (method === "confirm" && request.method === "POST") return ((out) => json(out, out.error ? 400 : 200))(await deployerOps.confirmByHand(await request.json().catch(() => ({}))));
     // An installer's shell, passed on to brain-static as it arrives. The deployer keeps none of it.
     if (method === "shell" && request.method === "POST") return deployerOps.shell(request);
@@ -23721,7 +23730,8 @@ const _braindeployer_test_deployer_refuses_a_deploy_over_an_unverified_one = asy
   expect((await rig.asOwner("apply", { workers: [v3] }, { "x-brain-unattended": "token:claude-1" })).results[0].reason).toBe(words);
   expect((await rig.recover({ workers: [v3], overUnverified: false })).results[0].reason).toBe(words);
   expect((await rig.recover({ workers: [v3], overUnverified: false, dry: true })).results[0].state).toBe("ready");
-  // The same version again is refused too, and so is a removal.
+  // The same version again changes nothing and is not refused; forced, it is a deploy and is refused. So is a removal.
+  expect((await rig.recover({ workers: [v2], overUnverified: false })).results[0].state).toBe("unchanged");
   expect((await rig.recover({ workers: [{ ...v2, force: true }], overUnverified: false })).results[0].reason).toBe(words);
   expect((await rig.recover({ remove: [A], overUnverified: false })).results[0]).toEqual({ worker: A, state: "refused", reason: words });
   // Another Worker in the same call goes on.
@@ -23854,6 +23864,8 @@ const _braindeployer_test_deployer_confirm_names_its_worker = async function _te
   const on = async () => Object.entries((await rig.state()).kernel).filter(([, k]) => k.state === "probation").map(([name]) => name).sort();
   expect(await on()).toEqual(["brain", A]);
   for (const body of [{}, { worker: "" }, { worker: null }, { only: A }]) expect(await rig.asOwner("confirm", body)).toEqual({ error: "InvalidRequest", message: "worker: name the Worker to confirm, one a call" });
+  // A sign-in link made to deploy does not keep its own deploy.
+  expect(await rig.asOwner("confirm", { worker: A }, { "x-brain-unattended": "token:claude-1" })).toEqual({ error: "Forbidden", message: "a sign-in link does not confirm a deploy: the owner's session or the recovery key" });
   expect(await on()).toEqual(["brain", A]);
   expect(await rig.asOwner("confirm", { worker: A })).toEqual({ confirmed: [A] });
   expect([await on(), ks().state]).toEqual([["brain"], "confirmed"]);
@@ -24463,7 +24475,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_nextKernelState", "nextKernelState", [], _braindeployer_nextKernelState);
   $def("_braindeployer_anon_17200b265d", null, ["md"], _braindeployer_anon_17200b265d);
   $def("_braindeployer_anon_e12ce2a2f9", null, ["md"], _braindeployer_anon_e12ce2a2f9);
-  $def("_braindeployer_anon_cceafa2739", null, ["md"], _braindeployer_anon_cceafa2739);
+  $def("_braindeployer_anon_cc66ae52c4", null, ["md"], _braindeployer_anon_cc66ae52c4);
   $def("_braindeployer_deployerOps", "deployerOps", ["config","secrets","rows","log","Response","URLSearchParams","sha256","FormData","partsHash","deployerAllows","wrapperFlags","deployerDistil","nextKernelState"], _braindeployer_deployerOps);
   $def("_braindeployer_anon_b5cfc17bdb", null, ["md"], _braindeployer_anon_b5cfc17bdb);
   $def("_braindeployer_deployerPage", "deployerPage", [], _braindeployer_deployerPage);
@@ -41734,7 +41746,7 @@ const _cloudbrain_brain = function _brain(session,brainDeployer,client,fromBrain
         const out = await client.procedure("infra.apply", { workers: [{ ...asSource(emitted), force, was }], reason });
         // The deployer's answer is what was deployed. A hash other than this page's is said, not hidden.
         for (const r of out.results) if (r.hash && r.hash !== emitted.hash) r.note = `the deployer distilled ${r.hash.slice(0, 12)}; this page made ${emitted.hash.slice(0, 12)}`;
-        for (const r of out.results) if (r.state === "deployed" || r.state === "probation") await loadService(r.worker, { expect: r.hash }).catch(() => null);
+        for (const r of out.results) if (["deployed", "probation", "verified", "failing"].includes(r.state)) await loadService(r.worker, { expect: r.hash }).catch(() => null);
         return out;
       },
       confirm: (worker) => client.procedure("infra.confirm", { worker })
@@ -42792,7 +42804,7 @@ A call from one Worker to another starts at step 3, as \`worker:NAME\`. The core
 A query may answer a WebSocket: the caller sends \`Upgrade: websocket\` on the \`GET\`, and the service answers 101 with a socket. The seven steps are the same and happen one time, at the upgrade; after that the frames pass through the kernel and the core with no step. A path can answer one in the same way. ${mod("brain-browser")} has the one method that does, \`browser.cdp\`. This is not an XRPC subscription: the frames are what the service sends, in both directions. Measured on cb4 on 2026-10-08: a socket was open 10 minutes, and a frame of 33 MB passed each way.
 
 Not built: Lexicon documents. The Workers do not check an input against a schema.`);};
-const _cloudbraindocs_anon_1987d66bfe = function _anonymous(md,mod) {return (md`## Deploy
+const _cloudbraindocs_anon_f04baa6a0c = function _anonymous(md,mod) {return (md`## Deploy
 
 A deploy is module source: \`{ module, source }\`. The deployer does the other steps.
 
@@ -42800,14 +42812,14 @@ A deploy is module source: \`{ module, source }\`. The deployer does the other s
 2. **Check.** An owner service has the name \`brain-x-NAME\`. It cannot claim a method or path that another Worker serves. It cannot name the deployer, the kernel or the core.
 3. **Approve.** Approval is on at install. The deployer page lists a held deploy. The owner approves it there with the recovery key, then presses **Apply** again. Approval does not deploy.
 4. **Go live.** The deployer uploads a version, sends its own request to that version, moves it to 100%, then checks its health. On a failure, the deployer restores the previous version and appends an inbox entry.
-5. **Verify.** The deployer opens the Brain's page in a browser of the Brain, with that Worker's module alone in the layout and no session. The page runs the module's \`test_\` cells and the deployer reads the verdict. Until they pass the Worker is on probation: a second deploy of it is refused. On a fail the deployer restores the previous version at once; with no verdict, after 10 minutes. \`infra.confirm { worker }\` ends one Worker's probation by hand.
+5. **Verify.** The deployer opens the Brain's page in a browser of the Brain, with that Worker's module and the shell in the layout, no other module of the Brain, and no session. The page runs the module's \`test_\` cells and the deployer reads the verdict. Until they pass the Worker is on probation: a second deploy of it is refused. On a fail the deployer restores the previous version at once; with no verdict, after 10 minutes. \`infra.confirm { worker }\` ends one Worker's probation by hand.
 
 A Worker's identity is the hash of its source and the version of the distiller. The deployer keeps each Worker's source. Each Worker serves its source at \`getSource\`. The page loads its modules from there, so the page shows the code that runs.
 
 A change to ${mod("cloudflare-iac")} is a deployer update. A deployer update needs the Cloudflare token and cannot start from the page. After it, the deployer distils each Worker again.`);};
-const _cloudbraindocs_anon_86b982901e = function _anonymous(md,mod) {return (md`## Probation and recovery
+const _cloudbraindocs_anon_1417c80f1b = function _anonymous(md,mod) {return (md`## Probation and recovery
 
-A bad kernel, core, \`brain-db\` or page can lock the owner out. A new version of one of these is on probation from the moment it is live. The owner presses **Keep this version**, or the page's tests pass. After two failed health checks, or 10 minutes with no confirm, the deployer restores the previous version.
+A bad kernel, core, \`brain-db\` or page can lock the owner out. A new version of any Worker is on probation from the moment it is live. The deployer's run of its tests passes, or the owner presses **Keep this version** (the kernel is kept this way only). After two failed health checks, or 10 minutes with no confirm, the deployer restores the previous version.
 
 No Worker of the Brain can change the deployer: the deployer refuses an apply that names it. The deployer page is one HTML response with no script. With the recovery key, the deployer page rolls the kernel back and approves a deploy. With the recovery key, the deployer also answers \`infra.*\` to a caller that is not the kernel. That is the path when the kernel is broken. The installer makes the recovery key and shows it one time.
 
@@ -42878,8 +42890,8 @@ export default function define(runtime, observer) {
   $def("_cloudbraindocs_anon_9ebf4ee571", null, ["md","mod"], _cloudbraindocs_anon_9ebf4ee571);
   $def("_cloudbraindocs_anon_dfb6c07db0", null, ["md","mod"], _cloudbraindocs_anon_dfb6c07db0);
   $def("_cloudbraindocs_anon_79afaaa51f", null, ["md","mod"], _cloudbraindocs_anon_79afaaa51f);
-  $def("_cloudbraindocs_anon_1987d66bfe", null, ["md","mod"], _cloudbraindocs_anon_1987d66bfe);
-  $def("_cloudbraindocs_anon_86b982901e", null, ["md","mod"], _cloudbraindocs_anon_86b982901e);
+  $def("_cloudbraindocs_anon_f04baa6a0c", null, ["md","mod"], _cloudbraindocs_anon_f04baa6a0c);
+  $def("_cloudbraindocs_anon_1417c80f1b", null, ["md","mod"], _cloudbraindocs_anon_1417c80f1b);
   $def("_cloudbraindocs_anon_866fa794d3", null, ["md","mod"], _cloudbraindocs_anon_866fa794d3);
   $def("_cloudbraindocs_anon_fe30eac93b", null, ["md"], _cloudbraindocs_anon_fe30eac93b);
   $def("_cloudbraindocs_anon_d0e09903ee", null, ["md","mod"], _cloudbraindocs_anon_d0e09903ee);
