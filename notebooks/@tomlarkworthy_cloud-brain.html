@@ -25700,7 +25700,7 @@ var Es=Object.defineProperty;var As=(e)=>e;function Ss(e,t){this[e]=As.bind(null
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainkernel_anon_0efa25cf71 = function _anonymous(md) {return (md`# brain-kernel
+const _brainkernel_anon_53539e1307 = function _anonymous(md) {return (md`# brain-kernel
 
 The Worker at the Brain's address. It serves the notebook, signs people in with atproto, works out who is calling, and forwards everything else to the core with that answer attached.
 
@@ -25737,7 +25737,9 @@ A person is an atproto account, named by its DID. There are two roles. The **own
 
 **Sign-in links** (added 2026-10-09). For a program with no browser, such as Claude Code on the web. \`token.link\` (procedure, owner's session) takes \`{ name, methods, minutes, hours, deploy, unattended }\` and answers \`{ name, deploy, unattended, link, until }\`; \`minutes\` (1 to 60, 10 if left out) is how long the link is good, \`hours\` (1 to 24, 8 if left out) how long its token lasts. The link is \`/auth/link?code=…\`. A GET of it answers text that says what to do and spends nothing, so a preview of a pasted link does not use it. The first POST answers \`{ name, token, methods, until, deploy, unattended }\` and deletes the link; a second answers 401. The token is one as \`token.create\` makes, with an end: it may not name \`infra.*\`, \`secret.*\`, \`token.*\`, \`grant.*\` or \`people.*\`, and \`token.list\` gives it with \`by: "link"\` until it ends. \`token.revoke\` with \`{ name }\` ends the token early, and deletes a link of that name nobody has used. A link is refused a name that a token or another link has.
 
-**Lists of methods** (2026-10-10). In \`token.create\` and \`token.link\` an entry of \`methods\` is a whole name or a prefix that ends \`.*\`: \`browser.*\` is every method of that service, \`*\` every method of this Brain. No prefix reaches a name a token may not have (\`infra\`, \`secret\`, \`token\`, \`grant\`, \`people\`). A grant to a DID still names whole methods.
+**Lists of methods** (2026-10-10). In \`token.create\` and \`token.link\` an entry of \`methods\` is a whole name or a prefix that ends \`.*\`: \`browser.*\` is every method of that service, \`*\` every method of this Brain. A name may go on after a \`/\` (\`ai.v1/chat/completions\`), and \`ai.v1/*\` is every method under \`ai.v1/\` and not \`ai.run\` (2026-10-10: the first shape check had refused every name with a \`/\`). No prefix reaches a name a token may not have (\`infra\`, \`secret\`, \`token\`, \`grant\`, \`people\`). A grant to a DID still names whole methods.
+
+**Other origins** (2026-10-10). No cookie is read, so any origin may call with a token and read the answer. A preflight is answered with the headers it asked for (\`access-control-request-headers\`), because a client library adds its own: the OpenAI one sends \`x-stainless-*\`. Before, only \`authorization\` and \`content-type\` passed.
 
 With \`deploy: true\`, \`token.link\` makes a link whose token also calls \`infra.*\` as the owner's session does, and these four only: \`infra.apply\`, \`infra.getState\`, \`infra.redistil\` and \`infra.confirm\` (which ends the probation of a kernel, core or page it deployed). Not \`infra.shell\`: that puts HTML at \`/\` with no reason, no \`was\` and no approval, and the page at \`/\` runs where the owner's session is kept; so a program cannot renew the page's shell, and the owner does after it deploys the page. It deploys and removes any Worker of this Brain, the kernel among them. What holds a session's apply holds its apply: a reason, \`was\`, and approval on the deployer's page (which needs the recovery key) when deploys need approval. The token itself names no secret, token, grant or people method. That is a limit only while deploys need approval: with approval off it can deploy a kernel of its own writing, and the kernel is what names the caller, so the token is then the owner in effect. Only a link makes such a token, so it always ends, in 24 hours at most; \`token.create\` cannot. Each call is logged by the kernel as \`infra.by.link\` with the token's name. Tom, 2026-10-09: "I do want singin links to be able to deploy with the authority of me".
 
@@ -25889,7 +25891,10 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   // Every caller sends a token in a header, this Brain's own page included, so any origin may call and read the answer.
   const cors = { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type", "access-control-allow-methods": "GET, POST", "access-control-expose-headers": "x-proxy-upstream", "access-control-max-age": "600" };
   app.use("/xrpc/*", async (c, next) => {
-    if (c.req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    // A client library adds headers of its own (the OpenAI one: x-stainless-*). The preflight is told the ones it
+    // asked for: no cookie is read and no header but authorization says who calls, so none of them is a risk.
+    const asked = c.req.header("access-control-request-headers") || "";
+    if (c.req.method === "OPTIONS") return new Response(null, { status: 204, headers: { ...cors, ...(/^[A-Za-z0-9, -]{1,1000}$/.test(asked) ? { "access-control-allow-headers": asked, vary: "access-control-request-headers" } : {}) } });
     await next();
     if (!c.req.header("authorization")) return;
     const headers = new Headers(c.res.headers);
@@ -26080,14 +26085,15 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   const never = (m) => /^com\.lopecode\.brain\.(infra|secret|token|grant|people)\./.test(m);
   // A token's list holds whole names and prefixes: "browser.*" is every method of that service, "*" every method
   // of this Brain. No prefix reaches a name a token may not have.
-  const listed = (m) => /^[A-Za-z0-9]+(\.[A-Za-z0-9]+)*(\.\*)?$/.test(m);
-  const names = (methods, nsid) => !never(nsid) && methods.some((m) => m === nsid || (m.endsWith(".*") && nsid.startsWith(m.slice(0, -1))));
+  // A name may go on in segments after a / (ai.v1/chat/completions); "ai.v1/*" is every method under ai.v1/.
+  const listed = (m) => /^[A-Za-z0-9]+(\.[A-Za-z0-9]+)*(\/[A-Za-z0-9]+)*([./]\*)?$/.test(m);
+  const names = (methods, nsid) => !never(nsid) && methods.some((m) => m === nsid || (/[./]\*$/.test(m) && nsid.startsWith(m.slice(0, -1))));
   app.get(NS + "token.list", session, async (c) => c.json({ tokens: (await rows.list("token/")).map((r) => r.value).filter((t) => !(t.until < Date.now())) }));
   app.post(NS + "token.create", session, async (c) => {
     const { name, methods = [] } = await c.req.json();
     const named = methods.map(full);
     if (!/^[a-z0-9-]{1,40}$/.test(name || "")) return fail(c, 400, "InvalidRequest", "name is lower case letters, digits and -");
-    if (!named.every(listed)) return fail(c, 400, "InvalidRequest", "a method is a name, or a prefix that ends .* (browser.*), or *");
+    if (!named.every(listed)) return fail(c, 400, "InvalidRequest", "a method is a name, or a prefix that ends .* or /* (browser.*, ai.v1/*), or *");
     if (named.some(never)) return fail(c, 400, "InvalidRequest", "a token cannot name infra, secret, token, grant or people methods");
     const token = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
     await rows.put("token/" + (await sha256(token)), { name, methods: named, created: Date.now() });
@@ -26103,7 +26109,7 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
     if (unattended && !deploy) return fail(c, 400, "InvalidRequest", "unattended is for a link made with deploy");
     const named = methods.map(full);
     if (!/^[a-z0-9-]{1,40}$/.test(name || "")) return fail(c, 400, "InvalidRequest", "name is lower case letters, digits and -");
-    if (!named.every(listed)) return fail(c, 400, "InvalidRequest", "a method is a name, or a prefix that ends .* (browser.*), or *");
+    if (!named.every(listed)) return fail(c, 400, "InvalidRequest", "a method is a name, or a prefix that ends .* or /* (browser.*, ai.v1/*), or *");
     if (named.some(never)) return fail(c, 400, "InvalidRequest", "a token cannot name infra, secret, token, grant or people methods");
     if (!(minutes >= 1 && minutes <= 60 && hours >= 1 && hours <= 24)) return fail(c, 400, "InvalidRequest", "minutes is 1 to 60, hours is 1 to 24");
     // What has ended is deleted here: links nobody used, and the tokens of links.
@@ -26600,7 +26606,7 @@ const _brainkernel_test_tokens_reach_only_their_methods = async function _test_t
   expect((await rig.call("inbox.list", { bearer: all.token })).status).toBe(403);
   await rig.call("token.revoke", { session: rig.owner, body: { name: "wide" } });
   // A prefix: every method under it, none beside it, and never a name a token may not have.
-  for (const bad of ["secret.*", "infra.*", "pro*", "*.fetch", "proxy.*.x", ""]) expect((await rig.call("token.create", { session: rig.owner, body: { name: "bad", methods: [bad] } })).status).toBe(400);
+  for (const bad of ["secret.*", "infra.*", "pro*", "*.fetch", "proxy.*.x", "", "ai.v1/", "ai.v1//x", "ai/v1.x", "ai.v1/*/x", "/x"]) expect((await rig.call("token.create", { session: rig.owner, body: { name: "bad", methods: [bad] } })).status).toBe(400);
   const star = (await rig.call("token.create", { session: rig.owner, body: { name: "star", methods: ["proxy.*"] } })).data.token;
   expect((await rig.call("proxy.fetch", { bearer: star, body: {} })).status).toBe(200);
   expect(rig.seen.at(-1).headers["x-brain-caller"]).toBe("token:star");
@@ -26608,6 +26614,12 @@ const _brainkernel_test_tokens_reach_only_their_methods = async function _test_t
   const every = (await rig.call("token.create", { session: rig.owner, body: { name: "every", methods: ["*"] } })).data.token;
   expect((await rig.call("inbox.list", { bearer: every })).status).toBe(200);
   for (const m of ["secret.get", "token.list", "infra.getState", "people.list"]) expect((await rig.call(m, { bearer: every })).status).toBe(403);
+  // A name with a /: the whole name, or everything under the part before a /*. Neither reaches the names beside it.
+  const whole = (await rig.call("token.create", { session: rig.owner, body: { name: "whole", methods: ["ai.v1/chat/completions"] } })).data.token;
+  const under = (await rig.call("token.create", { session: rig.owner, body: { name: "under", methods: ["ai.v1/*"] } })).data.token;
+  expect(await Promise.all(["ai.v1/chat/completions", "ai.v1/models", "ai.run", "ai.v1x/models"].map(async (m) => (await rig.call(m, { bearer: whole, body: {} })).status))).toEqual([200, 403, 403, 403]);
+  expect(await Promise.all(["ai.v1/chat/completions", "ai.v1/models", "ai.run", "ai.v1x/models"].map(async (m) => (await rig.call(m, { bearer: under, body: {} })).status))).toEqual([200, 200, 403, 403]);
+  for (const n of ["whole", "under"]) await rig.call("token.revoke", { session: rig.owner, body: { name: n } });
   // A member's method: its id is hex and may begin with a digit. A grant to a DID takes no prefix.
   expect((await rig.call("token.create", { session: rig.owner, body: { name: "mem", methods: ["m.0a1b2c3d4e.hello", "m.0a1b2c3d4e.*"] } })).status).toBe(200);
   for (const m of ["proxy.*", "*"]) expect((await rig.call("grant.put", { session: rig.owner, body: { did: "did:plc:other", methods: [m] } })).status).toBe(400);
@@ -27105,6 +27117,11 @@ const _brainkernel_test_a_token_is_the_callers_to_send_from_anywhere = async fun
   expect((await rig.call("token.list", { headers: { origin: "null" } })).status).toBe(401);
   const there = await rig.call("token.list", { session: rig.owner, headers: { origin: sibling } });
   expect([there.status, there.headers.get("access-control-allow-origin")]).toEqual([200, "*"]);
+  // A preflight is told the headers it asked for, so a client library that adds its own is not stopped.
+  const pre = (asked) => rig.call("ai.v1/chat/completions", { method: "OPTIONS", headers: { origin: sibling, "access-control-request-method": "POST", ...(asked ? { "access-control-request-headers": asked } : {}) } });
+  expect([(await pre("authorization, content-type, x-stainless-os, http-referer, x-title")).status, (await pre("authorization, content-type, x-stainless-os, http-referer, x-title")).headers.get("access-control-allow-headers")]).toEqual([204, "authorization, content-type, x-stainless-os, http-referer, x-title"]);
+  expect((await pre()).headers.get("access-control-allow-headers")).toBe("authorization, content-type");
+  expect((await pre("x-a; b=(c)")).headers.get("access-control-allow-headers")).toBe("authorization, content-type");
   return "401 without a token, whatever the origin";
 };
 const _brainkernel_test_a_portal_token_reaches_one_members_services_as_the_viewer = async function _test_a_portal_token_reaches_one_members_services_as_the_viewer(kernelRig,sha256,sessionToken,expect,turnToken,portalToken) {
@@ -27171,7 +27188,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainkernel_anon_0efa25cf71", null, ["md"], _brainkernel_anon_0efa25cf71);
+  $def("_brainkernel_anon_53539e1307", null, ["md"], _brainkernel_anon_53539e1307);
   $def("_brainkernel_kernel_service", "kernel_service", ["cloudflare","kernelApp"], _brainkernel_kernel_service);
   $def("_brainkernel_kernel_announce", "kernel_announce", ["plugins","kernel_service","invalidation"], _brainkernel_kernel_announce);
   $def("_brainkernel_atcute", "atcute", ["library","FileAttachment"], _brainkernel_atcute);
@@ -35661,12 +35678,12 @@ Open models for a Cloud Brain, from [Cloudflare Workers AI](https://developers.c
 Built and deployed to cb4 on 2026-10-09. The Workers AI documents were read that day; what was measured is in \`aiMeasured\`. Through the Brain a call took about 60 ms more than at Cloudflare's own address (${aiMeasured.latency}).`);};
 const _brainai_viewof_aiView = function _aiView(aiPanel,client,session) {return (aiPanel({ client, owner: !!(session && session.owner) }));};
 const _brainai_aiView = (G, _) => G.input(_);
-const _brainai_anon_6e91c5f6c6 = function _anonymous(md) {return (md`## Methods
+const _brainai_anon_72e6e41095 = function _anonymous(md) {return (md`## Methods
 
 | | |
 |---|---|
 | Worker | \`brain-x-ai\` |
-| \`ai.run\` | procedure, the one method with a price. \`?model=&usd=\` in the query string, and the body is the model's input as [Cloudflare documents it for that model](https://developers.cloudflare.com/workers-ai/models/): \`{ "messages": [...] }\`, \`{ "prompt": "…" }\`, \`{ "text": ["…"] }\`, with \`"stream": true\` for server-sent events. \`usd\` is what the call costs the caller, in US dollars, and the most Cloudflare may be made to spend on it. The answer is Cloudflare's, with its status, and two headers more: \`x-ai-neurons\`, when Cloudflare gave the count, and \`x-ai-usd\`, that count at Cloudflare's rate. |
+| \`ai.run\` | procedure, with a price (the two \`ai.v1\` procedures are the others). \`?model=&usd=\` in the query string, and the body is the model's input as [Cloudflare documents it for that model](https://developers.cloudflare.com/workers-ai/models/): \`{ "messages": [...] }\`, \`{ "prompt": "…" }\`, \`{ "text": ["…"] }\`, with \`"stream": true\` for server-sent events. \`usd\` is what the call costs the caller, in US dollars, and the most Cloudflare may be made to spend on it. The answer is Cloudflare's, with its status, and two headers more: \`x-ai-neurons\`, when Cloudflare gave the count, and \`x-ai-usd\`, that count at Cloudflare's rate. |
 | \`ai.models\` | query. Cloudflare's [model search](https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list/) with the caller's query string: \`?search=&task=&per_page=&page=\`. Each model has \`name\`, \`task\`, \`description\` and \`properties\`, where \`price\` is Cloudflare's price. |
 | \`ai.v1/chat/completions\`, \`ai.v1/embeddings\`, \`ai.v1/models\` | the same models at an address an OpenAI client can be given (see An OpenAI client). Added 2026-10-10. |
 | Storage | none. One log line a priced call, a refused one too: \`at\` (\`"ai.run"\`, \`"ai.v1/chat/completions"\`, \`"ai.v1/embeddings"\`), \`model\`, \`usd\`, \`neurons\`, \`status\`, and \`error\` when this service refused. |
@@ -35683,9 +35700,9 @@ curl -N -X POST -H "Authorization: Bearer $BRAIN_TOKEN" -H "content-type: applic
 \`\`\`
 
 A refusal of this service is JSON \`{ error, message }\`: 400 \`InvalidRequest\`, 404 \`UnknownModel\`, 402 \`BudgetTooSmall\` with \`needs\`, 413 \`TooLarge\`, 502 \`ModelListUnavailable\` when Cloudflare's model list did not answer. Anything else is Cloudflare's answer, a 413 of its own among them.`);};
-const _brainai_anon_dd37c8d676 = function _anonymous(md,aiDefaults) {return (md`## An OpenAI client
+const _brainai_anon_fe961c5b4e = function _anonymous(md,aiDefaults) {return (md`## An OpenAI client
 
-A client that speaks the OpenAI API is given two things: the base URL \`https://HOST/xrpc/com.lopecode.brain.ai.v1\`, and a Brain token as the API key (\`token.create\` with \`methods: ["ai.v1/chat/completions", "ai.v1/embeddings", "ai.v1/models"]\`). The model is one of Cloudflare's names. Run on cb4 with curl and such a token, 2026-10-10 05:24 UTC:
+A client that speaks the OpenAI API is given two things: the base URL \`https://HOST/xrpc/com.lopecode.brain.ai.v1\`, and a Brain token as the API key (\`token.create\` with \`methods: ["ai.v1/chat/completions", "ai.v1/embeddings", "ai.v1/models"]\`, or \`["ai.v1/*"]\` for the three; neither reaches \`ai.run\` or \`ai.models\`, 403 on cb4). The model is one of Cloudflare's names. Run on cb4 with curl and such a token, 2026-10-10 05:24 UTC, and again at 05:58 with a new token of each kind. Between the two the kernel refused such a token (400): a check on the shape of a method name, added that morning, took no \`/\`. It takes one since 05:57.
 
 \`\`\`
 curl -H "Authorization: Bearer $BRAIN_TOKEN" -H "content-type: application/json" \\
@@ -35696,19 +35713,19 @@ curl -H "Authorization: Bearer $BRAIN_TOKEN" -H "content-type: application/json"
 \`\`\`
 
 - The body goes to Cloudflare's [OpenAI address](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/), \`/ai/v1/chat/completions\` or \`/ai/v1/embeddings\`, and the answer is Cloudflare's, a stream too (\`"stream": true\`, and \`"stream_options": {"include_usage": true}\` for the usage at its end).
-- **The price.** An OpenAI client sends no \`usd\`. A call with none is charged ${aiDefaults.v1Usd} and budgeted from that, as The price says for \`usd\`. The run above cost Cloudflare $0.0000019, so it was charged 5300 times that. A client that can add to the query string (\`defaultQuery: { usd: "0.0005" }\` in the OpenAI SDKs) names its own. The price cannot be read from the body: the core's rule sees the query string only. A call whose input is counted over the budget is refused 402, so a body over about ${Math.round(aiDefaults.v1Usd / 0.15e-6 * aiDefaults.bytesPerToken / 1000)} kB to a model of $0.15 a million input tokens needs \`usd\`.
-- **\`max_completion_tokens\`** is not read by Cloudflare (\`aiMeasured.twice\`: 3 was asked and 135 tokens came). The service writes it as \`max_tokens\`, the less of the two when both are given, and then bounds it as in \`ai.run\`.
-- **\`ai.v1/models\`** is Cloudflare's model search written as \`{ object: "list", data: [{ id, object: "model", created, owned_by }] }\`. Cloudflare has no such list at its OpenAI address (405, 2026-10-10).
+- **The price.** An OpenAI client sends no \`usd\`. A call with none is charged ${aiDefaults.v1Usd} and budgeted from that, as The price says for \`usd\`. The run above cost Cloudflare $0.0000019, so it was charged 5300 times that. A client that can add to the query string (\`defaultQuery: { usd: "0.0005" }\` in the OpenAI SDKs) names its own. The price cannot be read from the body: the core's rule sees the query string only. **A token's allowance is $0.10 a day** unless the owner set another (\`quota.put\` for that token, \`quota.setDefaults\` for all), so a token that sends no \`usd\` makes 10 calls a day and is refused after. The number is \`v1Usd\` in \`aiDefaults\`, written into the price rule at deploy, so it is not a stored setting; the owner changes the rule with \`price.put\`. It was left at ${aiDefaults.v1Usd}: at a tenth of that, a prompt over about 6600 tokens to a model of $0.15 a million would be refused 402, and an agent's prompt in \`ai-cache.md\` was 27 000. A call whose input is counted over the budget is refused 402, so a body over about ${Math.round(aiDefaults.v1Usd / 0.15e-6 * aiDefaults.bytesPerToken / 1000)} kB to a model of $0.15 a million input tokens needs \`usd\`.
+- **\`max_completion_tokens\`** is not read by Cloudflare (\`aiMeasured.twice\`: 3 was asked and 135 tokens came). The service writes it as \`max_tokens\`, the less of the two when both are given, and then bounds it as in \`ai.run\`. A body that has the field is parsed and written again whole, so a number in it past 2^53 is not kept exact; a body without it is treated as \`ai.run\` treats one.
+- **\`ai.v1/models\`** is Cloudflare's model search written as \`{ object: "list", data: [{ id, object: "model", created, owned_by }] }\`. Cloudflare has no such list at its OpenAI address (405, 2026-10-10). It is one request with \`per_page=200\` and no second page. On cb4, 2026-10-10, it gave 70 models, and that was all of them: Cloudflare answered \`per_page: 100\` and \`total_count: 324\`, page 2 was empty, and \`per_page=50\` gave 50 and then 20. What 324 counts is not known.
 - **\`x-session-affinity\`**, a header of the caller, is passed on. Cloudflare [uses it](https://developers.cloudflare.com/workers-ai/features/prompt-caching/) to keep a session on the instance that has its prefix cached. Measured in \`tools/cloud-brain/ai-cache.md\`.
 - A refusal of this service is \`{ error, message }\`, not OpenAI's \`{ error: { message } }\`. \`/responses\` is not passed (404).
-- From a page in a browser, the kernel allows the headers \`authorization\` and \`content-type\` and no other. A client that adds one (the OpenAI SDK's \`x-stainless-*\`, OpenRouter's \`HTTP-Referer\` and \`X-Title\`, \`x-session-affinity\`) fails its preflight. Read from the kernel's answer to OPTIONS, 2026-10-10; no browser client was run.
+- **From a page in a browser.** The kernel answers a preflight with the headers it asked for, since 2026-10-10 05:57 UTC; before, it allowed \`authorization\` and \`content-type\` only, and a client that adds a header failed. Run in a browser of the cluster from a page of \`https://example.com\`, 05:59 UTC, with a token for the three methods: \`fetch\` with \`x-stainless-os\`, \`http-referer\`, \`x-title\`, \`x-session-affinity\` and \`openai-organization\` answered 200, and the OpenAI SDK for JavaScript (\`openai@4\` from esm.sh, \`dangerouslyAllowBrowser\`, \`defaultQuery: { usd }\`) made a chat completion and listed 70 models. A token in a page is readable by that page's scripts. robocoop-5 was not run against it.
 
 ## Serverless
 
 Nothing is deployed or kept warm for a model, and Cloudflare bills by the call: "[$0.011 per 1,000 Neurons](https://developers.cloudflare.com/workers-ai/platform/pricing/)", with 10,000 neurons a day at no charge (read 2026-10-10). A model not used on this account before answered its first call in 463 to 682 ms and its fifth in 309 to 460 ms, four models (\`aiMeasured.cold\`): no load of several seconds was seen. Not measured: a model after hours of nobody's use anywhere, since other accounts use the same models.`);};
-const _brainai_anon_e95f84fa0f = function _anonymous(md,aiDefaults) {return (md`## The price
+const _brainai_anon_67cc59bb14 = function _anonymous(md,aiDefaults) {return (md`## The price
 
-The core charges a call before it forwards it, and what a model costs is known only after it ran. So the caller names the price, \`usd\`, and the service holds Cloudflare's cost under it. The rule of the price is \`double(request.params.usd)\`. A call with no \`usd\` is refused by the core. The core charges in millionths of a dollar, rounded up: \`usd=0.00000214\` was charged $0.000003 (\`aiMeasured.rounding\`). Nothing is returned: a call that used less, a call Cloudflare refused, and a call this service refused are all charged \`usd\`.
+The core charges a call before it forwards it, and what a model costs is known only after it ran. So the caller names the price, \`usd\`, and the service holds Cloudflare's cost under it. The rule of the price is \`double(request.params.usd)\`. An \`ai.run\` call with no \`usd\` is refused by the core; an \`ai.v1\` call with none is priced as An OpenAI client says. The core charges in millionths of a dollar, rounded up: \`usd=0.00000214\` was charged $0.000003 (\`aiMeasured.rounding\`). Nothing is returned: a call that used less, a call Cloudflare refused, and a call this service refused are all charged \`usd\`.
 
 **A model priced by the token** (text generation, embeddings: the \`price\` property has \`per M input tokens\`). The service reads the model's price from Cloudflare's list, each model once in 10 minutes for one instance.
 
@@ -35724,12 +35741,12 @@ The error of this, in two parts.
 - **What the caller guessed.** \`usd\` is a ceiling and the whole of it is charged. Three runs with a \`usd\` picked by eye were charged 22 to 79 times what Cloudflare counted (\`aiMeasured.loose\`). A caller that sets \`max_tokens\` and a \`usd\` to match pays for the over-count of the input and for the output the model did not write: 1.03 to 1.21 times in three runs that wrote to the limit or near it, 7.5 times in one that stopped after 2 tokens of 20 (\`aiMeasured.tight\`).
 - **What the service counted.** The byte count is not a token count. English text was 3.8 to 4.8 bytes a token, so the input is over-counted. A script that packs more than one token in ${aiDefaults.bytesPerToken} bytes is under-counted, and so is a model whose template is over ${aiDefaults.templateTokens} tokens or that bills reasoning the body does not show: there Cloudflare's cost can pass \`usd\`. No such run was seen; no reasoning model was run.
 
-Each run logs \`usd\` and \`neurons\`, so the two can be compared (\`logs.query\`, \`at\` is \`ai.run\`). A neuron is $0.000011. The header \`cf-ai-neurons\`, which \`x-ai-neurons\` repeats, is rounded to two places; \`usage.neurons\` in a text answer is not. Cloudflare gives the account 10 000 neurons a day at no charge; a caller is charged \`usd\` all the same.
+Each run logs \`usd\` and \`neurons\`, so the two can be compared (\`logs.query\`; \`at\` is the method, \`ai.run\`, \`ai.v1/chat/completions\` or \`ai.v1/embeddings\`). A neuron is $0.000011. The header \`cf-ai-neurons\`, which \`x-ai-neurons\` repeats, is rounded to two places; \`usage.neurons\` in a text answer is not. Cloudflare gives the account 10 000 neurons a day at no charge; a caller is charged \`usd\` all the same.
 
 Settings, stored with \`config.set\` for \`brain-x-ai\`, read with no deploy: \`bytesPerToken\` (${aiDefaults.bytesPerToken}), \`templateTokens\` (${aiDefaults.templateTokens}), \`flatUsd\` (${aiDefaults.flatUsd}), \`maxBody\` (${aiDefaults.maxBody} bytes), \`maxTokens\` (${aiDefaults.maxTokens}). A setting counts when it is a number over 0, also one written as text; any other value is the default.`);};
-const _brainai_anon_163b7318b2 = function _anonymous(md,aiDefaults) {return (md`## Who can call
+const _brainai_anon_be785b633b = function _anonymous(md,aiDefaults) {return (md`## Who can call
 
-\`ai.run\` and \`ai.models\`: the owner, a Worker of this Brain, and a token or a member the owner gave the method. The owner can set another rule (\`rule.put\`) or another price (\`price.put\`). **A price the owner puts must still be \`double(request.params.usd)\` or more.** The core does not tell a Worker what it charged (it sets \`x-brain-price\` on the answer only, read in \`forward\` and \`priced\` of brain-core, 2026-10-09), so this service budgets from \`usd\` in the query string: with a price under \`usd\` a caller is charged less than Cloudflare may be made to spend. The most one call may cost is the core's (\`quota.setDefaults\`, \`perCall\`), and each account's spend for a day is the core's too.
+\`ai.run\`, \`ai.models\` and the three \`ai.v1\` methods, each on its own: the owner, a Worker of this Brain, and a token or a member the owner gave the method. The owner can set another rule (\`rule.put\`) or another price (\`price.put\`). **A price the owner puts must still be \`double(request.params.usd)\` or more**, and for an \`ai.v1\` procedure \`v1Usd\` or more when there is no \`usd\`. The core does not tell a Worker what it charged (it sets \`x-brain-price\` on the answer only, read in \`forward\` and \`priced\` of brain-core, 2026-10-09), so this service budgets from \`usd\` in the query string: with a price under \`usd\` a caller is charged less than Cloudflare may be made to spend. The most one call may cost is the core's (\`quota.setDefaults\`, \`perCall\`), and each account's spend for a day is the core's too.
 
 ## The Cloudflare token
 
@@ -36284,10 +36301,10 @@ export default function define(runtime, observer) {
   $def("_brainai_anon_fb0495eabc", null, ["md","aiMeasured"], _brainai_anon_fb0495eabc);
   $def("_brainai_viewof_aiView", "viewof aiView", ["aiPanel","client","session"], _brainai_viewof_aiView);
   $def("_brainai_aiView", "aiView", ["Generators","viewof aiView"], _brainai_aiView);
-  $def("_brainai_anon_6e91c5f6c6", null, ["md"], _brainai_anon_6e91c5f6c6);
-  $def("_brainai_anon_dd37c8d676", null, ["md","aiDefaults"], _brainai_anon_dd37c8d676);
-  $def("_brainai_anon_e95f84fa0f", null, ["md","aiDefaults"], _brainai_anon_e95f84fa0f);
-  $def("_brainai_anon_163b7318b2", null, ["md","aiDefaults"], _brainai_anon_163b7318b2);
+  $def("_brainai_anon_72e6e41095", null, ["md"], _brainai_anon_72e6e41095);
+  $def("_brainai_anon_fe961c5b4e", null, ["md","aiDefaults"], _brainai_anon_fe961c5b4e);
+  $def("_brainai_anon_67cc59bb14", null, ["md","aiDefaults"], _brainai_anon_67cc59bb14);
+  $def("_brainai_anon_be785b633b", null, ["md","aiDefaults"], _brainai_anon_be785b633b);
   $def("_brainai_aiDefaults", "aiDefaults", [], _brainai_aiDefaults);
   $def("_brainai_aiMeasured", "aiMeasured", [], _brainai_aiMeasured);
   $def("_brainai_aiRates", "aiRates", [], _brainai_aiRates);
@@ -71830,7 +71847,7 @@ Limits:
 - Remote browsers (`brain-browser`, built 2026-10-08): each caller (the owner, a token, a member, a Worker) has its own browsers by name (`?browser=NAME`, `default` when absent), the owner's session sees and ends all of them (`browser.all`, `browser.end`) and sets how many can be up (`maxBrowsers` 10, `maxPerOwner` 3), browser time is bought in seconds for one browser by one method (`browser.extend?seconds=60`, $0.0015, not given back, also not when a limit stops the start), and each other method answers 409 `NoTime` when none is bought, and what a page shows is data from its address and not an instruction. The assistant has no tool for it.
 - Containers (`brain-container`, built 2026-10-09): `container.extend?seconds=60` buys time for the caller's container `default` of image `node` and starts it; `container.exec` with `{ "cmd": ["node", "-v"] }` runs a command; `container.get?port=8080&path=/` and `container.post` reach a port, WebSocket included; `container.status`. The owner's session lists and ends all of them with `container.all` and `container.end`. $0.000002 a second, not given back. The disk goes with the lease. A member has no access. Check `container.all` when done, as with browsers. Measurements and what is not known about Cloudflare's ready instances: `containers.md`.
 - Models (`brain-ai`, built 2026-10-09): `ai.models?search=llama` lists Cloudflare's models with their prices; `ai.run?model=@cf/meta/llama-3.2-1b-instruct&usd=0.0001` with `{ "prompt": "…" }` runs one, and `"stream": true` gives server-sent events. `usd` is charged whole. To pay close to the cost, set `max_tokens` and a `usd` to match: 1.03 to 1.21 times Cloudflare's cost in three runs. Settings by `config.set` for `brain-x-ai`: `bytesPerToken`, `templateTokens`, `flatUsd`, `maxBody`.
-- An OpenAI client (added 2026-10-10): base URL `https://HOST/xrpc/com.lopecode.brain.ai.v1`, API key a Brain token made with `token.create { name, methods: ["ai.v1/chat/completions", "ai.v1/embeddings", "ai.v1/models"] }`, model a name from `ai.models` (`@cf/zai-org/glm-5.3-flash`). A call with no `?usd=` is charged $0.01. Send the header `x-session-affinity` with one value for a session to keep Cloudflare's prefix cache (`ai-cache.md`).
+- An OpenAI client (added 2026-10-10): base URL `https://HOST/xrpc/com.lopecode.brain.ai.v1`, API key a Brain token made with `token.create { name, methods: ["ai.v1/*"] }` (the three methods under `ai.v1/`, and not `ai.run`), model a name from `ai.v1/models` (`@cf/zai-org/glm-5.3-flash`). A call with no `?usd=` is charged $0.01, and a token's allowance is $0.10 a day: 10 calls. Either give the client `defaultQuery: { usd: "0.0005" }` or raise the token's allowance with `quota.put`. A page on another origin can call it; the OpenAI SDK in a browser ran on 2026-10-10. Send the header `x-session-affinity` with one value for a session to keep Cloudflare's prefix cache (`ai-cache.md`).
 - The knowledge base (`brain-knowledge`, built 2026-10-09): `knowledge.search?q=words` and `knowledge.list`, in the owner's session; `knowledge.put` to enter. It is a D1 database of its own, `<base>-x-knowledge`, made on the first deploy and bound to that Worker alone. Removing the Worker does not drop the database. Files are not in it; an entry names its file in `brain-static`.
 - Snapshots (`brain-snapshot`, built 2026-10-09): each day at 06:00 UTC the Brain fetches its list of public feeds and keeps them at `/static/snapshot/<day>/<source>.json`, with `index.json` beside them and `/static/snapshot/days.json` for the days. `snapshot.run` as the owner runs it now and replaces today's files; `snapshot.setSources` changes the list. It writes no summary. From a checkout: `BRAIN_BASE=<base> bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.snapshot.run --owner -X POST`. `papers.json` beside the index is the day's papers that carry a signal (votes on Hugging Face, a link from a lab feed, a link from a blogger or aggregator item); `arxiv.json` is the whole list, for looking a paper up. The timed run drops days older than `keepDays` (90).
 - Files kept by date are named `<service>/<YYYY-MM-DD>/<name>`. `static.delete` with `{ prefix, before }` drops what is under a prefix that ends in `/` and was saved before a date; a Worker reaches only its own name, and nothing under `shell/` goes this way.
