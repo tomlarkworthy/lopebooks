@@ -42825,18 +42825,21 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braindashboard_anon_f2ae6bd4b8 = function _anonymous(md,metricTable,metricRules) {return (md`# brain-dashboard
+const _braindashboard_anon_bf068a1cd7 = function _anonymous(md,metricTable,metricRules,metricLimits) {return (md`# brain-dashboard
 
-A Cloud Brain recipe: metrics read from the lines this Brain's Workers already log. A metric is a definition that names a Worker, the \`at\` of its lines, a numeric field to add up (or none: the lines are counted) and the fields a query may group or filter by. Nothing is added to the Worker that writes the lines, and this service keeps nothing. Task 1 of \`plan/cloud-brain-dashboard-service.md\`; a member's metrics, dashboards and the memory of an answer are later tasks and are not here.
+A Cloud Brain recipe: metrics read from the lines this Brain's Workers already log. A metric is a definition that names a Worker, the \`at\` of its lines, a numeric field to add up (or none: the lines are counted) and the fields a query may group or filter by. Nothing is added to the Worker that writes the lines. The metrics of the Brain's own Workers are a value of this module; a member's are rows of this service. Tasks 1 and 2 of \`plan/cloud-brain-dashboard-service.md\`; dashboards and the memory of an answer are later tasks and are not here.
 
 | Method | Answers |
 |---|---|
-| \`GET metric.list\` | \`{ metrics }\`: the definitions, no data |
+| \`GET metric.list\` | \`{ metrics }\`: the definitions the caller may name, no data |
 | \`GET metric.query?metric=NAME&since=MS&until=MS&by=dim,dim&DIM=value\` | \`{ metric, since, until, step, groups, series }\`: one Cloudflare telemetry query (\`POST /accounts/ACCOUNT/workers/observability/telemetry/query\`, \`view: "calculations"\`) |
+| \`POST metric.put\` | a member's own. Body \`{ name, worker, at, value, dims }\`; answers \`{ metric }\`, the definition as kept. A name that is kept is written over |
+| \`POST metric.delete\` | a member's own. Body \`{ name }\`; answers \`{ deleted }\`, or 404 for a name that is not kept |
+| Storage | \`rows\`, key \`metric/<name>\`: a member's definition, \`{ name, worker, at, value, dims }\`. The member's DID is not kept |
 
 ## The metrics
 
-They are a value of this module (\`metricDefinitions\`) and no method writes one: adding a metric is a change to the seed.
+The metrics of the Brain's own Workers are a value of this module (\`metricDefinitions\`) and no method writes one: adding one is a change to the seed.
 
 | Name | Worker | Lines | Value | Dimensions |
 |---|---|---|---|---|
@@ -42846,7 +42849,7 @@ For a line of the deployer the Worker deployed is \`target\`; \`worker\` on it i
 
 ## A query
 
-\`since\` and \`until\` are times in milliseconds, \`since\` before \`until\`; with neither, the hour before now. \`by\` is a list of dimensions of the metric, joined with commas. Any other parameter is a filter and its name is a dimension: \`target=brain-x-git\`, \`status=502\`. A name that is not a dimension of the metric is answered 400, in \`by\` or as a filter, and Cloudflare is not asked.
+\`since\` and \`until\` are times in milliseconds, \`since\` before \`until\`; with neither, the hour before now, and with \`until\` alone the hour before it (an \`until\` under an hour is 400). \`by\` is a list of dimensions of the metric, joined with commas. Any other parameter is a filter and its name is a dimension: \`target=brain-x-git\`, \`status=502\`. A name that is not a dimension of the metric is answered 400, in \`by\` or as a filter, and Cloudflare is not asked.
 
 The caller sends no body of Cloudflare's. The service writes it (\`metricBody\`): the script of the definition's Worker (\`logsScope\` of brain-logs, with the Worker named), the line's \`at\`, the filters asked, \`groupBys\` of \`by\` with each dimension's type, a count, and for a metric with a value its sum and max; \`limit\` 500.
 
@@ -42866,10 +42869,46 @@ A row is one step and one group: \`t\` the step's time, the dimensions asked, \`
 |---|---|
 | \`metric.query\` | \`${metricRules.query}\` |
 | \`metric.list\` | \`${metricRules.list}\` |
+| \`metric.put\` | \`${metricRules.put}\` |
+| \`metric.delete\` | \`${metricRules.delete}\` |
 
 So \`core.calls\` is read by the owner in their own tab, as \`logs.query\` is. A token of the owner reads \`deploys.*\`: counts of what \`logs.deploys\` already gives it. The rule reads \`metric\` from the query string, and a call with none is refused for every caller but the owner in their tab. The owner changes the rule with \`rule.put\` and no deploy.
 
-A member (a caller that is a DID) is held in the service, whatever the rule says: \`metric.list\` answers them no definition, and \`metric.query\` answers 403 for every metric, the built-in ones included. A member's own metrics, named \`m.ID.NAME\`, are task 2. \`metric.list\` does not follow the rule of \`metric.query\`: a token is listed \`core.calls\` and is refused it.
+\`metric.list\` does not follow the rule of \`metric.query\`: a token is listed \`core.calls\` and is refused it.
+
+Whatever a rule has become, the service itself answers two kinds of caller and no other (\`metricTenant\`): the owner, with their tokens, and a member, a caller whose name starts \`did:\`. A Worker, a member's Worker included, and a stranger are answered 403 by every method.
+
+## A member's metrics
+
+A member's metric is named \`m.ID.NAME\` and is over a Worker \`brain-m-ID-SERVICE\`, where \`ID\` is the first ten hex digits of the SHA-256 of the member's DID (\`id\` of \`member.whoami\`; the same id as in the name of their Workers and their repositories). The service computes it from the caller on each call, and nothing a member sends changes it.
+
+\`\`\`js
+POST /xrpc/com.lopecode.brain.metric.put
+{ "name": "m.0123456789.errors",          // m.ID. and then 1 to 30 of a-z, 0-9 and -
+  "worker": "brain-m-0123456789-todo",    // brain-m-ID- and then the service's name, 1 to 20 of a-z and 0-9
+  "at": "todo.error",                     // the \`at\` of the lines, 1 to 100 characters
+  "value": null,                          // a field of the line that is a number, or null: the lines are counted
+  "dims": [{ "key": "kind" }, { "key": "code", "type": "number" }] }   // 8 at most
+\`\`\`
+
+A field's name, in \`value\` and in a \`key\`, is a letter or \`_\` and then up to 63 letters, digits, \`_\` and \`.\`. A \`key\` is not \`metric\`, \`since\`, \`until\` or \`by\`, which are parameters of a query. A member keeps ${metricLimits.kept} metrics.
+
+| A member's call | Answer |
+|---|---|
+| \`metric.put\` with a \`name\` that does not start \`m.ID.\` with their own id, or a \`worker\` that does not start \`brain-m-ID-\` with it | 403 |
+| \`metric.put\` with their own name and Worker and a definition that is not one, or a new name when ${metricLimits.kept} are kept | 400 |
+| \`metric.delete\` of a name that does not start \`m.ID.\` with their own id | 403 |
+| \`metric.query\` of a metric that does not start \`m.ID.\` with their own id: another member's, and every metric of the Brain's own Workers | 403, the same for a name that is kept and one that is not |
+| \`metric.query\` of their own name that is not kept | 404 |
+| \`metric.list\` | their own definitions and no other |
+
+The owner and their tokens are listed every definition, and are refused \`metric.put\` and \`metric.delete\` by the service (403): a metric written by the owner over a Worker of the Brain would give a token that Worker's lines under another name. The owner in their own tab reads a member's metric with \`metric.query\`, as they read every line with \`logs.query\`; a token does not, by the rule.
+
+What holds one member's counts from another: the script Cloudflare is asked for is the \`worker\` of the definition, a definition is kept only with a \`worker\` of the member who put it, and it is read only by that member's own name. A kept row whose \`worker\` is not its member's (no method writes one) is answered 500 and Cloudflare is not asked.
+
+**A member reaches these methods only when the owner granted them** (\`grant.put\` of each of the four for that DID): the kernel refuses a DID any method outside its own list before a rule is read.
+
+**No price.** Each \`metric.query\` is one query of Cloudflare's logs on the owner's account, and no method here has a price. What one such query costs was not found: Cloudflare prices Workers Logs by the lines written, and says a price for observability starts 2026-12-01 without giving it (read 2026-10-11, \`plan/cloud-brain-dashboard-service.md\`, "Read"). The core counts a member's Worker's calls for a day; a member's own call of a granted method was not found to be counted. What bounds a member today is the grant, which the owner takes back. The owner sets a price with no deploy: \`price.put { target: "com.lopecode.brain.metric.query", price: 'caller.kind == "did" ? 0.001 : 0.0' }\` would charge the account of a member's call a tenth of a cent a query (read in brain-core, \`priced\`, and not run; the number is an example, not a measure).
 
 ## The Cloudflare token
 
@@ -42877,7 +42916,7 @@ The service declares \`cloudflare: ["Workers Observability Read"]\`, as brain-lo
 
 ## Not known
 
-Whether Cloudflare samples a \`calculations\` answer over a long span, as it does a wide \`events\` query (brain-logs, "Whole, not sampled"). What Cloudflare answers for a span that starts before the 7 days it keeps. The shape of an answer with no \`by\`: the service reads a group with no \`groups\` as one row a step.`);};
+A member's call on a running Brain: every answer above is from the tests of this module, with the caller's name given to the service as the core gives it. Whether Cloudflare samples a \`calculations\` answer over a long span, as it does a wide \`events\` query (brain-logs, "Whole, not sampled"). What Cloudflare answers for a span that starts before the 7 days it keeps. The shape of an answer with no \`by\`: the service reads a group with no \`groups\` as one row a step.`);};
 const _braindashboard_metricDefinitions = function _metricDefinitions() {return ([
   { name: "core.calls", worker: "brain-core", at: "call", value: "ms", dims: [{ key: "worker" }, { key: "method" }, { key: "status", type: "number" }] },
   { name: "deploys.confirmed", worker: "brain-deployer", at: "deploy.confirmed", value: null, dims: [{ key: "target" }] },
@@ -42890,12 +42929,30 @@ const _braindashboard_metricTable = function _metricTable(metricDefinitions) {
 };
 const _braindashboard_metricRules = function _metricRules() {return ({
   query: 'caller.session || (caller.id == "owner" && request.params.metric.startsWith("deploys.")) || (caller.kind == "did" && request.params.metric.startsWith("m."))',
-  list: 'caller.session || caller.id == "owner" || caller.kind == "did"'
+  list: 'caller.session || caller.id == "owner" || caller.kind == "did"',
+  put: 'caller.kind == "did"',
+  delete: 'caller.kind == "did"'
+});};
+const _braindashboard_metricLimits = function _metricLimits() {return ({ kept: 50 });};
+const _braindashboard_metricTenant = function _metricTenant(sha256) {return (async (caller) => (caller === "owner" ? { id: "" } : /^did:/.test(caller || "") ? { id: (await sha256(caller)).slice(0, 10) } : null));};
+const _braindashboard_metricOwn = function _metricOwn() {return ((id, body) => {
+  const b = body && typeof body === "object" ? body : {};
+  const name = "m." + id + ".", worker = "brain-m-" + id + "-", field = /^[A-Za-z_][A-Za-z0-9_.]{0,63}$/;
+  if (typeof b.name !== "string" || !b.name.startsWith(name)) return { status: 403, error: `a member's metric is named ${name}NAME` };
+  if (typeof b.worker !== "string" || !b.worker.startsWith(worker)) return { status: 403, error: `a member's metric is over a Worker of their own, ${worker}SERVICE` };
+  if (!/^[a-z0-9-]{1,30}$/.test(b.name.slice(name.length))) return { status: 400, error: `name is ${name} and then 1 to 30 of a-z, 0-9 and -` };
+  if (!/^[a-z0-9]{1,20}$/.test(b.worker.slice(worker.length))) return { status: 400, error: `worker is ${worker} and then the service's name, 1 to 20 of a-z and 0-9` };
+  if (typeof b.at !== "string" || b.at.length < 1 || b.at.length > 100) return { status: 400, error: "at is the `at` of the lines, 1 to 100 characters" };
+  if (!(b.value == null || (typeof b.value === "string" && field.test(b.value)))) return { status: 400, error: "value is a field of the line that is a number, or null: the lines are counted" };
+  const dims = b.dims == null ? [] : b.dims;
+  const ok = (d) => d && typeof d === "object" && typeof d.key === "string" && field.test(d.key) && !["metric", "since", "until", "by"].includes(d.key) && (d.type == null || d.type === "string" || d.type === "number");
+  if (!Array.isArray(dims) || dims.length > 8 || !dims.every(ok) || new Set(dims.map((d) => d.key)).size !== dims.length) return { status: 400, error: 'dims is 8 at most of { key } or { key, type: "number" }, each key once; a key is a field of the line and not metric, since, until or by' };
+  return { def: { name: b.name, worker: b.worker, at: b.at, value: b.value == null ? null : b.value, dims: dims.map((d) => (d.type === "number" ? { key: d.key, type: "number" } : { key: d.key })) } };
 });};
 const _braindashboard_metricAsk = function _metricAsk() {return ((def, params, now) => {
   const given = (name, or) => (params.has(name) ? (/^\d{1,15}$/.test(params.get(name)) ? Number(params.get(name)) : NaN) : or);
   const until = given("until", now), since = given("since", until - 3600000);
-  if (!(since < until)) return { error: "since and until are times in milliseconds, since before until" };
+  if (!(since >= 0 && since < until)) return { error: "since and until are times in milliseconds, since before until" };
   const dims = new Map(def.dims.map((d) => [d.key, d.type || "string"]));
   const names = `the dimensions of ${def.name} are ${[...dims.keys()].join(", ")}`;
   const by = (params.get("by") || "").split(",").filter((k) => k !== "");
@@ -42943,19 +43000,42 @@ const _braindashboard_metricSeries = function _metricSeries() {return ((result, 
   if (def.value) field("sum", "sum"), field("max", "max");
   return { step: ((result && result.run) || {}).granularity || 60000, groups: (of("count").aggregates || []).length, series: [...rows.values()].filter((r) => r.n > 0).sort((a, b) => a.t - b.t) };
 });};
-const _braindashboard_dashboard_service = function _dashboard_service(cloudflare,Response,metricDefinitions,metricAsk,cloudflareApi,metricBody,config,metricSeries,metricRules) {return (cloudflare.Service(
+const _braindashboard_dashboard_service = function _dashboard_service(cloudflare,Response,metricTenant,rows,metricDefinitions,metricOwn,metricLimits,metricAsk,cloudflareApi,metricBody,config,metricSeries,metricRules) {return (cloudflare.Service(
   "dashboard",
   async (request, { caller }) => {
     const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
     const refuse = (status, error, message) => json(status, { error, message });
     const url = new URL(request.url), what = url.pathname.split("com.lopecode.brain.").pop();
-    // A member is held here, whatever the method's rule has become: no definition of the Brain's own Workers, and no data.
-    const member = String(caller).startsWith("did:");
-    if (request.method !== "GET" || !["metric.list", "metric.query"].includes(what)) return refuse(404, "MethodNotImplemented", "GET metric.list and GET metric.query");
-    if (what === "metric.list") return json(200, { metrics: member ? [] : metricDefinitions });
-    if (member) return refuse(403, "Forbidden", "a member reads no metric of the Brain's own Workers");
-    const def = metricDefinitions.find((d) => d.name === url.searchParams.get("metric"));
-    if (!def) return refuse(404, "NotFound", "metric is one of " + metricDefinitions.map((d) => d.name).join(", "));
+    const verbs = { "metric.list": "GET", "metric.query": "GET", "metric.put": "POST", "metric.delete": "POST" };
+    if (verbs[what] !== request.method) return refuse(404, "MethodNotImplemented", "GET metric.list, GET metric.query, POST metric.put, POST metric.delete");
+    // The tenant is held here, whatever a method's rule has become: a member reaches m.<their id>.… and nothing else.
+    const who = await metricTenant(caller);
+    if (!who) return refuse(403, "Forbidden", "metrics are for the owner and for a member");
+    const mine = who.id ? "m." + who.id + "." : null;
+    const kept = async (prefix) => (await rows.list("metric/" + prefix)).map((r) => r.value);
+    if (what === "metric.list") return json(200, { metrics: mine ? await kept(mine) : [...metricDefinitions, ...(await kept("m."))] });
+    if (what === "metric.put" || what === "metric.delete") {
+      if (!mine) return refuse(403, "Forbidden", "a member writes their own metrics; a metric of the Brain's own Workers is a value of the seed");
+      const body = await request.json().catch(() => null);
+      if (what === "metric.put") {
+        const own = metricOwn(who.id, body);
+        if (own.error) return refuse(own.status, own.status === 403 ? "Forbidden" : "InvalidRequest", own.error);
+        if (!(await rows.get("metric/" + own.def.name)) && (await kept(mine)).length >= metricLimits.kept) return refuse(400, "InvalidRequest", `a member keeps ${metricLimits.kept} metrics: delete one first`);
+        await rows.put("metric/" + own.def.name, own.def);
+        return json(200, { metric: own.def });
+      }
+      const name = body && typeof body.name === "string" ? body.name : "";
+      if (!name.startsWith(mine)) return refuse(403, "Forbidden", `a member deletes their own metrics, named ${mine}NAME`);
+      if (!(await rows.get("metric/" + name))) return refuse(404, "NotFound", `no metric ${name} is kept`);
+      await rows.delete("metric/" + name);
+      return json(200, { deleted: name });
+    }
+    const name = url.searchParams.get("metric") || "";
+    if (mine && !name.startsWith(mine)) return refuse(403, "Forbidden", `a member reads their own metrics, named ${mine}NAME`);
+    const def = metricDefinitions.find((d) => d.name === name) || (name.startsWith("m.") ? await rows.get("metric/" + name) : null);
+    if (!def) return refuse(404, "NotFound", mine ? `no metric ${name} is kept: metric.list names yours` : "metric is one of " + metricDefinitions.map((d) => d.name).join(", ") + ", or a member's (metric.list)");
+    // The script Cloudflare is asked for is the tenant: a kept definition is read only over a Worker of the member it is named for.
+    if (!metricDefinitions.includes(def) && !String(def.worker).startsWith("brain-m-" + name.split(".")[1] + "-")) return refuse(500, "InternalError", `the kept definition of ${name} is not over a Worker of its member`);
     const ask = metricAsk(def, url.searchParams, Date.now());
     if (ask.error) return refuse(400, "InvalidRequest", ask.error);
     const r = await cloudflareApi.fetch("/workers/observability/telemetry/query", { method: "POST", body: JSON.stringify(metricBody(def, ask, config.base)) });
@@ -42967,7 +43047,9 @@ const _braindashboard_dashboard_service = function _dashboard_service(cloudflare
     cloudflare: ["Workers Observability Read"],
     methods: {
       "com.lopecode.brain.metric.list": { type: "query", allow: metricRules.list },
-      "com.lopecode.brain.metric.query": { type: "query", allow: metricRules.query }
+      "com.lopecode.brain.metric.query": { type: "query", allow: metricRules.query },
+      "com.lopecode.brain.metric.put": { type: "procedure", allow: metricRules.put },
+      "com.lopecode.brain.metric.delete": { type: "procedure", allow: metricRules.delete }
     }
   }
 ));};
@@ -42976,7 +43058,7 @@ const _braindashboard_dashboard_announce = function _dashboard_announce(plugins,
   return "announced dashboard_service";
 };
 const _braindashboard_anon_be3d699220 = function _anonymous(md) {return (md`## Tests`);};
-const _braindashboard_dashboardRig = function _dashboardRig(simulate,dashboard_service,Response) {return (async (answer = () => ({ run: { granularity: 60000 }, calculations: [] })) => {
+const _braindashboard_dashboardRig = function _dashboardRig(simulate,dashboard_service,Response,sha256) {return (async (answer = () => ({ run: { granularity: 60000 }, calculations: [] })) => {
   const seen = [];
   const sim = await simulate(dashboard_service, {
     secrets: { CF_TOKEN: "minted-1", BRAIN_KEY: "k" },
@@ -42990,11 +43072,16 @@ const _braindashboard_dashboardRig = function _dashboardRig(simulate,dashboard_s
   });
   // A token of the owner unless told: the owner with no tab.
   const token = { "x-brain-caller": "owner", "x-brain-via": "delegation:b6559fa96c36", "x-brain-holder": "secret:loop-dashboard", "x-brain-tab": "0" };
-  const call = async (method, query = "", { headers = token, verb = "GET" } = {}) => {
-    const r = await sim.fetch("https://dashboard.internal/xrpc/com.lopecode.brain." + method + query, { method: verb, headers, ...(verb === "GET" ? {} : { body: "{}" }) });
+  const call = async (method, query = "", { headers = token, verb = "GET", body = {} } = {}) => {
+    const r = await sim.fetch("https://dashboard.internal/xrpc/com.lopecode.brain." + method + query, { method: verb, headers, ...(verb === "GET" ? {} : { body: JSON.stringify(body) }) });
     return { status: r.status, data: await r.json() };
   };
-  return { sim, seen, call };
+  // A member: their id, and their calls. `write` is a POST with a body, `read` a GET.
+  const member = async (did) => {
+    const headers = { "x-brain-caller": did }, id = (await sha256(did)).slice(0, 10);
+    return { did, id, write: (method, body) => call(method, "", { headers, verb: "POST", body }), read: (method, query = "") => call(method, query, { headers }) };
+  };
+  return { sim, seen, call, member };
 });};
 const _braindashboard_test_metric_query_sends_cloudflare_one_body_written_from_the_definition = async function _test_metric_query_sends_cloudflare_one_body_written_from_the_definition(dashboardRig,expect) {
   const H = 3600000, since = 1791676800000, until = since + H;
@@ -43059,8 +43146,12 @@ const _braindashboard_test_metric_rules_give_a_token_the_deploy_counts_and_the_o
   // The five callers of brain-logs' rule test: the owner in a tab, a token of the owner, a member, a Worker, a stranger.
   const callers = [{ caller: "owner", via: "session", tab: true }, { caller: "owner", via: "delegation:b6559fa96c36", holder: "secret:loop-dashboard", tab: false }, { caller: "did:plc:member" }, { caller: "worker:brain-x-echo" }, { caller: "anonymous" }];
   const may = (nsid, params) => callers.map((who) => decide({ allow: meta.access[nsid].allow }, { caller: callerOf(who), origin: callerOf(who), request: { params } }).allow);
-  const query = "com.lopecode.brain.metric.query", list = "com.lopecode.brain.metric.list";
-  expect(Object.entries(meta.access).map(([nsid, a]) => [nsid, a.type, a.allow])).toEqual([[list, "query", metricRules.list], [query, "query", metricRules.query]]);
+  const query = "com.lopecode.brain.metric.query", list = "com.lopecode.brain.metric.list", put = "com.lopecode.brain.metric.put", del = "com.lopecode.brain.metric.delete";
+  expect(Object.entries(meta.access).map(([nsid, a]) => [nsid, a.type, a.allow])).toEqual([[del, "procedure", metricRules.delete], [list, "query", metricRules.list], [put, "procedure", metricRules.put], [query, "query", metricRules.query]]);
+  // A write is a member's: not the owner in a tab, not a token.
+  expect(may(put, {})).toEqual([false, false, true, false, false]);
+  expect(may(del, {})).toEqual([false, false, true, false, false]);
+  expect([meta.access[query].price, meta.access[put].price]).toEqual([undefined, undefined]);
   expect(may(query, { metric: "core.calls" })).toEqual([true, false, false, false, false]);
   expect(may(query, { metric: "deploys.confirmed" })).toEqual([true, true, false, false, false]);
   expect(may(query, { metric: "deploys.put-back" })).toEqual([true, true, false, false, false]);
@@ -43071,7 +43162,7 @@ const _braindashboard_test_metric_rules_give_a_token_the_deploy_counts_and_the_o
   // With no metric the rule cannot be read: everyone but the owner in their tab is refused.
   expect(may(query, {})).toEqual([true, false, false, false, false]);
   expect(may(list, {})).toEqual([true, true, true, false, false]);
-  return "8 rows of 5 callers";
+  return "10 rows of 5 callers";
 };
 const _braindashboard_test_metric_query_refuses_what_the_definition_does_not_name = async function _test_metric_query_refuses_what_the_definition_does_not_name(dashboardRig,expect,metricDefinitions,Response) {
   const since = 1791676800000, until = since + 3600000, span = `&since=${since}&until=${until}`;
@@ -43083,16 +43174,18 @@ const _braindashboard_test_metric_query_refuses_what_the_definition_does_not_nam
     expect(await status("metric.query", "?metric=core.calls" + span + bad, owner)).toEqual(["?metric=core.calls" + span + bad, 400]);
   expect(await status("metric.query", "?metric=deploys.confirmed&by=worker" + span)).toEqual(["?metric=deploys.confirmed&by=worker" + span, 400]);
   // A span that is not one.
-  for (const bad of [`&since=${until}&until=${since}`, `&since=${since}&until=${since}`, "&since=yesterday", `&since=${since}&until=`, "&since=-5"])
+  // `until` alone under an hour would send Cloudflare a time before 1970 (a note of review 1502).
+  for (const bad of [`&since=${until}&until=${since}`, `&since=${since}&until=${since}`, "&since=yesterday", `&since=${since}&until=`, "&since=-5", "&until=5", "&until=3599999"])
     expect(await status("metric.query", "?metric=deploys.confirmed" + bad)).toEqual(["?metric=deploys.confirmed" + bad, 400]);
   // A metric that is not defined, and no metric.
   for (const none of ["?metric=deploys.reason", "?metric=m.x.y", "?metric=", "", "?metric=core.calls%20"]) expect(await status("metric.query", none + (none ? span : ""), owner)).toEqual([none + (none ? span : ""), 404]);
-  // No method writes a definition, for the owner or anyone: the service has two reads.
-  for (const [method, verb] of [["metric.put", "POST"], ["metric.put", "GET"], ["metric.delete", "POST"], ["metric.query", "POST"], ["metric.list", "POST"], ["dashboard.put", "POST"], ["logs.query", "POST"]])
-    expect([method, verb, (await rig.call(method, "?metric=x.y", { ...owner, verb })).status]).toEqual([method, verb, 404]);
+  // No method writes a definition for the owner: a read is a GET, a write is a member's (403), and there is no other method.
+  for (const [method, verb, status] of [["metric.put", "POST", 403], ["metric.delete", "POST", 403], ["metric.put", "GET", 404], ["metric.delete", "GET", 404], ["metric.query", "POST", 404], ["metric.list", "POST", 404], ["dashboard.put", "POST", 404], ["logs.query", "POST", 404]])
+    expect([method, verb, (await rig.call(method, "?metric=x.y", { ...owner, verb, body: { name: "core.mine", worker: "brain-core", at: "call", value: null, dims: [{ key: "caller" }] } })).status]).toEqual([method, verb, status]);
+  expect(rig.sim.rows.size).toBe(0);
   expect((await rig.call("metric.list", "", owner)).data).toEqual({ metrics: metricDefinitions });
   expect(metricDefinitions.map((d) => d.name)).toEqual(["core.calls", "deploys.confirmed", "deploys.put-back", "deploys.failed"]);
-  // A member is held in the service, should the rule ever pass one: no definition, and no data of any metric.
+  // A member with no metric of their own: no definition, and no data of any metric.
   const member = { headers: { "x-brain-caller": "did:plc:alicemember" } };
   expect(await rig.call("metric.list", "", member)).toEqual({ status: 200, data: { metrics: [] } });
   for (const name of ["deploys.confirmed", "core.calls", "m.x.y", ""]) expect(await status("metric.query", "?metric=" + name + span, member)).toEqual(["?metric=" + name + span, 403]);
@@ -43105,7 +43198,87 @@ const _braindashboard_test_metric_query_refuses_what_the_definition_does_not_nam
   expect(out.data.message).toContain("429");
   return "nothing sent to Cloudflare";
 };
-const _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_keeps_nothing = async function _test_dashboard_declares_one_cloudflare_permission_and_keeps_nothing(dashboard_service,expect,metricDefinitions,metricRules,logsScript) {
+const _braindashboard_test_a_member_keeps_and_reads_metrics_of_their_own_workers_and_no_others = async function _test_a_member_keeps_and_reads_metrics_of_their_own_workers_and_no_others(dashboardRig,expect,metricDefinitions) {
+  const since = 1791676800000, until = since + 3600000, span = `&since=${since}&until=${until}`;
+  const rig = await dashboardRig();
+  const alice = await rig.member("did:plc:alice"), bob = await rig.member("did:plc:bob");
+  const errors = (m, worker = "todo") => ({ name: `m.${m.id}.errors`, worker: `brain-m-${m.id}-${worker}`, at: "todo.error", value: null, dims: [{ key: "kind" }, { key: "code", type: "number" }] });
+  // Over another member's Worker: refused, under either name. Over their own: kept, as the definition a built-in one is.
+  expect((await alice.write("metric.put", { ...errors(alice), worker: `brain-m-${bob.id}-todo` })).status).toBe(403);
+  expect((await alice.write("metric.put", { ...errors(bob), worker: `brain-m-${alice.id}-todo` })).status).toBe(403);
+  expect((await alice.write("metric.put", errors(bob))).status).toBe(403);
+  expect(rig.sim.rows.size).toBe(0);
+  expect(await alice.write("metric.put", errors(alice))).toEqual({ status: 200, data: { metric: errors(alice) } });
+  expect((await alice.write("metric.put", { name: `m.${alice.id}.slow`, worker: `brain-m-${alice.id}-todo`, at: "todo.done", value: "ms" })).data).toEqual({ metric: { name: `m.${alice.id}.slow`, worker: `brain-m-${alice.id}-todo`, at: "todo.done", value: "ms", dims: [] } });
+  expect((await bob.write("metric.put", errors(bob, "shop"))).status).toBe(200);
+  expect([...rig.sim.rows.keys()].sort()).toEqual([`metric/m.${alice.id}.errors`, `metric/m.${alice.id}.slow`, `metric/m.${bob.id}.errors`].sort());
+  expect(rig.sim.rows.get(`metric/m.${alice.id}.errors`)).toEqual(errors(alice));
+  // The Brain's own Workers, a Worker that is not a member's, a name of the Brain's metrics: none is a member's to write.
+  for (const body of [{ ...errors(alice), worker: "brain-core" }, { ...errors(alice), worker: "brain-x-git" }, { ...errors(alice), worker: `brain-m-${alice.id}` }, { ...errors(alice), name: "deploys.mine" }, { ...errors(alice), name: "core.calls" }, { ...errors(alice), name: `m.${alice.id}` }, { ...errors(alice), name: `m.${alice.id.toUpperCase()}.x` }, {}, null, "m"])
+    expect([JSON.stringify(body), (await alice.write("metric.put", body)).status]).toEqual([JSON.stringify(body), 403]);
+  // A definition that is not one: 400.
+  const nine = Array.from({ length: 9 }, (_, i) => ({ key: "d" + i }));
+  for (const change of [{ name: `m.${alice.id}.` }, { name: `m.${alice.id}.A` }, { name: `m.${alice.id}.a.b` }, { name: `m.${alice.id}.${"a".repeat(31)}` }, { worker: `brain-m-${alice.id}-` }, { worker: `brain-m-${alice.id}-to-do` }, { worker: `brain-m-${alice.id}-${"a".repeat(21)}` }, { at: "" }, { at: 5 }, { at: "a".repeat(101) }, { value: 5 }, { value: "$workers.scriptName" }, { value: "a b" }, { dims: nine }, { dims: "kind" }, { dims: [{ key: "kind" }, { key: "kind" }] }, { dims: [{ key: "by" }] }, { dims: [{ key: "since" }] }, { dims: [{ key: "metric" }] }, { dims: [{ key: "$metadata.id" }] }, { dims: [{ key: "kind", type: "date" }] }, { dims: [null] }, { dims: ["kind"] }])
+    expect([JSON.stringify(change).slice(0, 60), (await alice.write("metric.put", { ...errors(alice), ...change })).status]).toEqual([JSON.stringify(change).slice(0, 60), 400]);
+  expect(rig.sim.rows.size).toBe(3);
+  // The list: a member their own and no other, the owner and their tokens every definition.
+  expect((await alice.read("metric.list")).data.metrics.map((d) => d.name)).toEqual([`m.${alice.id}.errors`, `m.${alice.id}.slow`]);
+  expect((await bob.read("metric.list")).data).toEqual({ metrics: [errors(bob, "shop")] });
+  expect((await rig.call("metric.list")).data.metrics.map((d) => d.name).sort()).toEqual([...metricDefinitions.map((d) => d.name), `m.${alice.id}.errors`, `m.${alice.id}.slow`, `m.${bob.id}.errors`].sort());
+  // A read: their own is one body to Cloudflare inside the script of their own Worker. Another member's, and every built-in one, is 403.
+  expect(rig.seen.length).toBe(0);
+  const own = await alice.read("metric.query", `?metric=m.${alice.id}.errors&by=kind&code=500` + span);
+  expect([own.status, own.data.metric, own.data.series]).toEqual([200, `m.${alice.id}.errors`, []]);
+  expect(rig.seen.length).toBe(1);
+  expect(rig.seen[0].body.parameters).toEqual({
+    datasets: ["cloudflare-workers"],
+    filterCombination: "and",
+    filters: [{ key: "$workers.scriptName", operation: "eq", type: "string", value: `cb4-m-${alice.id}-todo` }, { kind: "group", filterCombination: "and", filters: [{ key: "at", operation: "eq", type: "string", value: "todo.error" }, { key: "code", operation: "eq", type: "number", value: 500 }] }],
+    calculations: [{ operator: "count" }],
+    groupBys: [{ type: "string", value: "kind" }],
+    limit: 500
+  });
+  for (const name of [`m.${bob.id}.errors`, `m.${bob.id}.none`, "deploys.confirmed", "deploys.put-back", "core.calls", "m.", "m", "", `M.${alice.id}.errors`, `xm.${alice.id}.errors`])
+    expect([name, (await alice.read("metric.query", "?metric=" + name + span)).status]).toEqual([name, 403]);
+  expect((await alice.read("metric.query", span.replace("&", "?"))).status).toBe(403);
+  expect((await alice.read("metric.query", `?metric=m.${alice.id}.none` + span)).status).toBe(404);
+  expect((await alice.read("metric.query", `?metric=m.${alice.id}.errors&by=caller` + span)).status).toBe(400);
+  expect(rig.seen.length).toBe(1);
+  // The owner in their tab reads a member's metric by its name, as they read every line with logs.query.
+  const tab = { headers: { "x-brain-caller": "owner", "x-brain-via": "session", "x-brain-tab": "1" } };
+  expect((await rig.call("metric.query", `?metric=m.${bob.id}.errors` + span, tab)).status).toBe(200);
+  expect(rig.seen[1].body.parameters.filters[0].value).toBe(`cb4-m-${bob.id}-shop`);
+  // A delete: their own. Another member's is 403 and stays.
+  expect((await bob.write("metric.delete", { name: `m.${alice.id}.errors` })).status).toBe(403);
+  expect((await alice.write("metric.delete", { name: "deploys.confirmed" })).status).toBe(403);
+  expect((await alice.write("metric.delete", {})).status).toBe(403);
+  expect(rig.sim.rows.size).toBe(3);
+  expect(await alice.write("metric.delete", { name: `m.${alice.id}.errors` })).toEqual({ status: 200, data: { deleted: `m.${alice.id}.errors` } });
+  expect((await alice.write("metric.delete", { name: `m.${alice.id}.errors` })).status).toBe(404);
+  expect((await alice.read("metric.query", `?metric=m.${alice.id}.errors` + span)).status).toBe(404);
+  expect([...rig.sim.rows.keys()].sort()).toEqual([`metric/m.${alice.id}.slow`, `metric/m.${bob.id}.errors`].sort());
+  // Who is not a member writes nothing: the owner in their tab, a token, a member's Worker, a stranger, a DID spelled in capitals.
+  const callers = [tab.headers, undefined, { "x-brain-caller": `worker:brain-m-${alice.id}-todo` }, { "x-brain-caller": "anonymous" }, {}, { "x-brain-caller": "DID:plc:alice" }, { "x-brain-caller": "deployer" }];
+  for (const headers of callers) for (const method of ["metric.put", "metric.delete"])
+    expect([JSON.stringify(headers), method, (await rig.call(method, "", { ...(headers ? { headers } : {}), verb: "POST", body: errors(alice) })).status]).toEqual([JSON.stringify(headers), method, 403]);
+  // And who is neither the owner nor a member reads nothing, whatever the rule has become.
+  for (const headers of callers.slice(2)) for (const [method, query] of [["metric.list", ""], ["metric.query", "?metric=deploys.confirmed" + span], ["metric.query", `?metric=m.${bob.id}.errors` + span]])
+    expect([JSON.stringify(headers), method + query, (await rig.call(method, query, { headers })).status]).toEqual([JSON.stringify(headers), method + query, 403]);
+  expect(rig.sim.rows.size).toBe(2);
+  expect(rig.seen.length).toBe(2);
+  // 50 metrics a member: the 51st name is refused, a kept name is still written over.
+  for (let i = 0; i < 49; i++) rig.sim.rows.set(`metric/m.${alice.id}.n${i}`, { ...errors(alice), name: `m.${alice.id}.n${i}` });
+  expect((await alice.write("metric.put", { ...errors(alice), name: `m.${alice.id}.one-more` })).status).toBe(400);
+  expect((await alice.write("metric.put", { ...errors(alice), name: `m.${alice.id}.slow`, at: "todo.slow" })).status).toBe(200);
+  expect(rig.sim.rows.get(`metric/m.${alice.id}.slow`).at).toBe("todo.slow");
+  expect((await bob.write("metric.put", { ...errors(bob), name: `m.${bob.id}.second` })).status).toBe(200);
+  // A row that names a Worker which is not its member's (no method writes one) is not read from Cloudflare.
+  rig.sim.rows.set(`metric/m.${alice.id}.n0`, { ...errors(alice), name: `m.${alice.id}.n0`, worker: "brain-core" });
+  expect((await alice.read("metric.query", `?metric=m.${alice.id}.n0` + span)).status).toBe(500);
+  expect(rig.seen.length).toBe(2);
+  return "2 bodies sent to Cloudflare";
+};
+const _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows = async function _test_dashboard_declares_one_cloudflare_permission_and_its_rows(dashboard_service,expect,metricDefinitions,metricRules,metricLimits,logsScript) {
   const { meta, parts, source } = await dashboard_service.emit();
   expect(meta.worker).toBe("brain-x-dashboard");
   // The reference the Worker serves holds the first cell with its holes filled: a row a definition, and both rules.
@@ -43113,9 +43286,13 @@ const _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_keep
   for (const d of metricDefinitions) expect(source.reference).toContain("| `" + d.name + "` | `" + d.worker + "` |");
   expect(source.reference).toContain("| `metric.query` | `" + metricRules.query + "` |");
   expect(source.reference).toContain("| `metric.list` | `" + metricRules.list + "` |");
+  expect(source.reference).toContain("| `metric.put` | `" + metricRules.put + "` |");
+  expect(source.reference).toContain("| `metric.delete` | `" + metricRules.delete + "` |");
+  expect(source.reference).toContain("A member keeps " + metricLimits.kept + " metrics.");
   expect(source.reference).not.toMatch(/\$\{/);
   expect(meta.cloudflare).toEqual(["Workers Observability Read"]);
-  expect([meta.resources, meta.secrets, meta.calls]).toEqual([[], [], []]);
+  // Rows for a member's definitions, beside the Cloudflare token: the first service with both.
+  expect([meta.resources, meta.secrets, meta.calls]).toEqual([["rows"], [], []]);
   // The token is read from the binding the deployer made, and the script filter is brain-logs' own cell, carried into this Worker.
   expect(parts[0].text).toContain("__rt.platform.secrets.CF_TOKEN");
   expect(parts[0].text).toContain("$workers.scriptName");
@@ -43134,28 +43311,34 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braindashboard_anon_f2ae6bd4b8", null, ["md","metricTable","metricRules"], _braindashboard_anon_f2ae6bd4b8);
+  $def("_braindashboard_anon_bf068a1cd7", null, ["md","metricTable","metricRules","metricLimits"], _braindashboard_anon_bf068a1cd7);
   $def("_braindashboard_metricDefinitions", "metricDefinitions", [], _braindashboard_metricDefinitions);
   $def("_braindashboard_metricTable", "metricTable", ["metricDefinitions"], _braindashboard_metricTable);
   $def("_braindashboard_metricRules", "metricRules", [], _braindashboard_metricRules);
+  $def("_braindashboard_metricLimits", "metricLimits", [], _braindashboard_metricLimits);
+  $def("_braindashboard_metricTenant", "metricTenant", ["sha256"], _braindashboard_metricTenant);
+  $def("_braindashboard_metricOwn", "metricOwn", [], _braindashboard_metricOwn);
   $def("_braindashboard_metricAsk", "metricAsk", [], _braindashboard_metricAsk);
   $def("_braindashboard_metricBody", "metricBody", ["logsScope"], _braindashboard_metricBody);
   $def("_braindashboard_metricSeries", "metricSeries", [], _braindashboard_metricSeries);
-  $def("_braindashboard_dashboard_service", "dashboard_service", ["cloudflare","Response","metricDefinitions","metricAsk","cloudflareApi","metricBody","config","metricSeries","metricRules"], _braindashboard_dashboard_service);
+  $def("_braindashboard_dashboard_service", "dashboard_service", ["cloudflare","Response","metricTenant","rows","metricDefinitions","metricOwn","metricLimits","metricAsk","cloudflareApi","metricBody","config","metricSeries","metricRules"], _braindashboard_dashboard_service);
   $def("_braindashboard_dashboard_announce", "dashboard_announce", ["plugins","dashboard_service","invalidation"], _braindashboard_dashboard_announce);
   $def("_braindashboard_anon_be3d699220", null, ["md"], _braindashboard_anon_be3d699220);
-  $def("_braindashboard_dashboardRig", "dashboardRig", ["simulate","dashboard_service","Response"], _braindashboard_dashboardRig);
+  $def("_braindashboard_dashboardRig", "dashboardRig", ["simulate","dashboard_service","Response","sha256"], _braindashboard_dashboardRig);
   $def("_braindashboard_test_metric_query_sends_cloudflare_one_body_written_from_the_definition", "test_metric_query_sends_cloudflare_one_body_written_from_the_definition", ["dashboardRig","expect"], _braindashboard_test_metric_query_sends_cloudflare_one_body_written_from_the_definition);
   $def("_braindashboard_test_metric_rules_give_a_token_the_deploy_counts_and_the_owners_tab_the_rest", "test_metric_rules_give_a_token_the_deploy_counts_and_the_owners_tab_the_rest", ["dashboard_service","decide","callerOf","expect","metricRules"], _braindashboard_test_metric_rules_give_a_token_the_deploy_counts_and_the_owners_tab_the_rest);
   $def("_braindashboard_test_metric_query_refuses_what_the_definition_does_not_name", "test_metric_query_refuses_what_the_definition_does_not_name", ["dashboardRig","expect","metricDefinitions","Response"], _braindashboard_test_metric_query_refuses_what_the_definition_does_not_name);
-  $def("_braindashboard_test_dashboard_declares_one_cloudflare_permission_and_keeps_nothing", "test_dashboard_declares_one_cloudflare_permission_and_keeps_nothing", ["dashboard_service","expect","metricDefinitions","metricRules","logsScript"], _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_keeps_nothing);
+  $def("_braindashboard_test_a_member_keeps_and_reads_metrics_of_their_own_workers_and_no_others", "test_a_member_keeps_and_reads_metrics_of_their_own_workers_and_no_others", ["dashboardRig","expect","metricDefinitions"], _braindashboard_test_a_member_keeps_and_reads_metrics_of_their_own_workers_and_no_others);
+  $def("_braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows", "test_dashboard_declares_one_cloudflare_permission_and_its_rows", ["dashboard_service","expect","metricDefinitions","metricRules","metricLimits","logsScript"], _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("cloudflareApi", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflareApi", _));
+  main.define("rows", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("rows", _));
   main.define("config", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("config", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
   main.define("callerOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerOf", _));
+  main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
   main.define("module @tomlarkworthy/brain-logs", [], async () => runtime.module((await import("/@tomlarkworthy/brain-logs.js?v=4")).default));
   main.define("logsScope", ["module @tomlarkworthy/brain-logs","@variable"], (_, v) => v.import("logsScope", _));
   main.define("logsScript", ["module @tomlarkworthy/brain-logs","@variable"], (_, v) => v.import("logsScript", _));
