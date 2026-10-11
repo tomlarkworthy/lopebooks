@@ -35589,7 +35589,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainlogs_anon_d9bd6248bc = function _anonymous(md) {return (md`# brain-logs
+const _brainlogs_anon_397befcd80 = function _anonymous(md) {return (md`# brain-logs
 
 A Cloud Brain recipe: the logs of this Brain's Workers, read from Cloudflare Workers Logs. It keeps nothing and has no query language of its own. A body is passed to Cloudflare's telemetry API and the answer is returned as Cloudflare gave it, its errors and limits included.
 
@@ -35642,7 +35642,7 @@ A line is the deployer's own object and its time. What Cloudflare stores beside 
 
 **Whole, not sampled.** Cloudflare samples a wide \`events\` query: 5 of the \`deploy.verified\` lines of 2 days came back with \`statistics.abr_level: 10\`, where one-hour windows gave 35 for 3.5 of those hours with \`abr_level: 1\` (cb4, 2026-10-11). So \`deployLines\` asks for the span, and asks again for the two halves of any window whose answer has an \`abr_level\` other than 1 or as many lines as the limit of 2000. Halves share their middle and a line is kept once, by Cloudflare's id. A minute that is still not whole, or a span that needs more than 200 queries, is answered 502 and no lines.
 
-**What is counted** (\`deployRuns\`). A run is a \`deploy.verified\` or a \`deploy.failed\` line: the tests of one Worker at one hash, run by the deployer after a deploy. \`none\` and \`stale\` are runs that gave no verdict for the hash deployed, \`putBack\` every put-back, for a test or not. A line of \`tests\` is one test that failed in the span:
+**What is counted** (\`deployRuns\`). A run is a \`deploy.verified\` or a \`deploy.failed\` line: the tests of one Worker at one hash, run by the deployer after a deploy. A put-back whose reason starts \`its tests failed:\` with no \`deploy.failed\` line of that Worker and hash before it is a failed run as well, with the first test its reason names and no other: the put-back of brain-x-issues at 05:50:48 UTC on 2026-10-11 has no such line, its verdict came from a page. \`none\` and \`stale\` are runs that gave no verdict for the hash deployed, \`putBack\` every put-back, for a test or not. A line of \`tests\` is one test that failed in the span:
 
 | Field | Meaning |
 |---|---|
@@ -35707,13 +35707,20 @@ const _brainlogs_deployRuns = function _deployRuns() {return ((lines) => {
     if (!workers.has(l.target)) workers.set(l.target, { worker: l.target, runs: 0, verified: 0, failed: 0, none: 0, stale: 0, putBack: 0, hashes: [] });
     const w = workers.get(l.target);
     w[kind]++;
-    if (kind !== "verified" && kind !== "failed") continue;
-    w.runs++;
+    // A put-back on a test follows its deploy.failed line. One with none before it is a failed run too: the verdict
+    // came from a page and not from the deployer's own run, and the reason names the first test that failed.
+    const told = kind === "putBack" && /^its tests failed: /.test(String(l.reason));
+    if (kind !== "verified" && kind !== "failed" && !told) continue;
     let h = w.hashes.find((x) => x.hash === l.hash);
-    if (!h) w.hashes.push((h = { hash: l.hash, verified: 0, failed: 0, passed: [] }));
-    h[kind]++;
-    if (kind === "verified") h.passed.push(l.t);
-    else for (const test of Array.isArray(l.failed) ? l.failed : []) fails.push({ worker: l.target, test: String(test), hash: l.hash, t: l.t });
+    if (!h) w.hashes.push((h = { hash: l.hash, verified: 0, failed: 0, passed: [], unanswered: 0 }));
+    if (told && h.unanswered > 0) { h.unanswered--; continue; }
+    w.runs++;
+    if (kind === "verified") { h.verified++; h.passed.push(l.t); continue; }
+    h.failed++;
+    if (told) w.failed++;
+    else h.unanswered++;
+    const named = told ? (/^its tests failed: ([A-Za-z_$][\w$]*): /.exec(l.reason) || []).slice(1) : Array.isArray(l.failed) ? l.failed : [];
+    for (const test of named) fails.push({ worker: l.target, test: String(test), hash: l.hash, t: l.t });
   }
   const tests = new Map();
   for (const f of fails) {
@@ -35951,15 +35958,18 @@ const _brainlogs_test_deploy_runs_counts_by_worker_hash_and_failed_test = functi
   const line = (t, at, target, hash, more = {}) => ({ at, target, hash, t, ...more });
   const lines = [
     // The caret test of 2026-10-11: failed on one hash, passed on the next two. No pass on the hash it failed on.
-    line(10, "deploy.verify", "brain-x-issues", "i1"),
-    line(11, "deploy.failed", "brain-x-issues", "i1", { failed: ["test_caret"], otherTestsRan: 132, ms: 9000 }),
-    line(12, "deploy.put-back", "brain-x-issues", "i1", { previous: "i0", reason: "its tests failed: test_caret: no" }),
+    // Its put-back has no deploy.failed line before it, as on cb4 at 05:50:48 UTC: the put-back is the failed run.
+    line(11, "deploy.put-back", "brain-x-issues", "i1", { previous: "i0", reason: "its tests failed: test_caret: expect(received).toEqual(expected)\n\nDifference; test_other: no" }),
     line(20, "deploy.verified", "brain-x-issues", "i2", { tests: 21 }),
     line(30, "deploy.verified", "brain-x-issues", "i3", { tests: 21 }),
     // One hash that failed and then passed with no change: the only evidence of a flake these lines hold.
     line(40, "deploy.failed", "brain-x-snapshot", "s1", { failed: ["test_days", "test_redraw"] }),
     line(41, "deploy.verified", "brain-x-snapshot", "s1", { tests: 9 }),
+    // A failed run with its put-back, twice at one hash: two runs, not four.
     line(42, "deploy.failed", "brain-x-snapshot", "s2", { failed: ["test_redraw"] }),
+    line(43, "deploy.put-back", "brain-x-snapshot", "s2", { previous: "s1", reason: "its tests failed: test_redraw: no" }),
+    line(44, "deploy.failed", "brain-x-snapshot", "s2", { failed: ["test_redraw"] }),
+    line(45, "deploy.put-back", "brain-x-snapshot", "s2", { previous: "s1", reason: "its tests failed: test_redraw: no" }),
     // No verdict, a verdict for another hash, a put-back with no test run, and a line with no Worker.
     line(50, "deploy.verify.none", "brain-x-git", "g1", { reason: "the page left no verdict" }),
     line(51, "deploy.verify.stale", "brain-x-git", "g0", { running: "g1" }),
@@ -35972,12 +35982,12 @@ const _brainlogs_test_deploy_runs_counts_by_worker_hash_and_failed_test = functi
   expect(out.workers).toEqual([
     { worker: "brain-x-git", runs: 0, verified: 0, failed: 0, none: 1, stale: 1, putBack: 1, hashes: [] },
     { worker: "brain-x-issues", runs: 3, verified: 2, failed: 1, none: 0, stale: 0, putBack: 1, hashes: [{ hash: "i1", verified: 0, failed: 1 }, { hash: "i2", verified: 1, failed: 0 }, { hash: "i3", verified: 1, failed: 0 }] },
-    { worker: "brain-x-snapshot", runs: 3, verified: 1, failed: 2, none: 0, stale: 0, putBack: 0, hashes: [{ hash: "s1", verified: 1, failed: 1 }, { hash: "s2", verified: 0, failed: 1 }] }
+    { worker: "brain-x-snapshot", runs: 4, verified: 1, failed: 3, none: 0, stale: 0, putBack: 2, hashes: [{ hash: "s1", verified: 1, failed: 1 }, { hash: "s2", verified: 0, failed: 2 }] }
   ]);
   expect(out.tests).toEqual([
-    { worker: "brain-x-snapshot", test: "test_redraw", fails: 2, runs: 3, passedOnSameHash: 1, passedLater: 0, hashes: ["s1", "s2"], last: 42 },
+    { worker: "brain-x-snapshot", test: "test_redraw", fails: 3, runs: 4, passedOnSameHash: 1, passedLater: 0, hashes: ["s1", "s2"], last: 44 },
     { worker: "brain-x-issues", test: "test_caret", fails: 1, runs: 3, passedOnSameHash: 0, passedLater: 1, hashes: ["i1"], last: 11 },
-    { worker: "brain-x-snapshot", test: "test_days", fails: 1, runs: 3, passedOnSameHash: 1, passedLater: 0, hashes: ["s1"], last: 40 }
+    { worker: "brain-x-snapshot", test: "test_days", fails: 1, runs: 4, passedOnSameHash: 1, passedLater: 0, hashes: ["s1"], last: 40 }
   ]);
   expect(deployRuns([])).toEqual({ workers: [], tests: [] });
   return "3 Workers, 3 tests";
@@ -35988,7 +35998,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainlogs_anon_d9bd6248bc", null, ["md"], _brainlogs_anon_d9bd6248bc);
+  $def("_brainlogs_anon_397befcd80", null, ["md"], _brainlogs_anon_397befcd80);
   $def("_brainlogs_logsScript", "logsScript", [], _brainlogs_logsScript);
   $def("_brainlogs_logsScope", "logsScope", ["logsScript"], _brainlogs_logsScope);
   $def("_brainlogs_deployLines", "deployLines", ["logsScript","logsScope"], _brainlogs_deployLines);
