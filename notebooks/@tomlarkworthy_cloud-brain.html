@@ -19573,7 +19573,7 @@ const _cloudflareiac_serviceList = function _serviceList(htl,serviceRows,Inputs)
     body.replaceChildren(htl.html`${table}
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">${why}${apply}${again}<span style="color:var(--theme-foreground-muted)">${busy}</span></div>
       ${waiting.length ? htl.html`<div style="margin-top:6px;color:var(--theme-foreground-muted)">Waiting for approval: ${waiting.map((r) => r.worker).join(", ")}. ${brain && brain.deployerUrl ? htl.html`Approve on the <a href=${brain.deployerUrl} target="_blank" rel="noopener">deployer page</a>, then press Apply again.` : ""}</div>` : ""}
-      ${refused.map((r) => htl.html`<div style="margin-top:6px;color:#e5484d">${r.state === "refused" ? "Refused: " + r.reason : `${r.worker} failed its health check and was put back to ${short(r.previous)}. ${r.reason}`}</div>`)}`);
+      ${refused.map((r) => htl.html`<div style="margin-top:6px;color:#e5484d">${r.state === "refused" ? "Refused: " + r.reason : `${r.worker} was put back to ${short(r.previous)}: ${r.reason}`}</div>`)}`);
   };
   const refresh = async () => {
     emitted = await Promise.all(services.map((s) => s.emit().catch((e) => ({ name: s.name, error: String((e && e.message) || e) }))));
@@ -21734,9 +21734,10 @@ const _braindeployer_deployerAllows = function _deployerAllows() {return ((row) 
 const _braindeployer_anon_3508e33bff = function _anonymous(md) {return (md`## Probation
 
 One transition function for a Worker on probation, driven by the deployer's one-minute cron, by a passing verdict and by \`infra.confirm\`. Times are milliseconds.`);};
-const _braindeployer_nextKernelState = function _nextKernelState() {return ((s, event) => {
+const _braindeployer_probationDefaultMs = function _probationDefaultMs() {return (10 * 60 * 1000);};
+const _braindeployer_nextKernelState = function _nextKernelState(probationDefaultMs) {return ((s, event) => {
   // 10 minutes unless the deployer's config sets probationMs, which a test Brain does.
-  const PROBATION_MS = event.probationMs ?? 10 * 60 * 1000;
+  const PROBATION_MS = event.probationMs ?? probationDefaultMs;
   const span = PROBATION_MS % 60000 ? PROBATION_MS / 1000 + " seconds" : PROBATION_MS / 60000 + " minutes";
   if (s.state !== "probation") return s;
   if (event.type === "confirm") return { state: "confirmed", version: s.version, lastGood: s.version };
@@ -21802,7 +21803,7 @@ While a Worker is on probation a second deploy or a removal of it is refused: \`
 - \`overUnverified: true\` in the body of an \`infra.apply\` signed with the recovery key deploys over it, and writes \`deploy.over-unverified\`. It is for when what verifies is itself broken. The key alone does not do it, because \`brain.ts apply\` signs every call with the key; the CLI's flag is \`--over-unverified\`.
 
 Not measured on a Brain yet. On 2026-10-10 the page half was run in a local Chrome against cb4's address with the built modules substituted (\`tools/scratch/cloud-brain-experiments/verify-page/shell-check.ts\`, \`BUILT='*' ONLY=verify\`), once for each of the 19 Workers cb4 runs other than the kernel: 19 pass, 3 to 34 tests each, a verdict 1.4 to 2.6 s after load for 17, 7.0 s for brain-x-bluesky and 11.8 s for brain-x-browser. The deployer half is tested with a faked browser only.`);};
-const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log,Response,URLSearchParams,sha256,FormData,partsHash,deployerAllows,wrapperFlags,deployerDistil,nextKernelState) {
+const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log,Response,URLSearchParams,sha256,FormData,partsHash,deployerAllows,wrapperFlags,probationDefaultMs,deployerDistil,nextKernelState) {
   const text = (v) => JSON.stringify(v);
   const jsonType = { "content-type": "application/json" };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -22334,7 +22335,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
     const ks = await rows.get("kernelstate/" + logical);
     if (!ks || ks.state !== "probation") return null;
     if (recovery && over) return say({ at: "deploy.over-unverified", target: logical, hash: ks.hash, by: "recovery key" }), null;
-    const at = new Date(ks.since + (config.probationMs ?? 10 * 60 * 1000)).toISOString().slice(11, 19);
+    const at = new Date(ks.since + (config.probationMs ?? probationDefaultMs)).toISOString().slice(11, 19);
     return `${logical} is ${h12(ks.hash)} and not verified yet: its tests are running, and it is put back at ${at} if they have not passed. Deploy again after that.`;
   };
   // An approval is of one hash over one hash: it does not stand once the Worker has moved.
@@ -22675,7 +22676,7 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
     kernel: Object.fromEntries(
       (await rows.list("kernelstate/")).map(({ key, value }) => [
         key.slice("kernelstate/".length),
-        value.state === "probation" ? { ...value, deadline: value.since + (config.probationMs ?? 10 * 60 * 1000) } : value
+        value.state === "probation" ? { ...value, deadline: value.since + (config.probationMs ?? probationDefaultMs) } : value
       ])
     ),
     confirmed: Object.fromEntries((await rows.list("confirmed/")).map(({ key, value }) => [key.slice("confirmed/".length), value])),
@@ -23071,7 +23072,9 @@ const _braindeployer_deployerModules = function _deployerModules(distillerData,d
     return out;
   }
   if (own && own.text) out.push({ module: own.module, worker: "brain-deployer", hash: deployerOps.self.hash, text: own.text, files: {} });
-  for (const { key, value } of await rows.list("source/")) if (!value.stale) out.push({ module: key.slice("source/".length), worker: value.worker, hash: value.hash, text: value.text, files: value.files || {} });
+  // Not the source of a Worker that was removed: its row is kept, and nothing runs it.
+  const runs = new Set((await rows.list("worker/")).filter((r) => r.value && r.value.hash).map((r) => r.key.slice("worker/".length)));
+  for (const { key, value } of await rows.list("source/")) if (!value.stale && runs.has(value.worker)) out.push({ module: key.slice("source/".length), worker: value.worker, hash: value.hash, text: value.text, files: value.files || {} });
   return out;
 });};
 const _braindeployer_deployerDistil = function _deployerDistil(distilIn,quickjsLib,quickjs,distillerData) {return (async (request) => {
@@ -24311,7 +24314,10 @@ const _braindeployer_test_getModules_lists_what_the_deployer_owns_and_what_runs 
   // The key the deployer made for that Worker is not in the answer.
   expect(JSON.stringify(await list()).includes(rig.sim.rows.get("worker/brain-x-static").key)).toBe(false);
   expect((await rig.sim.fetch(U, { method: "POST" })).status).toBe(401);
-  return first.length + " then 3";
+  // A Worker that was removed: its source is kept and is not listed (18 such rows on cb4, 2026-10-10).
+  expect((await rig.recover({ remove: ["brain-x-static"] })).results[0].state).toBe("removed");
+  expect([rig.sim.rows.has("source/@tomlarkworthy/brain-static"), (await list()).length]).toEqual([true, 2]);
+  return first.length + " then 3, then 2";
 };
 const _braindeployer_deployer_probe_service = function _deployer_probe_service(cloudflare,Response) {return (cloudflare.Service("probe", async () => new Response("ok"), { methods: { "com.lopecode.brain.probe.ping": { type: "query", who: "anyone" } } }));};
 const _braindeployer_anon_3f4eb74132 = function _anonymous(md) {return (md`## A member's Worker
@@ -24472,11 +24478,12 @@ export default function define(runtime, observer) {
   $def("_braindeployer_anon_1af2f0356e", null, ["md"], _braindeployer_anon_1af2f0356e);
   $def("_braindeployer_deployerAllows", "deployerAllows", [], _braindeployer_deployerAllows);
   $def("_braindeployer_anon_3508e33bff", null, ["md"], _braindeployer_anon_3508e33bff);
-  $def("_braindeployer_nextKernelState", "nextKernelState", [], _braindeployer_nextKernelState);
+  $def("_braindeployer_probationDefaultMs", "probationDefaultMs", [], _braindeployer_probationDefaultMs);
+  $def("_braindeployer_nextKernelState", "nextKernelState", ["probationDefaultMs"], _braindeployer_nextKernelState);
   $def("_braindeployer_anon_17200b265d", null, ["md"], _braindeployer_anon_17200b265d);
   $def("_braindeployer_anon_e12ce2a2f9", null, ["md"], _braindeployer_anon_e12ce2a2f9);
   $def("_braindeployer_anon_cc66ae52c4", null, ["md"], _braindeployer_anon_cc66ae52c4);
-  $def("_braindeployer_deployerOps", "deployerOps", ["config","secrets","rows","log","Response","URLSearchParams","sha256","FormData","partsHash","deployerAllows","wrapperFlags","deployerDistil","nextKernelState"], _braindeployer_deployerOps);
+  $def("_braindeployer_deployerOps", "deployerOps", ["config","secrets","rows","log","Response","URLSearchParams","sha256","FormData","partsHash","deployerAllows","wrapperFlags","probationDefaultMs","deployerDistil","nextKernelState"], _braindeployer_deployerOps);
   $def("_braindeployer_anon_b5cfc17bdb", null, ["md"], _braindeployer_anon_b5cfc17bdb);
   $def("_braindeployer_deployerPage", "deployerPage", [], _braindeployer_deployerPage);
   $def("_braindeployer_deployerFn", "deployerFn", ["deployerOps","Response","deployerPage","secrets","deployerModules","rows","config","deployerDistil"], _braindeployer_deployerFn);
@@ -25785,13 +25792,16 @@ const _braincore_test_settings_are_stored_by_the_owner_and_sent_with_each_forwar
   expect((await rig.anonymous("config.get?worker=brain-x-conf")).status).toBe(401);
   await rig.owner("conf.go", {});
   expect(got.pop()).toEqual({});
-  const log = console.log;
-  console.log = (line) => void (line && line.at === "config" ? logged.push(line) : null);
+  // Lines given to console.log while a test listens. It is never put back: two tests that each put back the value
+  // they saved, out of order, left console.log as a function that kept every later line from everyone (2026-10-10).
+  const before = console.log;
+  let listening = true;
+  console.log = (...a) => (listening && a[0] && a[0].at === "config" && a[0].worker === "brain-x-conf" ? logged.push(a[0]) : null, before.apply(console, a));
   try {
     expect((await set(rig.owner, S)).data).toEqual({ ...S, old: null });
     expect((await set(rig.owner, { ...S, value: 45000 })).data).toEqual({ ...S, value: 45000, old: 60000 });
   } finally {
-    console.log = log;
+    listening = false;
   }
   expect(logged.map((l) => [l.worker, l.key, l.old, l.value, l.by])).toEqual([["brain-x-conf", "pollMs", null, 60000, "owner"], ["brain-x-conf", "pollMs", 60000, 45000, "owner"]]);
   await rig.owner("conf.go", {});
@@ -26853,7 +26863,7 @@ var Es=Object.defineProperty;var As=(e)=>e;function Ss(e,t){this[e]=As.bind(null
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainkernel_anon_2069e0dc56 = function _anonymous(md) {return (md`# brain-kernel
+const _brainkernel_anon_cff569ae76 = function _anonymous(md) {return (md`# brain-kernel
 
 The Worker at the Brain's address. It serves the notebook, signs people in with atproto, works out who is calling, and forwards everything else to the core with that answer attached.
 
@@ -26898,7 +26908,7 @@ A person is an atproto account, named by its DID. There are two roles. The **own
 
 **Other origins** (2026-10-10). No cookie is read, so any origin may call with a token and read the answer. A refusal is readable too: until 2026-10-10 an answer to a call with no \`authorization\` header carried no \`access-control-allow-origin\`, so a page with no key saw a network error where curl saw 401. A preflight is answered with the headers it asked for (\`access-control-request-headers\`), because a client library adds its own: the OpenAI one sends \`x-stainless-*\`. That holds when the names are letters, digits and \`-\`; a preflight that asks for any other (\`x_trace_id\`) is told \`authorization, content-type\` only, as every preflight was before. A page on another origin can read four headers of an answer: \`x-brain-price\`, \`x-ai-usd\`, \`x-ai-neurons\` and \`x-proxy-upstream\` (before 2026-10-10, the last only).
 
-With \`deploy: true\`, \`token.link\` makes a link whose token also calls \`infra.*\` as the owner's session does, and these four only: \`infra.apply\`, \`infra.getState\`, \`infra.redistil\` and \`infra.confirm\` (which ends the probation of a kernel, core or page it deployed). Not \`infra.shell\`: that puts HTML at \`/\` with no reason, no \`was\` and no approval, and the page at \`/\` runs where the owner's session is kept; so a program cannot renew the page's shell, and the owner does after it deploys the page. It deploys and removes any Worker of this Brain, the kernel among them. What holds a session's apply holds its apply: a reason, \`was\`, and approval on the deployer's page (which needs the recovery key) when deploys need approval. The token itself names no secret, token, grant or people method. That is a limit only while deploys need approval: with approval off it can deploy a kernel of its own writing, and the kernel is what names the caller, so the token is then the owner in effect. Only a link makes such a token, so it always ends, in 24 hours at most; \`token.create\` cannot. Each call is logged by the kernel as \`infra.by.link\` with \`d:\` and the id of the token's delegation. Tom, 2026-10-09: "I do want singin links to be able to deploy with the authority of me".
+With \`deploy: true\`, \`token.link\` makes a link whose token also calls \`infra.*\` as the owner's session does, and these three only: \`infra.apply\`, \`infra.getState\` and \`infra.redistil\`. Not \`infra.confirm\` since 2026-10-11: it would keep its own deploy with no test run, and the deployer verifies a deploy itself. Not \`infra.shell\`: that puts HTML at \`/\` with no reason, no \`was\` and no approval, and the page at \`/\` runs where the owner's session is kept; so a program cannot renew the page's shell, and the owner does after it deploys the page. It deploys and removes any Worker of this Brain, the kernel among them. What holds a session's apply holds its apply: a reason, \`was\`, and approval on the deployer's page (which needs the recovery key) when deploys need approval. The token itself names no secret, token, grant or people method. That is a limit only while deploys need approval: with approval off it can deploy a kernel of its own writing, and the kernel is what names the caller, so the token is then the owner in effect. Only a link makes such a token, so it always ends, in 24 hours at most; \`token.create\` cannot. Each call is logged by the kernel as \`infra.by.link\` with \`d:\` and the id of the token's delegation. Tom, 2026-10-09: "I do want singin links to be able to deploy with the authority of me".
 
 With \`unattended: true\` beside \`deploy: true\` (added 2026-10-09), nothing that token applies, removes or redistils waits for approval, a Worker that declares Cloudflare permissions among them, so it changes which Cloudflare token a Worker is minted; the deployer logs \`by: token:NAME\`. It also reaches \`infra.shell\`. Such a token is the owner in effect for as long as it lasts: it can deploy a kernel of its own writing with nobody asked. What bounds it: it ends (8 hours unless said, 24 at most), \`token.revoke\` ends it, every change is logged with its reason, \`was\` holds, and the deployer mints only the groups in its \`GROUPS\`. Tom, 2026-10-09: "I would like LLMs to be able to deploy without approval and also choose what services they have".
 
@@ -27289,7 +27299,7 @@ const _brainkernel_kernelApp = function _kernelApp(hono,Response,secrets,config,
   const full = (m) => (m.startsWith("com.") ? m : "com.lopecode.brain." + m);
   // What the token of a sign-in link made with deploy reaches of infra. Not infra.shell: it puts HTML at / with no
   // reason, no was and no approval, and that page runs where the owner's session is kept.
-  const DEPLOYS = ["apply", "getState", "redistil", "confirm"].map((m) => "com.lopecode.brain.infra." + m);
+  const DEPLOYS = ["apply", "getState", "redistil"].map((m) => "com.lopecode.brain.infra." + m);
   // A link made to deploy with no approval can deploy a kernel with nobody asked, so keeping the page at / from it
   // would keep nothing: it reaches infra.shell too, and finishes a deploy of the page.
   const deploys = (who) => (who.unattended ? [...DEPLOYS, "com.lopecode.brain.infra.shell"] : DEPLOYS);
@@ -27360,7 +27370,7 @@ spend) when the owner set one, and that command keeps it in a file of
 mode 600 in a temporary directory without printing it. The link then stops working. Keep the token there, outside
 any repository. Send it as "Authorization: Bearer <token>", e.g. $(jq -r .token <that file>). It calls
 the methods in \`methods\` and no others, until \`until\` (milliseconds). With "deploy": true in the answer it also
-calls infra.apply, infra.getState, infra.redistil and infra.confirm as the owner does: it deploys and removes this
+calls infra.apply, infra.getState and infra.redistil as the owner does: it deploys and removes this
 Brain's Workers. With "unattended": true nothing it deploys waits for the owner, and it calls infra.shell too. /llms.txt says how.
 With "unattended": true its calls to the methods that \`methods\` names by a name or a prefix are made as the owner's
 own tab. A method that only "*" reaches is not: such a call is refused where the owner's own session is asked for.
@@ -28082,18 +28092,21 @@ const _brainkernel_test_tokens_reach_only_their_methods = async function _test_t
   const dep = (await rig.call("token.link", { session: rig.owner, body: { name: "dep", methods: [], deploy: true } })).data;
   const ship = (await rig.call(dep.link.slice(dep.link.indexOf("/auth/link")), { method: "POST" })).data;
   expect([ship.deploy, web.deploy]).toEqual([true, false]);
+  // Lines given to console.log while a test listens. It is never put back: two tests that each put back the value
+  // they saved, out of order, left console.log as a function that kept every later line from everyone (2026-10-10).
   const lines = [], was = console.log;
-  console.log = (line) => lines.push(line);
+  let listening = true;
+  console.log = (...a) => (listening && lines.push(a[0]), was.apply(console, a));
   try {
     expect((await rig.call("infra.getState", { bearer: ship.token })).status).toBe(200);
   } finally {
-    console.log = was;
+    listening = false;
   }
   // The kernel says which token it was: the deployer is told the owner.
   expect(lines.filter((l) => typeof l === "string" && l.includes("infra.by.link")).map((l) => JSON.parse(l)).map((l) => [l.event, l.token, l.method])).toEqual([["infra.by.link", "d:" + [...rig.held.values()].find((d) => d.name === "dep").id, "infra.getState"]]);
-  for (const m of ["infra.confirm", "infra.redistil"]) expect((await rig.call(m, { bearer: ship.token, body: {} })).status).toBe(200);
-  // Not the page at /, and no other infra name.
-  for (const m of ["infra.shell", "infra.distil", "infra.rollback"]) expect((await rig.call(m, { bearer: ship.token, body: {} })).status).toBe(403);
+  for (const m of ["infra.redistil"]) expect((await rig.call(m, { bearer: ship.token, body: {} })).status).toBe(200);
+  // Not the page at /, not a confirm of its own deploy, and no other infra name.
+  for (const m of ["infra.shell", "infra.confirm", "infra.distil", "infra.rollback"]) expect((await rig.call(m, { bearer: ship.token, body: {} })).status).toBe(403);
   expect((await rig.call("infra.apply", { bearer: ship.token, body: { workers: [], reason: "a test" } })).status).toBe(200);
   expect(rig.toDeployer.at(-1).headers["x-brain-caller"]).toBe("owner");
   for (const m of ["secret.get", "token.list", "people.list", "inbox.list"]) expect((await rig.call(m, { bearer: ship.token })).status).toBe(403);
@@ -28118,9 +28131,11 @@ const _brainkernel_test_tokens_reach_only_their_methods = async function _test_t
   expect((await rig.call("token.link", { session: rig.owner, body: { name: "bad", methods: ["pro*"] } })).status).toBe(400);
   const wide = (await rig.call("token.link", { session: rig.owner, body: { name: "wide", methods: ["proxy.*", "logs.query"], deploy: true, unattended: true } })).data;
   const all = (await rig.call(wide.link.slice(wide.link.indexOf("/auth/link")), { method: "POST" })).data;
+  // Never put back, for the reason given in the test above.
   const said = [], plain = console.log;
-  console.log = (...a) => said.push(a[0]);
-  try { expect((await rig.call("proxy.fetch", { bearer: all.token, body: {} })).status).toBe(200); } finally { console.log = plain; }
+  let hearing = true;
+  console.log = (...a) => (hearing && said.push(a[0]), plain.apply(console, a));
+  try { expect((await rig.call("proxy.fetch", { bearer: all.token, body: {} })).status).toBe(200); } finally { hearing = false; }
   // No rewrite and no line of the kernel's: the core reads the cap session from the row, and its line has the id.
   expect(said.filter((l) => typeof l === "string" && l.includes("call.by.link"))).toEqual([]);
   expect([rig.seen.at(-1).headers["x-brain-caller"], rig.seen.at(-1).headers["x-brain-via"], rig.seen.at(-1).headers["x-brain-delegation"]]).toEqual(["owner", "token", [...rig.held.values()].find((d) => d.name === "wide").id]);
@@ -28822,7 +28837,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainkernel_anon_2069e0dc56", null, ["md"], _brainkernel_anon_2069e0dc56);
+  $def("_brainkernel_anon_cff569ae76", null, ["md"], _brainkernel_anon_cff569ae76);
   $def("_brainkernel_kernel_service", "kernel_service", ["cloudflare","kernelApp"], _brainkernel_kernel_service);
   $def("_brainkernel_kernel_announce", "kernel_announce", ["plugins","kernel_service","invalidation"], _brainkernel_kernel_announce);
   $def("_brainkernel_atcute", "atcute", ["library","FileAttachment"], _brainkernel_atcute);
