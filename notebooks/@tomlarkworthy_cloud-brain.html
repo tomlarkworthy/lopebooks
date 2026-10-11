@@ -44106,7 +44106,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainfeedback_anon_7291dc6f7f = function _anonymous(md) {return (md`# brain-feedback
+const _brainfeedback_anon_b8b22ee0f1 = function _anonymous(md) {return (md`# brain-feedback
 
 Feedback about the Brain's page, written on the page. A note placed with \`@tomlarkworthy/annotate\` is filed as a \`feedback\` issue of \`brain-issues\`, and from then on the note shows that issue.
 
@@ -44116,9 +44116,10 @@ Feedback about the Brain's page, written on the page. A note placed with \`@toml
 | Start one | The page menu, Annotate, Feedback; or select text and press the chip \`feedback\`. Click what the note is about, write, press **File**. |
 | What is filed | \`issue.open\` with kind \`feedback\`, the label \`annotation\`, the id \`fb-<note id>\`, the first line as the title, and \`about\` the Worker whose module was clicked (\`brain\` when it is none). The body is the text, one sentence that says where, and the anchor as JSON in a fence named \`annotation\`. |
 | On page load | \`issue.list?label=annotation\`, then \`issue.get\` for each, and a note is placed for each at its anchor. Asked again every 30 s while the tab is visible; an issue is read again only when its \`updated_at\` moved. |
-| Progress | The note shows the state, what the issue is part of or linked to, and the last comment, move or review with who wrote it. |
-| Done | When the issue is closed the note reads **Done** with the reason, and has **Remove**. |
-| Remove | On a closed issue, Remove (or the note's own ×) takes the label \`annotation\` off with \`issue.label\`, so no page loads the note again. The issue stays in the record. On an open issue the × hides the note until the page is loaded again. A note not yet filed is deleted. |
+| Progress | The note shows the state, what the issue is part of or linked to with the state of each, and the last comment, move or review with who wrote it. |
+| Gathered | The loop closes a feedback issue when it has made it part of a project or linked it to another issue, which is before the work is done. Such a note reads **gathered**, follows those issues (\`feedbackFollows\`: its parent, and each issue it says a link of), and has no Remove. They are not in the list, so each is read with \`issue.get\` on every ask. One step: an issue they are part of in turn is not followed. |
+| Done | The note reads **Done**, and has **Remove**, when the issue is closed and so is every issue it follows. The reason shown is the one each of those was closed with, after its id and state (\`proj done: …\`, \`proj rejected: …\`); the issue's own when it follows none. |
+| Remove | On a done issue, Remove (or the note's own ×) takes the label \`annotation\` off with \`issue.label\`, so no page loads the note again. The issue stays in the record. On an open or gathered issue the × hides the note until the page is loaded again. A note not yet filed is deleted. |
 
 No Worker and no table: the record is the issue. The label is the switch, so anyone who may label can take a note off every page; the loop's briefs say not to.
 
@@ -44145,16 +44146,23 @@ const _brainfeedback_feedbackParse = function _feedbackParse(feedbackLimits) {re
     return null;
   }
 });};
-const _brainfeedback_feedbackProgress = function _feedbackProgress() {return ((ticket) => {
+const _brainfeedback_feedbackFollows = function _feedbackFollows() {return ((issue) => (issue && issue.closed ? [...new Set([issue.parent, ...(issue.links || []).map((l) => l.to)].filter(Boolean))] : []));};
+const _brainfeedback_feedbackProgress = function _feedbackProgress(feedbackFollows) {return ((ticket, followed = []) => {
   const { issue, events = [] } = ticket;
   const who = (by = {}) => (String(by.holder || "").startsWith("secret:") ? by.holder.slice(7).replace(/^issues-/, "") : by.caller || "");
   const said = (e) => e.body || e.reason || (e.type === "linked" ? `${e.remove ? "no longer " : ""}${e.rel}${e.to ? " " + e.to : ""}` : e.type === "swapped" ? "moved to another workflow" : "");
-  const last = [...events].reverse().find((e) => e.type !== "opened" && said(e));
-  const closing = [...events].reverse().find((e) => e.type === "moved" && e.to === issue.state);
-  const links = [issue.parent && `part of ${issue.parent}`, ...(issue.links || []).map((l) => `${l.rel} ${l.to}`)].filter(Boolean);
-  return { state: issue.state, closed: !!issue.closed, links, reason: issue.closed && closing ? closing.reason || "" : "", last: last ? { who: who(last.by), at: last.at, type: last.type, text: said(last) } : null };
+  const lastOf = (t) => [...(t.events || [])].reverse().find((e) => e.type !== "opened" && said(e));
+  const reasonOf = (t) => ((e) => (e ? e.reason || "" : ""))([...(t.events || [])].reverse().find((e) => e.type === "moved" && e.to === t.issue.state));
+  const follows = feedbackFollows(issue), read = (id) => followed[follows.indexOf(id)];
+  const stateOf = (id) => ((t) => (t ? `: ${t.issue.state}` : ""))(read(id));
+  const done = !!issue.closed && follows.every((id) => read(id) && read(id).issue.closed), gathered = !!issue.closed && !done;
+  const links = [issue.parent && `part of ${issue.parent}${stateOf(issue.parent)}`, ...(issue.links || []).map((l) => `${l.rel} ${l.to}${stateOf(l.to)}`)].filter(Boolean);
+  // The later of the issue's own last event and those of the issues it is followed in, which is named.
+  const last = [[null, lastOf(ticket)], ...follows.map((id) => [id, read(id) && lastOf(read(id))])].filter(([, e]) => e).sort((x, y) => y[1].at - x[1].at)[0];
+  const reason = !done ? "" : follows.length ? follows.map((id) => `${id} ${read(id).issue.state}${reasonOf(read(id)) ? ": " + reasonOf(read(id)) : ""}`).join("\n") : reasonOf(ticket);
+  return { state: issue.state, closed: !!issue.closed, done, gathered, links, reason, last: last ? { who: who(last[1].by), at: last[1].at, type: last[1].type, text: (last[0] ? last[0] + ": " : "") + said(last[1]) } : null };
 });};
-const _brainfeedback_feedbackApp = function _feedbackApp(feedbackLimits,htl,feedbackProgress,feedbackParse,feedbackBody) {return (({ client, store, about = () => "brain", near = () => "", limits = feedbackLimits }) => {
+const _brainfeedback_feedbackApp = function _feedbackApp(feedbackLimits,feedbackProgress,feedbackFollows,htl,feedbackParse,feedbackBody) {return (({ client, store, about = () => "brain", near = () => "", limits = feedbackLimits }) => {
   // tickets: issue id to what issue.get answered. of: note id to issue id. hidden: open issues whose note was closed here.
   const tickets = new Map(), of = new Map(), els = new Map(), drafts = new Map(), says = new Map(), hidden = new Set(), filing = new Set();
   let busy = false;
@@ -44166,6 +44174,7 @@ const _brainfeedback_feedbackApp = function _feedbackApp(feedbackLimits,htl,feed
   };
   const cut = (s, n) => (String(s).length > n ? String(s).slice(0, n) + "…" : String(s));
   const has = async (id) => (await store.refresh(), !!store.get(id));
+  const progress = (t) => feedbackProgress(t, feedbackFollows(t.issue).map((f) => tickets.get(f)));
   const view = (id) => {
     const iss = of.get(id), t = iss && tickets.get(iss), muted = "color:var(--theme-foreground-muted)";
     if (!iss) {
@@ -44174,13 +44183,13 @@ const _brainfeedback_feedbackApp = function _feedbackApp(feedbackLimits,htl,feed
       return htl.html`<div data-feedback="draft">${box}<div style="display:flex;gap:8px;align-items:center;margin-top:4px"><button onclick=${() => file(id)}>File</button><span style=${muted}>${says.get(id) || "Filed as a feedback issue."}</span></div></div>`;
     }
     if (!t) return htl.html`<div data-feedback="filing" style=${muted}>${iss}…</div>`;
-    const p = feedbackProgress(t), w = feedbackParse(t.issue.body);
-    return htl.html`<div data-feedback=${p.closed ? "done" : "open"} style=${"border-left:3px solid " + (p.closed ? "#2a9d4b" : "var(--theme-foreground-faint)") + ";padding-left:8px"}>
-      <div><b>${p.closed ? "Done" : p.state}</b> <code>${iss}</code></div>
+    const p = progress(t), w = feedbackParse(t.issue.body);
+    return htl.html`<div data-feedback=${p.done ? "done" : p.gathered ? "gathered" : "open"} style=${"border-left:3px solid " + (p.done ? "#2a9d4b" : "var(--theme-foreground-faint)") + ";padding-left:8px"}>
+      <div><b>${p.done ? "Done" : p.gathered ? "gathered" : p.state}</b> <code>${iss}</code></div>
       <div style="white-space:pre-wrap">${cut(w ? w.text : t.issue.title, limits.shown)}</div>
       ${p.links.length ? htl.html`<div style=${muted}>${p.links.join("; ")}</div>` : ""}
-      ${p.closed && p.reason ? htl.html`<div data-feedback-reason style="white-space:pre-wrap">${cut(p.reason, limits.shown)}</div>` : p.last ? htl.html`<div data-feedback-last style=${muted + ";white-space:pre-wrap"}>${p.last.who}, ${new Date(p.last.at).toLocaleString()}: ${cut(p.last.text, limits.shown)}</div>` : ""}
-      ${p.closed ? htl.html`<div style="display:flex;gap:8px;align-items:center;margin-top:4px"><button onclick=${() => remove(id)}>Remove</button><span style=${muted}>${says.get(id) || ""}</span></div>` : ""}
+      ${p.done && p.reason ? htl.html`<div data-feedback-reason style="white-space:pre-wrap">${cut(p.reason, limits.shown)}</div>` : p.last ? htl.html`<div data-feedback-last style=${muted + ";white-space:pre-wrap"}>${p.last.who}, ${new Date(p.last.at).toLocaleString()}: ${cut(p.last.text, limits.shown)}</div>` : ""}
+      ${p.done ? htl.html`<div style="display:flex;gap:8px;align-items:center;margin-top:4px"><button onclick=${() => remove(id)}>Remove</button><span style=${muted}>${says.get(id) || ""}</span></div>` : ""}
     </div>`;
   };
   const draw = (id) => els.get(id) && els.get(id).replaceChildren(view(id));
@@ -44211,6 +44220,8 @@ const _brainfeedback_feedbackApp = function _feedbackApp(feedbackLimits,htl,feed
     try {
       const listed = (await client.query("issue.list", { label: limits.label, limit: 200 })).issues.filter((i) => !i.hidden);
       for (const i of listed) if (!tickets.has(i.id) || tickets.get(i.id).issue.updated_at !== i.updated_at) await get(i.id);
+      // What a closed one is followed in is not listed here, so nothing says it moved: each is read on every ask.
+      for (const f of new Set(listed.flatMap((i) => feedbackFollows(tickets.get(i.id).issue)))) await get(f).catch(() => tickets.delete(f));
       const placed = new Set(of.values()), ids = new Set(listed.map((i) => i.id));
       for (const i of listed) {
         const where = !placed.has(i.id) && !hidden.has(i.id) && feedbackParse(tickets.get(i.id).issue.body);
@@ -44233,7 +44244,7 @@ const _brainfeedback_feedbackApp = function _feedbackApp(feedbackLimits,htl,feed
     }
   };
   // Run when the page's notes change. A filed note that is no longer a cell was removed by the reader: when its
-  // issue is closed the label comes off, and no page loads it again.
+  // issue is done (feedbackProgress) the label comes off, and no page loads it again.
   const gone = async () => {
     for (const [id, iss] of [...of]) {
       if (await has(id)) continue;
@@ -44241,7 +44252,7 @@ const _brainfeedback_feedbackApp = function _feedbackApp(feedbackLimits,htl,feed
       els.delete(id);
       const t = tickets.get(iss);
       if (!t) continue;
-      if (!t.issue.closed) hidden.add(iss);
+      if (!progress(t).done) hidden.add(iss);
       else {
         tickets.delete(iss);
         await client.procedure("issue.label", { key: `annotation/${iss}/removed`, id: iss, remove: [limits.label] }).catch((e) => console.warn("brain-feedback: issue.label was refused: " + e.message));
@@ -44424,6 +44435,54 @@ const _brainfeedback_test_feedback_done_then_remove_takes_the_label_off = async 
   expect(rig.store.all().map((a) => a.issue)).toEqual(["fb-open"]);
   return "a closed issue reads Done with its reason; Remove takes the label off once; an open one comes back on the next load";
 };
+const _brainfeedback_test_feedback_a_gathered_note_follows_what_it_is_part_of = async function _test_feedback_a_gathered_note_follows_what_it_is_part_of(feedbackRig,feedbackBody,expect,feedbackProgress,feedbackFollows) {
+  const rig = feedbackRig(), anchor = { cell: "services", surface: "element", frac: { fx: 0.1, fy: 0.2 } };
+  await rig.client.procedure("issue.open", { id: "fb-dash", title: "Dashboards", body: feedbackBody("we should have a better abstraction for dashboards", { anchor }), kind: "feedback", about: "brain", labels: ["annotation"] });
+  await rig.client.procedure("issue.open", { id: "proj", title: "Dashboards share a series", body: "a spec", kind: "project", about: "brain", labels: [] });
+  rig.say("proj", { type: "moved", from: "open", to: "spec-review", reason: "The spec is written." }, { state: "spec-review" });
+  rig.say("fb-dash", { type: "moved", from: "open", to: "closed", reason: "In the spec of a-name-that-was-refused." }, { state: "closed", closed: true });
+  rig.say("fb-dash", { type: "linked", rel: "part-of", to: "proj" }, { parent: "proj" });
+  rig.say("fb-dash", { type: "commented", body: "The project is proj." });
+  const app = rig.app();
+  await app.sync();
+  const id = [...app.of.keys()][0], el = app.note(id), labels = () => rig.calls.filter((c) => c[0] === "issue.label").length;
+  const reads = (from) => rig.calls.slice(from).map((c) => c[0] + (c[1].id ? " " + c[1].id : ""));
+  // Closed, and the project it is part of is not: not Done, no Remove, and the project's state is what it reads.
+  expect([el.querySelector("[data-feedback]").dataset.feedback, el.querySelector("b").textContent, el.querySelector("button"), el.querySelector("[data-feedback-reason]")]).toEqual(["gathered", "gathered", null, null]);
+  expect([el.textContent.includes("part of proj: spec-review"), el.querySelector("[data-feedback-last]").textContent.includes("The project is proj.")]).toEqual([true, true]);
+  // The project is read again on each ask, though nothing listed moved; its last event is drawn when it is the later one.
+  let from = rig.calls.length;
+  await app.sync();
+  expect(reads(from)).toEqual(["issue.list", "issue.get proj"]);
+  rig.say("proj", { type: "moved", from: "spec-review", to: "building", reason: "The owner approved the spec." }, { state: "building" });
+  await app.sync();
+  expect([el.textContent.includes("part of proj: building"), el.querySelector("[data-feedback-last]").textContent.includes("proj: The owner approved the spec."), el.querySelector("button")]).toEqual([true, true, null]);
+  // The box's x on it: hidden here, the label stays, and it is back on the next load.
+  rig.store.remove(id);
+  await app.gone();
+  expect([labels(), [...app.hidden], rig.issues.get("fb-dash").issue.labels]).toEqual([0, ["fb-dash"], ["annotation"]]);
+  const loaded = rig.app();
+  await loaded.sync();
+  const id2 = [...loaded.of.keys()][0], el2 = loaded.note(id2);
+  expect([rig.store.all().map((a) => a.issue), el2.querySelector("b").textContent]).toEqual([["fb-dash"], "gathered"]);
+  // The project is done: the note reads Done with the project's reason, and Remove takes the label off.
+  rig.say("proj", { type: "moved", from: "building", to: "done", reason: "The dashboards share one series: brain-x-page 4d5e6f." }, { state: "done", closed: true });
+  await loaded.sync();
+  expect([el2.querySelector("[data-feedback]").dataset.feedback, el2.querySelector("b").textContent, el2.querySelector("[data-feedback-reason]").textContent]).toEqual(["done", "Done", "proj done: The dashboards share one series: brain-x-page 4d5e6f."]);
+  el2.querySelector("button").click();
+  for (let i = 0; i < 100 && rig.issues.get("fb-dash").issue.labels.length; i++) await new Promise((r) => setTimeout(r, 10));
+  expect([labels(), rig.cells.size]).toEqual([1, 0]);
+  // A link said of another issue is followed the same way; one that cannot be read is not done.
+  await rig.client.procedure("issue.open", { id: "fb-dup", title: "Dup", body: feedbackBody("Dup", { anchor }), kind: "feedback", about: "brain", labels: ["annotation"] });
+  await rig.client.procedure("issue.open", { id: "task", title: "A task", body: "", kind: "task", about: "brain", labels: [] });
+  rig.say("fb-dup", { type: "moved", from: "open", to: "closed", reason: "The same report." }, { state: "closed", closed: true, links: [{ rel: "cause", to: "task" }, { rel: "related", to: "nowhere" }] });
+  const open = (t) => feedbackProgress(rig.issues.get("fb-dup"), feedbackFollows(rig.issues.get("fb-dup").issue).map((f) => t[f]));
+  expect(feedbackFollows(rig.issues.get("fb-dup").issue)).toEqual(["task", "nowhere"]);
+  const shut = { issue: { id: "x", state: "done", closed: true }, events: [] };
+  expect([open({}).done, open({ task: shut }).done, open({ task: shut, nowhere: { issue: { id: "nowhere", state: "open", closed: false, hidden: true }, events: [] } }).done, open({ task: shut, nowhere: shut }).done]).toEqual([false, false, false, true]);
+  expect([feedbackFollows({ closed: false, parent: "proj" }), feedbackFollows(null)]).toEqual([[], []]);
+  return "a closed note whose project is open reads gathered with the project's state and has no Remove; Done and Remove when the project is closed";
+};
 const _brainfeedback_test_feedback_cells_stay_in_this_module_with_annotates_store = async function _test_feedback_cells_stay_in_this_module_with_annotates_store(feedbackRig,feedbackLimits,feedbackApp,a2Store,plugins,expect,feedbackBody) {
   const rig = feedbackRig(), limits = { ...feedbackLimits, kind: "feedbacktest" }, app = feedbackApp({ client: rig.client, store: a2Store, limits });
   const until = async (f) => { for (let i = 0; i < 200 && !(await f()); i++) await new Promise((r) => setTimeout(r, 25)); return !!(await f()); };
@@ -44485,14 +44544,15 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainfeedback_anon_7291dc6f7f", null, ["md"], _brainfeedback_anon_7291dc6f7f);
+  $def("_brainfeedback_anon_b8b22ee0f1", null, ["md"], _brainfeedback_anon_b8b22ee0f1);
   $def("_brainfeedback_feedbackOn", "feedbackOn", ["brainOrigin","brainPortal","brainWho","location"], _brainfeedback_feedbackOn);
   $def("_brainfeedback_feedbackLimits", "feedbackLimits", [], _brainfeedback_feedbackLimits);
   $def("_brainfeedback_feedbackWhere", "feedbackWhere", ["feedbackLimits"], _brainfeedback_feedbackWhere);
   $def("_brainfeedback_feedbackBody", "feedbackBody", ["feedbackWhere","feedbackLimits"], _brainfeedback_feedbackBody);
   $def("_brainfeedback_feedbackParse", "feedbackParse", ["feedbackLimits"], _brainfeedback_feedbackParse);
-  $def("_brainfeedback_feedbackProgress", "feedbackProgress", [], _brainfeedback_feedbackProgress);
-  $def("_brainfeedback_feedbackApp", "feedbackApp", ["feedbackLimits","htl","feedbackProgress","feedbackParse","feedbackBody"], _brainfeedback_feedbackApp);
+  $def("_brainfeedback_feedbackFollows", "feedbackFollows", [], _brainfeedback_feedbackFollows);
+  $def("_brainfeedback_feedbackProgress", "feedbackProgress", ["feedbackFollows"], _brainfeedback_feedbackProgress);
+  $def("_brainfeedback_feedbackApp", "feedbackApp", ["feedbackLimits","feedbackProgress","feedbackFollows","htl","feedbackParse","feedbackBody"], _brainfeedback_feedbackApp);
   $def("_brainfeedback_feedbackNear", "feedbackNear", ["a2Anchors"], _brainfeedback_feedbackNear);
   $def("_brainfeedback_feedback", "feedback", ["feedbackOn","feedbackApp","brainClient","a2Store","feedbackNear","brainModules"], _brainfeedback_feedback);
   $def("_brainfeedback_feedbackNote", "feedbackNote", ["feedback","htl"], _brainfeedback_feedbackNote);
@@ -44504,6 +44564,7 @@ export default function define(runtime, observer) {
   $def("_brainfeedback_test_feedback_file_opens_an_issue_and_the_note_shows_it", "test_feedback_file_opens_an_issue_and_the_note_shows_it", ["feedbackRig","expect","Event","feedbackParse"], _brainfeedback_test_feedback_file_opens_an_issue_and_the_note_shows_it);
   $def("_brainfeedback_test_feedback_load_places_a_note_for_each_labeled_issue", "test_feedback_load_places_a_note_for_each_labeled_issue", ["feedbackRig","feedbackBody","expect"], _brainfeedback_test_feedback_load_places_a_note_for_each_labeled_issue);
   $def("_brainfeedback_test_feedback_done_then_remove_takes_the_label_off", "test_feedback_done_then_remove_takes_the_label_off", ["feedbackRig","feedbackBody","expect"], _brainfeedback_test_feedback_done_then_remove_takes_the_label_off);
+  $def("_brainfeedback_test_feedback_a_gathered_note_follows_what_it_is_part_of", "test_feedback_a_gathered_note_follows_what_it_is_part_of", ["feedbackRig","feedbackBody","expect","feedbackProgress","feedbackFollows"], _brainfeedback_test_feedback_a_gathered_note_follows_what_it_is_part_of);
   $def("_brainfeedback_test_feedback_cells_stay_in_this_module_with_annotates_store", "test_feedback_cells_stay_in_this_module_with_annotates_store", ["feedbackRig","feedbackLimits","feedbackApp","a2Store","plugins","expect","feedbackBody"], _brainfeedback_test_feedback_cells_stay_in_this_module_with_annotates_store);
   $def("_brainfeedback_test_feedback_near_reads_under_the_anchor_and_a_kept_note_without_its_label_goes", "test_feedback_near_reads_under_the_anchor_and_a_kept_note_without_its_label_goes", ["expect","feedbackNear","feedbackRig","feedbackBody"], _brainfeedback_test_feedback_near_reads_under_the_anchor_and_a_kept_note_without_its_label_goes);
   $def("_brainfeedback_test_feedback_is_off_away_from_the_owners_page", "test_feedback_is_off_away_from_the_owners_page", ["expect","feedbackOn","brainOrigin","brainPortal","brainWho","location","feedback","feedbackSync","feedbackNote","feedbackKind"], _brainfeedback_test_feedback_is_off_away_from_the_owners_page);
