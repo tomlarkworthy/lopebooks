@@ -36999,7 +36999,7 @@ An entry holds text to search, not a file. A paper's PDF or a page's HTML stays 
 An entry is found by its words, or by its words and its meaning together: each has one vector in one Vectorize index, and \`knowledge.search\` with \`semantic=true\` puts the entries nearest a question and the entries that have its words into one order. That is how an agent finds the module, the paper or the note for a task. The vectors were added 2026-10-10 (\`tools/cloud-brain/knowledge-vectors.md\`); the one order on 2026-10-11, from what was measured in \`tools/cloud-brain/knowledge-reranking.md\`.`);};
 const _brainknowledge_viewof_knowledgeView = function _knowledgeView(knowledgePanel,client,session) {return (knowledgePanel({ client, owner: !!(session && session.owner) }));};
 const _brainknowledge_knowledgeView = (G, _) => G.input(_);
-const _brainknowledge_anon_af1cd4a81f = function _anonymous(md,knowledgeLimits,knowledgeVectors,knowledgeKinds) {return (md`## Methods
+const _brainknowledge_anon_b4af66fbb6 = function _anonymous(md,knowledgeLimits,knowledgeVectors,knowledgeKinds) {return (md`## Methods
 
 | | |
 |---|---|
@@ -37031,7 +37031,7 @@ const _brainknowledge_anon_af1cd4a81f = function _anonymous(md,knowledgeLimits,k
 | \`method\` | how it was entered, ${knowledgeLimits.method} characters at most: \`snapshot\`, \`digest:research-2026-10-09\`, \`manual\` |
 | \`cites\` | ids of the entries this one is drawn from, ${knowledgeLimits.cites} at most. A finding cites its sources. |
 | \`tags\` | \`a-z 0-9 -\`, ${knowledgeLimits.source} characters each, ${knowledgeLimits.tags} at most |
-| \`by\`, \`at\` | who entered it and when. Set here from the caller the core names (\`owner\`, \`token:NAME\`, \`worker:brain-x-NAME\`, a DID); a value in the body is not read. |
+| \`by\`, \`at\` | who entered it and when. \`by\` is the caller the core names (\`x-brain-caller\`): \`owner\`, \`worker:brain-x-NAME\` or a DID. A value in the body is not read. A token's call is the owner's, so an entry a token entered has \`by: "owner"\`, as one the owner entered in their tab has: the delegation and the token's name, which the core sends beside the caller (\`x-brain-via\`, \`x-brain-holder: secret:NAME\`), are not kept. \`changed.by\` is set the same way. |
 | \`staleSince\` | \`null\`, or when what the entry was made from was first seen to differ from it, in milliseconds. Whoever enters the entry sets it; a put of \`{ id, staleSince: 0 }\` clears it. Nothing here looks at a source. An entry that has one is still found and answered, with the date. |
 | \`changed\` | \`null\`, or \`{ by, method, at }\` of the last put after the first, whatever it changed: a put of \`staleSince\` or of a \`sha256\` alone counts. Its \`method\` is the one that put gave, \`null\` when it gave none. |
 | \`wordsAt\` | when the title or the text was last written, in milliseconds. \`changed.at\` does not say that: every one of the 400 module cards on cb4 had a \`changed.at\` of 2026-10-10 08:30 to 08:33 UTC after a pass that gave each its hash and wrote no word. For an entry whose words were last written before 2026-10-10 11:02 CEST it is when the entry was first entered. |
@@ -37532,9 +37532,10 @@ const _brainknowledge_knowledgeRig = function _knowledgeRig(knowledgeFakeSql,kno
   };
   const sim = await simulate(knowledge_service, { sql: db.run, vectors: index, core });
   const X = "https://knowledge.internal/xrpc/com.lopecode.brain.knowledge.";
-  const as = (who) => {
+  // more: the other headers the core sends with a call (x-brain-via, x-brain-holder).
+  const as = (who, more = {}) => {
     const send = async (path, init = {}) => {
-      const r = await sim.fetch(X + path, { ...init, headers: { ...(init.headers || {}), "x-brain-caller": who } });
+      const r = await sim.fetch(X + path, { ...init, headers: { ...(init.headers || {}), ...more, "x-brain-caller": who } });
       return { status: r.status, data: await r.json() };
     };
     return { get: (name, params = {}) => send(name + "?" + new URLSearchParams(params)), post: (name, input) => send(name, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) }) };
@@ -37568,6 +37569,23 @@ const _brainknowledge_test_knowledge_records_who_entered_it_and_how = async func
   expect((await rig.owner.get("get", { id: a.ids[0] })).data.cites).toEqual(["arxiv:1"]);
   expect((await rig.owner.get("get", { id: "arxiv:9" })).data.error).toBe("EntryNotFound");
   return "entered by the Worker, changed by the owner";
+};
+const _brainknowledge_test_knowledge_a_token_enters_as_the_owner_and_the_reference_says_so = async function _test_knowledge_a_token_enters_as_the_owner_and_the_reference_says_so(knowledgeRig,expect) {
+  const rig = await knowledgeRig();
+  const token = rig.as("owner", { "x-brain-via": "delegation:d1", "x-brain-tab": "0", "x-brain-holder": "secret:rsi-index" });
+  expect((await token.post("put", rig.paper(1))).data).toMatchObject({ entered: 1, changed: 0 });
+  await rig.snapshot.post("put", rig.paper(2));
+  expect((await token.post("put", { id: "arxiv:2", tags: ["rsi"] })).data).toMatchObject({ entered: 0, changed: 1 });
+  const [one, two] = [(await rig.owner.get("get", { id: "arxiv:1" })).data, (await rig.owner.get("get", { id: "arxiv:2" })).data];
+  expect([one.by, one.changed, two.by, two.changed.by]).toEqual(["owner", null, "worker:brain-x-snapshot", "owner"]);
+  expect((await rig.owner.get("stats")).data.by).toEqual({ owner: 1, "worker:brain-x-snapshot": 1 });
+  const got = await rig.sim.fetch("https://knowledge.internal/xrpc/com.lopecode.brain.getSource?part=reference", { headers: { "x-brain-caller": "anonymous" } });
+  expect(got.status).toBe(200);
+  const row = (await got.text()).split("\n").filter((l) => l.startsWith("| `by`, `at` |"));
+  expect(row.length).toBe(1);
+  expect(row[0]).not.toContain("token:NAME");
+  expect(row[0]).toContain('A token\'s call is the owner\'s, so an entry a token entered has `by: "owner"`');
+  return "by owner, changed.by owner, 1 row of the reference";
 };
 const _brainknowledge_test_knowledge_search_finds_by_word_and_filter = async function _test_knowledge_search_finds_by_word_and_filter(knowledgeRig,expect,knowledgeMatch) {
   const rig = await knowledgeRig(), o = rig.owner;
@@ -37813,7 +37831,7 @@ export default function define(runtime, observer) {
   $def("_brainknowledge_anon_c32134be48", null, ["md"], _brainknowledge_anon_c32134be48);
   $def("_brainknowledge_viewof_knowledgeView", "viewof knowledgeView", ["knowledgePanel","client","session"], _brainknowledge_viewof_knowledgeView);
   $def("_brainknowledge_knowledgeView", "knowledgeView", ["Generators","viewof knowledgeView"], _brainknowledge_knowledgeView);
-  $def("_brainknowledge_anon_af1cd4a81f", null, ["md","knowledgeLimits","knowledgeVectors","knowledgeKinds"], _brainknowledge_anon_af1cd4a81f);
+  $def("_brainknowledge_anon_b4af66fbb6", null, ["md","knowledgeLimits","knowledgeVectors","knowledgeKinds"], _brainknowledge_anon_b4af66fbb6);
   $def("_brainknowledge_anon_8441f6dd8e", null, ["md","knowledgeHybrid","knowledgeVectors","knowledgeStop"], _brainknowledge_anon_8441f6dd8e);
   $def("_brainknowledge_knowledge_service", "knowledge_service", ["cloudflare","knowledgeApp","knowledgeVectors"], _brainknowledge_knowledge_service);
   $def("_brainknowledge_knowledge_announce", "knowledge_announce", ["plugins","knowledge_service","invalidation"], _brainknowledge_knowledge_announce);
@@ -37837,6 +37855,7 @@ export default function define(runtime, observer) {
   $def("_brainknowledge_knowledgeFakeVectors", "knowledgeFakeVectors", [], _brainknowledge_knowledgeFakeVectors);
   $def("_brainknowledge_knowledgeRig", "knowledgeRig", ["knowledgeFakeSql","knowledgeFakeVectors","knowledgeVectors","Response","simulate","knowledge_service","URLSearchParams"], _brainknowledge_knowledgeRig);
   $def("_brainknowledge_test_knowledge_records_who_entered_it_and_how", "test_knowledge_records_who_entered_it_and_how", ["knowledgeRig","expect"], _brainknowledge_test_knowledge_records_who_entered_it_and_how);
+  $def("_brainknowledge_test_knowledge_a_token_enters_as_the_owner_and_the_reference_says_so", "test_knowledge_a_token_enters_as_the_owner_and_the_reference_says_so", ["knowledgeRig","expect"], _brainknowledge_test_knowledge_a_token_enters_as_the_owner_and_the_reference_says_so);
   $def("_brainknowledge_test_knowledge_search_finds_by_word_and_filter", "test_knowledge_search_finds_by_word_and_filter", ["knowledgeRig","expect","knowledgeMatch"], _brainknowledge_test_knowledge_search_finds_by_word_and_filter);
   $def("_brainknowledge_test_knowledge_search_by_meaning_answers_what_the_caller_reads", "test_knowledge_search_by_meaning_answers_what_the_caller_reads", ["knowledgeRig","knowledgeVectors","expect","knowledgeTenant","knowledgeHybrid"], _brainknowledge_test_knowledge_search_by_meaning_answers_what_the_caller_reads);
   $def("_brainknowledge_test_knowledge_orders_by_words_and_meaning_together", "test_knowledge_orders_by_words_and_meaning_together", ["expect","knowledgeFuse","knowledgeRig","simulate","knowledge_service","Response"], _brainknowledge_test_knowledge_orders_by_words_and_meaning_together);
