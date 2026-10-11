@@ -42552,17 +42552,27 @@ const _cloudbrain_signIn = function _signIn(brainOrigin,htl,session,press,client
   return handle;
 };
 const _cloudbrain_anon_8a5035967f = function _anonymous(md) {return (md`## Health`);};
-const _cloudbrain_healthView = async function _healthView(assembled,client,session,htl,callsQuery,callsSeries,dashboard,requestsChart,width,healthStrip,methodTable,moduleLink,brainModules,services,d3) {
-  assembled;
-  // The owner's own session only: logs.query is not a visitor's. A visitor is shown no chart, and no made-up one.
-  if (!client || !session.owner) return htl.html`<i style="color:var(--theme-foreground-muted)">Sign in as the owner to see the calls of the last hour.</i>`;
-  const until = Date.now(), ask = { since: until - 3600000, until };
-  const data = await client.procedure("logs.query", callsQuery(ask)).then((answer) => callsSeries(answer, ask), (e) => ({ ...ask, step: 60000, series: [], error: String((e && e.message) || e) }));
+const _cloudbrain_healthView = function _healthView(calls,htl,dashboard,requestsChart,width,healthStrip,methodTable,moduleLink,brainModules,services,d3) {
+  // A visitor is shown no chart, and no made-up one.
+  if (!calls) return htl.html`<i style="color:var(--theme-foreground-muted)">Sign in as the owner to see the calls of the last hour.</i>`;
+  const data = calls;
   return dashboard([
     { title: "Calls", body: requestsChart(data, { width: width - 40 }), wide: true },
     { title: "Health", body: healthStrip(data, { width: width - 40 }), wide: true },
     { title: "By method", body: methodTable(data, { link: (worker, label) => ((row) => (row && row.module ? moduleLink(row.module, label) : null))([...((brainModules && brainModules.modules) || []), ...(services || [])].find((r) => r.worker === worker)) }), wide: true }
   ], { note: data.error ? "logs.query failed: " + data.error : `The last hour, from the core's log lines: ${d3.sum(data.series, (d) => d.n)} calls in ${data.groups} groups.` });
+};
+const _cloudbrain_timeRange = function _timeRange() {
+  const until = Date.now();
+  return { since: until - 3600000, until };
+};
+const _cloudbrain_callsRead = function _callsRead(callsQuery,callsSeries) {return (async ({ client, range }) => {
+  if (!client) return null;
+  return client.procedure("logs.query", callsQuery(range)).then((answer) => callsSeries(answer, range), (e) => ({ ...range, step: 60000, series: [], error: String((e && e.message) || e) }));
+});};
+const _cloudbrain_calls = function _calls(assembled,callsRead,session,client,timeRange) {
+  assembled;
+  return callsRead({ client: session.owner ? client : null, range: timeRange });
 };
 const _cloudbrain_callsQuery = function _callsQuery() {return (({ since, until }) => ({
   queryId: "brain-calls",
@@ -42674,6 +42684,21 @@ const _cloudbrain_test_calls_from_the_logs_become_chart_rows = function _test_ca
   expect(callsSeries({ result: { calculations: [] } }, ask).series).toEqual([]);
   expect(callsSeries(null, ask)).toMatchObject({ series: [], groups: 0, step: 60000 });
   return "3 rows from 3 calculations";
+};
+const _cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client = async function _test_calls_are_read_once_for_a_range_and_not_without_a_client(callsRead,expect,callsQuery) {
+  const range = { since: Date.UTC(2026, 9, 9, 7, 0), until: Date.UTC(2026, 9, 9, 8, 0) };
+  const seen = [];
+  const data = await callsRead({ client: { procedure: async (name, body) => (seen.push([name, body]), { result: { run: { granularity: 60000 }, calculations: [] } }) }, range });
+  expect(seen.length).toBe(1);
+  expect(seen[0]).toEqual(["logs.query", callsQuery(range)]);
+  expect([seen[0][1].timeframe, seen[0][1].view]).toEqual([{ from: range.since, to: range.until }, "calculations"]);
+  expect(data).toEqual({ ...range, step: 60000, series: [], groups: 0 });
+  // No client (a visitor): nothing is sent.
+  expect(await callsRead({ client: null, range })).toBe(null);
+  expect(seen.length).toBe(1);
+  // A query that fails answers the range, no rows and the error.
+  expect(await callsRead({ client: { procedure: async () => { throw new Error("AuthRequired"); } }, range })).toEqual({ ...range, step: 60000, series: [], error: "AuthRequired" });
+  return "1 logs.query for a range, 0 with no client";
 };
 const _cloudbrain_LOGIN_METHODS = function _LOGIN_METHODS() {return (["issue.list", "issue.get", "knowledge.search", "knowledge.get", "knowledge.list", "quota.get"]);};
 const _cloudbrain_loginLink = function _loginLink(brain,htl,loginBrief,client,LOGIN_METHODS,press,copyLater) {
@@ -43817,7 +43842,10 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_statusLine", "statusLine", ["htl","session","brainOrigin"], _cloudbrain_statusLine);
   $def("_cloudbrain_signIn", "signIn", ["brainOrigin","htl","session","press","client","brainSession","location","Inputs"], _cloudbrain_signIn);
   $def("_cloudbrain_anon_8a5035967f", null, ["md"], _cloudbrain_anon_8a5035967f);
-  $def("_cloudbrain_healthView", "healthView", ["assembled","client","session","htl","callsQuery","callsSeries","dashboard","requestsChart","width","healthStrip","methodTable","moduleLink","brainModules","services","d3"], _cloudbrain_healthView);
+  $def("_cloudbrain_healthView", "healthView", ["calls","htl","dashboard","requestsChart","width","healthStrip","methodTable","moduleLink","brainModules","services","d3"], _cloudbrain_healthView);
+  $def("_cloudbrain_timeRange", "timeRange", [], _cloudbrain_timeRange);
+  $def("_cloudbrain_callsRead", "callsRead", ["callsQuery","callsSeries"], _cloudbrain_callsRead);
+  $def("_cloudbrain_calls", "calls", ["assembled","callsRead","session","client","timeRange"], _cloudbrain_calls);
   $def("_cloudbrain_callsQuery", "callsQuery", [], _cloudbrain_callsQuery);
   $def("_cloudbrain_callsSeries", "callsSeries", [], _cloudbrain_callsSeries);
   $def("_cloudbrain_rollup", "rollup", [], _cloudbrain_rollup);
@@ -43827,6 +43855,7 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_methodTable", "methodTable", ["Inputs","rollup"], _cloudbrain_methodTable);
   $def("_cloudbrain_dashboard", "dashboard", ["htl"], _cloudbrain_dashboard);
   $def("_cloudbrain_test_calls_from_the_logs_become_chart_rows", "test_calls_from_the_logs_become_chart_rows", ["callsQuery","expect","callsSeries","rollup","requestsChart","healthStrip","methodTable","dashboard"], _cloudbrain_test_calls_from_the_logs_become_chart_rows);
+  $def("_cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client", "test_calls_are_read_once_for_a_range_and_not_without_a_client", ["callsRead","expect","callsQuery"], _cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client);
   $def("_cloudbrain_LOGIN_METHODS", "LOGIN_METHODS", [], _cloudbrain_LOGIN_METHODS);
   $def("_cloudbrain_loginLink", "loginLink", ["brain","htl","loginBrief","client","LOGIN_METHODS","press","copyLater"], _cloudbrain_loginLink);
   $def("_cloudbrain_copyLater", "copyLater", ["ClipboardItem"], _cloudbrain_copyLater);
