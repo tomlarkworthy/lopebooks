@@ -35589,7 +35589,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainlogs_anon_838bbccf45 = function _anonymous(md) {return (md`# brain-logs
+const _brainlogs_anon_d9bd6248bc = function _anonymous(md) {return (md`# brain-logs
 
 A Cloud Brain recipe: the logs of this Brain's Workers, read from Cloudflare Workers Logs. It keeps nothing and has no query language of its own. A body is passed to Cloudflare's telemetry API and the answer is returned as Cloudflare gave it, its errors and limits included.
 
@@ -35598,6 +35598,7 @@ A Cloud Brain recipe: the logs of this Brain's Workers, read from Cloudflare Wor
 | \`logs.query\` | \`POST /accounts/ACCOUNT/workers/observability/telemetry/query\`: events, invocations, traces or calculations |
 | \`logs.keys\` | \`…/telemetry/keys\`: the field names seen in a time range |
 | \`logs.values\` | \`…/telemetry/values\`: the values of one field |
+| \`logs.deploys?from=&to=\` | \`…/telemetry/query\`, with a body of the service's own: what the deployer wrote about deploys, and the test runs counted. See "The deploys of a span" |
 
 The body is Cloudflare's: [the query API](https://developers.cloudflare.com/api/resources/workers/subresources/observability/subresources/telemetry/methods/query/). The service changes two things in it (\`logsScope\`). \`datasets\` is \`["cloudflare-workers"]\`. The filters are put inside one filter on the script name, joined with AND, so a query reads only the Workers of this Brain: the base name, and every name that starts with the base name and a hyphen. A base name therefore has no hyphen: the Brain \`cb4\` would read the scripts of a Brain \`cb4-test\` on the same account. The installer refuses such a name (\`installBrain\`, \`brain.ts\`); nothing checks a Brain installed before 2026-10-08. With \`?worker=brain-x-NAME\` in the address the filter is that one Worker.
 
@@ -35626,9 +35627,37 @@ Cloudflare keeps what a Worker writes with \`console.log\`, 7 days on Workers Pa
 
 \`ray\` is the \`cf-ray\` header of the answer a caller received, without the hyphen and the letters after it (\`a47789bfbccce517-FRA\` is logged as \`a47789bfbccce517\`): a Worker sees the id with no data-centre code. \`method\` is the name after \`com.lopecode.brain.\`, the path pattern a service declared, or \`(unknown)\` for a name nobody declared. A line of the kernel is found by \`$metadata.rayId\`, and every line of the call by the \`traceId\` of that line.
 
+## The deploys of a span
+
+\`GET logs.deploys?from=MS&to=MS\` answers the lines the deployer wrote with \`at: "deploy.…"\` between two times in milliseconds: with neither, the 24 hours before now; 7 days at most, which is what Cloudflare keeps. A caller gives the span and nothing else. The filter is fixed (the deployer's script, \`at\` starting \`deploy.\`) and is checked again on each line of the answer.
+
+\`\`\`js
+{ from, to, queries,                       // queries: how many Cloudflare was asked
+  lines: [{ at, target, hash, …, t }],     // each line as the deployer wrote it, oldest first; t is Cloudflare's time, ms
+  workers: [{ worker, runs, verified, failed, none, stale, putBack, hashes: [{ hash, verified, failed }] }],
+  tests: [{ worker, test, fails, runs, passedOnSameHash, passedLater, hashes, last }] }
+\`\`\`
+
+A line is the deployer's own object and its time. What Cloudflare stores beside it (the URL and path of the call, the ids) is left out. \`reason\` of \`deploy.reason\` is what whoever deployed gave as the reason; \`run\` of \`deploy.verify\` is the address the tests ran at.
+
+**Whole, not sampled.** Cloudflare samples a wide \`events\` query: 5 of the \`deploy.verified\` lines of 2 days came back with \`statistics.abr_level: 10\`, where one-hour windows gave 35 for 3.5 of those hours with \`abr_level: 1\` (cb4, 2026-10-11). So \`deployLines\` asks for the span, and asks again for the two halves of any window whose answer has an \`abr_level\` other than 1 or as many lines as the limit of 2000. Halves share their middle and a line is kept once, by Cloudflare's id. A minute that is still not whole, or a span that needs more than 200 queries, is answered 502 and no lines.
+
+**What is counted** (\`deployRuns\`). A run is a \`deploy.verified\` or a \`deploy.failed\` line: the tests of one Worker at one hash, run by the deployer after a deploy. \`none\` and \`stale\` are runs that gave no verdict for the hash deployed, \`putBack\` every put-back, for a test or not. A line of \`tests\` is one test that failed in the span:
+
+| Field | Meaning |
+|---|---|
+| \`fails\` | the \`deploy.failed\` lines that name it |
+| \`runs\` | the runs of its Worker in the span. The lines do not name the tests that passed, so this is every run of the Worker, also those from before the test was written |
+| \`passedOnSameHash\` | fails at a hash that also has a \`verified\` run in the span: the same code passed and failed, which is what a flaky test is (Parry et al., *A Survey of Flaky Tests*, TOSEM 2021). A failed version is put back at once, so a hash is seldom run twice |
+| \`passedLater\` | the other fails that a \`verified\` run of the Worker at another hash followed: fixed, or flaky; the lines cannot say which |
+
+So \`fails / runs\` is a fail rate, not a flake rate: a fail at a new hash may be the defect the run is there to catch. Not in the lines: the names of the tests that passed, the browser, and a failure's message past the 200 characters of the put-back's \`reason\`.
+
 ## Who can call
 
-The owner in their own session. The owner can set another rule (\`rule.put\`). To let a Worker read its own lines and no other's: \`caller.kind == "worker" && request.params.worker == caller.worker\` for \`com.lopecode.brain.logs.query\`.
+\`logs.query\`, \`logs.keys\` and \`logs.values\`: the owner in their own session. The owner can set another rule (\`rule.put\`). To let a Worker read its own lines and no other's: \`caller.kind == "worker" && request.params.worker == caller.worker\` for \`com.lopecode.brain.logs.query\`.
+
+\`logs.deploys\`: the owner, or a token of the owner that names it (\`caller.id == "owner"\`; a token's call is the owner's with no tab). The owner, 2026-10-11: "We should allow deployment log access for things that deploy and fix things because it is vital information". The deploy lines hold what the deployer wrote about a Worker and nothing a caller of a method sent; the core's line of each call and a service's own lines name callers, and stay with the three methods above. A token for it is made once with the owner's session: \`brain.ts token loop-deploys logs.deploys\`, then \`brain.ts curl "/xrpc/com.lopecode.brain.logs.deploys?from=MS&to=MS" --as loop-deploys\`.
 
 ## The Cloudflare token
 
@@ -35644,12 +35673,90 @@ const _brainlogs_logsScope = function _logsScope(logsScript) {return ((body, wha
   const scoped = { ...given, datasets: ["cloudflare-workers"], filterCombination: "and", filters: [mine, ...theirs] };
   return what === "query" ? { ...body, parameters: scoped } : scoped;
 });};
-const _brainlogs_logs_service = function _logs_service(cloudflare,Response,logsScript,config,cloudflareApi,logsScope) {return (cloudflare.Service(
+const _brainlogs_deployLines = function _deployLines(logsScript,logsScope) {return (async (ask, base, from, to, { limit = 2000, queries = 200 } = {}) => {
+  const script = logsScript(base, "brain-deployer"), kept = new Map();
+  let asked = 0;
+  const read = async (a, b) => {
+    if (asked >= queries) throw new Error(`more than ${queries} queries`);
+    asked++;
+    const result = await ask(logsScope({ queryId: "deploys", timeframe: { from: a, to: b }, view: "events", limit, parameters: { filters: [{ key: "at", operation: "starts_with", type: "string", value: "deploy." }] } }, "query", base, "brain-deployer"));
+    const events = (result && result.events && result.events.events) || [];
+    const level = result && result.run && result.run.statistics ? result.run.statistics.abr_level : undefined;
+    if (level !== 1 || events.length >= limit) {
+      if (b - a <= 60000) throw new Error(`the minute from ${a} is not whole: ${events.length} lines, abr_level ${level}`);
+      const mid = a + Math.floor((b - a) / 2);
+      return void (await Promise.all([read(a, mid), read(mid, b)]));
+    }
+    for (const e of events) {
+      // The filter again, on the answer: only the deployer's own deploy lines leave, without what Cloudflare keeps beside them.
+      const s = e && e.source;
+      if (!s || typeof s !== "object" || typeof s.at !== "string" || !s.at.startsWith("deploy.") || !e.$workers || e.$workers.scriptName !== script) continue;
+      const id = String((e.$metadata && e.$metadata.id) || JSON.stringify([e.timestamp, s]));
+      kept.set(id, { id, line: { ...s, t: e.timestamp } });
+    }
+  };
+  await read(from, to);
+  return [...kept.values()].sort((x, y) => x.line.t - y.line.t || (x.id < y.id ? -1 : 1)).map((k) => k.line);
+});};
+const _brainlogs_deployRuns = function _deployRuns() {return ((lines) => {
+  const kinds = { "deploy.verified": "verified", "deploy.failed": "failed", "deploy.verify.none": "none", "deploy.verify.stale": "stale", "deploy.put-back": "putBack" };
+  const workers = new Map(), fails = [];
+  for (const l of [...lines].sort((a, b) => a.t - b.t)) {
+    const kind = l && typeof l.target === "string" ? kinds[l.at] : undefined;
+    if (!kind) continue;
+    if (!workers.has(l.target)) workers.set(l.target, { worker: l.target, runs: 0, verified: 0, failed: 0, none: 0, stale: 0, putBack: 0, hashes: [] });
+    const w = workers.get(l.target);
+    w[kind]++;
+    if (kind !== "verified" && kind !== "failed") continue;
+    w.runs++;
+    let h = w.hashes.find((x) => x.hash === l.hash);
+    if (!h) w.hashes.push((h = { hash: l.hash, verified: 0, failed: 0, passed: [] }));
+    h[kind]++;
+    if (kind === "verified") h.passed.push(l.t);
+    else for (const test of Array.isArray(l.failed) ? l.failed : []) fails.push({ worker: l.target, test: String(test), hash: l.hash, t: l.t });
+  }
+  const tests = new Map();
+  for (const f of fails) {
+    const w = workers.get(f.worker), key = JSON.stringify([f.worker, f.test]);
+    if (!tests.has(key)) tests.set(key, { worker: f.worker, test: f.test, fails: 0, runs: w.runs, passedOnSameHash: 0, passedLater: 0, hashes: [], last: f.t });
+    const t = tests.get(key);
+    t.fails++;
+    t.last = f.t;
+    if (!t.hashes.includes(f.hash)) t.hashes.push(f.hash);
+    if (w.hashes.find((h) => h.hash === f.hash).verified) t.passedOnSameHash++;
+    else if (w.hashes.some((h) => h.passed.some((at) => at > f.t))) t.passedLater++;
+  }
+  const by = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  return {
+    workers: [...workers.values()].sort((a, b) => by(a.worker, b.worker)).map((w) => ({ ...w, hashes: w.hashes.map(({ hash, verified, failed }) => ({ hash, verified, failed })) })),
+    tests: [...tests.values()].sort((a, b) => b.fails - a.fails || by(a.worker, b.worker) || by(a.test, b.test))
+  };
+});};
+const _brainlogs_logs_service = function _logs_service(cloudflare,Response,cloudflareApi,deployLines,config,deployRuns,logsScript,logsScope) {return (cloudflare.Service(
   "logs",
   async (request) => {
     const json = (status, error, message) => new Response(JSON.stringify({ error, message }), { status, headers: { "content-type": "application/json" } });
     const url = new URL(request.url), what = url.pathname.split(".").pop(), worker = url.searchParams.get("worker");
-    if (!["query", "keys", "values"].includes(what)) return json(404, "MethodNotImplemented", "logs.query, logs.keys and logs.values");
+    if (what === "deploys") {
+      const given = (name, or) => (url.searchParams.has(name) ? (/^\d{1,15}$/.test(url.searchParams.get(name)) ? Number(url.searchParams.get(name)) : NaN) : or);
+      const to = given("to", Date.now()), from = given("from", to - 86400000);
+      if (!(from < to && to - from <= 7 * 86400000)) return json(400, "InvalidRequest", "from and to are times in milliseconds, from before to, 7 days apart at most");
+      let queries = 0;
+      const ask = async (query) => {
+        queries++;
+        const r = await cloudflareApi.fetch("/workers/observability/telemetry/query", { method: "POST", body: JSON.stringify(query) });
+        const data = await r.json().catch(() => null);
+        if (!r.ok || !data || !data.result) throw new Error(`Cloudflare answered ${r.status} ${JSON.stringify((data && data.errors) || null).slice(0, 300)}`);
+        return data.result;
+      };
+      try {
+        const lines = await deployLines(ask, config.base, from, to);
+        return new Response(JSON.stringify({ from, to, queries, lines, ...deployRuns(lines) }), { headers: { "content-type": "application/json" } });
+      } catch (e) {
+        return json(502, "UpstreamFailure", String((e && e.message) || e));
+      }
+    }
+    if (!["query", "keys", "values"].includes(what)) return json(404, "MethodNotImplemented", "logs.query, logs.keys, logs.values and logs.deploys");
     const body = await request.json().catch(() => null);
     if (!body || typeof body !== "object" || Array.isArray(body)) return json(400, "InvalidRequest", "the body is the body of Cloudflare's telemetry " + what);
     if (worker !== null && !logsScript(config.base, worker)) return json(400, "InvalidRequest", "worker is the name of a Worker of this Brain: brain, brain-core, brain-x-NAME");
@@ -35659,6 +35766,8 @@ const _brainlogs_logs_service = function _logs_service(cloudflare,Response,logsS
   {
     cloudflare: ["Workers Observability Read"],
     methods: {
+      // The owner, or a token of the owner that names it: the deployer's lines about deploys hold nothing a caller sent.
+      "com.lopecode.brain.logs.deploys": { type: "query", allow: 'caller.id == "owner"' },
       "com.lopecode.brain.logs.query": { type: "procedure", allow: "caller.session" },
       "com.lopecode.brain.logs.keys": { type: "procedure", allow: "caller.session" },
       "com.lopecode.brain.logs.values": { type: "procedure", allow: "caller.session" }
@@ -35732,14 +35841,146 @@ const _brainlogs_test_logs_declares_one_cloudflare_permission_and_the_owners_ses
   expect(meta.worker).toBe("brain-x-logs");
   expect(meta.cloudflare).toEqual(["Workers Observability Read"]);
   expect([meta.resources, meta.secrets, meta.calls]).toEqual([[], [], []]);
-  expect(Object.values(meta.access).map((a) => a.allow)).toEqual(["caller.session", "caller.session", "caller.session"]);
+  expect(Object.entries(meta.access).map(([nsid, a]) => [nsid.split(".").pop(), a.type, a.allow])).toEqual([["deploys", "query", 'caller.id == "owner"'], ["keys", "procedure", "caller.session"], ["query", "procedure", "caller.session"], ["values", "procedure", "caller.session"]]);
   // The token is read from the binding the deployer made, and from nowhere a caller can set.
   expect(parts[0].text).toContain("__rt.platform.secrets.CF_TOKEN");
   // The owner's rule for a Worker reading its own lines.
   const rule = { allow: 'caller.kind == "worker" && request.params.worker == caller.worker' };
   const ask = (caller, worker) => decide(rule, { caller: callerOf({ caller }), origin: callerOf({ caller }), request: { params: worker === null ? {} : { worker } } }).allow;
   expect([ask("worker:brain-x-echo", "brain-x-echo"), ask("worker:brain-x-echo", "brain-core"), ask("worker:brain-x-echo", null), ask("anonymous", "")]).toEqual([true, false, false, false]);
+  // A token of the owner is the owner with no tab: it reads the deploy lines and no others. A member, a Worker and a stranger read neither.
+  const may = (allow, who) => decide({ allow }, { caller: callerOf(who), origin: callerOf(who), request: { params: {} } }).allow;
+  const callers = [{ caller: "owner", via: "session", tab: true }, { caller: "owner", via: "delegation:b6559fa96c36", holder: "secret:loop-deploys", tab: false }, { caller: "did:plc:member" }, { caller: "worker:brain-x-echo" }, { caller: "anonymous" }];
+  expect(callers.map((who) => may(meta.access["com.lopecode.brain.logs.deploys"].allow, who))).toEqual([true, true, false, false, false]);
+  expect(callers.map((who) => may(meta.access["com.lopecode.brain.logs.query"].allow, who))).toEqual([true, false, false, false, false]);
   return meta.cloudflare[0];
+};
+const _brainlogs_deploysRig = function _deploysRig(simulate,logs_service,Response) {return (async (events, { whole = 6 * 3600000, status = 200 } = {}) => {
+  const seen = [];
+  const answer = (body) => {
+    seen.push(body);
+    const { from, to } = body.timeframe;
+    const inside = events.filter((e) => e.timestamp >= from && e.timestamp <= to).sort((a, b) => b.timestamp - a.timestamp).slice(0, body.limit);
+    return { run: { statistics: { abr_level: to - from > whole ? 10 : 1 } }, events: { events: inside, count: inside.length } };
+  };
+  const sim = await simulate(logs_service, {
+    secrets: { CF_TOKEN: "minted-1", BRAIN_KEY: "k" },
+    config: { base: "cb4", account: "acct" },
+    fetch: async (request) => new Response(JSON.stringify(status === 200 ? { success: true, result: answer(await request.json()) } : { success: false, errors: [{ code: 10000, message: "rate limited" }] }), { status, headers: { "content-type": "application/json" } })
+  });
+  const get = async (query) => {
+    const r = await sim.fetch("https://logs.internal/xrpc/com.lopecode.brain.logs.deploys" + query, { headers: { "x-brain-caller": "owner", "x-brain-via": "delegation:b6559fa96c36", "x-brain-holder": "secret:loop-deploys", "x-brain-tab": "0" } });
+    return { status: r.status, data: await r.json() };
+  };
+  return { seen, answer, get };
+});};
+const _brainlogs_deployEvent = function _deployEvent() {return ((timestamp, source, scriptName = "cb4-deployer") => ({
+  source: { ...source, deployer: "f9007d2d", worker: "brain-deployer", ray: "a48bd6e14a6acc97" },
+  dataset: "cloudflare-workers",
+  timestamp,
+  $workers: { truncated: false, scriptName, eventType: "fetch", event: { request: { method: "POST", url: "https://cb4-deployer.endpointservices.workers.dev/xrpc/com.lopecode.brain.infra.apply?secret=1", path: "/xrpc/com.lopecode.brain.infra.apply" } } },
+  $metadata: { id: "id-" + timestamp + "-" + source.at + "-" + source.target, requestId: "c01b", traceId: "4ac2" }
+}));};
+const _brainlogs_test_deploys_answers_the_deployers_lines_of_a_span_whole = async function _test_deploys_answers_the_deployers_lines_of_a_span_whole(deployEvent,deploysRig,expect) {
+  const H = 3600000, from = 1791676800000, to = from + 24 * H;
+  const events = [
+    deployEvent(from + 1 * H, { at: "deploy.uploaded", target: "brain-x-echo", hash: "h1", version: "v1" }),
+    deployEvent(from + 1 * H + 5, { at: "deploy.verify", target: "brain-x-echo", hash: "h1", run: "https://cb4.example/#verify=brain-x-echo" }),
+    // On the middle of the span, which both halves are asked for.
+    deployEvent(from + 12 * H, { at: "deploy.failed", target: "brain-x-echo", hash: "h1", failed: ["test_a"], otherTestsRan: 132, ms: 8105 }),
+    deployEvent(from + 12 * H + 1, { at: "deploy.put-back", target: "brain-x-echo", hash: "h1", previous: "h0", reason: "its tests failed: test_a: no" }),
+    deployEvent(from + 23 * H, { at: "deploy.verified", target: "brain-x-echo", hash: "h2", tests: 3, otherTestsRan: 132, ms: 900 }),
+    // What the fixed filter keeps out, should Cloudflare answer it anyway: another Worker's line, and a line of the deployer about a token.
+    deployEvent(from + 2 * H, { at: "deploy.verified", target: "brain-x-echo", hash: "h9", tests: 1 }, "cb4-x-echo"),
+    deployEvent(from + 3 * H, { at: "token.minted", target: "brain-x-logs", token: "t" }),
+    { timestamp: from + 4 * H, $workers: { scriptName: "cb4-deployer" }, $metadata: { id: "text" }, source: "deploy.verified as text" }
+  ];
+  const rig = await deploysRig(events);
+  // The caller's filters are not read: the body sent is the service's own.
+  const out = await rig.get(`?from=${from}&to=${to}&worker=brain-core&filters=x`);
+  expect(out.status).toBe(200);
+  expect(rig.seen[0]).toEqual({
+    queryId: "deploys",
+    timeframe: { from, to },
+    view: "events",
+    limit: 2000,
+    parameters: { datasets: ["cloudflare-workers"], filterCombination: "and", filters: [{ key: "$workers.scriptName", operation: "eq", type: "string", value: "cb4-deployer" }, { kind: "group", filterCombination: "and", filters: [{ key: "at", operation: "starts_with", type: "string", value: "deploy." }] }] }
+  });
+  // 24 hours are sampled here and 6 are not: the span, two halves, four quarters.
+  expect(rig.seen.map((b) => (b.timeframe.to - b.timeframe.from) / H)).toEqual([24, 12, 12, 6, 6, 6, 6]);
+  expect(out.data.queries).toBe(7);
+  expect([out.data.from, out.data.to]).toEqual([from, to]);
+  // Each line once, oldest first, as the deployer wrote it with its time: nothing of the request Cloudflare keeps beside it.
+  expect(out.data.lines.map((l) => [l.t - from, l.at, l.hash])).toEqual([[1 * H, "deploy.uploaded", "h1"], [1 * H + 5, "deploy.verify", "h1"], [12 * H, "deploy.failed", "h1"], [12 * H + 1, "deploy.put-back", "h1"], [23 * H, "deploy.verified", "h2"]]);
+  expect(out.data.lines[2]).toEqual({ at: "deploy.failed", target: "brain-x-echo", hash: "h1", failed: ["test_a"], otherTestsRan: 132, ms: 8105, deployer: "f9007d2d", worker: "brain-deployer", ray: "a48bd6e14a6acc97", t: from + 12 * H });
+  expect(JSON.stringify(out.data)).not.toMatch(/secret=1|\$workers|\$metadata|token\.minted|h9/);
+  expect(out.data.workers).toEqual([{ worker: "brain-x-echo", runs: 2, verified: 1, failed: 1, none: 0, stale: 0, putBack: 1, hashes: [{ hash: "h1", verified: 0, failed: 1 }, { hash: "h2", verified: 1, failed: 0 }] }]);
+  expect(out.data.tests).toEqual([{ worker: "brain-x-echo", test: "test_a", fails: 1, runs: 2, passedOnSameHash: 0, passedLater: 1, hashes: ["h1"], last: from + 12 * H }]);
+  // With no span, the 24 hours before now.
+  const now = await rig.get("");
+  expect(now.data.to - now.data.from).toBe(24 * H);
+  expect(Math.abs(now.data.to - Date.now())).toBeLessThan(600000);
+  // A span that is not one, or longer than Cloudflare keeps, is refused before Cloudflare is asked.
+  const asked = rig.seen.length;
+  for (const bad of [`?from=${to}&to=${from}`, `?from=${from}&to=${from}`, "?from=yesterday", `?from=${from}&to=${from + 7 * 24 * H + 1}`, `?from=${from}&to=`]) expect([bad, (await rig.get(bad)).status]).toEqual([bad, 400]);
+  expect(rig.seen.length).toBe(asked);
+  // Cloudflare's refusal is an error of this method, with its status named.
+  const down = await (await deploysRig(events, { status: 429 })).get(`?from=${from}&to=${to}`);
+  expect([down.status, down.data.error]).toEqual([502, "UpstreamFailure"]);
+  expect(down.data.message).toContain("429");
+  return "5 lines in 7 queries";
+};
+const _brainlogs_test_deploy_lines_halves_a_window_until_it_is_whole = async function _test_deploy_lines_halves_a_window_until_it_is_whole(deployEvent,deploysRig,deployLines,expect) {
+  const M = 60000, from = 1791676800000;
+  const events = [0, 1, 2, 3, 4, 5, 6, 7].map((i) => deployEvent(from + i * 10 * M, { at: "deploy.uploaded", target: "brain-x-w" + i, hash: "h" + i }));
+  // A window that answers as many lines as the limit may hold more: it is halved, though nothing was sampled.
+  const rig = await deploysRig(events, { whole: Infinity });
+  const lines = await deployLines(async (body) => rig.answer(body), "cb4", from, from + 80 * M, { limit: 3 });
+  expect(lines.map((l) => l.target)).toEqual(events.map((e) => e.source.target));
+  expect(rig.seen.every((b) => b.limit === 3)).toBe(true);
+  expect(rig.seen.length).toBeGreaterThan(3);
+  // A minute that is still not whole is an error, not a short answer; so is a span that needs more queries than the bound.
+  const crowded = await deploysRig([0, 1, 2].map((i) => deployEvent(from + i, { at: "deploy.uploaded", target: "brain-x-c" + i, hash: "h" })), { whole: Infinity });
+  await expect(deployLines(async (body) => crowded.answer(body), "cb4", from, from + 80 * M, { limit: 3 })).rejects.toThrow(/not whole/);
+  const sampled = await deploysRig(events, { whole: 0 });
+  await expect(deployLines(async (body) => sampled.answer(body), "cb4", from, from + 7 * 24 * 60 * M, { queries: 20 })).rejects.toThrow(/more than 20 queries/);
+  expect(sampled.seen.length).toBe(20);
+  return rig.seen.length + " queries for 8 lines at 3 a window";
+};
+const _brainlogs_test_deploy_runs_counts_by_worker_hash_and_failed_test = function _test_deploy_runs_counts_by_worker_hash_and_failed_test(deployRuns,expect) {
+  const line = (t, at, target, hash, more = {}) => ({ at, target, hash, t, ...more });
+  const lines = [
+    // The caret test of 2026-10-11: failed on one hash, passed on the next two. No pass on the hash it failed on.
+    line(10, "deploy.verify", "brain-x-issues", "i1"),
+    line(11, "deploy.failed", "brain-x-issues", "i1", { failed: ["test_caret"], otherTestsRan: 132, ms: 9000 }),
+    line(12, "deploy.put-back", "brain-x-issues", "i1", { previous: "i0", reason: "its tests failed: test_caret: no" }),
+    line(20, "deploy.verified", "brain-x-issues", "i2", { tests: 21 }),
+    line(30, "deploy.verified", "brain-x-issues", "i3", { tests: 21 }),
+    // One hash that failed and then passed with no change: the only evidence of a flake these lines hold.
+    line(40, "deploy.failed", "brain-x-snapshot", "s1", { failed: ["test_days", "test_redraw"] }),
+    line(41, "deploy.verified", "brain-x-snapshot", "s1", { tests: 9 }),
+    line(42, "deploy.failed", "brain-x-snapshot", "s2", { failed: ["test_redraw"] }),
+    // No verdict, a verdict for another hash, a put-back with no test run, and a line with no Worker.
+    line(50, "deploy.verify.none", "brain-x-git", "g1", { reason: "the page left no verdict" }),
+    line(51, "deploy.verify.stale", "brain-x-git", "g0", { running: "g1" }),
+    line(52, "deploy.put-back", "brain-x-git", "g1", { reason: "not confirmed in 10 minutes" }),
+    line(60, "deploy.waiting", undefined, undefined),
+    line(61, "deploy.uploaded", "brain-x-echo", "e1")
+  ];
+  // The order given does not matter: it is counted by time.
+  const out = deployRuns([...lines].reverse());
+  expect(out.workers).toEqual([
+    { worker: "brain-x-git", runs: 0, verified: 0, failed: 0, none: 1, stale: 1, putBack: 1, hashes: [] },
+    { worker: "brain-x-issues", runs: 3, verified: 2, failed: 1, none: 0, stale: 0, putBack: 1, hashes: [{ hash: "i1", verified: 0, failed: 1 }, { hash: "i2", verified: 1, failed: 0 }, { hash: "i3", verified: 1, failed: 0 }] },
+    { worker: "brain-x-snapshot", runs: 3, verified: 1, failed: 2, none: 0, stale: 0, putBack: 0, hashes: [{ hash: "s1", verified: 1, failed: 1 }, { hash: "s2", verified: 0, failed: 1 }] }
+  ]);
+  expect(out.tests).toEqual([
+    { worker: "brain-x-snapshot", test: "test_redraw", fails: 2, runs: 3, passedOnSameHash: 1, passedLater: 0, hashes: ["s1", "s2"], last: 42 },
+    { worker: "brain-x-issues", test: "test_caret", fails: 1, runs: 3, passedOnSameHash: 0, passedLater: 1, hashes: ["i1"], last: 11 },
+    { worker: "brain-x-snapshot", test: "test_days", fails: 1, runs: 3, passedOnSameHash: 1, passedLater: 0, hashes: ["s1"], last: 40 }
+  ]);
+  expect(deployRuns([])).toEqual({ workers: [], tests: [] });
+  return "3 Workers, 3 tests";
 };
 
 export default function define(runtime, observer) {
@@ -35747,16 +35988,23 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainlogs_anon_838bbccf45", null, ["md"], _brainlogs_anon_838bbccf45);
+  $def("_brainlogs_anon_d9bd6248bc", null, ["md"], _brainlogs_anon_d9bd6248bc);
   $def("_brainlogs_logsScript", "logsScript", [], _brainlogs_logsScript);
   $def("_brainlogs_logsScope", "logsScope", ["logsScript"], _brainlogs_logsScope);
-  $def("_brainlogs_logs_service", "logs_service", ["cloudflare","Response","logsScript","config","cloudflareApi","logsScope"], _brainlogs_logs_service);
+  $def("_brainlogs_deployLines", "deployLines", ["logsScript","logsScope"], _brainlogs_deployLines);
+  $def("_brainlogs_deployRuns", "deployRuns", [], _brainlogs_deployRuns);
+  $def("_brainlogs_logs_service", "logs_service", ["cloudflare","Response","cloudflareApi","deployLines","config","deployRuns","logsScript","logsScope"], _brainlogs_logs_service);
   $def("_brainlogs_logs_announce", "logs_announce", ["plugins","logs_service","invalidation"], _brainlogs_logs_announce);
   $def("_brainlogs_anon_be3d699220", null, ["md"], _brainlogs_anon_be3d699220);
   $def("_brainlogs_logsRig", "logsRig", ["simulate","logs_service","Response"], _brainlogs_logsRig);
   $def("_brainlogs_test_a_query_is_passed_on_inside_this_brains_filter", "test_a_query_is_passed_on_inside_this_brains_filter", ["logsRig","expect"], _brainlogs_test_a_query_is_passed_on_inside_this_brains_filter);
   $def("_brainlogs_test_worker_narrows_a_query_to_one_worker_of_this_brain", "test_worker_narrows_a_query_to_one_worker_of_this_brain", ["logsRig","expect","logsScript"], _brainlogs_test_worker_narrows_a_query_to_one_worker_of_this_brain);
   $def("_brainlogs_test_logs_declares_one_cloudflare_permission_and_the_owners_session", "test_logs_declares_one_cloudflare_permission_and_the_owners_session", ["logs_service","expect","decide","callerOf"], _brainlogs_test_logs_declares_one_cloudflare_permission_and_the_owners_session);
+  $def("_brainlogs_deploysRig", "deploysRig", ["simulate","logs_service","Response"], _brainlogs_deploysRig);
+  $def("_brainlogs_deployEvent", "deployEvent", [], _brainlogs_deployEvent);
+  $def("_brainlogs_test_deploys_answers_the_deployers_lines_of_a_span_whole", "test_deploys_answers_the_deployers_lines_of_a_span_whole", ["deployEvent","deploysRig","expect"], _brainlogs_test_deploys_answers_the_deployers_lines_of_a_span_whole);
+  $def("_brainlogs_test_deploy_lines_halves_a_window_until_it_is_whole", "test_deploy_lines_halves_a_window_until_it_is_whole", ["deployEvent","deploysRig","deployLines","expect"], _brainlogs_test_deploy_lines_halves_a_window_until_it_is_whole);
+  $def("_brainlogs_test_deploy_runs_counts_by_worker_hash_and_failed_test", "test_deploy_runs_counts_by_worker_hash_and_failed_test", ["deployRuns","expect"], _brainlogs_test_deploy_runs_counts_by_worker_hash_and_failed_test);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("cloudflareApi", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflareApi", _));
