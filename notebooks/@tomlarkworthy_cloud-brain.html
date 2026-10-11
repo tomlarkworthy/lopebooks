@@ -19940,7 +19940,8 @@ const _cloudflareiac_workerRuntime = function _workerRuntime(Response,URLSearchP
     return new Request(request, { headers });
   };
   // The text of every prose cell (a cell that returns one md`…`) in a module's source, in order, with the escapes of a
-  // template literal undone. A method table in a later cell is part of the reference too.
+  // template literal undone. A method table in a later cell is part of the reference too. For a Worker emitted
+  // before 2026-10-11, which carries no reference of its own; a hole in it is not filled.
   const referenceOf = (text) =>
     [...text.matchAll(/\{\s*return \(\s*md`((?:[^`\\]|\\[\s\S])*)`/g)].map((m) => m[1].replace(/\\([`\\$])/g, "$1")).join("\n\n");
   const bindingName = (name) => "X_" + name.toUpperCase().replace(/[^A-Z0-9]/g, "_");
@@ -20124,7 +20125,7 @@ const _cloudflareiac_workerRuntime = function _workerRuntime(Response,URLSearchP
         const describes = url.pathname === "/xrpc/com.lopecode.brain.getInfo" ? "info" : url.pathname === "/xrpc/com.lopecode.brain.getSource" ? "source" : null;
         // part=reference: the module's prose cells, which hold its method tables, as text.
         if (describes === "source" && url.searchParams.get("part") === "reference" && request.method === "GET" && (!asked || asked === info().name) && (inside || edge || keyed))
-          return new Response(referenceOf(source ? source.text : ""), { headers: { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" } });
+          return new Response(source ? source.reference ?? referenceOf(source.text) : "", { headers: { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" } });
         if (describes && request.method === "GET" && (!asked || asked === info().name) && (inside || edge || keyed))
           return new Response(JSON.stringify(describes === "info" ? info() : { worker: info().name, hash: info().hash, module: source ? source.module : null, text: source ? source.text : null }), {
             headers: { "content-type": "application/json", "access-control-allow-origin": "*" }
@@ -20361,6 +20362,28 @@ const _cloudflareiac_emit = function _emit(runtime,platformTag,libraries,noteboo
   // The module the service's cell is in, as source. The Worker serves it, and it is part of what is hashed, so
   // what runs and what it was made from are deployed and put back together.
   const source = await moduleSource(root._module);
+  // The reference a Worker serves: the module's prose cells as text, each hole filled with the value its cell has
+  // here. Made at the emit, in the tab and in the deployer's QuickJS alike, because a Worker holds the cells'
+  // source and does not run them: served from source, a hole read as ${gitDefaults.seconds} (40 of them in four
+  // Workers on 2026-10-10). A hole that cannot be computed here refuses the emit: kept as source text it would
+  // give the tab and the deployer two hashes for one module.
+  if (source) {
+    const filled = (strings, ...values) => strings.reduce((a, t, i) => a + t + (i < values.length ? String(values[i]) : ""), "");
+    const prose = [];
+    // The whole definition is one md`…`: a cell that only holds such text in a string (a test's fixture) is not
+    // prose, and calling it here would run it (the library's tests ran themselves without end, 2026-10-11).
+    for (const v of [...runtime._variables]) {
+      const written = v._module === root._module && typeof v._definition === "function" ? /^function[^(]*\([^)]*\)\s*\{\s*return \(\s*md`((?:[^`\\]|\\[\s\S])*)`\s*\)?;?\s*\}$/.exec(String(v._definition)) : null;
+      if (!written) continue;
+      const names = (v._inputs || []).map((i) => i._name);
+      prose.push(
+        await Promise.all(names.map((n) => (n === "md" ? filled : v._module.value(n))))
+          .then((inputs) => String(v._definition(...inputs)))
+          .catch((e) => refuse(v._name || "(a prose cell)", "is prose with a value that cannot be computed at the emit: " + (e && e.message)))
+      );
+    }
+    source.reference = prose.join("\n\n");
+  }
   if (source) lines.push(`import __source from "./source.js";`);
   // The interpreter's WebAssembly is a part of the Worker. Cloudflare compiles it at upload.
   if (used.has("quickjs")) lines.push(`import __quickjs_wasm from "./quickjs.wasm";`, `const __quickjs = { module: async () => __quickjs_wasm };`);
@@ -20609,9 +20632,9 @@ const _cloudflareiac_logged = function _logged(invalidation,simWaits) {
     return lines.filter((l) => l && typeof l === "object");
   };
 };
-const _cloudflareiac_anon_45a3f5c4f1 = function _anonymous(md) {return (md`## Fixtures and tests
+const _cloudflareiac_anon_912aa9c444 = function _anonymous(md,wrapperFlags) {return (md`## Fixtures and tests
 
-Cells named \`fx_*\` exist for the tests. Three of them are services the emit must refuse.`);};
+Cells named \`fx_*\` exist for the tests. Three of them are services the emit must refuse. Every Worker emitted here runs with the compatibility flags ${wrapperFlags.map((f) => "\`" + f + "\`").join(", ")}.`);};
 const _cloudflareiac_fx_double = function _fx_double() {return ((x) => x * 2);};
 const _cloudflareiac_fx_base = function _fx_base() {return (7);};
 const _cloudflareiac_fx_logging_service = function _fx_logging_service(cloudflare,log,xrpc,Response) {return (cloudflare.Service("fxlog", async (request) => {
@@ -21348,7 +21371,7 @@ const _cloudflareiac_test_simulate = async function _test_simulate(simulate,fx_s
   expect(bare.requests.length).toBe(1);
   return "row, inbox entry and outbound call observed; no fake = 500";
 };
-const _cloudflareiac_test_a_worker_serves_its_manifest_and_its_source = async function _test_a_worker_serves_its_manifest_and_its_source(simulate,fx_service,expect,partsHash) {
+const _cloudflareiac_test_a_worker_serves_its_manifest_and_its_source = async function _test_a_worker_serves_its_manifest_and_its_source(simulate,fx_service,expect,partsHash,wrapperFlags) {
   const sim = await simulate(fx_service, { secrets: { T: "s3" }, info: { role: "kernel" } });
   const e = sim.emitted;
   expect(e.meta.module).toBe("@tomlarkworthy/cloudflare-iac");
@@ -21364,13 +21387,24 @@ const _cloudflareiac_test_a_worker_serves_its_manifest_and_its_source = async fu
   // Every response says which Worker and version produced it.
   expect(got.headers.get("x-brain-served-by")).toBe("brain-x-fixture@" + e.hash.slice(0, 12));
   expect(body.text).toBe(e.source.text);
-  // part=reference: the prose cells of the module as text, with the escapes of their templates undone.
+  // part=reference: the prose cells of the module as text, with the escapes of their templates undone and each
+  // hole filled with its cell's value at the emit. It is part of the source that is hashed.
   const reference = await sim.fetch("https://cb.sub.workers.dev/xrpc/com.lopecode.brain.getSource?part=reference");
   expect(reference.headers.get("content-type")).toMatch(/^text\/plain/);
   const said = await reference.text();
   expect(said.length).toBeGreaterThan(100);
   expect(body.text).toContain(said.slice(0, 60).replace(/[`\\$]/g, "\\$&"));
   expect(said).not.toMatch(/\\`/);
+  expect(said).toBe(e.source.reference);
+  expect(body.text).toContain("compatibility flags ${wrapperFlags.map(");
+  expect(said).toContain("compatibility flags " + wrapperFlags.map((f) => "`" + f + "`").join(", ") + ".");
+  expect(said).not.toContain("${wrapperFlags");
+  expect(body.reference).toBeUndefined();
+  // Every prose cell of the source is in it, in the source's order: only the hole differs.
+  const hole = '${wrapperFlags.map((f) => "`" + f + "`").join(", ")}';
+  const asWritten = [...body.text.matchAll(/\{\s*return \(\s*md`((?:[^`\\]|\\[\s\S])*)`/g)].map((m) => m[1].replace(/\\([`\\$])/g, "$1")).join("\n\n");
+  expect(asWritten).toContain(hole);
+  expect(said).toBe(asWritten.replace(hole, wrapperFlags.map((f) => "`" + f + "`").join(", ")));
   // A question about another Worker is not this Worker's to answer.
   expect((await sim.fetch("https://cb.sub.workers.dev/xrpc/com.lopecode.brain.getSource?worker=brain-x-other")).status).not.toBe(200);
   // A recipe does not answer the internet at all; over a binding it does.
@@ -21603,7 +21637,7 @@ export default function define(runtime, observer) {
   $def("_cloudflareiac_simulate", "simulate", ["Response","Request","simWaits"], _cloudflareiac_simulate);
   $def("_cloudflareiac_simWaits", "simWaits", [], _cloudflareiac_simWaits);
   $def("_cloudflareiac_logged", "logged", ["invalidation","simWaits"], _cloudflareiac_logged);
-  $def("_cloudflareiac_anon_45a3f5c4f1", null, ["md"], _cloudflareiac_anon_45a3f5c4f1);
+  $def("_cloudflareiac_anon_912aa9c444", null, ["md","wrapperFlags"], _cloudflareiac_anon_912aa9c444);
   $def("_cloudflareiac_fx_double", "fx_double", [], _cloudflareiac_fx_double);
   $def("_cloudflareiac_fx_base", "fx_base", [], _cloudflareiac_fx_base);
   $def("_cloudflareiac_fx_logging_service", "fx_logging_service", ["cloudflare","log","xrpc","Response"], _cloudflareiac_fx_logging_service);
@@ -21664,7 +21698,7 @@ export default function define(runtime, observer) {
   $def("_cloudflareiac_fx_named_new", "fx_named_new", ["cloudflare","Response"], _cloudflareiac_fx_named_new);
   $def("_cloudflareiac_test_a_service_declared_with_the_old_name_emits_the_same", "test_a_service_declared_with_the_old_name_emits_the_same", ["fx_named_old","fx_named_new","expect"], _cloudflareiac_test_a_service_declared_with_the_old_name_emits_the_same);
   $def("_cloudflareiac_test_simulate", "test_simulate", ["simulate","fx_service","Response","expect"], _cloudflareiac_test_simulate);
-  $def("_cloudflareiac_test_a_worker_serves_its_manifest_and_its_source", "test_a_worker_serves_its_manifest_and_its_source", ["simulate","fx_service","expect","partsHash"], _cloudflareiac_test_a_worker_serves_its_manifest_and_its_source);
+  $def("_cloudflareiac_test_a_worker_serves_its_manifest_and_its_source", "test_a_worker_serves_its_manifest_and_its_source", ["simulate","fx_service","expect","partsHash","wrapperFlags"], _cloudflareiac_test_a_worker_serves_its_manifest_and_its_source);
   $def("_cloudflareiac_test_plain_function_caller_and_error_shape", "test_plain_function_caller_and_error_shape", ["simulate","fx_plain","Response","expect"], _cloudflareiac_test_plain_function_caller_and_error_shape);
   $def("_cloudflareiac_test_hono_same_in_tab_and_emitted", "test_hono_same_in_tab_and_emitted", ["backend","simulate","fx_service","fx_six","Request","expect"], _cloudflareiac_test_hono_same_in_tab_and_emitted);
   $def("_cloudflareiac_test_getInfo_cannot_be_replaced", "test_getInfo_cannot_be_replaced", ["simulate","fx_service","expect"], _cloudflareiac_test_getInfo_cannot_be_replaced);
@@ -35657,9 +35691,9 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainsnapshot_anon_7c3defae9b = function _anonymous(md,snapshotAgent) {return (md`# brain-snapshot
+const _brainsnapshot_anon_99f19121fa = function _anonymous(md,snapshotAgent) {return (md`# brain-snapshot
 
-A Cloud Brain recipe: once a day it fetches a list of public feeds and keeps what each one said as a public JSON file. It records. It makes no model call, ranks nothing and writes no summary: a notebook reads the files and does that.
+A Cloud Brain recipe: once a day it fetches a list of public feeds and keeps what each one said as a public JSON file. It records. It makes no model call, ranks nothing and writes no summary: a notebook reads the files and does that. A run that kept items opens one task in the Brain's tracker, \`digest-<day>\`, for whoever writes that day's digest.
 
 | | |
 |---|---|
@@ -35669,6 +35703,7 @@ A Cloud Brain recipe: once a day it fetches a list of public feeds and keeps wha
 | \`snapshot.setSources\` | procedure, the owner's own session. \`{ sources: [...] }\` replaces the list; \`{ sources: null }\` goes back to the list below. \`{ keepDays }\` sets how many days are kept (90 unless set). |
 | Timer | each day at the first tick after 06:00 UTC, once (\`rows\`: \`ran/<day>\`). The tick is the wrapper's minute alarm, armed by the deployer's health check at deploy; the cron is declared as well. |
 | Storage | files in \`brain-static\` under \`snapshot/<day>/\`, public, tag \`snapshot\`. \`rows\`: \`sources\`, \`keepDays\`, \`ran/<day>\`, \`day/<day>\`. |
+| Tracker | \`issue.open\` as this Worker, once a day: id \`digest-<day>\`, kind \`task\`, label \`digest\`, key \`snapshot/<day>/digest\`. |
 
 To run it now: the **Run now** button below, in the owner's own session. From this checkout: \`BRAIN_BASE=cb4 bun tools/cloud-brain/brain.ts curl /xrpc/com.lopecode.brain.snapshot.run --owner -X POST\`. A token is refused.
 
@@ -35679,7 +35714,7 @@ Anyone reads these with no session. \`<day>\` is the UTC date, \`2026-10-09\`.
 | Address | Holds |
 |---|---|
 | \`/static/snapshot/days.json\` | \`{ days: [{ day, ranAt, items, papers }] }\`, newest first; \`papers\` is the count in that day's \`papers.json\` |
-| \`/static/snapshot/<day>/index.json\` | \`{ day, ranAt, sources: [{ name, tier, status, count, matched, of, bytes, ms, path, error, lookup }], papers: { count, path }, knowledge, errors }\` |
+| \`/static/snapshot/<day>/index.json\` | \`{ day, ranAt, sources: [{ name, tier, status, count, matched, of, bytes, ms, path, error, lookup }], papers: { count, path }, knowledge, issue, errors }\` |
 | \`/static/snapshot/<day>/<source>.json\` | \`{ source, tier, url, day, fetchedAt, count, items }\` |
 | \`/static/snapshot/<day>/papers.json\` | \`{ day, ranAt, count, papers: [{ id, url, title, summary, points, signals, via }] }\`: the papers with a signal seen that day (below) |
 
@@ -35693,6 +35728,7 @@ A feed's summary has its markup taken out, after its entities are read: a \`<\` 
 - A failed source does not fail the run. The timer runs once a day and does not try again; \`snapshot.run\` does.
 - \`of\` is how many items the feed held, \`matched\` how many passed \`keep\` and \`days\`, \`count\` how many were kept. \`matched\` above \`count\` means \`limit\` cut the list, unless the row has an \`error\`: a source whose file was refused has \`count: 0\` and its \`matched\`.
 - The papers of \`papers.json\` that have a title are entered in the knowledge base with \`knowledge.put\`, as \`arxiv:<id>\`, kind \`paper\`, method \`snapshot\`, each signal a tag (\`votes-hf-papers\`), 100 at most. \`knowledge\` in the index is \`{ entered, changed }\`, or \`{ error }\` on a Brain with no \`brain-x-knowledge\`; that is not one of \`errors\`.
+- A run that kept at least one item opens a task for that day's digest with \`issue.open\`. Its body is the day, the time of the run, the counts, the two addresses and each source that answered with an error; it says nothing of how a digest is written. The key is the day's, so a second run that day opens nothing and is answered the first one's id. \`issue\` in the index is \`{ id, seq }\`, \`{ skipped }\` for a run that kept nothing, or \`{ error }\` on a Brain with no \`brain-x-issues\`; that is not one of \`errors\`. Nothing here writes the digest or closes the task.
 - \`errors\` in the index, and in the log line, names a write of \`index.json\`, \`papers.json\` or \`days.json\` that failed.
 - The daily run drops the files of days older than \`keepDays\` with \`static.delete\` \`{ prefix: "snapshot/", before }\`. \`snapshot.run\` drops nothing.
 
@@ -35857,7 +35893,25 @@ const _brainsnapshot_snapshotCheck = function _snapshotCheck() {return ((list) =
   }
   return null;
 });};
-const _brainsnapshot_snapshotOps = function _snapshotOps(xrpc,snapshotEntries,rows,snapshotSources,snapshotAgent,snapshotItems,snapshotSignals,log) {
+const _brainsnapshot_snapshotTask = function _snapshotTask() {return ((index, items) => {
+  const day = index.day, kept = index.sources.filter((s) => s.count), failed = index.sources.filter((s) => s.error);
+  return {
+    key: `snapshot/${day}/digest`,
+    id: "digest-" + day,
+    kind: "task",
+    about: "brain-x-snapshot",
+    labels: ["digest"],
+    title: "Research digest for " + day,
+    body: [
+      `The snapshot of ${day} ran at ${index.ranAt}. Its digest is not written.`,
+      "",
+      `- ${items} items kept from ${kept.length} of ${index.sources.length} sources: /static/snapshot/${day}/index.json`,
+      `- ${index.papers.count} papers with a signal: /static/${index.papers.path}`,
+      ...failed.map((s) => `- ${s.name} gave nothing: ${String(s.error).slice(0, 120)}`)
+    ].join("\n")
+  };
+});};
+const _brainsnapshot_snapshotOps = function _snapshotOps(xrpc,snapshotEntries,snapshotTask,rows,snapshotSources,snapshotAgent,snapshotItems,snapshotSignals,log) {
   const STATIC = "com.lopecode.brain.static.";
   const dayOf = (now) => new Date(now).toISOString().slice(0, 10);
   const put = async (path, value) => {
@@ -35873,6 +35927,18 @@ const _brainsnapshot_snapshotOps = function _snapshotOps(xrpc,snapshotEntries,ro
       const r = await xrpc.fetch("com.lopecode.brain.knowledge.put", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ entries }) });
       const d = await r.json().catch(() => null);
       return r.ok && d ? { entered: d.entered, changed: d.changed } : { error: "knowledge.put " + r.status };
+    } catch (e) {
+      return { error: String((e && e.message) || e).slice(0, 200) };
+    }
+  };
+  // The task for the day's digest, opened as this Worker. The key is the day's: a second run opens nothing.
+  // On a Brain with no brain-x-issues the call is refused, and the index says so.
+  const ask = async (index, items) => {
+    if (!items) return { skipped: "the run kept no items" };
+    try {
+      const r = await xrpc.fetch("com.lopecode.brain.issue.open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(snapshotTask(index, items)) });
+      const d = await r.json().catch(() => null);
+      return r.ok && d ? { id: d.id, seq: d.seq } : { error: "issue.open " + r.status };
     } catch (e) {
       return { error: String((e && e.message) || e).slice(0, 200) };
     }
@@ -35911,6 +35977,7 @@ const _brainsnapshot_snapshotOps = function _snapshotOps(xrpc,snapshotEntries,ro
     index.knowledge = await enter(papers);
     await rows.put("day/" + day, { day, ranAt: index.ranAt, items, papers: papers.length });
     await tried(put("snapshot/days.json", { days: (await rows.list("day/")).map((r) => r.value).sort((a, b) => (a.day < b.day ? 1 : -1)) }));
+    index.issue = await ask(index, items);
     index.errors = errors;
     // The index is written last, with what failed before it. Its own failure is in the answer and the log.
     await tried(put(`snapshot/${day}/index.json`, index));
@@ -35969,7 +36036,7 @@ const _brainsnapshot_snapshot_service = function _snapshot_service(cloudflare,Re
     crons: ["0 6 * * *"],
     // A cron event carries its time; the wrapper's minute alarm does not.
     scheduled: (event) => snapshotOps.tick((event && event.scheduledTime) || Date.now()),
-    calls: ["com.lopecode.brain.static.put", "com.lopecode.brain.static.delete", "com.lopecode.brain.knowledge.put"],
+    calls: ["com.lopecode.brain.static.put", "com.lopecode.brain.static.delete", "com.lopecode.brain.knowledge.put", "com.lopecode.brain.issue.open"],
     methods: {
       "com.lopecode.brain.snapshot.run": { type: "procedure", allow: "caller.session" },
       "com.lopecode.brain.snapshot.sources": { type: "query", who: "anyone" },
@@ -36020,8 +36087,8 @@ const _brainsnapshot_snapshotPanel = function _snapshotPanel(htl,Inputs,Event) {
   return el;
 });};
 const _brainsnapshot_anon_be3d699220 = function _anonymous(md) {return (md`## Tests`);};
-const _brainsnapshot_snapshotRig = function _snapshotRig(simulate,snapshot_service,Response) {return (async ({ feeds = {}, rows = new Map(), fail = null, knowledge = 200 } = {}) => {
-  const files = new Map(), asked = [], dropped = [], entered = [];
+const _brainsnapshot_snapshotRig = function _snapshotRig(simulate,snapshot_service,Response) {return (async ({ feeds = {}, rows = new Map(), fail = null, knowledge = 200, issues = 200 } = {}) => {
+  const files = new Map(), asked = [], dropped = [], entered = [], opened = [];
   const sim = await simulate(snapshot_service, {
     rows,
     secrets: { BRAIN_KEY: "k" },
@@ -36037,6 +36104,13 @@ const _brainsnapshot_snapshotRig = function _snapshotRig(simulate,snapshot_servi
         entered.push({ entries: (await request.json()).entries });
         return knowledge === 200 ? Response.json({ entered: entered.at(-1).entries.length, changed: 0, ids: [] }) : Response.json({ error: "MethodNotImplemented" }, { status: knowledge });
       }
+      // As the tracker answers: a key it holds gives the first event's id and seq again.
+      if (u.pathname.endsWith("issue.open")) {
+        if (issues !== 200) return Response.json({ error: "MethodNotImplemented" }, { status: issues });
+        const act = await request.json(), had = opened.find((o) => o.key === act.key);
+        if (!had) opened.push({ ...act, seq: opened.length + 1, caller: request.headers.get("x-brain-caller") });
+        return Response.json({ id: act.id, seq: (had || opened.at(-1)).seq, ...(had ? { duplicate: true } : {}) });
+      }
       if (u.pathname.endsWith("static.delete")) return dropped.push(await request.json()), Response.json({ deleted: 2, paths: [] });
       if (fail && fail(u.searchParams.get("path"))) return Response.json({ error: "Forbidden" }, { status: 403 });
       files.set(u.searchParams.get("path"), { public: u.searchParams.get("public"), tags: u.searchParams.get("tags"), caller: request.headers.get("x-brain-caller"), value: JSON.parse(await request.text()) });
@@ -36047,7 +36121,7 @@ const _brainsnapshot_snapshotRig = function _snapshotRig(simulate,snapshot_servi
     const r = await sim.fetch("https://snapshot.internal/xrpc/com.lopecode.brain.snapshot." + name, { method: body === undefined ? "GET" : "POST", headers: { "content-type": "application/json", "x-brain-caller": caller }, body: body === undefined ? undefined : JSON.stringify(body) });
     return { status: r.status, data: await r.json() };
   };
-  return { sim, files, asked, dropped, entered, rows, call };
+  return { sim, files, asked, dropped, entered, opened, rows, call };
 });};
 const _brainsnapshot_snapshotFixtures = function _snapshotFixtures() {return ({
   rss: `<?xml version="1.0"?><rss><channel><title>Feed</title><link>https://blog.example/</link>
@@ -36192,6 +36266,36 @@ const _brainsnapshot_test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention
   expect([bare.knowledge, bare.errors, bare.papers.count]).toEqual([{ error: "knowledge.put 404" }, [], 1]);
   return "5 papers, 3 signals, 4 entered";
 };
+const _brainsnapshot_test_a_run_that_kept_items_opens_one_task_for_the_days_digest = async function _test_a_run_that_kept_items_opens_one_task_for_the_days_digest(snapshotFixtures,snapshotRig,expect) {
+  const sources = [{ name: "blog", tier: "blogger", url: "https://blog.example/feed", kind: "rss" }, { name: "refused", tier: "aggregator", url: "https://refused.example/feed", kind: "rss" }];
+  const feeds = { "https://blog.example/feed": snapshotFixtures.rss, "https://refused.example/feed": 429 };
+  const rig = await snapshotRig({ rows: new Map([["sources", sources]]), feeds });
+  const out = (await rig.call("run", {})).data, day = out.day;
+  expect(out.issue).toEqual({ id: "digest-" + day, seq: 1 });
+  expect(rig.opened.length).toBe(1);
+  const { seq, caller, ...sent } = rig.opened[0];
+  expect(sent).toEqual({
+    key: `snapshot/${day}/digest`, id: "digest-" + day, kind: "task", about: "brain-x-snapshot", labels: ["digest"], title: "Research digest for " + day,
+    body: [`The snapshot of ${day} ran at ${out.ranAt}. Its digest is not written.`, "", `- 2 items kept from 1 of 2 sources: /static/snapshot/${day}/index.json`, `- 0 papers with a signal: /static/snapshot/${day}/papers.json`, "- refused gave nothing: the source answered 429"].join("\n")
+  });
+  // The index that is kept says which task.
+  expect(rig.files.get(`snapshot/${day}/index.json`).value.issue).toEqual({ id: "digest-" + day, seq: 1 });
+  // A second run that day sends the same key, and the tracker opens nothing.
+  expect([(await rig.call("run", {})).data.issue, rig.opened.length]).toEqual([{ id: "digest-" + day, seq: 1 }, 1]);
+  // The timer's run opens the task of its own day.
+  await rig.sim.scheduled({ scheduledTime: Date.parse("2020-01-02T06:00:30Z") });
+  expect(rig.opened.map((o) => o.id)).toEqual(["digest-" + day, "digest-2020-01-02"]);
+  // A run that kept nothing opens none.
+  const quiet = await snapshotRig({ rows: new Map([["sources", sources.slice(1)]]), feeds });
+  expect([(await quiet.call("run", {})).data.issue, quiet.opened.length]).toEqual([{ skipped: "the run kept no items" }, 0]);
+  // A Brain with no tracker: the run is whole, and the index says no task was opened.
+  const none = await snapshotRig({ issues: 404, rows: new Map([["sources", sources]]), feeds });
+  const bare = (await none.call("run", {})).data;
+  expect([bare.issue, bare.errors, bare.sources[0].count]).toEqual([{ error: "issue.open 404" }, [], 2]);
+  // What is sent is one the tracker's own limits take.
+  expect([sent.id.length <= 40, /^[a-z0-9-]+$/.test(sent.id), sent.key.length <= 100, sent.key.startsWith("policy/")]).toEqual([true, true, true, false]);
+  return "1 task a day";
+};
 const _brainsnapshot_test_the_timer_runs_once_a_day_after_six = async function _test_the_timer_runs_once_a_day_after_six(snapshotRig,snapshotFixtures,expect) {
   const rig = await snapshotRig({ rows: new Map([["sources", [{ name: "blog", tier: "blogger", url: "https://blog.example/feed", kind: "rss" }]]]), feeds: { "https://blog.example/feed": snapshotFixtures.rss } });
   // A cron event carries its time, and the tick reads that.
@@ -36234,10 +36338,10 @@ const _brainsnapshot_test_the_owner_sets_the_sources_and_a_bad_list_is_refused =
   expect(new Set(snapshotSources.map((s) => s.tier))).toEqual(new Set(["research", "blogger", "aggregator"]));
   return snapshotSources.length + " default sources";
 };
-const _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_three_calls = async function _test_snapshot_declares_its_rules_its_timer_and_three_calls(snapshot_service,expect,decide,callerOf) {
+const _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_four_calls = async function _test_snapshot_declares_its_rules_its_timer_and_four_calls(snapshot_service,expect,decide,callerOf) {
   const { meta } = await snapshot_service.emit();
   expect(meta.worker).toBe("brain-x-snapshot");
-  expect([meta.calls, meta.secrets, meta.crons]).toEqual([["com.lopecode.brain.knowledge.put", "com.lopecode.brain.static.delete", "com.lopecode.brain.static.put"], [], ["0 6 * * *"]]);
+  expect([meta.calls, meta.secrets, meta.crons]).toEqual([["com.lopecode.brain.issue.open", "com.lopecode.brain.knowledge.put", "com.lopecode.brain.static.delete", "com.lopecode.brain.static.put"], [], ["0 6 * * *"]]);
   const N = "com.lopecode.brain.snapshot.";
   const ask = (m, caller, via = "") => decide(meta.access[N + m], { caller: callerOf({ caller, via }), origin: callerOf({ caller, via }), request: { params: {} } }).allow;
   expect([ask("run", "owner", "session"), ask("run", "owner", "token"), ask("run", "token:laptop"), ask("run", "worker:brain-x-echo"), ask("run", "anonymous")]).toEqual([true, false, false, false, false]);
@@ -36267,11 +36371,14 @@ const _brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one = asyn
   expect([...el.querySelectorAll("a")].map((a) => a.href)).toEqual(["https://b.example/static/snapshot/2026-10-09/hn.json", "https://b.example/static/snapshot/2026-10-09/papers.json"]);
   // Run now calls the Brain and reads the days again. A reader who is not the owner has no button.
   const button = el.querySelector("button");
+  // The redraw sends the panel's input event. Waited for by that event, not by the clock: 50 ms was not enough
+  // in the deployer's browser, which put this Worker back twice on 2026-10-11.
+  const redrawn = new Promise((r) => el.addEventListener("input", r, { once: true }));
   button.click();
   // Off until the run settles: a second press does nothing.
   expect(button.disabled).toBe(true);
   button.click();
-  await new Promise((r) => setTimeout(r, 50));
+  await redrawn;
   expect(el.textContent).not.toContain("cut from 2");
   expect(el.querySelector("button").disabled).toBe(false);
   expect([ran, heard]).toEqual([["snapshot.run"], 2]);
@@ -36292,7 +36399,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainsnapshot_anon_7c3defae9b", null, ["md","snapshotAgent"], _brainsnapshot_anon_7c3defae9b);
+  $def("_brainsnapshot_anon_99f19121fa", null, ["md","snapshotAgent"], _brainsnapshot_anon_99f19121fa);
   $def("_brainsnapshot_viewof_snapshotView", "viewof snapshotView", ["snapshotPanel","client","session"], _brainsnapshot_viewof_snapshotView);
   $def("_brainsnapshot_snapshotView", "snapshotView", ["Generators","viewof snapshotView"], _brainsnapshot_snapshotView);
   $def("_brainsnapshot_snapshotAgent", "snapshotAgent", [], _brainsnapshot_snapshotAgent);
@@ -36306,7 +36413,8 @@ export default function define(runtime, observer) {
   $def("_brainsnapshot_snapshotSignals", "snapshotSignals", ["snapshotPapers"], _brainsnapshot_snapshotSignals);
   $def("_brainsnapshot_snapshotEntries", "snapshotEntries", [], _brainsnapshot_snapshotEntries);
   $def("_brainsnapshot_snapshotCheck", "snapshotCheck", [], _brainsnapshot_snapshotCheck);
-  $def("_brainsnapshot_snapshotOps", "snapshotOps", ["xrpc","snapshotEntries","rows","snapshotSources","snapshotAgent","snapshotItems","snapshotSignals","log"], _brainsnapshot_snapshotOps);
+  $def("_brainsnapshot_snapshotTask", "snapshotTask", [], _brainsnapshot_snapshotTask);
+  $def("_brainsnapshot_snapshotOps", "snapshotOps", ["xrpc","snapshotEntries","snapshotTask","rows","snapshotSources","snapshotAgent","snapshotItems","snapshotSignals","log"], _brainsnapshot_snapshotOps);
   $def("_brainsnapshot_snapshot_service", "snapshot_service", ["cloudflare","Response","snapshotOps","rows","snapshotSources","snapshotCheck"], _brainsnapshot_snapshot_service);
   $def("_brainsnapshot_snapshot_announce", "snapshot_announce", ["plugins","snapshot_service","invalidation"], _brainsnapshot_snapshot_announce);
   $def("_brainsnapshot_snapshotPanel", "snapshotPanel", ["htl","Inputs","Event"], _brainsnapshot_snapshotPanel);
@@ -36318,9 +36426,10 @@ export default function define(runtime, observer) {
   $def("_brainsnapshot_test_a_json_source_is_read_by_the_paths_its_map_names", "test_a_json_source_is_read_by_the_paths_its_map_names", ["snapshotSources","snapshotItems","expect"], _brainsnapshot_test_a_json_source_is_read_by_the_paths_its_map_names);
   $def("_brainsnapshot_test_a_run_keeps_one_public_file_a_source_and_a_failed_source_does_not_stop_it", "test_a_run_keeps_one_public_file_a_source_and_a_failed_source_does_not_stop_it", ["snapshotRig","snapshotFixtures","logged","expect"], _brainsnapshot_test_a_run_keeps_one_public_file_a_source_and_a_failed_source_does_not_stop_it);
   $def("_brainsnapshot_test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention", "test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention", ["snapshotSources","snapshotRig","expect"], _brainsnapshot_test_papers_are_the_ones_with_votes_a_lab_link_or_a_mention);
+  $def("_brainsnapshot_test_a_run_that_kept_items_opens_one_task_for_the_days_digest", "test_a_run_that_kept_items_opens_one_task_for_the_days_digest", ["snapshotFixtures","snapshotRig","expect"], _brainsnapshot_test_a_run_that_kept_items_opens_one_task_for_the_days_digest);
   $def("_brainsnapshot_test_the_timer_runs_once_a_day_after_six", "test_the_timer_runs_once_a_day_after_six", ["snapshotRig","snapshotFixtures","expect"], _brainsnapshot_test_the_timer_runs_once_a_day_after_six);
   $def("_brainsnapshot_test_the_owner_sets_the_sources_and_a_bad_list_is_refused", "test_the_owner_sets_the_sources_and_a_bad_list_is_refused", ["snapshotRig","expect","snapshotSources","snapshotCheck"], _brainsnapshot_test_the_owner_sets_the_sources_and_a_bad_list_is_refused);
-  $def("_brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_three_calls", "test_snapshot_declares_its_rules_its_timer_and_three_calls", ["snapshot_service","expect","decide","callerOf"], _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_three_calls);
+  $def("_brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_four_calls", "test_snapshot_declares_its_rules_its_timer_and_four_calls", ["snapshot_service","expect","decide","callerOf"], _brainsnapshot_test_snapshot_declares_its_rules_its_timer_and_four_calls);
   $def("_brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one", "test_the_panel_lists_the_days_and_the_sources_of_one", ["Response","snapshotPanel","expect"], _brainsnapshot_test_the_panel_lists_the_days_and_the_sources_of_one);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
