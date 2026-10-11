@@ -42595,20 +42595,33 @@ const _cloudbrain_signIn = function _signIn(brainOrigin,htl,session,press,client
   return handle;
 };
 const _cloudbrain_anon_8a5035967f = function _anonymous(md) {return (md`## Health`);};
-const _cloudbrain_healthView = function _healthView(calls,htl,dashboard,requestsChart,width,healthStrip,methodTable,moduleLink,brainModules,services,d3) {
+const _cloudbrain_spanOptions = function _spanOptions() {return (new Map([["15 minutes", 15], ["1 hour", 60], ["6 hours", 360], ["24 hours", 1440], ["7 days", 10080]]));};
+const _cloudbrain_viewof_span = function _span(Inputs,spanOptions) {return (Inputs.select(spanOptions, { label: "Last", value: 60 }));};
+const _cloudbrain_span = (G, _) => G.input(_);
+const _cloudbrain_viewof_asked = function _asked(Inputs) {return (Inputs.button("Refresh"));};
+const _cloudbrain_asked = (G, _) => G.input(_);
+const _cloudbrain_healthView = function _healthView(calls,htl,spanName,span,dashboard,requestsChart,width,healthStrip,methodTable,moduleLink,brainModules,services,callsNote) {
   // A visitor is shown no chart, and no made-up one.
-  if (!calls) return htl.html`<i style="color:var(--theme-foreground-muted)">Sign in as the owner to see the calls of the last hour.</i>`;
+  if (!calls) return htl.html`<i style="color:var(--theme-foreground-muted)">Sign in as the owner to see the calls of the last ${spanName(span)}.</i>`;
   const data = calls;
   return dashboard([
     { title: "Calls", body: requestsChart(data, { width: width - 40 }), wide: true },
     { title: "Health", body: healthStrip(data, { width: width - 40 }), wide: true },
     { title: "By method", body: methodTable(data, { link: (worker, label) => ((row) => (row && row.module ? moduleLink(row.module, label) : null))([...((brainModules && brainModules.modules) || []), ...(services || [])].find((r) => r.worker === worker)) }), wide: true }
-  ], { note: data.error ? "logs.query failed: " + data.error : `The last hour, from the core's log lines: ${d3.sum(data.series, (d) => d.n)} calls in ${data.groups} groups.` });
+  ], { note: callsNote(data) });
 };
-const _cloudbrain_timeRange = function _timeRange() {
-  const until = Date.now();
-  return { since: until - 3600000, until };
+const _cloudbrain_timeRange = function _timeRange(asked,rangeOf,span) {
+  asked;
+  return rangeOf(span, Date.now());
 };
+const _cloudbrain_rangeOf = function _rangeOf() {return ((minutes, now) => ({ since: now - minutes * 60000, until: now }));};
+const _cloudbrain_spanName = function _spanName(spanOptions) {return ((minutes) => (([name]) => name.replace(/^1 /, ""))([...spanOptions].find(([, m]) => m === minutes) || [minutes + " minutes"]));};
+const _cloudbrain_callsNote = function _callsNote(callsQuery,spanName) {return ((data) => {
+  if (data.error) return "logs.query failed: " + data.error;
+  const each = (ms) => (ms % 3600000 === 0 ? [ms / 3600000, "hour"] : ms % 60000 === 0 ? [ms / 60000, "minute"] : [ms / 1000, "s"]);
+  const [count, unit] = each(data.step), limit = callsQuery(data).parameters.limit;
+  return `The last ${spanName(Math.round((data.until - data.since) / 60000))}, from the core's log lines: ${data.series.reduce((sum, d) => sum + d.n, 0)} calls in ${data.groups} groups, one bar each ${count} ${unit === "s" || count === 1 ? unit : unit + "s"}.${data.groups >= limit ? ` ${limit} groups is the limit of one answer: some calls may be missing.` : ""}`;
+});};
 const _cloudbrain_callsRead = function _callsRead(callsQuery,callsSeries) {return (async ({ client, range }) => {
   if (!client) return null;
   return client.procedure("logs.query", callsQuery(range)).then((answer) => callsSeries(answer, range), (e) => ({ ...range, step: 60000, series: [], error: String((e && e.message) || e) }));
@@ -42742,6 +42755,26 @@ const _cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client 
   // A query that fails answers the range, no rows and the error.
   expect(await callsRead({ client: { procedure: async () => { throw new Error("AuthRequired"); } }, range })).toEqual({ ...range, step: 60000, series: [], error: "AuthRequired" });
   return "1 logs.query for a range, 0 with no client";
+};
+const _cloudbrain_test_the_note_names_the_span_and_says_when_the_answer_is_at_the_limit = function _test_the_note_names_the_span_and_says_when_the_answer_is_at_the_limit(expect,spanOptions,spanName,callsNote,callsQuery,rangeOf) {
+  const hour = { since: Date.UTC(2026, 9, 9, 7, 0), until: Date.UTC(2026, 9, 9, 8, 0), step: 60000, series: [{ n: 3 }, { n: 1 }] };
+  expect([...spanOptions]).toEqual([["15 minutes", 15], ["1 hour", 60], ["6 hours", 360], ["24 hours", 1440], ["7 days", 10080]]);
+  expect([15, 60, 360, 1440, 10080, 90].map(spanName)).toEqual(["15 minutes", "hour", "6 hours", "24 hours", "7 days", "90 minutes"]);
+  // Span, step and groups, read from the answer and not from the control: the note is of what was drawn.
+  expect(callsNote({ ...hour, groups: 2 })).toBe("The last hour, from the core's log lines: 4 calls in 2 groups, one bar each 1 minute.");
+  const week = { since: hour.until - 10080 * 60000, until: hour.until, step: 3600000, series: [], groups: 499 };
+  expect(callsNote(week)).toBe("The last 7 days, from the core's log lines: 0 calls in 499 groups, one bar each 1 hour.");
+  // The limit is the query's own, 500: an answer with that many groups may have been cut.
+  const limit = callsQuery(week).parameters.limit;
+  expect(limit).toBe(500);
+  expect(callsNote({ ...week, groups: limit })).toBe("The last 7 days, from the core's log lines: 0 calls in 500 groups, one bar each 1 hour. 500 groups is the limit of one answer: some calls may be missing.");
+  expect(callsNote({ ...week, groups: 2 })).not.toContain("limit");
+  expect(callsNote({ ...week, step: 90000, groups: 2 })).toContain("one bar each 90 s.");
+  // A query that failed: the error, as before.
+  expect(callsNote({ ...hour, series: [], error: "AuthRequired" })).toBe("logs.query failed: AuthRequired");
+  // What a range is for a span, with the clock given: one instant, both ends from it.
+  expect(rangeOf(360, hour.until)).toEqual({ since: hour.until - 6 * 3600000, until: hour.until });
+  return "the note for 2, 499 and 500 groups";
 };
 const _cloudbrain_LOGIN_METHODS = function _LOGIN_METHODS() {return (["issue.list", "issue.get", "knowledge.search", "knowledge.get", "knowledge.list", "quota.get"]);};
 const _cloudbrain_loginLink = function _loginLink(brain,htl,loginBrief,client,LOGIN_METHODS,press,copyLater) {
@@ -43885,8 +43918,16 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_statusLine", "statusLine", ["htl","session","brainOrigin"], _cloudbrain_statusLine);
   $def("_cloudbrain_signIn", "signIn", ["brainOrigin","htl","session","press","client","brainSession","location","Inputs"], _cloudbrain_signIn);
   $def("_cloudbrain_anon_8a5035967f", null, ["md"], _cloudbrain_anon_8a5035967f);
-  $def("_cloudbrain_healthView", "healthView", ["calls","htl","dashboard","requestsChart","width","healthStrip","methodTable","moduleLink","brainModules","services","d3"], _cloudbrain_healthView);
-  $def("_cloudbrain_timeRange", "timeRange", [], _cloudbrain_timeRange);
+  $def("_cloudbrain_spanOptions", "spanOptions", [], _cloudbrain_spanOptions);
+  $def("_cloudbrain_viewof_span", "viewof span", ["Inputs","spanOptions"], _cloudbrain_viewof_span);
+  $def("_cloudbrain_span", "span", ["Generators","viewof span"], _cloudbrain_span);
+  $def("_cloudbrain_viewof_asked", "viewof asked", ["Inputs"], _cloudbrain_viewof_asked);
+  $def("_cloudbrain_asked", "asked", ["Generators","viewof asked"], _cloudbrain_asked);
+  $def("_cloudbrain_healthView", "healthView", ["calls","htl","spanName","span","dashboard","requestsChart","width","healthStrip","methodTable","moduleLink","brainModules","services","callsNote"], _cloudbrain_healthView);
+  $def("_cloudbrain_timeRange", "timeRange", ["asked","rangeOf","span"], _cloudbrain_timeRange);
+  $def("_cloudbrain_rangeOf", "rangeOf", [], _cloudbrain_rangeOf);
+  $def("_cloudbrain_spanName", "spanName", ["spanOptions"], _cloudbrain_spanName);
+  $def("_cloudbrain_callsNote", "callsNote", ["callsQuery","spanName"], _cloudbrain_callsNote);
   $def("_cloudbrain_callsRead", "callsRead", ["callsQuery","callsSeries"], _cloudbrain_callsRead);
   $def("_cloudbrain_calls", "calls", ["assembled","callsRead","session","client","timeRange"], _cloudbrain_calls);
   $def("_cloudbrain_callsQuery", "callsQuery", [], _cloudbrain_callsQuery);
@@ -43899,6 +43940,7 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_dashboard", "dashboard", ["htl"], _cloudbrain_dashboard);
   $def("_cloudbrain_test_calls_from_the_logs_become_chart_rows", "test_calls_from_the_logs_become_chart_rows", ["callsQuery","expect","callsSeries","rollup","requestsChart","healthStrip","methodTable","dashboard"], _cloudbrain_test_calls_from_the_logs_become_chart_rows);
   $def("_cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client", "test_calls_are_read_once_for_a_range_and_not_without_a_client", ["callsRead","expect","callsQuery"], _cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client);
+  $def("_cloudbrain_test_the_note_names_the_span_and_says_when_the_answer_is_at_the_limit", "test_the_note_names_the_span_and_says_when_the_answer_is_at_the_limit", ["expect","spanOptions","spanName","callsNote","callsQuery","rangeOf"], _cloudbrain_test_the_note_names_the_span_and_says_when_the_answer_is_at_the_limit);
   $def("_cloudbrain_LOGIN_METHODS", "LOGIN_METHODS", [], _cloudbrain_LOGIN_METHODS);
   $def("_cloudbrain_loginLink", "loginLink", ["brain","htl","loginBrief","client","LOGIN_METHODS","press","copyLater"], _cloudbrain_loginLink);
   $def("_cloudbrain_copyLater", "copyLater", ["ClipboardItem"], _cloudbrain_copyLater);
@@ -44310,9 +44352,9 @@ const _cloudbraindocs_anon_866fa794d3 = function _anonymous(md,mod) {return (md`
 ${mod("brain-db")} reads the query plan of each SQL statement that is not the owner's, before it runs the statement. It refuses a plan that has an opcode outside its list. There is no rule by column or by row. A removed Worker keeps its tables.
 
 **Tags** decide who reads or changes a file or a blob. The store writes \`by:DID\` and \`worker:NAME\`; a caller cannot set them. \`public\` opens a file to anyone. \`members\` opens it to each member. The owner grants a member \`read\` or \`write\` on any other tag. Reference: ${mod("brain-static")}, ${mod("brain-blob")}.`);};
-const _cloudbraindocs_anon_fe30eac93b = function _anonymous(md) {return (md`## Calls and faults
+const _cloudbraindocs_anon_14f24bda49 = function _anonymous(md) {return (md`## Calls and faults
 
-The core writes one log line for each call that it answers or forwards: who called, the method, the Worker, the status, the time taken. Cloudflare keeps the lines 7 days. The Health section of the page counts the last hour of them with one \`logs.query\`, by Worker, method and status, for the owner. A visitor sees no chart.
+The core writes one log line for each call that it answers or forwards: who called, the method, the Worker, the status, the time taken. Cloudflare keeps the lines 7 days. The Health section of the page counts them over a span chosen there (15 minutes, 1 hour, 6 hours, 24 hours or 7 days; an hour when the page opens) with one \`logs.query\`, by Worker, method and status, for the owner. It asks again when the span is changed or "Refresh" is pressed, and at no other time. The line under the charts gives the span, the step and the number of groups, and says so when the answer has 500 groups, the most one answer holds. A visitor sees no chart.
 
 A fault is a status of 500 or above, except 501.
 
@@ -44365,7 +44407,7 @@ export default function define(runtime, observer) {
   $def("_cloudbraindocs_anon_f04baa6a0c", null, ["md","mod"], _cloudbraindocs_anon_f04baa6a0c);
   $def("_cloudbraindocs_anon_1417c80f1b", null, ["md","mod"], _cloudbraindocs_anon_1417c80f1b);
   $def("_cloudbraindocs_anon_866fa794d3", null, ["md","mod"], _cloudbraindocs_anon_866fa794d3);
-  $def("_cloudbraindocs_anon_fe30eac93b", null, ["md"], _cloudbraindocs_anon_fe30eac93b);
+  $def("_cloudbraindocs_anon_14f24bda49", null, ["md"], _cloudbraindocs_anon_14f24bda49);
   $def("_cloudbraindocs_anon_d0e09903ee", null, ["md","mod"], _cloudbraindocs_anon_d0e09903ee);
   $def("_cloudbraindocs_anon_d013d79c85", null, ["md","mod"], _cloudbraindocs_anon_d013d79c85);
   $def("_cloudbraindocs_mod", "mod", ["htl","linkTo","navigate"], _cloudbraindocs_mod);
