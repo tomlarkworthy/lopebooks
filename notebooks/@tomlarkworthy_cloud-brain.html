@@ -30869,7 +30869,7 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainstatic_anon_915699dce2 = function _anonymous(md) {return (md`# brain-static
+const _brainstatic_anon_175411e17e = function _anonymous(md) {return (md`# brain-static
 
 Files kept by a Cloud Brain and served from its address.
 
@@ -30882,7 +30882,7 @@ Files kept by a Cloud Brain and served from its address.
 | \`static.tag\` | procedure. \`{ path, tags }\` replaces the file's labels. |
 | \`static.setPublic\` | procedure. \`{ path, public }\` adds or removes the \`public\` label. |
 | \`static.delete\` | procedure. \`{ path }\` drops one file. \`{ prefix, before }\` drops each file under the prefix that the caller may change, saved before \`before\` (an ISO date or milliseconds; all of them without it). Answers \`{ deleted, paths }\`. The prefix is a folder: it ends in \`/\`, and one that does not (\`"s"\`, \`""\`) is refused with 400. Nothing under \`shell/\` is dropped this way. |
-| \`GET /static/<path>\` | whoever may read the file by its tags. \`ETag\` is the SHA-256; \`If-None-Match\` answers 304. |
+| \`GET /static/<path>\` | whoever may read the file by its tags. \`ETag\` is the SHA-256; \`If-None-Match\` answers 304. A public file is sent with \`Access-Control-Allow-Origin: *\` (since 2026-10-11), so a page of another origin, or of none, reads it. |
 | Storage | bytes in \`blobs\` and one row per file in \`rows\`, both under \`f/<path>\` |
 
 A path is segments of \`A-Z a-z 0-9 @ . _ -\` joined by \`/\`, at most 200 characters. A file is at most 50 MB. Without \`type\`, and for a caller whose \`type\` is not taken, the content type comes from the extension (\`staticTypes\`), else \`application/octet-stream\`. A file is private until it is put or set public.
@@ -31036,6 +31036,9 @@ const _brainstatic_staticApp = function _staticApp(hono,config,sha256,ownTab,row
     const headers = { "content-type": meta.type, etag, "cache-control": "no-cache", "x-content-type-options": "nosniff", "x-static-sha256": meta.sha256 };
     // Bytes somebody other than the owner last wrote are not the owner's to vouch for: a browser shows them with no script and no origin.
     if (!vouched(path, meta)) headers["content-security-policy"] = "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'";
+    // A public file is read by anyone who has its path. So is it by a page with no origin of its own: a library
+    // notebook the owner did not put is one (brain-library), and it reads the snapshot's files from here.
+    if (meta.public) headers["access-control-allow-origin"] = "*";
     // A file kept compressed is sent compressed, with no-transform so workers.dev leaves the ETag on it.
     const packed = meta.gzip && /\bgzip\b/.test(c.req.header("accept-encoding") || "");
     if (packed) Object.assign(headers, { "content-encoding": "gzip", "cache-control": "no-cache, no-transform", vary: "accept-encoding" });
@@ -31327,6 +31330,10 @@ const _brainstatic_test_static_a_files_tags_decide_who_reads_and_who_changes_it 
   expect((await rig.post2(alice, "setPublic", { path: file, public: true })).status).toBe(200);
   const open = await rig.call2({ "x-brain-caller": "anonymous" }, "/static/" + file);
   expect([open.status, open.headers.get("content-security-policy").startsWith("sandbox")]).toEqual([200, true]);
+  // A public file may be read from another origin, or from none. A file that is not public says nothing of it.
+  expect(open.headers.get("access-control-allow-origin")).toBe("*");
+  await rig.put("owner", "site/private.html", "<p>");
+  expect([(await rig.call("owner", "/static/site/private.html")).status, (await rig.call("owner", "/static/site/private.html")).headers.get("access-control-allow-origin")]).toEqual([200, null]);
   await rig.put("owner", "site/a.html", "<p>", "&public=true");
   expect((await rig.call("anonymous", "/static/site/a.html")).headers.get("content-security-policy")).toBe(null);
   expect(rig.sim.rows.get("f/site/a.html").tags).toEqual(["by:owner", "public"]);
@@ -31451,7 +31458,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainstatic_anon_915699dce2", null, ["md"], _brainstatic_anon_915699dce2);
+  $def("_brainstatic_anon_175411e17e", null, ["md"], _brainstatic_anon_175411e17e);
   $def("_brainstatic_static_service", "static_service", ["cloudflare","staticApp"], _brainstatic_static_service);
   $def("_brainstatic_static_announce", "static_announce", ["plugins","static_service","invalidation"], _brainstatic_static_announce);
   $def("_brainstatic_staticTypes", "staticTypes", [], _brainstatic_staticTypes);
@@ -32133,22 +32140,22 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _brainlibrary_anon_6fb3681e07 = function _anonymous(md) {return (md`# brain-library
+const _brainlibrary_anon_4097d76a23 = function _anonymous(md,librarySandbox) {return (md`# brain-library
 
 Notebooks kept by a Cloud Brain and served from its address. The files are in \`brain-static\`, under \`library/\`; this Worker keeps the list, the versions and who may open each.
 
 | | |
 |---|---|
 | Worker | \`brain-x-library\` |
-| \`library.put\` | procedure, the owner's own session; a token or a turn is refused, because the file is served as a page. \`?name=\`, optional \`public=true\` and \`parent=<sha256>\`; the body is the notebook's HTML file. |
+| \`library.put\` | procedure, the owner, or a token that names it. \`?name=\`, optional \`public=true\` and \`parent=<sha256>\`; the body is the notebook's HTML file. A version the owner did not put in their own session is served with no origin (below), and the answer has \`sandboxed: true\`. Anyone but the owner in their own session is refused (403) a name whose newest version is the owner's. |
 | \`library.list\` | query, anyone. The owner gets every notebook, anyone else the public ones; a member granted the method is anyone else. |
 | \`library.versions\` | query, owner. \`?name=\`. The last 10 saves, newest first. |
 | \`library.setPublic\` | procedure, owner. \`{ name, public }\`. The cards made from the notebook are read by whoever reads it (see Module cards). \`{ name, public, cards, stale }\` |
 | \`library.delete\` | procedure, owner. \`{ name }\`. Deletes every version, and the cards made from the notebook: \`{ deleted, versions, cards }\`. With \`sha256\`, one kept version that is not the newest, and no card. |
 | \`library.index\` | procedure, owner. \`{ name }\`. Writes the module cards of the newest version again, from its kept file (see Module cards). \`{ name, cards, stale }\`. With \`rebuild: false\` it does what a put does: enters the cards that are missing and marks the ones that differ. With \`modules\`, 1 to 100 names \`@user/name\`, only those modules' cards are written, and a name the notebook does not have is passed over. |
-| \`GET /library/<name>\` | the notebook. Anyone for a public one, the owner for any. \`?v=<sha256>\` opens a kept version. |
+| \`GET /library/<name>\` | the notebook. Anyone for a public one, the owner for any. \`?v=<sha256>\` opens a kept version. A version with a \`writer\` is sent with \`Content-Security-Policy: ${librarySandbox}\`. |
 | Calls | \`static.put\`, \`static.get\`, \`static.delete\`, \`knowledge.put\`, \`knowledge.delete\` |
-| Storage | \`rows\`, key \`n/<name>\`: \`{ title, sha256, size, public, savedAt, versions }\`. Files at \`library/<name>/<first 16 of sha256>.html\` in \`brain-static\`. |
+| Storage | \`rows\`, key \`n/<name>\`: \`{ title, sha256, size, public, savedAt, versions }\`; a version is \`{ sha256, size, savedAt }\`, and \`writer\` when the owner's own session did not put it. Files at \`library/<name>/<first 16 of sha256>.html\` in \`brain-static\`. |
 
 A name is 1 to 80 of \`A-Z a-z 0-9 @ . _ -\`. The body must be a lopecode notebook: a file with a \`bootconf.json\` block. The title is the file's \`<title>\`. With \`parent\`, a put is refused with 409 unless \`parent\` is the SHA-256 of the notebook's newest version (empty for a new name), so two tabs saving one notebook do not overwrite each other unseen.
 
@@ -32161,6 +32168,8 @@ await client.procedure("library.put", htmlBytes, { params: { name: "notes", publ
 \`libraryPanel({ client, origin, owner })\` is the list as a table, with upload, public and delete for the owner.
 
 A notebook served from \`/library\` runs on the Brain's own address, so its cells call the Brain as whoever is signed in. Put only notebooks you would run as yourself.
+
+**A notebook somebody else put** (a token, a turn, a portal: anything but the owner's own session) is not the owner's to vouch for, and the reader may be the owner. Since 2026-10-11 it is kept and served, with a header that gives the page its scripts and no origin. Measured that day on a 4.8 MB digest in Playwright's Chromium under that header, served from a local address: the page reads \`self.origin\` as \`"null"\`, \`localStorage\` and \`document.cookie\` throw \`SecurityError\`, every cell computed with none in error, and a write of \`location.hash\` moved the layout. So its cells cannot read the session of whoever opens it, and cannot call the Brain as them. What it costs the reader: nothing is kept in the browser between visits, and a fetch from it is a cross-origin one, which reads a public file of \`brain-static\` and nothing that needs a session. The file is kept in \`brain-static\` as \`text/plain\`, so its own address there shows text. The owner putting the same notebook in their own session makes it an ordinary library page. Until 2026-10-11 the put was the owner's own session only, so a version with no \`writer\` is the owner's.
 
 ## Module cards
 
@@ -32185,11 +32194,12 @@ A put does not write a card that is kept (since 2026-10-10 10:30 CEST; before, e
 - \`library.delete\` deletes the cards made from the notebook's newest version (since 2026-10-10; before, they stayed and named an address that answered 404). A module another notebook has is without a card until that notebook is put or indexed. A card of a module that only an older version had stays.
 - The put answers \`cards\`, how many were entered; a card left as it was is not counted. When \`knowledge.put\` fails the notebook is kept all the same and \`cards\` is smaller; \`library.index\` with \`rebuild: false\` enters them.
 - The library keeps 10 versions of a notebook. A stale card's \`file\` may be a version that is gone.`);};
+const _brainlibrary_librarySandbox = function _librarySandbox() {return ("sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads");};
 const _brainlibrary_library_service = function _library_service(cloudflare,libraryApp) {return (cloudflare.Service("library", libraryApp, {
   methods: {
-    // A saved notebook is served as a page that runs as whoever opens it: only the owner's own tab saves one, not a token or a turn.
-    // Fixed: this Worker is a writer brain-static trusts, so what reaches put is served as a page.
-    "com.lopecode.brain.library.put": { type: "procedure", who: "owner", allow: "caller.session", fixed: true },
+    // The owner, or a token that names it. A saved notebook is served as a page: one the owner's own tab did not put
+    // is served with no origin (librarySandbox). Fixed, so no rule opens the put to a caller the owner did not name.
+    "com.lopecode.brain.library.put": { type: "procedure", who: "owner", fixed: true },
     "com.lopecode.brain.library.list": { type: "query", who: "anyone" },
     "com.lopecode.brain.library.versions": { type: "query", who: "owner" },
     "com.lopecode.brain.library.setPublic": { type: "procedure", who: "owner" },
@@ -32241,7 +32251,7 @@ const _brainlibrary_libraryCards = function _libraryCards(libraryCardId,sha256) 
     };
   }));
 });};
-const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,config,rows,libraryCardId,Response) {
+const _brainlibrary_libraryApp = function _libraryApp(hono,ownTab,xrpc,libraryCards,config,rows,libraryCardId,librarySandbox,Response) {
   const app = new hono.Hono();
   const NS = "/xrpc/com.lopecode.brain.library.";
   const STATIC = "com.lopecode.brain.static.";
@@ -32253,6 +32263,8 @@ const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,con
     const who = c.req.header("x-brain-caller") || "";
     return who === "owner" || who.startsWith("token:");
   };
+  // The owner in their own tab. A token, a turn, a portal and a PDS call are the owner's too, and are not this.
+  const ownPut = (c) => (c.req.header("x-brain-caller") || "") === "owner" && ownTab(c.req.raw.headers);
   const fileOf = (name, sha) => `library/${name}/${sha.slice(0, 16)}.html`;
   const drop = (name, sha) => xrpc.fetch(STATIC + "delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: fileOf(name, sha) }) });
   const known = async (entries) => {
@@ -32296,19 +32308,22 @@ const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,con
     const html = new TextDecoder().decode(bytes);
     if (!html.includes('id="bootconf.json"')) return fail(c, 400, "NotANotebook", "the file has no bootconf.json block");
     const head = await rows.get("n/" + name);
+    const own = ownPut(c), writer = own ? null : [c.req.header("x-brain-caller") || "", c.req.header("x-brain-via") || ""].join(" ").trim().slice(0, 120) || "unknown";
+    // A notebook the owner put is theirs to replace: a token's put over it would take the owner's page from its readers.
+    if (!own && head && !(head.versions[0] || {}).writer) return fail(c, 403, "Forbidden", `the newest version of ${name} is the owner's, and only their own session replaces it`);
     const parent = c.req.query("parent");
     if (parent != null && parent !== (head ? head.sha256 : "")) return fail(c, 409, "StaleParent", `the newest version of ${name} is ${head ? head.sha256 : "none"}`);
     const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
-    const kept = await xrpc.fetch(STATIC + "put", { method: "POST", params: { path: fileOf(name, sha256), type: "text/html; charset=utf-8", public: "false" }, body: bytes });
+    const kept = await xrpc.fetch(STATIC + "put", { method: "POST", params: { path: fileOf(name, sha256), type: own ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", public: "false" }, body: bytes });
     if (!kept.ok) return fail(c, 502, "UpstreamFailed", `static.put answered ${kept.status}`);
     const title = ((html.slice(0, 65536).match(/<title>([^<]*)<\/title>/) || [])[1] || name).trim().slice(0, 200);
     const savedAt = Date.now();
-    const versions = [{ sha256, size: bytes.length, savedAt }, ...(head ? head.versions.filter((v) => v.sha256 !== sha256) : [])];
+    const versions = [{ sha256, size: bytes.length, savedAt, ...(writer ? { writer } : {}) }, ...(head ? head.versions.filter((v) => v.sha256 !== sha256) : [])];
     for (const old of versions.slice(KEEP)) await drop(name, old.sha256);
     const open = c.req.query("public");
     const next = { title, sha256, size: bytes.length, public: open != null ? open === "true" : !!(head && head.public), savedAt, versions: versions.slice(0, KEEP) };
     await rows.put("n/" + name, next);
-    return c.json({ name, title, sha256, size: next.size, public: next.public, savedAt, versions: next.versions.length, ...(await enter(name, html, next, false)) });
+    return c.json({ name, title, sha256, size: next.size, public: next.public, savedAt, versions: next.versions.length, ...(writer ? { sandboxed: true } : {}), ...(await enter(name, html, next, false)) });
   });
   app.post(NS + "index", async (c) => {
     const { name, rebuild, modules } = await c.req.json().catch(() => ({}));
@@ -32367,10 +32382,13 @@ const _brainlibrary_libraryApp = function _libraryApp(hono,xrpc,libraryCards,con
     if (!head) return c.text("not found", 404);
     if (!head.public && !isOwner(c)) return c.text("unauthorized", 401);
     const sha = c.req.query("v") || head.sha256;
-    if (!head.versions.some((v) => v.sha256 === sha)) return c.text("not found", 404);
+    const version = head.versions.find((v) => v.sha256 === sha);
+    if (!version) return c.text("not found", 404);
     // A caller inside the Brain sees this. workers.dev removes it from a response it may compress (measured 2026-10-06).
     const etag = 'W/"' + sha + '"';
     const headers = { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache", etag, "x-library-sha256": sha };
+    // Not the owner's own put: scripts and no origin, so the page has no session of whoever opens it.
+    if (version.writer) headers["content-security-policy"] = librarySandbox;
     if ((c.req.header("if-none-match") || "").includes('"' + sha + '"')) return new Response(null, { status: 304, headers });
     const file = await xrpc.fetch(STATIC + "get", { params: { path: fileOf(name, sha) } });
     return file.ok ? new Response(file.body, { headers }) : c.text("not found", 404);
@@ -32643,6 +32661,37 @@ const _brainlibrary_test_library_keeps_ten_versions = async function _test_libra
   expect(rig.asked.filter((a) => a.startsWith("delete")).length).toBe(2);
   return "12 saves, 10 kept";
 };
+const _brainlibrary_test_library_a_notebook_the_owner_did_not_put_is_served_with_no_origin = async function _test_library_a_notebook_the_owner_did_not_put_is_served_with_no_origin(libraryRig,libraryNotebook,expect,librarySandbox) {
+  const rig = await libraryRig(), X = "/xrpc/com.lopecode.brain.library.";
+  const token = { "x-brain-via": "delegation:abc123" };
+  const put = (name, html, headers = {}, extra = "&public=true") => rig.call("owner", X + "put?name=" + name + extra, { method: "POST", body: html, headers });
+  const csp = async (path, who = "anonymous") => (await rig.call(who, path)).headers.get("content-security-policy");
+  // A token's put is kept, and says how it will be served.
+  const made = await (await put("digest", libraryNotebook("by a token"), token)).json();
+  expect([made.sandboxed, made.versions]).toEqual([true, 1]);
+  const page = await rig.call("anonymous", "/library/digest");
+  expect([page.status, page.headers.get("content-type"), page.headers.get("content-security-policy"), await page.text()]).toEqual([200, "text/html; charset=utf-8", librarySandbox, libraryNotebook("by a token")]);
+  expect(librarySandbox.includes("allow-scripts") && !librarySandbox.includes("allow-same-origin")).toBe(true);
+  // A 304 has the header as well.
+  expect((await rig.call("anonymous", "/library/digest", { headers: { "if-none-match": '"' + made.sha256 + '"' } })).headers.get("content-security-policy")).toBe(librarySandbox);
+  // Its file in the store is text: opened at its own address it is not a page.
+  expect(rig.stat.rows.get("f/library/digest/" + made.sha256.slice(0, 16) + ".html").type).toBe("text/plain; charset=utf-8");
+  // The owner's own put of the notebook makes it an ordinary page; the token's version stays as it was put.
+  const mine = await (await put("digest", libraryNotebook("read by the owner"))).json();
+  expect([mine.sandboxed, await csp("/library/digest"), await csp("/library/digest?v=" + made.sha256)]).toEqual([undefined, null, librarySandbox]);
+  expect(rig.stat.rows.get("f/library/digest/" + mine.sha256.slice(0, 16) + ".html").type).toBe("text/html; charset=utf-8");
+  // And then it is the owner's: a token does not replace it. Nor a notebook the owner put first, nor one from before `writer`.
+  const again = await put("digest", libraryNotebook("by a token, later"), token);
+  expect([again.status, (await again.json()).error, await (await rig.call("anonymous", "/library/digest")).text()]).toEqual([403, "Forbidden", libraryNotebook("read by the owner")]);
+  await put("notes", libraryNotebook("the owner's"));
+  expect([(await put("notes", libraryNotebook("over it"), token)).status, await csp("/library/notes")]).toEqual([403, null]);
+  // The owner by a turn or a portal is not the owner's own tab.
+  for (const via of ["turn:1", "portal:p1", "jwt"]) expect((await (await put("by-" + via.split(":")[0], libraryNotebook(via), { "x-brain-via": via })).json()).sandboxed).toBe(true);
+  // A token puts a second version over its own first.
+  expect((await put("by-turn", libraryNotebook("second"), token)).status).toBe(200);
+  expect(await csp("/library/by-turn")).toBe(librarySandbox);
+  return "served with: " + librarySandbox;
+};
 const _brainlibrary_test_library_declares_what_it_needs = async function _test_library_declares_what_it_needs(library_service,expect) {
   const { meta } = await library_service.emit();
   expect(meta).toMatchObject({
@@ -32650,7 +32699,8 @@ const _brainlibrary_test_library_declares_what_it_needs = async function _test_l
     calls: ["com.lopecode.brain.knowledge.delete", "com.lopecode.brain.knowledge.put", "com.lopecode.brain.static.delete", "com.lopecode.brain.static.get", "com.lopecode.brain.static.put"],
     paths: [{ path: "/library/*", who: "anyone" }]
   });
-  expect(meta.access["com.lopecode.brain.library.put"]).toMatchObject({ allow: "caller.session", fixed: true });
+  // The owner, or a token that names the method (who: "owner" is caller.trusted), and no rule put in its place.
+  expect(meta.access["com.lopecode.brain.library.put"]).toEqual({ type: "procedure", who: "owner", fixed: true });
   return meta.calls.join(", ");
 };
 const _brainlibrary_test_library_panel_lists_notebooks = async function _test_library_panel_lists_notebooks(libraryPanel,expect) {
@@ -32669,12 +32719,13 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_brainlibrary_anon_6fb3681e07", null, ["md"], _brainlibrary_anon_6fb3681e07);
+  $def("_brainlibrary_anon_4097d76a23", null, ["md","librarySandbox"], _brainlibrary_anon_4097d76a23);
+  $def("_brainlibrary_librarySandbox", "librarySandbox", [], _brainlibrary_librarySandbox);
   $def("_brainlibrary_library_service", "library_service", ["cloudflare","libraryApp"], _brainlibrary_library_service);
   $def("_brainlibrary_library_announce", "library_announce", ["plugins","library_service","invalidation"], _brainlibrary_library_announce);
   $def("_brainlibrary_libraryCardId", "libraryCardId", [], _brainlibrary_libraryCardId);
   $def("_brainlibrary_libraryCards", "libraryCards", ["libraryCardId","sha256"], _brainlibrary_libraryCards);
-  $def("_brainlibrary_libraryApp", "libraryApp", ["hono","xrpc","libraryCards","config","rows","libraryCardId","Response"], _brainlibrary_libraryApp);
+  $def("_brainlibrary_libraryApp", "libraryApp", ["hono","ownTab","xrpc","libraryCards","config","rows","libraryCardId","librarySandbox","Response"], _brainlibrary_libraryApp);
   $def("_brainlibrary_libraryPanel", "libraryPanel", ["htl","Inputs","open"], _brainlibrary_libraryPanel);
   $def("_brainlibrary_anon_be3d699220", null, ["md"], _brainlibrary_anon_be3d699220);
   $def("_brainlibrary_libraryNotebook", "libraryNotebook", [], _brainlibrary_libraryNotebook);
@@ -32686,6 +32737,7 @@ export default function define(runtime, observer) {
   $def("_brainlibrary_test_library_says_when_a_card_no_longer_matches_its_notebook", "test_library_says_when_a_card_no_longer_matches_its_notebook", ["libraryRig","libraryNotebook","libraryModule","expect"], _brainlibrary_test_library_says_when_a_card_no_longer_matches_its_notebook);
   $def("_brainlibrary_test_library_cards_follow_their_notebook", "test_library_cards_follow_their_notebook", ["libraryRig","libraryModule","libraryNotebook","expect"], _brainlibrary_test_library_cards_follow_their_notebook);
   $def("_brainlibrary_test_library_keeps_ten_versions", "test_library_keeps_ten_versions", ["libraryRig","libraryNotebook","expect"], _brainlibrary_test_library_keeps_ten_versions);
+  $def("_brainlibrary_test_library_a_notebook_the_owner_did_not_put_is_served_with_no_origin", "test_library_a_notebook_the_owner_did_not_put_is_served_with_no_origin", ["libraryRig","libraryNotebook","expect","librarySandbox"], _brainlibrary_test_library_a_notebook_the_owner_did_not_put_is_served_with_no_origin);
   $def("_brainlibrary_test_library_declares_what_it_needs", "test_library_declares_what_it_needs", ["library_service","expect"], _brainlibrary_test_library_declares_what_it_needs);
   $def("_brainlibrary_test_library_panel_lists_notebooks", "test_library_panel_lists_notebooks", ["libraryPanel","expect"], _brainlibrary_test_library_panel_lists_notebooks);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
@@ -32696,6 +32748,7 @@ export default function define(runtime, observer) {
   main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
   main.define("sha256", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("sha256", _));
+  main.define("ownTab", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("ownTab", _));
   main.define("module @tomlarkworthy/brain-static", [], async () => runtime.module((await import("/@tomlarkworthy/brain-static.js?v=4")).default));
   main.define("static_service", ["module @tomlarkworthy/brain-static","@variable"], (_, v) => v.import("static_service", _));
   main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
