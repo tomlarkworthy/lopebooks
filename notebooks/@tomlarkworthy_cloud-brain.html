@@ -44096,16 +44096,15 @@ const _cloudbrain_viewof_span = function _span(Inputs,spanOptions) {return (Inpu
 const _cloudbrain_span = (G, _) => G.input(_);
 const _cloudbrain_viewof_asked = function _asked(Inputs) {return (Inputs.button("Refresh"));};
 const _cloudbrain_asked = (G, _) => G.input(_);
-const _cloudbrain_healthView = function _healthView(calls,htl,spanName,span,dashboard,requestsChart,width,healthStrip,methodTable,moduleLink,brainModules,services,callsNote) {
+const _cloudbrain_healthView = function _healthView(calls,htl,spanName,span,dashboard,healthPanels,width,moduleLink,brainModules,services,callsNote) {
   // A visitor is shown no chart, and no made-up one.
   if (!calls) return htl.html`<i style="color:var(--theme-foreground-muted)">Sign in as the owner to see the calls of the last ${spanName(span)}.</i>`;
-  const data = calls;
-  return dashboard([
-    { title: "Calls", body: requestsChart(data, { width: width - 40 }), wide: true },
-    { title: "Health", body: healthStrip(data, { width: width - 40 }), wide: true },
-    { title: "By method", body: methodTable(data, { link: (worker, label) => ((row) => (row && row.module ? moduleLink(row.module, label) : null))([...((brainModules && brainModules.modules) || []), ...(services || [])].find((r) => r.worker === worker)) }), wide: true }
-  ], { note: callsNote(data) });
+  return dashboard(healthPanels(calls, { width: width - 40, link: (worker, label) => ((row) => (row && row.module ? moduleLink(row.module, label) : null))([...((brainModules && brainModules.modules) || []), ...(services || [])].find((r) => r.worker === worker)) }), { note: callsNote(calls) });
 };
+const _cloudbrain_healthPanels = function _healthPanels(requestsChart,methodTable) {return ((data, { width, link = null } = {}) => [
+  { title: "Calls", body: requestsChart(data, { width }), wide: true },
+  { title: "By method", body: methodTable(data, { link }), wide: true }
+]);};
 const _cloudbrain_timeRange = function _timeRange(asked,rangeOf,span) {
   asked;
   return rangeOf(span, Date.now());
@@ -44236,6 +44235,28 @@ const _cloudbrain_test_calls_from_the_logs_become_chart_rows = function _test_ca
   expect(callsSeries({ result: { calculations: [] } }, ask).series).toEqual([]);
   expect(callsSeries(null, ask)).toMatchObject({ series: [], groups: 0, step: 60000 });
   return "3 rows from 3 calculations";
+};
+const _cloudbrain_test_health_draws_calls_and_methods_and_no_strip_of_faults = function _test_health_draws_calls_and_methods_and_no_strip_of_faults(healthPanels,htl,expect,dashboard) {
+  const since = Date.UTC(2026, 9, 9, 7, 0), until = Date.UTC(2026, 9, 9, 8, 0);
+  const data = { since, until, step: 60000, groups: 2, series: [
+    { t: since + 60000, worker: "brain-x-inbox", method: "inbox.poll", status: 200, n: 2, ms: 80, max: 50 },
+    { t: since + 120000, worker: "brain-x-inbox", method: "inbox.poll", status: 502, n: 1, ms: 900, max: 900 },
+    { t: since + 60000, worker: "brain-core", method: "rule.list", status: 401, n: 1, ms: 3, max: 3 }
+  ] };
+  const panels = healthPanels(data, { width: 600, link: (worker, label) => (worker === "brain-core" ? htl.html`<a href="#core">${label}</a>` : null) });
+  expect(panels.map((p) => [p.title, p.wide])).toEqual([["Calls", true], ["By method", true]]);
+  // No panel has the legend of the strip, and the strip is not a panel under another title.
+  const drawn = dashboard(panels);
+  expect(drawn.querySelectorAll("div[style*=border]").length).toBe(2);
+  expect(drawn.textContent).not.toContain("share of calls that were faults");
+  // The faults are still read under Health, by method: 1 of inbox.poll's 3 calls.
+  const rows = [...panels[1].body.querySelectorAll("tbody tr")].map((tr) => [...tr.querySelectorAll("td")].map((td) => td.textContent.trim()).filter(Boolean));
+  expect(rows.map((r) => r.slice(0, 5))).toEqual([["brain-x-inbox", "inbox.poll", "3", "0", "1"], ["brain-core", "rule.list", "1", "1", "0"]]);
+  // link is handed to the table: a Worker it knows is a link, another is its name.
+  expect([...panels[1].body.querySelectorAll("tbody a")].map((a) => a.textContent)).toEqual(["brain-core"]);
+  // With no rows: the same two panels.
+  expect(healthPanels({ since, until, step: 60000, groups: 0, series: [] }, { width: 600 }).map((p) => p.title)).toEqual(["Calls", "By method"]);
+  return "2 panels under Health";
 };
 const _cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client = async function _test_calls_are_read_once_for_a_range_and_not_without_a_client(callsRead,expect,callsQuery) {
   const range = { since: Date.UTC(2026, 9, 9, 7, 0), until: Date.UTC(2026, 9, 9, 8, 0) };
@@ -44475,7 +44496,7 @@ const _cloudbrain_panelBody = function _panelBody(htl,panelNeeds,barsChart,group
   if (lacks.length) return line(`The draw "${panel.draw}" takes rows by ${needs.join(", ")}, and this panel's by has no ${lacks.join(", ")}.`);
   if (!answer.series.length) return line("No lines in this span.");
   const data = { since: answer.since, until: answer.until, step: answer.step, series: answer.series };
-  // The charts of Health name the sum `ms`.
+  // The charts made for Health name the sum `ms`.
   const calls = () => ({ ...data, series: answer.series.map((r) => ({ ...r, ms: r.sum || 0, max: r.max || 0 })) });
   const body = panel.draw === "bars" ? barsChart(data, { by, width }) : panel.draw === "table" ? groupTable(data, { by }) : panel.draw === "calls" ? requestsChart(calls(), { width }) : panel.draw === "faults" ? healthStrip(calls(), { width }) : methodTable(calls());
   return answer.groups >= dashboardGroupLimit ? htl.html`<div>${body}<div style="color:var(--theme-foreground-muted)">${dashboardGroupLimit} groups is the limit of one answer: some lines may be missing.</div></div>` : body;
@@ -44622,7 +44643,7 @@ const _cloudbrain_test_bars_and_a_table_draw_any_metric_and_a_panel_says_what_it
   const panel = (draw, by = ["target"]) => ({ title: draw, metric: counted.metric, by, filter: {}, draw });
   expect(marks(panelBody(panel("bars"), counted, { width: 600 }), "rect")).toBeGreaterThan(2);
   expect(cells(panelBody(panel("table"), counted)).length).toBe(2);
-  // The three draws of Health take the rows of core.calls, with the sum as `ms`.
+  // The three draws of the dashboard `health` take the rows of core.calls, with the sum as `ms`.
   const calls = { metric: "core.calls", since, until, step: 60000, groups: 2, series: [{ t: since + 60000, worker: "brain-x-inbox", method: "inbox.poll", status: 200, n: 2, sum: 80, max: 50 }, { t: since + 120000, worker: "brain-x-inbox", method: "inbox.poll", status: 502, n: 1, sum: 900, max: 900 }, { t: since + 60000, worker: "brain-core", method: "rule.list", status: 401, n: 1, sum: 3, max: 3 }] };
   const health = ["worker", "method", "status"];
   expect(marks(panelBody(panel("calls", health), calls), "rect")).toBeGreaterThan(2);
@@ -45802,7 +45823,8 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_span", "span", ["Generators","viewof span"], _cloudbrain_span);
   $def("_cloudbrain_viewof_asked", "viewof asked", ["Inputs"], _cloudbrain_viewof_asked);
   $def("_cloudbrain_asked", "asked", ["Generators","viewof asked"], _cloudbrain_asked);
-  $def("_cloudbrain_healthView", "healthView", ["calls","htl","spanName","span","dashboard","requestsChart","width","healthStrip","methodTable","moduleLink","brainModules","services","callsNote"], _cloudbrain_healthView);
+  $def("_cloudbrain_healthView", "healthView", ["calls","htl","spanName","span","dashboard","healthPanels","width","moduleLink","brainModules","services","callsNote"], _cloudbrain_healthView);
+  $def("_cloudbrain_healthPanels", "healthPanels", ["requestsChart","methodTable"], _cloudbrain_healthPanels);
   $def("_cloudbrain_timeRange", "timeRange", ["asked","rangeOf","span"], _cloudbrain_timeRange);
   $def("_cloudbrain_rangeOf", "rangeOf", [], _cloudbrain_rangeOf);
   $def("_cloudbrain_spanName", "spanName", ["spanOptions"], _cloudbrain_spanName);
@@ -45818,6 +45840,7 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_methodTable", "methodTable", ["Inputs","rollup"], _cloudbrain_methodTable);
   $def("_cloudbrain_dashboard", "dashboard", ["htl"], _cloudbrain_dashboard);
   $def("_cloudbrain_test_calls_from_the_logs_become_chart_rows", "test_calls_from_the_logs_become_chart_rows", ["callsQuery","expect","callsSeries","rollup","requestsChart","healthStrip","methodTable","dashboard"], _cloudbrain_test_calls_from_the_logs_become_chart_rows);
+  $def("_cloudbrain_test_health_draws_calls_and_methods_and_no_strip_of_faults", "test_health_draws_calls_and_methods_and_no_strip_of_faults", ["healthPanels","htl","expect","dashboard"], _cloudbrain_test_health_draws_calls_and_methods_and_no_strip_of_faults);
   $def("_cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client", "test_calls_are_read_once_for_a_range_and_not_without_a_client", ["callsRead","expect","callsQuery"], _cloudbrain_test_calls_are_read_once_for_a_range_and_not_without_a_client);
   $def("_cloudbrain_test_the_note_names_the_span_and_says_when_the_answer_is_at_the_limit", "test_the_note_names_the_span_and_says_when_the_answer_is_at_the_limit", ["expect","spanOptions","spanName","callsNote","callsQuery","rangeOf"], _cloudbrain_test_the_note_names_the_span_and_says_when_the_answer_is_at_the_limit);
   $def("_cloudbrain_LOGIN_METHODS", "LOGIN_METHODS", [], _cloudbrain_LOGIN_METHODS);
