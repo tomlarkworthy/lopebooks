@@ -35050,7 +35050,40 @@ const _brainbrowser_test_browser_refuses_urls_and_too_many_pages = async functio
   expect((await rig.owner.post("run", { url: "https://a.example/" })).data.error).toBe("TooManyPages");
   return refused.length + " addresses refused; 2 pages at most";
 };
-const _brainbrowser_test_browser_each_caller_has_its_own_browsers = async function _test_browser_each_caller_has_its_own_browsers(browserRig,expect) {
+const _brainbrowser_browserTickFailures = function _browserTickFailures() {return (async (fn) => {
+  const failed = [], before = console.error;
+  let listening = true;
+  console.error = (...a) => (listening && a[0] === "browser tick" ? failed.push(a[1]) : null, before.apply(console, a));
+  try {
+    await fn();
+  } finally {
+    listening = false;
+  }
+  return failed;
+});};
+const _brainbrowser_test_browser_tick_failures_are_heard_and_every_line_goes_on = async function _test_browser_tick_failures_are_heard_and_every_line_goes_on(browserRig,logged,browserTickFailures,expect) {
+  const rig = await browserRig(), mark = "tick-heard-" + Math.random().toString(36).slice(2);
+  await rig.open("a");
+  rig.rows.set("browser/" + rig.session(), null);
+  // A line of another test arrives while this one listens, and one after two listeners that ended out of order.
+  let first, second, release;
+  const held = new Promise((r) => (release = r));
+  const lines = await logged(async () => {
+    const outer = browserTickFailures(async () => {
+      second = await browserTickFailures(async () => (console.error({ at: mark, n: 1 }), await rig.tick()));
+      await held;
+    });
+    const inner = browserTickFailures(async () => void console.error({ at: mark, n: 2 }));
+    await inner;
+    release();
+    first = await outer;
+    console.error({ at: mark, n: 3 });
+  });
+  expect(lines.filter((l) => l.at === mark).map((l) => l.n)).toEqual([1, 2, 3]);
+  expect([first, second]).toEqual([["owner/default"], ["owner/default"]]);
+  return "1 failed tick heard by 2 listeners; 3 lines of another test went on";
+};
+const _brainbrowser_test_browser_each_caller_has_its_own_browsers = async function _test_browser_each_caller_has_its_own_browsers(browserRig,expect,browserTickFailures) {
   const rig = await browserRig({ paid: 0 }), A = "https://a.example/";
   const reader = rig.as("worker:brain-x-reader", "owner"), R = "worker:brain-x-reader/default";
   // Bought time runs down by the clock while the test runs: what is left is the amount less the seconds the test
@@ -35083,11 +35116,10 @@ const _brainbrowser_test_browser_each_caller_has_its_own_browsers = async functi
   rig.setPaid(-1, OB);
   expect([(await rig.owner.post("eval", { name: "a", expression: "1", ...inB })).data.error, (await rig.owner.post("eval", { name: "a", expression: "1 + 1" })).data.value, rig.fake.sessions.size]).toEqual(["NoTime", 2, 2]);
   // The tick of one browser fails (its row is broken here). The tick still closes the browser after it.
-  const sid = rig.session(), row = rig.rows.get("browser/" + sid), failed = [], error = console.error;
+  const sid = rig.session(), row = rig.rows.get("browser/" + sid);
   rig.rows.set("browser/" + sid, null);
   rig.setPaid(-1, R);
-  console.error = (...a) => failed.push(a[1]);
-  await rig.tick().finally(() => (console.error = error));
+  const failed = await browserTickFailures(() => rig.tick());
   rig.rows.set("browser/" + sid, row);
   expect(failed).toEqual(["owner/default"]);
   expect([rig.fake.sessions.size, rig.keys("browser/", R), rig.keys("browser/").length, (await reader.get("status", { name: "a" })).data.closed]).toEqual([1, [], 1, "time ran out"]);
@@ -35257,7 +35289,9 @@ export default function define(runtime, observer) {
   $def("_brainbrowser_test_browser_tick_makes_rows_and_sessions_agree", "test_browser_tick_makes_rows_and_sessions_agree", ["browserRig","expect"], _brainbrowser_test_browser_tick_makes_rows_and_sessions_agree);
   $def("_brainbrowser_test_browser_that_stops_answering_is_closed", "test_browser_that_stops_answering_is_closed", ["browserRig","expect"], _brainbrowser_test_browser_that_stops_answering_is_closed);
   $def("_brainbrowser_test_browser_refuses_urls_and_too_many_pages", "test_browser_refuses_urls_and_too_many_pages", ["expect","browserRefusal","browserRig"], _brainbrowser_test_browser_refuses_urls_and_too_many_pages);
-  $def("_brainbrowser_test_browser_each_caller_has_its_own_browsers", "test_browser_each_caller_has_its_own_browsers", ["browserRig","expect"], _brainbrowser_test_browser_each_caller_has_its_own_browsers);
+  $def("_brainbrowser_browserTickFailures", "browserTickFailures", [], _brainbrowser_browserTickFailures);
+  $def("_brainbrowser_test_browser_tick_failures_are_heard_and_every_line_goes_on", "test_browser_tick_failures_are_heard_and_every_line_goes_on", ["browserRig","logged","browserTickFailures","expect"], _brainbrowser_test_browser_tick_failures_are_heard_and_every_line_goes_on);
+  $def("_brainbrowser_test_browser_each_caller_has_its_own_browsers", "test_browser_each_caller_has_its_own_browsers", ["browserRig","expect","browserTickFailures"], _brainbrowser_test_browser_each_caller_has_its_own_browsers);
   $def("_brainbrowser_test_browser_a_turn_does_not_reach_the_browsers_of_its_callers_own_session", "test_browser_a_turn_does_not_reach_the_browsers_of_its_callers_own_session", ["browserRig","expect"], _brainbrowser_test_browser_a_turn_does_not_reach_the_browsers_of_its_callers_own_session);
   $def("_brainbrowser_test_browser_cdp_is_the_socket_of_the_callers_own_browser", "test_browser_cdp_is_the_socket_of_the_callers_own_browser", ["browserRig","expect"], _brainbrowser_test_browser_cdp_is_the_socket_of_the_callers_own_browser);
   $def("_brainbrowser_test_browser_panel_shows_pages_and_the_usage", "test_browser_panel_shows_pages_and_the_usage", ["browserPanel","expect","Event"], _brainbrowser_test_browser_panel_shows_pages_and_the_usage);
@@ -35268,6 +35302,7 @@ export default function define(runtime, observer) {
   main.define("log", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("log", _));
   main.define("hono", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("hono", _));
   main.define("simulate", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("simulate", _));
+  main.define("logged", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("logged", _));
   main.define("decide", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("decide", _));
   main.define("callerOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("callerOf", _));
   main.define("keeperOf", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("keeperOf", _));
