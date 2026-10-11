@@ -9592,7 +9592,7 @@ const _brainshell_verifyModule = function _verifyModule(brainClient,runtime,glob
   const failed = [];
   await Promise.all(
     names.map((name) =>
-      Promise.race([mod.value(name), new Promise((_, no) => setTimeout(() => no(new Error(`no result in ${limit / 1000} s`)), limit))]).catch((e) => failed.push({ name, message: String((e && e.message) || e).slice(0, 300) }))
+      Promise.race([mod.value(name), new Promise((_, no) => setTimeout(() => no(new Error(`no result in ${limit / 1000} s`)), limit))]).catch((e) => failed.push({ name, message: String((e && e.message) || e).slice(0, 300), stack: String((e && e.stack) || "").slice(0, 600) }))
     )
   );
   // What the Worker says it runs has to be what was loaded and tested. A new version takes some seconds to reach
@@ -9606,7 +9606,9 @@ const _brainshell_verifyModule = function _verifyModule(brainClient,runtime,glob
   if (running == null) return { worker, module, hash, none: "the Worker did not say what it runs" };
   if (running !== hash) failed.push({ name: "the Worker reports the hash that was loaded", message: `loaded ${String(hash).slice(0, 12)}, running ${String(running).slice(0, 12)}` });
   const otherTestsRan = [...rt._variables].filter((v) => v._module !== mod && isTest(v) && v._version > 0 && v._value !== undefined).length;
-  return { worker, module, hash, ok: failed.length === 0, tests: names.length, failed, otherTestsRan, ms: Date.now() - began, heapMB: globalThis.performance && performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1e6) : null };
+  // agent: the browser of the run. The deployer's is not the one a change was tested in (Chrome 128 against 151 on
+  // 2026-10-11, when a test of brain-container failed in the first alone).
+  return { worker, module, hash, ok: failed.length === 0, tests: names.length, failed, otherTestsRan, agent: globalThis.navigator ? navigator.userAgent : null, ms: Date.now() - began, heapMB: globalThis.performance && performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1e6) : null };
 });};
 const _brainshell_brainVerdict = async function _brainVerdict(location,brainOrigin,brainPortal,globalThis,brainModules,brainJoined,verifyModule) {
   const worker = decodeURIComponent((String(location.hash).replace(/^#/, "").split("&").find((p) => p.startsWith("verify=")) || "").slice(7));
@@ -21805,7 +21807,7 @@ A sign-in link made to deploy with no approval (\`token.link\` with \`unattended
 Every change says why. \`infra.apply\` (unless \`dry\`), \`infra.redistil\` with \`apply\`, a roll back on the page, \`member.deploy\` and \`member.remove\` take \`reason\`, 3 to 300 characters, and are refused without one (400 \`InvalidRequest\`, or \`refused\` for a member). The reason is logged before anything is done, as \`deploy.reason\` with \`reason\`, \`by\` (\`owner\`, \`recovery key\`, the member's DID, or \`token:NAME\` for a sign-in link made to deploy with no approval) and \`targets\`. Added 2026-10-09.
 
 The deployer writes a line for each step of a deploy with the \`log\` cell: \`deploy.uploaded\`, \`deploy.deployed\`, \`deploy.probation\`, \`deploy.confirmed\`, \`deploy.unhealthy\` with what the last health check answered, \`deploy.put-back\` with the reason, \`deploy.refused\`, \`deploy.waiting\`, \`deploy.removed\`, \`deploy.failing\`, \`deploy.logs-on\`, \`deploy.verify\`, \`deploy.verified\`, \`deploy.failed\`, \`deploy.verify.none\`, \`deploy.verify.stale\`, \`deploy.over-unverified\`, \`token.mint\`, \`token.roll\`, \`token.delete\`, \`token.mint-failed\`. A member's deploy writes \`deploy.deployed\` and \`deploy.put-back\`. The \`reason\` of a put-back can be Cloudflare's own text about the code that was sent; it is not text a caller of a method sent.`);};
-const _braindeployer_anon_33700bd162 = function _anonymous(md) {return (md`## A deploy is verified by the deployer
+const _braindeployer_anon_de0f2070c3 = function _anonymous(md) {return (md`## A deploy is verified by the deployer
 
 Written 2026-10-10 from \`plan/specs/deploy-verification.html\`. Before it, the owner's open page ran every Worker's tests and reported to the core, so a verdict depended on which tab was open and on what else that page had loaded.
 
@@ -21824,7 +21826,7 @@ The kernel is not run this way, because it serves the page of the run, and a Wor
 | the run gave | the deployer | the result's \`state\` | log line |
 |---|---|---|---|
 | a pass for the hash that runs | ends the probation, tells the core (\`deploy.report\`) | \`verified\` | \`deploy.verified\` |
-| a fail for the hash that runs | puts the version before back at once | \`put-back\`, reason \`its tests failed: NAME: MESSAGE; …\` (200 characters) | \`deploy.failed\`, \`deploy.put-back\` |
+| a fail for the hash that runs | puts the version before back at once | \`put-back\`, reason \`its tests failed: NAME: MESSAGE; …\` (200 characters). One issue is opened in the tracker (\`issue.open\`, kind \`bug\`, id \`fix-tests-WORKER-HASH8\`) whose body is the facts as JSON: Worker, module, both hashes, the run's address, the browser, each failed test with its message and stack. \`deploy.issue.none\` when the tracker refuses | \`deploy.failed\`, \`deploy.put-back\` |
 | a fail, and no version before | leaves it running, tells the core | \`failing\` | \`deploy.failed\` |
 | a verdict for another hash | nothing | \`probation\` | \`deploy.verify.stale\` |
 | no verdict: no browser, no time bought, the wait passed, the page could not judge | nothing | \`probation\` | \`deploy.verify.none\` with the reason |
@@ -22692,6 +22694,10 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
     }
     say({ at: "deploy.failed", target: logical, hash, failed, otherTestsRan, ms });
     const out = await verdictOf({ worker: logical, hash, ok: false, reason }, rec);
+    // An issue for the tests, with what a reader needs to find the rest. The key is the Worker and the hash, so a
+    // second apply of the same version adds nothing. A tracker that is down or refuses changes nothing here.
+    const facts = { worker: logical, module, failedHash: hash, putBackTo: out.previous || null, state: out.state, at: new Date().toISOString(), run: url, browser: v.agent || null, tests, otherTestsRan, ms, deployer: self.hash, logs: ["deploy.verify", "deploy.failed", "deploy.put-back"], failed: v.failed.map((f) => ({ name: String(f.name), message: String(f.message || "").slice(0, 300), stack: String(f.stack || "").slice(0, 600) })) };
+    await viaCore("issue.open", { key: `deployer/tests/${logical}/${hash}`, id: ("fix-tests-" + logical).slice(0, 31) + "-" + String(hash).slice(0, 8), kind: "bug", about: logical, title: `Fix tests: ${logical} ${String(hash).slice(0, 12)} failed ${failed.length} of ${tests} after its deploy`, body: JSON.stringify(facts, null, 1) }).then((r) => r && r.status !== 200 && say({ at: "deploy.issue.none", target: logical, hash, reason: `issue.open answered ${r.status} ${r.data.message || r.data.error || ""}`.slice(0, 300) }), () => null);
     if (out.state === "put-back") return { state: "put-back", previous: out.previous, reason: "its tests failed: " + reason.slice(0, 200) };
     // Nothing before it to go back to: it runs, and the core's route says its tests fail.
     await toCore("deploy.report", { worker: logical, hash, ok: false, tests, failed, reason: reason.slice(0, 300) }).catch(() => null);
@@ -23836,8 +23842,8 @@ const _braindeployer_test_deployer_pass_ends_probation = async function _test_de
   return "verified twice";
 };
 const _braindeployer_test_deployer_fail_puts_back_at_once = async function _test_deployer_fail_puts_back_at_once(verifyRig,expect) {
-  const failed = [{ name: "test_x", message: "expected 1" }, { name: "test_y", message: "no result in 30 s" }];
-  const t = await verifyRig({ run: () => t.verdict(t.v2.hash, { ok: false, failed }) });
+  const failed = [{ name: "test_x", message: "expected 1", stack: "at line 5" }, { name: "test_y", message: "no result in 30 s" }];
+  const t = await verifyRig({ run: () => t.verdict(t.v2.hash, { ok: false, failed, agent: "Chrome/128" }) });
   const { rig, A, v1, v2, ks, running } = t;
   const why = "its tests failed: test_x: expected 1; test_y: no result in 30 s";
   const lines = await rig.saidIn(async () => expect((await rig.recover({ workers: [v2] })).results[0]).toMatchObject({ worker: A, hash: v2.hash, state: "put-back", previous: v1.hash, reason: why }));
@@ -23847,6 +23853,12 @@ const _braindeployer_test_deployer_fail_puts_back_at_once = async function _test
   // The core is told the routes of the version put back, and no report of the one that is gone.
   expect(rig.fake.calls.filter((c) => c.nsid === "service.register" && c.body.worker === A).at(-1).body).toMatchObject({ hash: v1.hash, methods: { "com.lopecode.brain.a.one": { type: "query", who: "owner" } } });
   expect(rig.fake.calls.filter((c) => c.nsid === "deploy.report")).toEqual([]);
+  // One issue for the tests, with the facts as data. The same version applied again writes with the same key.
+  const opened = rig.fake.calls.filter((c) => c.nsid === "issue.open").map((c) => c.body);
+  expect(opened.map(({ key, id, kind, about, title }) => ({ key, id, kind, about, title }))).toEqual([{ key: `deployer/tests/${A}/${v2.hash}`, id: "fix-tests-brain-x-a-" + v2.hash.slice(0, 8), kind: "bug", about: A, title: `Fix tests: ${A} ${v2.hash.slice(0, 12)} failed 2 of 3 after its deploy` }]);
+  expect(JSON.parse(opened[0].body)).toMatchObject({ worker: A, module: t.M, failedHash: v2.hash, putBackTo: v1.hash, state: "put-back", browser: "Chrome/128", tests: 3, otherTestsRan: 132, failed: [{ name: "test_x", message: "expected 1", stack: "at line 5" }, { name: "test_y", message: "no result in 30 s", stack: "" }] });
+  expect(JSON.parse(opened[0].body).run).toContain("&verify=" + A);
+  expect(opened[0].id.length).toBeLessThanOrEqual(40);
   // ok: true with a failed test named is a fail.
   rig.fake.browser.run = () => t.verdict(t.v3.hash, { ok: true, failed: [failed[0]] });
   expect((await rig.recover({ workers: [t.v3] })).results[0].state).toBe("put-back");
@@ -24524,7 +24536,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_nextKernelState", "nextKernelState", ["probationDefaultMs"], _braindeployer_nextKernelState);
   $def("_braindeployer_anon_17200b265d", null, ["md"], _braindeployer_anon_17200b265d);
   $def("_braindeployer_anon_e12ce2a2f9", null, ["md"], _braindeployer_anon_e12ce2a2f9);
-  $def("_braindeployer_anon_33700bd162", null, ["md"], _braindeployer_anon_33700bd162);
+  $def("_braindeployer_anon_de0f2070c3", null, ["md"], _braindeployer_anon_de0f2070c3);
   $def("_braindeployer_deployerOps", "deployerOps", ["config","secrets","rows","log","Response","URLSearchParams","sha256","FormData","partsHash","deployerAllows","wrapperFlags","probationDefaultMs","deployerDistil","nextKernelState"], _braindeployer_deployerOps);
   $def("_braindeployer_anon_b5cfc17bdb", null, ["md"], _braindeployer_anon_b5cfc17bdb);
   $def("_braindeployer_deployerPage", "deployerPage", [], _braindeployer_deployerPage);
@@ -37404,8 +37416,9 @@ const _brainissues_issues_service = function _issues_service(cloudflare,issuesAp
   methods: Object.fromEntries(
     [["open", "procedure"], ["comment", "procedure"], ["label", "procedure"], ["review", "procedure"], ["move", "procedure"], ["swap", "procedure"], ["narrow", "procedure"], ["install", "procedure"], ["rebuild", "procedure"], ["resign", "procedure"], ["policy", "query"], ["snapshot", "query"], ["sync", "query"], ["get", "query"], ["list", "query"], ["verify", "query"], ["key", "query"]].map(([name, type]) => [
       "com.lopecode.brain.issue." + name,
-      // The owner, a token and a Worker of the Brain. A member's Worker calls as its author's DID and is not let in.
-      name === "key" ? { type, who: "anyone" } : { type, allow: 'caller.kind in ["owner", "token", "worker"]' }
+      // The owner, a token, a Worker of the Brain and the deployer, which opens an issue when it puts a Worker back
+      // on its tests. A member's Worker calls as its author's DID and is not let in.
+      name === "key" ? { type, who: "anyone" } : { type, allow: 'caller.kind in ["owner", "token", "worker", "deployer"]' }
     ])
   )
 }));};
@@ -38761,7 +38774,7 @@ const _brainissues_test_issues_declares_what_it_needs = async function _test_iss
   const methods = Object.keys(meta.access).sort().map((m) => m.replace("com.lopecode.brain.issue.", ""));
   expect(methods).toEqual(["comment", "get", "install", "key", "label", "list", "move", "narrow", "open", "policy", "rebuild", "resign", "review", "snapshot", "swap", "sync", "verify"]);
   const let_in = (who) => decide(meta.access["com.lopecode.brain.issue.open"], { caller: callerOf({ caller: who }), request: {} }).allow;
-  expect(["owner", "token:a", "worker:brain-x-echo", "did:plc:other", "anonymous"].map(let_in)).toEqual([true, true, true, false, false]);
+  expect(["owner", "token:a", "worker:brain-x-echo", "deployer", "did:plc:other", "anonymous"].map(let_in)).toEqual([true, true, true, true, false, false]);
   // The default policy passes its own check.
   expect(Object.keys((await issuePolicyAct(issuesDefaultPolicy)).hashes)).toEqual(["task", "security", "feedback"]);
   // Without the key a write is refused and says which secret.
@@ -39671,7 +39684,9 @@ const _braincontainer_containerBox = function _containerBox(containerLimits,Resp
     }
     // A request to a port of the container, with the path as the caller gave it.
     if (!s.up || !c.running) if (!(await up(ctx, s)).up) return json(down(s), 503);
-    const send = (r) => c.getTcpPort(port).fetch(new Request("http://box" + url.pathname + url.search, r));
+    // The parts are named, with duplex beside a body: a Request passed whole as the init is refused with a body where
+    // Request has no duplex of its own (Chrome 128, the browser the deployer runs the tests in).
+    const send = (r) => c.getTcpPort(port).fetch(new Request("http://box" + url.pathname + url.search, { method: r.method, headers: r.headers, ...(r.body ? { body: r.body, duplex: "half" } : {}) }));
     // Just after a start the process may not listen yet: the request is kept and tried again. After that it is passed once, unread.
     const fresh = Date.now() - s.startedAt < L.listenGrace;
     const kept = fresh && request.body ? await request.arrayBuffer() : null;
