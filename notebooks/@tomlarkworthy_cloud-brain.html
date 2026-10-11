@@ -42851,14 +42851,14 @@ export default function define(runtime, observer) {
   type="text/plain"
   data-mime="application/javascript"
 >
-const _braindashboard_anon_489011608e = function _anonymous(md,metricTable,metricMemoryDefaults,metricRules,dashboardRules,metricLimits,dashboardLimits,dashboardDraws,dashboardTable) {return (md`# brain-dashboard
+const _braindashboard_anon_3eb6f8fff9 = function _anonymous(md,metricTable,metricPieceDefaults,metricMemoryDefaults,metricRules,dashboardRules,metricLimits,dashboardLimits,dashboardDraws,dashboardTable) {return (md`# brain-dashboard
 
 A Cloud Brain recipe: metrics read from the lines this Brain's Workers already log. A metric is a definition that names a Worker, the \`at\` of its lines, a numeric field to add up (or none: the lines are counted) and the fields a query may group or filter by. Nothing is added to the Worker that writes the lines. The metrics of the Brain's own Workers are a value of this module; a member's are rows of this service. A dashboard is data: a name, a title and a list of panels, each naming a metric and how it is drawn. Tasks 1 to 4 of \`plan/cloud-brain-dashboard-service.md\`; the page that draws a dashboard is a later task and is not here.
 
 | Method | Answers |
 |---|---|
 | \`GET metric.list\` | \`{ metrics }\`: the definitions the caller may name, no data |
-| \`GET metric.query?metric=NAME&since=MS&until=MS&by=dim,dim&DIM=value\` | \`{ metric, since, until, step, groups, series, cost }\`: one Cloudflare telemetry query (\`POST /accounts/ACCOUNT/workers/observability/telemetry/query\`, \`view: "calculations"\`), or the answer kept from one (What a query costs) |
+| \`GET metric.query?metric=NAME&since=MS&until=MS&by=dim,dim&DIM=value\` | \`{ metric, since, until, step, groups, sampled, series, cost }\`: one Cloudflare telemetry query (\`POST /accounts/ACCOUNT/workers/observability/telemetry/query\`, \`view: "calculations"\`), with one more for each day of a span that Cloudflare answered from a sample (A query), or the answer kept from those (What a query costs) |
 | \`POST metric.put\` | a member's own. Body \`{ name, worker, at, value, dims }\`; answers \`{ metric }\`, the definition as kept. A name that is kept is written over |
 | \`POST metric.delete\` | a member's own. Body \`{ name }\`; answers \`{ deleted }\`, or 404 for a name that is not kept |
 | \`GET dashboard.list\` | \`{ dashboards }\`: \`{ name, title }\` of each dashboard the caller may read, no panels |
@@ -42888,15 +42888,20 @@ GET /xrpc/com.lopecode.brain.metric.query?metric=deploys.confirmed&by=target&sin
 { "metric": "deploys.confirmed", "since": 1791676800000, "until": 1791680400000,
   "step": 60000,       // Cloudflare's result.run.granularity; the service does not choose it
   "groups": 2,         // how many groups Cloudflare answered; 500 or more means it cut the answer
+  "sampled": 1,        // 1: counted from every line. More: Cloudflare counted from a sample, and n, sum and max are its estimates
   "series": [{ "t": 1791676860000, "target": "brain-x-git", "n": 2, "sum": null, "max": null }],
   "cost": { "ms": 431,           // from the send to Cloudflare until its whole answer was read; 0 from the memory (431 is an example, not a measure)
-            "queries": 1,        // how many queries Cloudflare was sent for this answer: 1, or 0 from the memory
+            "queries": 1,        // how many queries Cloudflare was sent for this answer: 1, 1 and the parts of a sampled span, or 0 from the memory
             "cached": false } }  // true: the answer is one kept in this instance's memory
 \`\`\`
 
 A row is one step and one group: \`t\` the step's time, the dimensions asked, \`n\` the lines, \`sum\` and \`max\` of the value (\`null\` for a counted metric). Steps with no line have no row. Cloudflare's refusal is answered 502 with its status in the message.
 
-**An answer over a span of days can be made from a sample of the lines, and nothing in it says so.** Counted on cb4, 2026-10-11, \`deploys.confirmed\` by \`target\`, against the lines \`at: "deploy.confirmed"\` that \`logs.deploys\` read over the same span, which are read whole:
+**An answer says whether Cloudflare made it from a sample of the lines: \`sampled\`.** \`1\` is an answer counted from every line. Above 1, each \`n\`, \`sum\` and \`max\` is Cloudflare's estimate from a sample, and a group with few lines can be left out whole. \`sampled\` is the highest of two numbers of Cloudflare's answer, either of which can be absent: \`result.run.statistics.abr_level\` ("The level of Adaptive Bit Rate (ABR) sampling used for the query. If empty the ABR level is 1") and the \`sampleInterval\` of each row ("A value above 1 means count and value are estimated from sampled data, not exact"). Both sentences are Cloudflare's, from its API reference of the telemetry query, read 2026-10-11. With neither number, \`sampled\` is 1.
+
+**A sampled answer over more than a day is asked again a day at a time.** The service sends the span as one query. When that answer is sampled and the span is longer than ${metricPieceDefaults.ms / 3600000} hours, it sends one query for each part of ${metricPieceDefaults.ms / 3600000} hours, counted back from \`until\` so that the first part is the short one, all at the same moment, and answers the rows of the parts in place of the first answer. \`step\` is then the longest of the parts' steps, \`groups\` the most any part answered, \`sampled\` the highest of the parts' (1 when every part was whole), and \`cost.queries\` is 1 and the parts. An answer is given as it is, with its \`sampled\`, and nothing is asked again, for a span of ${metricPieceDefaults.ms / 3600000} hours or less and for a span of more than ${metricPieceDefaults.most} parts. A part ends at the time the next one starts; whether Cloudflare counts a line of that millisecond in both was not read. Cloudflare's refusal of a part is answered 502, as of the span, and nothing is kept. The setting \`pieceMs\` stands in for the ${metricPieceDefaults.ms} ms; \`0\` asks nothing again (\`config.set { worker: "brain-x-dashboard", key: "pieceMs", value: 0 }\`, the owner, no deploy; not run on a Brain).
+
+What was counted on cb4 before this, 2026-10-11, with the service at \`f8667794afd8\`, which sent one query and read neither number: \`deploys.confirmed\` by \`target\`, against the lines \`at: "deploy.confirmed"\` that \`logs.deploys\` read over the same span, which are read whole:
 
 | span | sum of \`n\` | the lines |
 |---|---|---|
@@ -42907,11 +42912,11 @@ A row is one step and one group: \`t\` the step's time, the dimensions asked, \`
 | 7 days, the sixth ask | 100, one target | 173 |
 | the same 7 days, seven asks of one day | 173 | the same, target by target |
 
-In each of the seven answers that were short every \`n\` was a multiple of 10, and a target could be left out whole: \`brain-db\`, with 10 lines, was in none of them. The six 7-day asks differed by minutes at each end and held the same 173 lines. So the span alone does not say which answer is whole: 4 days was short where 5 and 6 were not. The service does not read whether Cloudflare sampled, and \`groups\` does not show it (22 for the 4-day answer). A count over more than 3 days that has to be whole is asked a day at a time. The asks are in \`tools/cloud-brain/records/dsv-4-cost.md\`.
+In each of the seven answers that were short every \`n\` was a multiple of 10, and a target could be left out whole: \`brain-db\`, with 10 lines, was in none of them. The six 7-day asks differed by minutes at each end and held the same 173 lines. So the span alone does not say which answer is whole: 4 days was short where 5 and 6 were not, and \`groups\` does not show it (22 for the 4-day answer). That is why the service goes by what Cloudflare says of each answer and by no length of span. The asks are in \`tools/cloud-brain/records/dsv-4-cost.md\`.
 
 ## What a query costs
 
-An answer is kept in the memory of the instance of the Worker that made it, for ${metricMemoryDefaults.ms / 1000} s from when Cloudflare answered, under the text of the query Cloudflare was sent (\`metricMemory\`). The same query asked of that instance inside that time is answered from the memory: Cloudflare is sent nothing, and \`cost\` is \`{ "ms": 0, "queries": 0, "cached": true }\`. The rest of the answer is the kept one, so it can be ${metricMemoryDefaults.ms / 1000} s old. The minutes are what make two asks the same query: a page that asks "the last hour" again inside one minute sends the same text.
+An answer is kept in the memory of the instance of the Worker that made it, for ${metricMemoryDefaults.ms / 1000} s from when Cloudflare answered, under the text of the query Cloudflare was sent (\`metricMemory\`). A span asked again in parts is kept as one answer, the joined one, under the text of the query for the span. The same query asked of that instance inside that time is answered from the memory: Cloudflare is sent nothing, and \`cost\` is \`{ "ms": 0, "queries": 0, "cached": true }\`. The rest of the answer is the kept one, so it can be ${metricMemoryDefaults.ms / 1000} s old. The minutes are what make two asks the same query: a page that asks "the last hour" again inside one minute sends the same text.
 
 - **The same query** is the same metric, minutes, \`by\` in the same order and filters in the same order. Who asks is not part of it. Every refusal of this service is decided before the memory is read (the tenant, the definition, the names in \`by\` and the filters), so an answer kept for one caller is given to another only when the service would have asked Cloudflare for that caller too.
 - **A member's metric put again** with another Worker, \`at\` or value, or another type of a dimension the query names, is another query. Deleted, it is 404.
@@ -42932,7 +42937,7 @@ An answer is kept in the memory of the instance of the Worker that made it, for 
 | 24 hours | 854 to 1095 | 1.04 to 1.35 s | 1440000 | 22 |
 | 7 days | 5949 to 8302, and 1097 once | 6.18 to 8.56 s, and 1.30 s once | 10074000 to 10079000 | 7, and 1 once |
 
-Each 7-day answer was made from a sample (A query); the one of 1097 ms is the one that summed to 100. The last ask of each span was then asked five more times: 25 answers from the memory, the whole call 0.14 to 0.26 s. The deployer's lines \`at: "deploy.…"\` of those 7 days were 1466, 173 of them \`deploy.confirmed\`; the time over a Worker that writes more was not measured, and \`core.calls\` is not read by a token.
+Each 7-day answer was made from a sample and was one query, as the service then sent (A query); the one of 1097 ms is the one that summed to 100. The last ask of each span was then asked five more times: 25 answers from the memory, the whole call 0.14 to 0.26 s. The deployer's lines \`at: "deploy.…"\` of those 7 days were 1466, 173 of them \`deploy.confirmed\`; the time over a Worker that writes more was not measured, and \`core.calls\` is not read by a token.
 
 ## Who can call
 
@@ -42983,7 +42988,7 @@ What holds one member's counts from another: the script Cloudflare is asked for 
 
 **A member reaches these methods only when the owner granted them** (\`grant.put\` of each of the four for that DID): the kernel refuses a DID any method outside its own list before a rule is read.
 
-**No price.** Each \`metric.query\` that is not answered from the memory is one query of Cloudflare's logs on the owner's account, and no method here has a price. What one such query costs was not found: Cloudflare prices Workers Logs by the lines written, and says a price for observability starts 2026-12-01 without giving it (read 2026-10-11, \`plan/cloud-brain-dashboard-service.md\`, "Read"). The core counts the calls a member's Worker makes against its author's calls for a day (2000 unless the owner set another; brain-core, \`asAuthor\`); a member's own call of a granted method was not found to be counted. A member's Worker is called by whoever its own rule lets in, so with the grant a caller of that Worker can make it send a \`metric.query\`, each a query on the owner's account, up to that count. What bounds a member's own calls today is the grant, which the owner takes back. The owner sets a price with no deploy: \`price.put { target: "com.lopecode.brain.metric.query", price: 'caller.kind == "did" ? 0.001 : 0.0' }\` would charge the account of a member's call a tenth of a cent a query (read in brain-core, \`priced\`, and not run; the number is an example, not a measure).
+**No price.** Each \`metric.query\` that is not answered from the memory is one query of Cloudflare's logs on the owner's account, or up to ${1 + metricPieceDefaults.most} for a span Cloudflare sampled (A query), and no method here has a price. What one such query costs was not found: Cloudflare prices Workers Logs by the lines written, and says a price for observability starts 2026-12-01 without giving it (read 2026-10-11, \`plan/cloud-brain-dashboard-service.md\`, "Read"). The core counts the calls a member's Worker makes against its author's calls for a day (2000 unless the owner set another; brain-core, \`asAuthor\`); a member's own call of a granted method was not found to be counted. A member's Worker is called by whoever its own rule lets in, so with the grant a caller of that Worker can make it send a \`metric.query\`, each a query on the owner's account, up to that count. What bounds a member's own calls today is the grant, which the owner takes back. The owner sets a price with no deploy: \`price.put { target: "com.lopecode.brain.metric.query", price: 'caller.kind == "did" ? 0.001 : 0.0' }\` would charge the account of a member's call a tenth of a cent a query (read in brain-core, \`priced\`, and not run; the number is an example, not a measure).
 
 ## Dashboards
 
@@ -43029,7 +43034,7 @@ The service declares \`cloudflare: ["Workers Observability Read"]\`, as brain-lo
 
 ## Not known
 
-A member's call on a running Brain: every answer to a member above is from the tests of this module, with the caller's name given to the service as the core gives it. How the page draws a panel: no page reads a dashboard yet, and \`draw\`, \`by\` and \`filter\` are kept as given. The time of a query of \`core.calls\`, which holds many more lines than the deploys measured above (What a query costs). Which asks Cloudflare answers from a sample: it was seen over 4 and 7 days and not over 5 and 6 (A query), and what decides it was not found. What Cloudflare answers for a span that starts before the 7 days it keeps. The shape of an answer with no \`by\`: the service reads a group with no \`groups\` as one row a step.`);};
+A member's call on a running Brain: every answer to a member above is from the tests of this module, with the caller's name given to the service as the core gives it. How the page draws a panel: no page reads a dashboard yet, and \`draw\`, \`by\` and \`filter\` are kept as given. The time of a query of \`core.calls\`, which holds many more lines than the deploys measured above (What a query costs). Which asks Cloudflare answers from a sample: it was seen over 4 and 7 days and not over 5 and 6 (A query), and what decides it was not found. Which of the two numbers \`sampled\` is read from an answer of a Brain carries: the tests give the service each alone and both, and what cb4 answered first is in \`tools/cloud-brain/records/metric-query-sampled-unsaid.md\`. A sample taken when a line is written (a Worker's own sampling rate of its logs), which asking again in parts does not undo: such an answer keeps its \`sampled\`. What Cloudflare answers for a span that starts before the 7 days it keeps. The shape of an answer with no \`by\`: the service reads a group with no \`groups\` as one row a step.`);};
 const _braindashboard_metricDefinitions = function _metricDefinitions() {return ([
   { name: "core.calls", worker: "brain-core", at: "call", value: "ms", dims: [{ key: "worker" }, { key: "method" }, { key: "status", type: "number" }] },
   { name: "deploys.confirmed", worker: "brain-deployer", at: "deploy.confirmed", value: null, dims: [{ key: "target" }] },
@@ -43154,7 +43159,26 @@ const _braindashboard_metricSeries = function _metricSeries() {return ((result, 
   };
   field("count", "n");
   if (def.value) field("sum", "sum"), field("max", "max");
-  return { step: ((result && result.run) || {}).granularity || 60000, groups: (of("count").aggregates || []).length, series: [...rows.values()].filter((r) => r.n > 0).sort((a, b) => a.t - b.t) };
+  const run = (result && result.run) || {}, most = (...xs) => Math.max(1, ...xs.map((x) => Number(x) || 1));
+  const sampled = most((run.statistics || {}).abr_level, ...calcs.flatMap((c) => [...(c.aggregates || []), ...(c.series || []).flatMap((p) => p.data || [])]).map((g) => g && g.sampleInterval));
+  return { step: run.granularity || 60000, groups: (of("count").aggregates || []).length, sampled, series: [...rows.values()].filter((r) => r.n > 0).sort((a, b) => a.t - b.t) };
+});};
+const _braindashboard_metricPieceDefaults = function _metricPieceDefaults() {return ({ ms: 86400000, most: 8 });};
+const _braindashboard_metricPieces = function _metricPieces(metricPieceDefaults) {return ((since, until, ms = metricPieceDefaults.ms, most = metricPieceDefaults.most) => {
+  if (!(ms >= 60000) || !(until - since > ms)) return [];
+  const count = Math.ceil((until - since) / ms);
+  return count > most ? [] : Array.from({ length: count }, (_, i) => [Math.max(since, until - (count - i) * ms), until - (count - i - 1) * ms]);
+});};
+const _braindashboard_metricJoin = function _metricJoin() {return ((parts, by) => {
+  const rows = new Map();
+  for (const part of parts)
+    for (const r of part.series) {
+      const id = JSON.stringify([r.t, by.map((k) => r[k])]), had = rows.get(id);
+      if (!had) rows.set(id, { ...r });
+      else Object.assign(had, { n: had.n + r.n }, r.sum === null ? {} : { sum: had.sum + r.sum, max: Math.max(had.max, r.max) });
+    }
+  const top = (key) => Math.max(...parts.map((p) => p[key]));
+  return { step: top("step"), groups: top("groups"), sampled: top("sampled"), series: [...rows.values()].sort((a, b) => a.t - b.t) };
 });};
 const _braindashboard_metricMemoryDefaults = function _metricMemoryDefaults() {return ({ ms: 60000, characters: 4000000 });};
 const _braindashboard_metricMemoryOf = function _metricMemoryOf(metricMemoryDefaults) {return ((most = metricMemoryDefaults.characters) => {
@@ -43177,7 +43201,7 @@ const _braindashboard_metricMemoryOf = function _metricMemoryOf(metricMemoryDefa
   };
 });};
 const _braindashboard_metricMemory = function _metricMemory(metricMemoryOf) {return (metricMemoryOf());};
-const _braindashboard_dashboard_service = function _dashboard_service(cloudflare,Response,metricTenant,dashboardDefinitions,rows,dashboardLimits,dashboardOwn,dashboardHold,metricDefinitions,metricOwn,metricLimits,metricAsk,metricBody,config,metricMemoryDefaults,metricMemory,cloudflareApi,metricSeries,metricRules,dashboardRules) {return (cloudflare.Service(
+const _braindashboard_dashboard_service = function _dashboard_service(cloudflare,Response,metricTenant,dashboardDefinitions,rows,dashboardLimits,dashboardOwn,dashboardHold,metricDefinitions,metricOwn,metricLimits,metricAsk,metricBody,config,metricMemoryDefaults,metricMemory,cloudflareApi,metricSeries,metricPieces,metricPieceDefaults,metricJoin,metricRules,dashboardRules) {return (cloudflare.Service(
   "dashboard",
   async (request, { caller }) => {
     const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -43249,12 +43273,24 @@ const _braindashboard_dashboard_service = function _dashboard_service(cloudflare
     const had = metricMemory.read(body, Date.now(), memoryMs);
     if (had) return json(200, { ...JSON.parse(had), cost: { ms: 0, queries: 0, cached: true } });
     const began = Date.now();
-    const r = await cloudflareApi.fetch("/workers/observability/telemetry/query", { method: "POST", body });
-    const data = await r.json().catch(() => null);
-    if (!r.ok || !data || !data.result) return refuse(502, "UpstreamFailure", `Cloudflare answered ${r.status} ${JSON.stringify((data && data.errors) || null).slice(0, 300)}`);
-    const ms = Date.now() - began, answer = { metric: def.name, since: ask.since, until: ask.until, ...metricSeries(data.result, def, ask.by) };
+    // One query of Cloudflare: its answer as metricSeries, or { error } for a refusal.
+    const send = async (text) => {
+      const r = await cloudflareApi.fetch("/workers/observability/telemetry/query", { method: "POST", body: text });
+      const data = await r.json().catch(() => null);
+      return !r.ok || !data || !data.result ? { error: `Cloudflare answered ${r.status} ${JSON.stringify((data && data.errors) || null).slice(0, 300)}` } : metricSeries(data.result, def, ask.by);
+    };
+    let got = await send(body), queries = 1;
+    // An answer made from a sample is asked again in parts, a day each, and the parts are the answer (metric-query-sampled-unsaid).
+    const parts = got.error || got.sampled <= 1 ? [] : metricPieces(ask.since, ask.until, Number(config.pieceMs ?? metricPieceDefaults.ms));
+    if (parts.length) {
+      const answers = await Promise.all(parts.map(([from, to]) => send(JSON.stringify(metricBody(def, { ...ask, since: from, until: to }, config.base)))));
+      queries += answers.length;
+      got = answers.find((a) => a.error) || metricJoin(answers, ask.by);
+    }
+    if (got.error) return refuse(502, "UpstreamFailure", got.error);
+    const ms = Date.now() - began, answer = { metric: def.name, since: ask.since, until: ask.until, ...got };
     metricMemory.keep(body, JSON.stringify(answer), Date.now(), memoryMs);
-    return json(200, { ...answer, cost: { ms, queries: 1, cached: false } });
+    return json(200, { ...answer, cost: { ms, queries, cached: false } });
   },
   {
     cloudflare: ["Workers Observability Read"],
@@ -43331,7 +43367,7 @@ const _braindashboard_test_metric_query_sends_cloudflare_one_body_written_from_t
   const at = (minute) => Date.UTC(2026, 9, 11, 16, minute);
   const rest = ({ cost, ...data }) => data;
   expect(out.data.cost.cached).toBe(false);
-  expect(rest(out.data)).toEqual({ metric: "deploys.confirmed", since, until, step: 60000, groups: 2, series: [{ t: at(1), target: "brain-x-git", n: 2, sum: null, max: null }, { t: at(1), target: "brain-x-echo", n: 1, sum: null, max: null }, { t: at(2), target: "brain-x-git", n: 1, sum: null, max: null }] });
+  expect(rest(out.data)).toEqual({ metric: "deploys.confirmed", since, until, step: 60000, groups: 2, sampled: 1, series: [{ t: at(1), target: "brain-x-git", n: 2, sum: null, max: null }, { t: at(1), target: "brain-x-echo", n: 1, sum: null, max: null }, { t: at(2), target: "brain-x-git", n: 1, sum: null, max: null }] });
   // A metric with a value: its sum and max are asked, a number dimension is grouped and filtered as a number, and the script is the core's.
   const poll = { worker: "brain-x-inbox", status: 200 }, bad = { worker: "brain-x-inbox", status: 502 };
   const valued = { run: { granularity: 300000 }, calculations: [
@@ -43350,7 +43386,7 @@ const _braindashboard_test_metric_query_sends_cloudflare_one_body_written_from_t
     groupBys: [{ type: "string", value: "worker" }, { type: "number", value: "status" }],
     limit: 500
   });
-  expect(rest(calls.data)).toEqual({ metric: "core.calls", since, until, step: 300000, groups: 2, series: [{ t: at(0), worker: "brain-x-inbox", status: 200, n: 2, sum: 80, max: 50 }, { t: at(5), worker: "brain-x-inbox", status: 502, n: 1, sum: 900, max: 900 }] });
+  expect(rest(calls.data)).toEqual({ metric: "core.calls", since, until, step: 300000, groups: 2, sampled: 1, series: [{ t: at(0), worker: "brain-x-inbox", status: 200, n: 2, sum: 80, max: 50 }, { t: at(5), worker: "brain-x-inbox", status: 502, n: 1, sum: 900, max: 900 }] });
   // With no span, the hour before now; with no `by`, no groupBys and one row a step.
   const whole = await dashboardRig(() => ({ run: { granularity: 60000 }, calculations: [calc("count", [{ value: 4 }], { "2026-10-11 16:01:00": [{ value: 4 }] })] }));
   const now = await whole.call("metric.query", "?metric=deploys.failed");
@@ -43673,7 +43709,7 @@ const _braindashboard_test_metric_query_asked_again_within_the_memory_sends_clou
   expect(second.data.cost).toEqual({ ms: 0, queries: 0, cached: true });
   const rest = ({ cost, ...data }) => data;
   expect(rest(second.data)).toEqual(rest(first.data));
-  expect(rest(first.data)).toEqual({ metric: "deploys.confirmed", since, until, step: M, groups: 1, series: [{ t: Date.UTC(2026, 9, 11, 16, 1), target: "brain-x-git", n: 3, sum: null, max: null }] });
+  expect(rest(first.data)).toEqual({ metric: "deploys.confirmed", since, until, step: M, groups: 1, sampled: 1, series: [{ t: Date.UTC(2026, 9, 11, 16, 1), target: "brain-x-git", n: 3, sum: null, max: null }] });
   // The minutes: a since and an until anywhere inside the same two minutes are the same query, answered with the minutes.
   const inside = await ask(`deploys.confirmed&by=target&since=${since + 1}&until=${until + M - 1}`);
   expect([inside.data.since, inside.data.until, inside.data.cost.cached, rig.seen.length]).toEqual([since, until, true, 1]);
@@ -43727,6 +43763,108 @@ const _braindashboard_test_metric_query_asked_again_within_the_memory_sends_clou
   expect([(await alice.read("metric.query", mine)).status, rig.seen.length]).toEqual([404, 12]);
   return "12 bodies";
 };
+const _braindashboard_sampledAnswer = function _sampledAnswer() {return ((lines, { whole, says = "both" }) => (body) => {
+  const { from, to } = body.timeframe, step = (to - from) / 60, k = to - from > whole ? 10 : 1;
+  const inside = lines.filter((l) => l.t >= from && l.t < to).filter((l, i) => i % k === 0);
+  const row = (target, n) => ({ groups: [{ key: "target", value: target }], groupKey: target, value: n * k, ...(says === "level" ? {} : { sampleInterval: k }) });
+  const tally = (list) => [...list.reduce((m, l) => m.set(l.target, (m.get(l.target) || 0) + 1), new Map())].map(([target, n]) => row(target, n));
+  const steps = new Map();
+  for (const l of inside) { const t = from + Math.floor((l.t - from) / step) * step; steps.set(t, [...(steps.get(t) || []), l]); }
+  const time = (t) => new Date(t).toISOString().slice(0, 19).replace("T", " ");
+  return { run: { granularity: step, ...(says === "interval" ? {} : { statistics: { abr_level: k } }) }, calculations: [{ calculation: "count", aggregates: tally(inside), series: [...steps].map(([t, list]) => ({ time: time(t), data: tally(list) })) }] };
+});};
+const _braindashboard_test_metric_query_says_a_sample_and_asks_a_sampled_span_of_days_a_day_at_a_time = async function _test_metric_query_says_a_sample_and_asks_a_sampled_span_of_days_a_day_at_a_time(dashboardRig,sampledAnswer,expect,Response) {
+  const M = 60000, D = 86400000, until = 1791744660000, since = until - 7 * D;
+  // 173 lines over the last four of seven days, as cb4 had on 2026-10-11; three targets, the third with one line in nine.
+  const lines = Array.from({ length: 173 }, (_, i) => ({ t: since + 3 * D + Math.floor((i * 4 * D) / 173), target: i % 9 === 4 ? "brain-db" : i % 2 ? "brain" : "brain-core" }));
+  const byTarget = (list, n = () => 1) => Object.fromEntries([...list.reduce((m, l) => m.set(l.target, (m.get(l.target) || 0) + n(l)), new Map())].sort());
+  const span = (a, b) => `?metric=deploys.confirmed&by=target&since=${a}&until=${b}`;
+  const frames = (rig, from = 0) => rig.seen.slice(from).map((s) => [s.body.timeframe.from, s.body.timeframe.to]);
+  const days = Array.from({ length: 7 }, (_, i) => [since + i * D, since + (i + 1) * D]);
+  // Sampled over three days, as cb4 was seen to be over four and seven: the span is asked, and then each of its days.
+  const rig = await dashboardRig(sampledAnswer(lines, { whole: 3 * D }));
+  const week = await rig.call("metric.query", span(since, until));
+  expect([week.status, week.data.sampled, rig.seen.length]).toEqual([200, 1, 8]);
+  expect(frames(rig)).toEqual([[since, until], ...days]);
+  expect([week.data.cost.queries, week.data.cost.cached, week.data.step, week.data.groups]).toEqual([8, false, D / 60, 3]);
+  expect(byTarget(week.data.series, (r) => r.n)).toEqual(byTarget(lines));
+  expect(week.data.series.map((r) => r.t)).toEqual([...week.data.series.map((r) => r.t)].sort((a, b) => a - b));
+  // The parts are sent as the span is but for the timeframe.
+  for (const s of rig.seen.slice(1)) expect({ ...s.body, timeframe: null }).toEqual({ ...rig.seen[0].body, timeframe: null });
+  // Asked again, the joined answer is the one kept: nothing is sent.
+  const again = await rig.call("metric.query", span(since, until));
+  expect([again.data.cost, again.data.sampled, rig.seen.length]).toEqual([{ ms: 0, queries: 0, cached: true }, 1, 8]);
+  expect(again.data.series).toEqual(week.data.series);
+  // A span that Cloudflare answers whole is one body, whatever its length.
+  for (const [a, n] of [[until - 60 * M, 9], [until - 3 * D, 10]]) expect([(await rig.call("metric.query", span(a, until))).data.sampled, rig.seen.length]).toEqual([1, n]);
+  // A span that is not whole days: the first part is the short one, and `step` is the longest of the parts'.
+  const odd = await rig.call("metric.query", span(since + 2 * D - 30 * M, until));
+  expect([odd.data.sampled, odd.data.cost.queries, odd.data.step]).toEqual([1, 7, D / 60]);
+  expect(frames(rig, 10)).toEqual([[since + 2 * D - 30 * M, until], [since + 2 * D - 30 * M, since + 2 * D], ...days.slice(2)]);
+  expect(byTarget(odd.data.series, (r) => r.n)).toEqual(byTarget(lines));
+  // What a sample is, with nothing asked again: every n a multiple of 10, and a target left out. The answer says 10.
+  const off = await dashboardRig(sampledAnswer(lines, { whole: 3 * D }), { pieceMs: 0 });
+  const short = await off.call("metric.query", span(since, until));
+  expect([short.data.sampled, short.data.cost.queries, off.seen.length, short.data.series.every((r) => r.n % 10 === 0)]).toEqual([10, 1, 1, true]);
+  expect(byTarget(short.data.series, (r) => r.n)).not.toEqual(byTarget(lines));
+  // Cloudflare tells it in two places, and either alone is read.
+  for (const says of ["level", "interval"]) {
+    const one = await dashboardRig(sampledAnswer(lines, { whole: 3 * D, says }), { pieceMs: 0 });
+    expect([says, (await one.call("metric.query", span(since, until))).data.sampled, (await one.call("metric.query", span(until - D, until))).data.sampled]).toEqual([says, 10, 1]);
+    const parts = await dashboardRig(sampledAnswer(lines, { whole: 3 * D, says }));
+    expect([says, (await parts.call("metric.query", span(since, until))).data.sampled, parts.seen.length]).toEqual([says, 1, 8]);
+  }
+  // A day that is itself sampled: the parts are answered, and the answer says 10. A span of a day or less is asked once.
+  const all = await dashboardRig(sampledAnswer(lines, { whole: 0 }));
+  const still = await all.call("metric.query", span(since, until));
+  expect([still.status, still.data.sampled, still.data.cost.queries, all.seen.length]).toEqual([200, 10, 8, 8]);
+  for (const [a, n] of [[until - D, 9], [until - 12 * 60 * M, 10], [until - D - M, 13]]) expect([a - until, (await all.call("metric.query", span(a, until))).data.sampled, all.seen.length]).toEqual([a - until, 10, n]);
+  // More than 8 parts are not asked: the one answer, which says 10.
+  const long = await all.call("metric.query", span(until - 8 * D - M, until));
+  expect([long.data.sampled, long.data.cost.queries, all.seen.length]).toEqual([10, 1, 14]);
+  expect([(await all.call("metric.query", span(until - 8 * D, until))).data.cost.queries, all.seen.length]).toEqual([9, 23]);
+  // Cloudflare's refusal of one part is the answer's, and nothing is kept: the next ask sends all of it again.
+  let sent = 0, down = true;
+  const inner = sampledAnswer(lines, { whole: 3 * D });
+  const flaky = await dashboardRig((body) => (++sent === 3 && down ? new Response('{"success":false,"errors":[{"code":10000,"message":"rate limited"}]}', { status: 429, headers: { "content-type": "application/json" } }) : inner(body)));
+  expect([(await flaky.call("metric.query", span(since, until))).status, flaky.seen.length]).toEqual([502, 8]);
+  down = false;
+  const after = await flaky.call("metric.query", span(since, until));
+  expect([after.status, after.data.sampled, after.data.cost.cached, flaky.seen.length]).toEqual([200, 1, false, 16]);
+  return "173 lines";
+};
+const _braindashboard_test_metric_parts_abut_and_their_rows_are_joined = function _test_metric_parts_abut_and_their_rows_are_joined(expect,metricPieceDefaults,metricPieces,metricJoin,metricDefinitions,metricSeries) {
+  const M = 60000, D = 86400000, T = 1791676800000;
+  expect(metricPieceDefaults).toEqual({ ms: D, most: 8 });
+  const parts = (...given) => metricPieces(...given).map(([a, b]) => [a - T, b - T]);
+  // A day or less is no part; over it, days counted back from the end, the first the short one.
+  expect([parts(T, T + D), parts(T, T + M), parts(T, T), parts(T + D, T)]).toEqual([[], [], [], []]);
+  expect(parts(T, T + D + M)).toEqual([[0, M], [M, D + M]]);
+  expect(parts(T, T + 3 * D)).toEqual([[0, D], [D, 2 * D], [2 * D, 3 * D]]);
+  expect([parts(T, T + 8 * D).length, parts(T, T + 8 * D + M), parts(0, T)]).toEqual([8, [], []]);
+  // Another length and another count; a length under a minute, or none, is no part.
+  expect(parts(T, T + 150 * M, 60 * M)).toEqual([[0, 30 * M], [30 * M, 90 * M], [90 * M, 150 * M]]);
+  expect([parts(T, T + 150 * M, 60 * M, 2), parts(T, T + 150 * M, 60 * M, 3).length]).toEqual([[], 3]);
+  for (const ms of [0, -1, NaN, 59999]) expect([String(ms), parts(T, T + 3 * D, ms)]).toEqual([String(ms), []]);
+  // Every part ends where the next starts, and the first and last are the span's ends.
+  const week = metricPieces(T + 7 * M, T + 6 * D + 3 * M);
+  expect([week[0][0], week.at(-1)[1], week.every(([a, b], i) => a < b && (i === 0 || a === week[i - 1][1]))]).toEqual([T + 7 * M, T + 6 * D + 3 * M, true]);
+  // The join: rows of all parts by time, a row of one step and group in two parts added up, and the max the higher.
+  const row = (t, worker, n, sum = null, max = null) => ({ t, worker, n, sum, max });
+  const a = { step: 1000, groups: 2, sampled: 1, series: [row(1, "x", 2, 20, 15), row(5, "y", 1, 7, 7)] }, b = { step: 3000, groups: 1, sampled: 10, series: [row(5, "y", 3, 9, 4), row(5, "x", 1, 1, 1), row(9, "x", 4, 8, 8)] };
+  expect(metricJoin([a, b], ["worker"])).toEqual({ step: 3000, groups: 2, sampled: 10, series: [row(1, "x", 2, 20, 15), row(5, "y", 4, 16, 7), row(5, "x", 1, 1, 1), row(9, "x", 4, 8, 8)] });
+  expect(a.series[1]).toEqual(row(5, "y", 1, 7, 7));
+  // A counted metric has no sum; with no `by`, one row a step.
+  expect(metricJoin([{ step: 1, groups: 1, sampled: 1, series: [{ t: 1, n: 2, sum: null, max: null }] }, { step: 1, groups: 1, sampled: 1, series: [{ t: 1, n: 3, sum: null, max: null }] }], [])).toEqual({ step: 1, groups: 1, sampled: 1, series: [{ t: 1, n: 5, sum: null, max: null }] });
+  // What Cloudflare says of a sample, in an answer: the level, a row's interval in the totals or in a step, the higher of them, or nothing.
+  const def = metricDefinitions.find((d) => d.name === "deploys.confirmed");
+  const result = (statistics, total, point) => ({ run: { granularity: M, ...(statistics ? { statistics } : {}) }, calculations: [{ calculation: "count", aggregates: [{ value: 1, ...total }], series: [{ time: "2026-10-11 16:01:00", data: [{ value: 1, ...point }] }] }] });
+  const sampled = (...given) => metricSeries(result(...given), def, []).sampled;
+  expect([sampled(), sampled({}), sampled({ abr_level: 1 }, { sampleInterval: 1 }, { sampleInterval: 1 }), sampled({ abr_level: 0 }), sampled({ abr_level: null }, { sampleInterval: "x" })]).toEqual([1, 1, 1, 1, 1]);
+  expect([sampled({ abr_level: 10 }), sampled(null, { sampleInterval: 10 }), sampled(null, {}, { sampleInterval: 2.5 }), sampled({ abr_level: 10 }, { sampleInterval: 100 }, { sampleInterval: 3 })]).toEqual([10, 10, 2.5, 100]);
+  expect([metricSeries(null, def, []).sampled, metricSeries({}, def, []).sampled]).toEqual([1, 1]);
+  return "parts and join";
+};
 const _braindashboard_test_metric_memory_forgets_at_its_time_and_the_ask_is_cut_to_minutes = function _test_metric_memory_forgets_at_its_time_and_the_ask_is_cut_to_minutes(metricMemoryDefaults,expect,metricMemoryOf,metricDefinitions,metricAsk,URLSearchParams) {
   const T = 1791676800000, ms = metricMemoryDefaults.ms;
   expect(metricMemoryDefaults).toEqual({ ms: 60000, characters: 4000000 });
@@ -43773,7 +43911,7 @@ const _braindashboard_test_metric_memory_forgets_at_its_time_and_the_ask_is_cut_
   expect(asked(`since=${T + 30 * M + 1}`)).toBe("400");
   return "kept " + ms + " ms";
 };
-const _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows = async function _test_dashboard_declares_one_cloudflare_permission_and_its_rows(dashboard_service,expect,metricDefinitions,metricRules,metricLimits,dashboardRules,dashboardDefinitions,dashboardLimits,metricMemoryDefaults,logsScript) {
+const _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows = async function _test_dashboard_declares_one_cloudflare_permission_and_its_rows(dashboard_service,expect,metricDefinitions,metricRules,metricLimits,dashboardRules,dashboardDefinitions,dashboardLimits,metricMemoryDefaults,metricPieceDefaults,logsScript) {
   const { meta, parts, source } = await dashboard_service.emit();
   expect(meta.worker).toBe("brain-x-dashboard");
   // The reference the Worker serves holds the first cell with its holes filled: a row a definition, and both rules.
@@ -43798,10 +43936,15 @@ const _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_
   expect(source.reference).toContain("is over " + metricMemoryDefaults.characters + " characters");
   expect(source.reference).toContain("stands in for the " + metricMemoryDefaults.ms + " ms");
   expect(source.reference).toContain('`cost` is `{ "ms": 0, "queries": 0, "cached": true }`');
-  expect(source.reference).toContain("| `{ metric, since, until, step, groups, series, cost }`");
+  expect(source.reference).toContain("| `{ metric, since, until, step, groups, sampled, series, cost }`");
   expect(source.reference).not.toContain("the memory of an answer and the page");
   // What was counted on cb4 (dsv-4-cost-on-cb4) is said, and the sentences that waited for it are gone.
-  expect(source.reference).toContain("can be made from a sample of the lines, and nothing in it says so");
+  // metric-query-sampled-unsaid: the answer says a sample, and the parts' length and count are the module's values.
+  expect(source.reference).toContain("An answer says whether Cloudflare made it from a sample of the lines: `sampled`.");
+  expect(source.reference).toContain("the span is longer than " + metricPieceDefaults.ms / 3600000 + " hours");
+  expect(source.reference).toContain("a span of more than " + metricPieceDefaults.most + " parts");
+  expect(source.reference).toContain("or up to " + (1 + metricPieceDefaults.most) + " for a span Cloudflare sampled");
+  for (const gone of ["nothing in it says so", "The service does not read whether Cloudflare sampled", "that has to be whole is asked a day at a time"]) expect(source.reference).not.toContain(gone);
   expect(source.reference).toContain("| 24 hours | 854 to 1095 |");
   for (const waited of ["not counted yet", "Whether Cloudflare samples", "and none is kept", "an ask does not wait for another's (read in"]) expect(source.reference).not.toContain(waited);
   expect(source.reference).not.toMatch(/\$\{/);
@@ -43826,7 +43969,7 @@ export default function define(runtime, observer) {
   const $def = (pid, name, deps, fn) => {
     main.variable(observer(name)).define(name, deps, fn).pid = pid;
   };
-  $def("_braindashboard_anon_489011608e", null, ["md","metricTable","metricMemoryDefaults","metricRules","dashboardRules","metricLimits","dashboardLimits","dashboardDraws","dashboardTable"], _braindashboard_anon_489011608e);
+  $def("_braindashboard_anon_3eb6f8fff9", null, ["md","metricTable","metricPieceDefaults","metricMemoryDefaults","metricRules","dashboardRules","metricLimits","dashboardLimits","dashboardDraws","dashboardTable"], _braindashboard_anon_3eb6f8fff9);
   $def("_braindashboard_metricDefinitions", "metricDefinitions", [], _braindashboard_metricDefinitions);
   $def("_braindashboard_metricTable", "metricTable", ["metricDefinitions"], _braindashboard_metricTable);
   $def("_braindashboard_metricRules", "metricRules", [], _braindashboard_metricRules);
@@ -43843,10 +43986,13 @@ export default function define(runtime, observer) {
   $def("_braindashboard_metricAsk", "metricAsk", [], _braindashboard_metricAsk);
   $def("_braindashboard_metricBody", "metricBody", ["logsScope"], _braindashboard_metricBody);
   $def("_braindashboard_metricSeries", "metricSeries", [], _braindashboard_metricSeries);
+  $def("_braindashboard_metricPieceDefaults", "metricPieceDefaults", [], _braindashboard_metricPieceDefaults);
+  $def("_braindashboard_metricPieces", "metricPieces", ["metricPieceDefaults"], _braindashboard_metricPieces);
+  $def("_braindashboard_metricJoin", "metricJoin", [], _braindashboard_metricJoin);
   $def("_braindashboard_metricMemoryDefaults", "metricMemoryDefaults", [], _braindashboard_metricMemoryDefaults);
   $def("_braindashboard_metricMemoryOf", "metricMemoryOf", ["metricMemoryDefaults"], _braindashboard_metricMemoryOf);
   $def("_braindashboard_metricMemory", "metricMemory", ["metricMemoryOf"], _braindashboard_metricMemory);
-  $def("_braindashboard_dashboard_service", "dashboard_service", ["cloudflare","Response","metricTenant","dashboardDefinitions","rows","dashboardLimits","dashboardOwn","dashboardHold","metricDefinitions","metricOwn","metricLimits","metricAsk","metricBody","config","metricMemoryDefaults","metricMemory","cloudflareApi","metricSeries","metricRules","dashboardRules"], _braindashboard_dashboard_service);
+  $def("_braindashboard_dashboard_service", "dashboard_service", ["cloudflare","Response","metricTenant","dashboardDefinitions","rows","dashboardLimits","dashboardOwn","dashboardHold","metricDefinitions","metricOwn","metricLimits","metricAsk","metricBody","config","metricMemoryDefaults","metricMemory","cloudflareApi","metricSeries","metricPieces","metricPieceDefaults","metricJoin","metricRules","dashboardRules"], _braindashboard_dashboard_service);
   $def("_braindashboard_dashboard_announce", "dashboard_announce", ["plugins","dashboard_service","invalidation"], _braindashboard_dashboard_announce);
   $def("_braindashboard_anon_be3d699220", null, ["md"], _braindashboard_anon_be3d699220);
   $def("_braindashboard_dashboardRig", "dashboardRig", ["simulate","dashboard_service","Response","sha256"], _braindashboard_dashboardRig);
@@ -43857,8 +44003,11 @@ export default function define(runtime, observer) {
   $def("_braindashboard_test_a_dashboard_is_kept_as_data_and_health_is_built_in", "test_a_dashboard_is_kept_as_data_and_health_is_built_in", ["dashboardRig","expect","dashboardDefinitions","dashboardOwn","metricDefinitions","dashboardDraws","dashboardLimits"], _braindashboard_test_a_dashboard_is_kept_as_data_and_health_is_built_in);
   $def("_braindashboard_test_a_member_keeps_dashboards_of_their_own_and_the_owner_writes_none_of_them", "test_a_member_keeps_dashboards_of_their_own_and_the_owner_writes_none_of_them", ["dashboardRig","expect","dashboardLimits"], _braindashboard_test_a_member_keeps_dashboards_of_their_own_and_the_owner_writes_none_of_them);
   $def("_braindashboard_test_metric_query_asked_again_within_the_memory_sends_cloudflare_one_body", "test_metric_query_asked_again_within_the_memory_sends_cloudflare_one_body", ["dashboardRig","expect","Response"], _braindashboard_test_metric_query_asked_again_within_the_memory_sends_cloudflare_one_body);
+  $def("_braindashboard_sampledAnswer", "sampledAnswer", [], _braindashboard_sampledAnswer);
+  $def("_braindashboard_test_metric_query_says_a_sample_and_asks_a_sampled_span_of_days_a_day_at_a_time", "test_metric_query_says_a_sample_and_asks_a_sampled_span_of_days_a_day_at_a_time", ["dashboardRig","sampledAnswer","expect","Response"], _braindashboard_test_metric_query_says_a_sample_and_asks_a_sampled_span_of_days_a_day_at_a_time);
+  $def("_braindashboard_test_metric_parts_abut_and_their_rows_are_joined", "test_metric_parts_abut_and_their_rows_are_joined", ["expect","metricPieceDefaults","metricPieces","metricJoin","metricDefinitions","metricSeries"], _braindashboard_test_metric_parts_abut_and_their_rows_are_joined);
   $def("_braindashboard_test_metric_memory_forgets_at_its_time_and_the_ask_is_cut_to_minutes", "test_metric_memory_forgets_at_its_time_and_the_ask_is_cut_to_minutes", ["metricMemoryDefaults","expect","metricMemoryOf","metricDefinitions","metricAsk","URLSearchParams"], _braindashboard_test_metric_memory_forgets_at_its_time_and_the_ask_is_cut_to_minutes);
-  $def("_braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows", "test_dashboard_declares_one_cloudflare_permission_and_its_rows", ["dashboard_service","expect","metricDefinitions","metricRules","metricLimits","dashboardRules","dashboardDefinitions","dashboardLimits","metricMemoryDefaults","logsScript"], _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows);
+  $def("_braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows", "test_dashboard_declares_one_cloudflare_permission_and_its_rows", ["dashboard_service","expect","metricDefinitions","metricRules","metricLimits","dashboardRules","dashboardDefinitions","dashboardLimits","metricMemoryDefaults","metricPieceDefaults","logsScript"], _braindashboard_test_dashboard_declares_one_cloudflare_permission_and_its_rows);
   main.define("module @tomlarkworthy/cloudflare-iac", [], async () => runtime.module((await import("/@tomlarkworthy/cloudflare-iac.js?v=4")).default));
   main.define("cloudflare", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflare", _));
   main.define("cloudflareApi", ["module @tomlarkworthy/cloudflare-iac","@variable"], (_, v) => v.import("cloudflareApi", _));
