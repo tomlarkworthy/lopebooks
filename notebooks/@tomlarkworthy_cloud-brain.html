@@ -44339,7 +44339,7 @@ const _cloudbrain_test_the_login_brief_carries_the_link_and_the_host = function 
   return "ok";
 };
 const _cloudbrain_GUEST_METHODS = function _GUEST_METHODS() {return (["ai.models", "ai.run"]);};
-const _cloudbrain_guestInvite = function _guestInvite(brain,htl,field,GUEST_METHODS,client,guestBrief,press,copyLater) {
+const _cloudbrain_guestInvite = function _guestInvite(brain,htl,field,GUEST_METHODS,guestBrief,guestLink,client,press,copyLater,guestCopied) {
   if (!brain) return htl.html`<span></span>`;
   const note = htl.html`<span style="color:var(--theme-foreground-muted);margin-left:8px"></span>`;
   const who = field("guest's name, e.g. ada", { width: "12em" });
@@ -44347,23 +44347,47 @@ const _cloudbrain_guestInvite = function _guestInvite(brain,htl,field,GUEST_METH
   methods.value = GUEST_METHODS.join(" ");
   const daily = field("US dollars a day", { width: "8em" });
   daily.value = "0.10";
-  const make = async () => {
+  const people = field("people", { width: "5em" });
+  people.value = "1";
+  const make = async (uses) => {
     const name = "guest-" + who.value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24);
     if (name === "guest-") throw new Error("a name for the guest");
     const names = methods.value.split(/[\s,]+/).filter(Boolean), usd = Number(daily.value);
     if (!names.length) throw new Error("at least one method");
     if (!(Number.isFinite(usd) && usd >= 0) || daily.value.trim() === "") throw new Error("dollars a day is a number");
     // A second press for the same person replaces the first: the link nobody used, or the token, of that name ends.
-    await client.procedure("token.revoke", { name });
-    const made = await client.procedure("token.link", { name, methods: names, minutes: 10080, hours: 168, daily: usd });
-    return guestBrief(made.link, { methods: names, daily: usd });
+    return guestBrief(await guestLink(client, { name, methods: names, daily: usd, uses }), { methods: names, daily: usd, uses });
   };
-  const button = press("Copy Guest Invite", () => copyLater(make, note, "Copied. Send it to them. The link works once, in the next 7 days; its token lasts 7 days, calls those methods on your allowance up to that much a day, and cannot deploy. Access below ends it; so does another invite for the same name. To make them a member, add their handle in People."));
-  return htl.html`<div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:8px">${who}${methods}${daily}${button}${note}</div>`;
+  // The field is read once a press: the note that is copied and the line under the button are of one number.
+  const button = press("Copy Guest Invite", () => { const uses = Number(people.value); return copyLater(() => make(uses), note, guestCopied(uses)); });
+  return htl.html`<div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:8px">${who}${methods}${daily}${people}${button}${note}</div>`;
 };
-const _cloudbrain_guestBrief = function _guestBrief(redeemSteps) {return ((link, { methods, daily }) => {
+const _cloudbrain_guestLink = function _guestLink() {return (async (client, { name, methods, daily, uses }) => {
+  if (!(Number.isInteger(uses) && uses >= 1 && uses <= 20)) throw new Error("people is a whole number, 1 to 20");
+  await client.procedure("token.revoke", { name });
+  const made = await client.procedure("token.link", { name, methods, minutes: 10080, hours: 168, daily, ...(uses > 1 ? { uses } : {}) });
+  if (uses > 1 && made.uses !== uses) throw (await client.procedure("token.revoke", { name }), new Error("this Brain's kernel makes a link for one person only: no group link was made"));
+  return made.link;
+});};
+const _cloudbrain_test_a_guest_link_for_several_is_not_copied_from_a_kernel_that_makes_one = async function _test_a_guest_link_for_several_is_not_copied_from_a_kernel_that_makes_one(guestLink,expect) {
+  const fake = (answer) => { const calls = [], sent = []; return { calls, sent, procedure: async (m, b) => (calls.push([m, b.name, b.uses]), sent.push(b), m === "token.link" ? answer(b) : { revoked: 0 }) }; };
+  const now = fake((b) => ({ link: "https://b.example/auth/link?code=abc", ...(b.uses ? { uses: b.uses } : {}) })), old = fake(() => ({ link: "https://b.example/auth/link?code=abc" }));
+  const ask = (c, uses) => guestLink(c, { name: "guest-team", methods: ["ai.run"], daily: 0.1, uses }).then((link) => link, (e) => e.message);
+  expect([await ask(now, 5), now.calls]).toEqual(["https://b.example/auth/link?code=abc", [["token.revoke", "guest-team", undefined], ["token.link", "guest-team", 5]]]);
+  // The link ends 7 days after it is made, and a token it gives lasts 7 days.
+  expect([now.sent[1].minutes, now.sent[1].hours]).toEqual([10080, 168]);
+  // One person: no uses is sent, so a kernel of either age makes the link it always made.
+  expect([await ask(old, 1), old.calls.at(-1)]).toEqual(["https://b.example/auth/link?code=abc", ["token.link", "guest-team", undefined]]);
+  expect([await ask(old, 5), old.calls.slice(-2).map((c) => c[0])]).toEqual(["this Brain's kernel makes a link for one person only: no group link was made", ["token.link", "token.revoke"]]);
+  for (const bad of [0, 21, 1.5, NaN]) expect(await ask(now, bad)).toBe("people is a whole number, 1 to 20");
+  return "ok";
+};
+const _cloudbrain_guestCopied = function _guestCopied() {return ((uses) => uses > 1
+  ? `Copied. Send it to them. The link works for ${uses} people, once each, in the next 7 days; each gets a token of their own that lasts 7 days, calls those methods on your allowance up to that much a day, and cannot deploy. Access below ends one token; another invite for the same name ends the link and every token it gave. To make one of them a member, add their handle in People.`
+  : "Copied. Send it to them. The link works once, in the next 7 days; its token lasts 7 days, calls those methods on your allowance up to that much a day, and cannot deploy. Access below ends it; so does another invite for the same name. To make them a member, add their handle in People.");};
+const _cloudbrain_guestBrief = function _guestBrief(redeemSteps) {return ((link, { methods, daily, uses = 1 }) => {
   const host = new URL(link).host;
-  return `You are invited to a Cloud Brain as a guest: a set of Cloudflare Workers that one notebook defines, deploys and operates, at https://${host}. Paste this whole note to your Claude Code session. The link in it works once, within 7 days, and is yours alone: do not forward it.
+  return `You are invited to a Cloud Brain as a guest: a set of Cloudflare Workers that one notebook defines, deploys and operates, at https://${host}. Paste this whole note to your Claude Code session. ${uses > 1 ? `The link in it works for ${uses} people, once each, within 7 days, and is for the people it was sent to: do not pass it on. Each of you gets a token of your own.` : "The link in it works once, within 7 days, and is yours alone: do not forward it."}
 
 For the program:
 
@@ -44380,6 +44404,11 @@ const _cloudbrain_test_the_guest_brief_says_what_a_guest_has_and_how_to_join = f
   expect(text).toContain("at most $0.1 a day");
   expect(text).toContain("signs in at https://b.example/ with that account");
   expect(text).toContain("Only the owner of this Brain can approve");
+  expect(text).toContain("works once, within 7 days, and is yours alone");
+  const group = guestBrief("https://b.example/auth/link?code=abc", { methods: GUEST_METHODS, daily: 0.1, uses: 5 });
+  expect(group).toContain("works for 5 people, once each, within 7 days");
+  expect(group).not.toContain("yours alone");
+  expect(group).toContain("at most $0.1 a day");
   return "ok";
 };
 const _cloudbrain_anon_5add630d47 = function _anonymous(md) {return (md`## Dashboards
@@ -44742,7 +44771,19 @@ const _cloudbrain_libraryView = function _libraryView(libraryPanel,client,brainO
 const _cloudbrain_anon_fafab875a3 = function _anonymous(md) {return (md`## Access
 
 A **token** is for a caller with no session, such as a script. A **grant** lets another atproto account call this Brain through its own PDS. Each names the methods it may call; neither can read a secret or give access, and neither can deploy, but for the token of a sign-in link made with "link may deploy" below, which the list marks. Copy Login Link and Copy Guest Invite above make links that do not deploy.`);};
-const _cloudbrain_accessPanel = async function _accessPanel(brain,htl,field,press,client) {
+const _cloudbrain_tokenOf = function _tokenOf() {return ((t) => (t && typeof t.group === "string" && t.group ? " of " + t.group : ""));};
+const _cloudbrain_test_the_page_says_how_many_an_invite_is_for_and_which_link_a_token_is_of = function _test_the_page_says_how_many_an_invite_is_for_and_which_link_a_token_is_of(guestCopied,expect,tokenOf) {
+  const one = guestCopied(1), five = guestCopied(5);
+  expect(one).toContain("The link works once, in the next 7 days");
+  expect(one).toContain("Access below ends it; so does another invite for the same name");
+  expect(five).toContain("The link works for 5 people, once each, in the next 7 days");
+  expect(five).toContain("another invite for the same name ends the link and every token it gave");
+  expect(five).not.toContain("works once");
+  expect(guestCopied(20)).toContain("for 20 people");
+  expect([{ name: "guest-team-a1b2", group: "guest-team" }, { name: "guest-ada" }, { name: "x", group: "" }, { name: "y", group: null }, { name: "z", group: 3 }].map(tokenOf)).toEqual([" of guest-team", "", "", "", ""]);
+  return "ok";
+};
+const _cloudbrain_accessPanel = async function _accessPanel(brain,htl,field,press,client,tokenOf) {
   if (!brain) return htl.html`<i style="color:var(--theme-foreground-muted)">Sign in as the owner to see access.</i>`;
   const list = htl.html`<div></div>`, note = htl.html`<div style="color:var(--theme-foreground-muted);margin-top:6px;word-break:break-all"></div>`;
   const who = field("token name, or a DID to grant", { width: "18em" });
@@ -44754,7 +44795,7 @@ const _cloudbrain_accessPanel = async function _accessPanel(brain,htl,field,pres
   const draw = async () => {
     const [{ tokens }, { grants }] = await Promise.all([client.query("token.list"), client.query("grant.list")]);
     list.replaceChildren(htl.html`<table style="border-collapse:collapse;margin:0">
-      ${tokens.map((t) => htl.html`<tr><td style="padding:2px 12px 2px 0">token <b>${t.name}</b></td><td style="padding:2px 12px">${t.deploy ? htl.html`<b>${t.unattended ? "deploys with no approval" : "deploys"}</b>${t.methods.length ? ", " : ""}` : ""}${short(t.methods)}</td><td style="padding:2px 12px;color:var(--theme-foreground-muted)">created ${new Date(t.created).toISOString().slice(0, 10)}${t.until ? ", ends " + new Date(t.until).toISOString().slice(0, 16).replace("T", " ") + " UTC" : ""}${t.daily != null ? ", $" + t.daily + " a day" : ""}</td><td>${remove("Revoke", () => client.procedure("token.revoke", { name: t.name }))}</td></tr>`)}
+      ${tokens.map((t) => htl.html`<tr><td style="padding:2px 12px 2px 0">token <b>${t.name}</b>${tokenOf(t)}</td><td style="padding:2px 12px">${t.deploy ? htl.html`<b>${t.unattended ? "deploys with no approval" : "deploys"}</b>${t.methods.length ? ", " : ""}` : ""}${short(t.methods)}</td><td style="padding:2px 12px;color:var(--theme-foreground-muted)">created ${new Date(t.created).toISOString().slice(0, 10)}${t.until ? ", ends " + new Date(t.until).toISOString().slice(0, 16).replace("T", " ") + " UTC" : ""}${t.daily != null ? ", $" + t.daily + " a day" : ""}</td><td>${remove("Revoke", () => client.procedure("token.revoke", { name: t.name }))}</td></tr>`)}
       ${grants.map((g) => htl.html`<tr><td style="padding:2px 12px 2px 0">${g.did}</td><td style="padding:2px 12px">${short(g.methods)}</td><td style="padding:2px 12px;color:var(--theme-foreground-muted)">granted ${new Date(g.granted).toISOString().slice(0, 10)}</td><td>${remove("Remove", () => client.procedure("grant.delete", { did: g.did }))}</td></tr>`)}
       ${tokens.length + grants.length ? "" : htl.html`<tr><td style="color:var(--theme-foreground-muted)">No tokens or grants.</td></tr>`}
     </table>`);
@@ -45850,7 +45891,10 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_loginBrief", "loginBrief", ["redeemSteps"], _cloudbrain_loginBrief);
   $def("_cloudbrain_test_the_login_brief_carries_the_link_and_the_host", "test_the_login_brief_carries_the_link_and_the_host", ["loginBrief","expect","LOGIN_METHODS"], _cloudbrain_test_the_login_brief_carries_the_link_and_the_host);
   $def("_cloudbrain_GUEST_METHODS", "GUEST_METHODS", [], _cloudbrain_GUEST_METHODS);
-  $def("_cloudbrain_guestInvite", "guestInvite", ["brain","htl","field","GUEST_METHODS","client","guestBrief","press","copyLater"], _cloudbrain_guestInvite);
+  $def("_cloudbrain_guestInvite", "guestInvite", ["brain","htl","field","GUEST_METHODS","guestBrief","guestLink","client","press","copyLater","guestCopied"], _cloudbrain_guestInvite);
+  $def("_cloudbrain_guestLink", "guestLink", [], _cloudbrain_guestLink);
+  $def("_cloudbrain_test_a_guest_link_for_several_is_not_copied_from_a_kernel_that_makes_one", "test_a_guest_link_for_several_is_not_copied_from_a_kernel_that_makes_one", ["guestLink","expect"], _cloudbrain_test_a_guest_link_for_several_is_not_copied_from_a_kernel_that_makes_one);
+  $def("_cloudbrain_guestCopied", "guestCopied", [], _cloudbrain_guestCopied);
   $def("_cloudbrain_guestBrief", "guestBrief", ["redeemSteps"], _cloudbrain_guestBrief);
   $def("_cloudbrain_test_the_guest_brief_says_what_a_guest_has_and_how_to_join", "test_the_guest_brief_says_what_a_guest_has_and_how_to_join", ["guestBrief","GUEST_METHODS","expect"], _cloudbrain_test_the_guest_brief_says_what_a_guest_has_and_how_to_join);
   $def("_cloudbrain_anon_5add630d47", null, ["md"], _cloudbrain_anon_5add630d47);
@@ -45892,7 +45936,9 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_anon_d98158477c", null, ["md"], _cloudbrain_anon_d98158477c);
   $def("_cloudbrain_libraryView", "libraryView", ["libraryPanel","client","brainOrigin","session","brain","notebookHtml"], _cloudbrain_libraryView);
   $def("_cloudbrain_anon_fafab875a3", null, ["md"], _cloudbrain_anon_fafab875a3);
-  $def("_cloudbrain_accessPanel", "accessPanel", ["brain","htl","field","press","client"], _cloudbrain_accessPanel);
+  $def("_cloudbrain_tokenOf", "tokenOf", [], _cloudbrain_tokenOf);
+  $def("_cloudbrain_test_the_page_says_how_many_an_invite_is_for_and_which_link_a_token_is_of", "test_the_page_says_how_many_an_invite_is_for_and_which_link_a_token_is_of", ["guestCopied","expect","tokenOf"], _cloudbrain_test_the_page_says_how_many_an_invite_is_for_and_which_link_a_token_is_of);
+  $def("_cloudbrain_accessPanel", "accessPanel", ["brain","htl","field","press","client","tokenOf"], _cloudbrain_accessPanel);
   $def("_cloudbrain_anon_da27f1f9fe", null, ["md"], _cloudbrain_anon_da27f1f9fe);
   $def("_cloudbrain_spendingPanel", "spendingPanel", ["brain","htl","field","Inputs","press","client"], _cloudbrain_spendingPanel);
   $def("_cloudbrain_anon_3806ad70b8", null, ["md"], _cloudbrain_anon_3806ad70b8);
@@ -80793,7 +80839,7 @@ Added 2026-10-09. `https://<host>/llms.txt` says how to call this Brain, how the
 
 From Claude Code on the web the environment must allow the Brain's host and hold the token in a file of mode 600 outside the repository (a link's token) or an environment variable (a standing one). Tried from there on 2026-10-10 by a session with no CLAUDE.md: it redeemed a link and deployed; what slowed it is in `spec-as-built.md`, "The button copies a briefing; a link is good for 8 hours".
 
-Since 2026-10-10 16:48 **Copy Login Link** makes a token that reads (issues, knowledge, `quota.get`) and does not deploy; the program asks for more (`/auth/ask`) and the owner answers at `/auth/request`. A link that deploys is made under Access with "link may deploy". **Copy Guest Invite** beside it is for a colleague: a name, the methods and dollars a day; the link and its token last 7 days. To make them a member, add the handle they send under People.
+Since 2026-10-10 16:48 **Copy Login Link** makes a token that reads (issues, knowledge, `quota.get`) and does not deploy; the program asks for more (`/auth/ask`) and the owner answers at `/auth/request`. A link that deploys is made under Access with "link may deploy". **Copy Guest Invite** beside it is for a colleague: a name, the methods, dollars a day and people; the link and its token last 7 days. With people at 1 the link works once, as before. With 2 to 20 (since 2026-10-11) the page asks the kernel for one link that gives each of that many people a token of their own (`token.link` with `uses`), and a token whose `token.list` row has a `group` is drawn under Access as `of GROUP`. A kernel that takes no `uses` makes no such link: the press says "this Brain's kernel makes a link for one person only: no group link was made" and copies nothing. The kernel's part is task 1 of `plan/cloud-brain-group-invites.md` and was not on cb4 when this was written (`tools/cloud-brain/records/gi-2-page-invite-for-several.md`). To make them a member, add the handle they send under People.
 
 From a checkout that holds a Brain's state file (added 2026-10-10): an agent makes a token with `brain.ts token NAME <method…>` and calls with `brain.ts curl <path> --as NAME`, in place of `--owner`. The session `brain.ts` mints from the state file is the owner's own, and a call with it reads as the owner present. The reason and what was run are in `knowledge/working-with-cloud-brain-remote-lopecode-cluster.md`, "Access from this checkout".
 
