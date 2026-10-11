@@ -43394,16 +43394,17 @@ const _cloudbrain_press = function _press(Inputs) {return ((label, fn) => {
 });};
 const _cloudbrain_inboxHandlers = function _inboxHandlers(plugins) {return (plugins.get("inbox"));};
 const _cloudbrain_turnClient = function _turnClient(xrpcClient,brainOrigin) {return ((token) => xrpcClient(brainOrigin, { namespace: "com.lopecode.brain", headers: { authorization: "Bearer " + token } }));};
-const _cloudbrain_callAnswer = function _callAnswer() {return ((out, offset) => {
+const _cloudbrain_callAnswer = function _callAnswer() {return ((out, offset, kind) => {
   const text = typeof out === "string" ? out : JSON.stringify(out, null, 1);
   const from = Math.min(text.length, Math.max(0, Math.floor(Number(offset) || 0))), end = Math.min(text.length, from + 20000);
-  const more = end < text.length ? `\n[characters ${from} to ${end} of ${text.length}. The rest: the same call with offset ${end}]` : "";
+  const more = end >= text.length ? "" : `\n[characters ${from} to ${end} of ${text.length}. ${kind === "procedure" ? "The rest is not read: a procedure called again would run a second time" : "The rest: the same call with offset " + end}]`;
   return { output: text.slice(from, end) + more, outputLimit: 20200 };
 });};
-const _cloudbrain_turnTool = function _turnTool(defineTool,assistantRefuses,callAnswer) {return ((turn) =>
+const _cloudbrain_offsetRefused = function _offsetRefused() {return ("offset is for a query. A procedure called again would run a second time, so it is not called.");};
+const _cloudbrain_turnTool = function _turnTool(defineTool,assistantRefuses,offsetRefused,callAnswer) {return ((turn) =>
   defineTool({
     id: "brain_call",
-    description: "Call one XRPC method of the Cloud Brain as the person this message came from. method is short (library.list, getInfo) or a full NSID. kind is query (GET, input becomes the query string) or procedure (POST, input is the JSON body). The Brain refuses what that person may not call. An answer is shown 20000 characters at a time and its last line says when there is more: make the same query again with offset.",
+    description: "Call one XRPC method of the Cloud Brain as the person this message came from. method is short (library.list, getInfo) or a full NSID. kind is query (GET, input becomes the query string) or procedure (POST, input is the JSON body). The Brain refuses what that person may not call. An answer is shown 20000 characters at a time and its last line says when there is more: make the same query again with offset. offset is refused with a procedure.",
     parameters: {
       type: "object",
       properties: { method: { type: "string" }, kind: { type: "string", enum: ["query", "procedure"] }, input: { type: "object" }, offset: { type: "number" } },
@@ -43412,8 +43413,9 @@ const _cloudbrain_turnTool = function _turnTool(defineTool,assistantRefuses,call
     execute: async ({ method, kind, input, offset }) => {
       if (!turn.call) throw new Error("No message is being answered.");
       if (assistantRefuses(method)) throw new Error(`${method} is not available to the assistant. The owner does this on the page.`);
+      if (kind !== "query" && offset) throw new Error(offsetRefused);
       const out = kind === "query" ? await turn.call.query(method, input) : await turn.call.procedure(method, input);
-      return { title: method, ...callAnswer(out, offset) };
+      return { title: method, ...callAnswer(out, offset, kind) };
     }
   }));};
 const _cloudbrain_turnPrompt = function _turnPrompt(assistantPrompt) {return ((turn) =>
@@ -43540,7 +43542,7 @@ const _cloudbrain_assistantPrompt = function _assistantPrompt(brainOrigin) {retu
 How to work:
 - Start from what is running. Each step you are shown "brain", a one-line state of every Worker, probation, held deploys and the inbox. Call brain_status for the detail. Answer a question about what is running from brain_status, brain_services or brain_call, not by reading source: source says what would be deployed, not what is.
 - How the Brain works is a different question. The module @tomlarkworthy/cloud-brain-docs says what the owner and a member can do, and how the core is built: the deployer, the kernel, the core, who is calling, tokens, rules, the call path, deploys, data and metrics. Read it with read_file /src/@tomlarkworthy/cloud-brain-docs.js before you answer a question about how the Brain works, and before you change a service. Answer from it and from the module it names, not from memory.
-- What this brief does not say is read where it is kept, not remembered. What the Brain holds on a question (the guides to how this Brain and its notebooks are worked on, the designs, notebook modules, papers): brain_call knowledge.search { q, semantic: "true" }, with kind: "doc" for the guides alone, then knowledge.get { id } for an entry's text. One Worker's methods, inputs and answers as deployed: brain_call getSource { worker, part: "reference" }, before a method you have not called. How a program calls this Brain, and every method deployed: ${brainOrigin}/llms.txt. The files the agents that maintain this Brain read: ${brainOrigin}/static/cloud-brain-dev/index.md lists them. Those two are addresses, not methods: eval_js with (await (await fetch(address)).text()).slice(0, 7000), then slice(7000, 14000) and on, since eval_js shows 8000 characters of a result with the middle cut out.
+- What this brief does not say is read where it is kept, not remembered. What the Brain holds on a question (the guides to how this Brain and its notebooks are worked on, the designs, notebook modules, papers): brain_call knowledge.search { q, semantic: "true" }, with kind: "doc" for the guides alone, then knowledge.get { id } for an entry's text. One Worker's methods, inputs and answers as deployed: brain_call getSource { worker, part: "reference" }, before a method you have not called. How a program calls this Brain, and every method deployed: ${brainOrigin}/llms.txt. The files the agents that maintain this Brain read: ${brainOrigin}/static/cloud-brain-dev/index.md lists them. Those two are addresses, not methods: eval_js with (await (await fetch(address)).text()).slice(0, 6000), then slice(6000, 12000) and on, since eval_js shows the first 6000 characters of a text and drops the rest.
 - Lead an answer with the state and what you did, in the owner's terms (which Worker, which version, is it serving). Leave cell names and notebook mechanics out unless asked.
 - Say so unprompted when something needs the owner: a Worker failing or put back, a version on probation that nobody has kept, a deploy waiting for approval, a secret a service names that is not set, messages waiting.
 - To change or add a service: read /content/@tomlarkworthy/markdown-wiki/running-a-cloud-brain.md, edit its cells, see its tests pass, brain_apply it, then check brain_status until it is serving or was put back, and report which. Prove a new or changed service from outside, with a real call, before you say it works. A kernel or core update is on probation until the owner presses Keep this version; tell them.
@@ -43574,7 +43576,7 @@ const _cloudbrain_assistantRule = function _assistantRule(registerRule,invalidat
   return "prompt section registered";
 };
 const _cloudbrain_assistantRefuses = function _assistantRefuses() {return ((method) => /^(com\.lopecode\.brain\.)?(secret\.get|secret\.read|token\.|grant\.|people\.(put|remove|link|unlink)|rule\.put|rule\.delete|price\.put|price\.delete|quota\.put|quota\.setDefaults|settings?\.|infra\.|service\.|lease\.|inbox\.poll)/.test(method));};
-const _cloudbrain_assistantTools = function _assistantTools(brain,defineTool,$0,client,brainOrigin,assistantRefuses,callAnswer,declaredWorkers,registerTool,invalidation,unregisterTool) {
+const _cloudbrain_assistantTools = function _assistantTools(brain,defineTool,$0,client,brainOrigin,assistantRefuses,offsetRefused,callAnswer,declaredWorkers,registerTool,invalidation,unregisterTool) {
   const need = () => {
     if (!brain) throw new Error("No owner session: this notebook is not signed in to a Brain.");
   };
@@ -43618,7 +43620,7 @@ const _cloudbrain_assistantTools = function _assistantTools(brain,defineTool,$0,
     }),
     defineTool({
       id: "brain_call",
-      description: "Call one XRPC method of the Cloud Brain as its owner. method is short (inbox.list, people.list, secret.list, library.list, getInfo) or a full NSID. kind is query (GET, input becomes the query string) or procedure (POST, input is the JSON body). An answer is shown 20000 characters at a time and its last line says when there is more: make the same query again with offset.",
+      description: "Call one XRPC method of the Cloud Brain as its owner. method is short (inbox.list, people.list, secret.list, library.list, getInfo) or a full NSID. kind is query (GET, input becomes the query string) or procedure (POST, input is the JSON body). An answer is shown 20000 characters at a time and its last line says when there is more: make the same query again with offset. offset is refused with a procedure.",
       parameters: {
         type: "object",
         properties: { method: { type: "string" }, kind: { type: "string", enum: ["query", "procedure"] }, input: { type: "object" }, offset: { type: "number" } },
@@ -43627,8 +43629,9 @@ const _cloudbrain_assistantTools = function _assistantTools(brain,defineTool,$0,
       execute: async ({ method, kind, input, offset }) => {
         need();
         if (assistantRefuses(method)) throw new Error(`${method} is not available to the operator. The owner does this on the page.`);
+        if (kind !== "query" && offset) throw new Error(offsetRefused);
         const out = kind === "query" ? await client.query(method, input) : await client.procedure(method, input);
-        return { title: method, ...callAnswer(out, offset) };
+        return { title: method, ...callAnswer(out, offset, kind) };
       }
     }),
     defineTool({
@@ -43665,7 +43668,7 @@ const _cloudbrain_test_the_operator_is_pointed_at_what_the_brain_holds = functio
     expect(turnPrompt({ role: "owner", channel: "bluesky", room: { name: "r", people: [] } })).not.toContain(pointer);
   }
   expect(["knowledge.search", "knowledge.get", "getSource", "com.lopecode.brain.knowledge.search"].map(assistantRefuses)).toEqual(Array(4).fill(false));
-  expect(assistantPrompt).toContain(".slice(0, 7000)");
+  expect(assistantPrompt).toContain(".slice(0, 6000), then slice(6000, 12000)");
   return "5 pointers; 3 methods brain_call makes";
 };
 const _cloudbrain_test_brain_call_shows_a_long_answer_in_parts_and_the_loop_cuts_none = async function _test_brain_call_shows_a_long_answer_in_parts_and_the_loop_cuts_none(expect,truncate,turnTool,callAnswer) {
@@ -43685,6 +43688,26 @@ const _cloudbrain_test_brain_call_shows_a_long_answer_in_parts_and_the_loop_cuts
   expect(callAnswer("abc", 9).output).toBe("");
   expect(callAnswer("abc", -1).output).toBe("abc");
   return "27094 characters in 2 calls, none cut";
+};
+const _cloudbrain_test_brain_call_never_runs_a_procedure_again_for_the_rest = async function _test_brain_call_never_runs_a_procedure_again_for_the_rest(turnTool,expect,offsetRefused,callAnswer) {
+  let ran = 0;
+  const tool = turnTool({ call: { procedure: async () => (ran++, "p".repeat(25000)) } }), call = { method: "inbox.reply", kind: "procedure", input: { id: 1, text: "x" } };
+  const first = (await tool.execute(call)).output;
+  expect(first.slice(20000)).toBe("\n[characters 0 to 20000 of 25000. The rest is not read: a procedure called again would run a second time]");
+  expect(first).not.toContain("with offset");
+  expect((await tool.execute({ ...call, offset: 20000 })).output).toBe("Error: " + offsetRefused);
+  expect(ran).toBe(1);
+  expect(callAnswer("q".repeat(25000), 0, "query").output).toContain("The rest: the same call with offset 20000]");
+  return "1 procedure for 2 calls";
+};
+const _cloudbrain_test_eval_js_shows_the_slice_the_brief_names_whole = async function _test_eval_js_shows_the_slice_the_brief_names_whole(runtime,globalThis,expect,truncate) {
+  document;
+  const tool_eval_js = await runtime.module((await globalThis.importShim("/@tomlarkworthy/robocoop-5-srctools.js?v=4")).default).value("tool_eval_js");
+  const shown = async (n) => (await tool_eval_js.execute({ module: "@tomlarkworthy/cloud-brain", code: `"x".repeat(${n})` })).output;
+  expect(await shown(6000)).toBe("x".repeat(6000));
+  expect(await shown(6001)).toBe("x".repeat(6000) + " \u2026(+1 chars)");
+  expect(truncate(await shown(6000), 8000)).toBe("x".repeat(6000));
+  return "6000 whole, 6001 cut";
 };
 const _cloudbrain_test_assistant_refuses_owner_only_methods = function _test_assistant_refuses_owner_only_methods(expect,assistantRefuses,assistantPrompt) {
   expect(["secret.get", "com.lopecode.brain.secret.get", "token.create", "grant.put", "people.put", "people.link", "infra.apply", "lease.take", "service.register"].map(assistantRefuses)).toEqual(Array(9).fill(true));
@@ -44048,7 +44071,8 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_inboxHandlers", "inboxHandlers", ["plugins"], _cloudbrain_inboxHandlers);
   $def("_cloudbrain_turnClient", "turnClient", ["xrpcClient","brainOrigin"], _cloudbrain_turnClient);
   $def("_cloudbrain_callAnswer", "callAnswer", [], _cloudbrain_callAnswer);
-  $def("_cloudbrain_turnTool", "turnTool", ["defineTool","assistantRefuses","callAnswer"], _cloudbrain_turnTool);
+  $def("_cloudbrain_offsetRefused", "offsetRefused", [], _cloudbrain_offsetRefused);
+  $def("_cloudbrain_turnTool", "turnTool", ["defineTool","assistantRefuses","offsetRefused","callAnswer"], _cloudbrain_turnTool);
   $def("_cloudbrain_turnPrompt", "turnPrompt", ["assistantPrompt"], _cloudbrain_turnPrompt);
   $def("_cloudbrain_conversations", "conversations", [], _cloudbrain_conversations);
   $def("_cloudbrain_turnKey", "turnKey", [], _cloudbrain_turnKey);
@@ -44065,10 +44089,12 @@ export default function define(runtime, observer) {
   $def("_cloudbrain_assistantWatches", "assistantWatches", ["brainSummary"], _cloudbrain_assistantWatches);
   $def("_cloudbrain_assistantRule", "assistantRule", ["registerRule","invalidation","unregisterRule"], _cloudbrain_assistantRule);
   $def("_cloudbrain_assistantRefuses", "assistantRefuses", [], _cloudbrain_assistantRefuses);
-  $def("_cloudbrain_assistantTools", "assistantTools", ["brain","defineTool","viewof services","client","brainOrigin","assistantRefuses","callAnswer","declaredWorkers","registerTool","invalidation","unregisterTool"], _cloudbrain_assistantTools);
+  $def("_cloudbrain_assistantTools", "assistantTools", ["brain","defineTool","viewof services","client","brainOrigin","assistantRefuses","offsetRefused","callAnswer","declaredWorkers","registerTool","invalidation","unregisterTool"], _cloudbrain_assistantTools);
   $def("_cloudbrain_test_the_operator_is_told_to_read_the_docs", "test_the_operator_is_told_to_read_the_docs", ["expect","assistantPrompt","turnPrompt"], _cloudbrain_test_the_operator_is_told_to_read_the_docs);
   $def("_cloudbrain_test_the_operator_is_pointed_at_what_the_brain_holds", "test_the_operator_is_pointed_at_what_the_brain_holds", ["expect","assistantPrompt","turnPrompt","assistantRefuses"], _cloudbrain_test_the_operator_is_pointed_at_what_the_brain_holds);
   $def("_cloudbrain_test_brain_call_shows_a_long_answer_in_parts_and_the_loop_cuts_none", "test_brain_call_shows_a_long_answer_in_parts_and_the_loop_cuts_none", ["expect","truncate","turnTool","callAnswer"], _cloudbrain_test_brain_call_shows_a_long_answer_in_parts_and_the_loop_cuts_none);
+  $def("_cloudbrain_test_brain_call_never_runs_a_procedure_again_for_the_rest", "test_brain_call_never_runs_a_procedure_again_for_the_rest", ["turnTool","expect","offsetRefused","callAnswer"], _cloudbrain_test_brain_call_never_runs_a_procedure_again_for_the_rest);
+  $def("_cloudbrain_test_eval_js_shows_the_slice_the_brief_names_whole", "test_eval_js_shows_the_slice_the_brief_names_whole", ["runtime","globalThis","expect","truncate"], _cloudbrain_test_eval_js_shows_the_slice_the_brief_names_whole);
   $def("_cloudbrain_test_assistant_refuses_owner_only_methods", "test_assistant_refuses_owner_only_methods", ["expect","assistantRefuses","assistantPrompt"], _cloudbrain_test_assistant_refuses_owner_only_methods);
   $def("_cloudbrain_turnRig", "turnRig", [], _cloudbrain_turnRig);
   $def("_cloudbrain_test_turn_answered_then_finished", "test_turn_answered_then_finished", ["turnRig","conversationTurn","expect"], _cloudbrain_test_turn_answered_then_finished);
