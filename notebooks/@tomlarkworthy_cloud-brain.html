@@ -21807,7 +21807,7 @@ A sign-in link made to deploy with no approval (\`token.link\` with \`unattended
 Every change says why. \`infra.apply\` (unless \`dry\`), \`infra.redistil\` with \`apply\`, a roll back on the page, \`member.deploy\` and \`member.remove\` take \`reason\`, 3 to 300 characters, and are refused without one (400 \`InvalidRequest\`, or \`refused\` for a member). The reason is logged before anything is done, as \`deploy.reason\` with \`reason\`, \`by\` (\`owner\`, \`recovery key\`, the member's DID, or \`token:NAME\` for a sign-in link made to deploy with no approval) and \`targets\`. Added 2026-10-09.
 
 The deployer writes a line for each step of a deploy with the \`log\` cell: \`deploy.uploaded\`, \`deploy.deployed\`, \`deploy.probation\`, \`deploy.confirmed\`, \`deploy.unhealthy\` with what the last health check answered, \`deploy.put-back\` with the reason, \`deploy.refused\`, \`deploy.waiting\`, \`deploy.removed\`, \`deploy.failing\`, \`deploy.logs-on\`, \`deploy.verify\`, \`deploy.verified\`, \`deploy.failed\`, \`deploy.verify.none\`, \`deploy.verify.stale\`, \`deploy.over-unverified\`, \`token.mint\`, \`token.roll\`, \`token.delete\`, \`token.mint-failed\`. A member's deploy writes \`deploy.deployed\` and \`deploy.put-back\`. The \`reason\` of a put-back can be Cloudflare's own text about the code that was sent; it is not text a caller of a method sent.`);};
-const _braindeployer_anon_de0f2070c3 = function _anonymous(md) {return (md`## A deploy is verified by the deployer
+const _braindeployer_anon_ca1f3feee0 = function _anonymous(md) {return (md`## A deploy is verified by the deployer
 
 Written 2026-10-10 from \`plan/specs/deploy-verification.html\`. Before it, the owner's open page ran every Worker's tests and reported to the core, so a verdict depended on which tab was open and on what else that page had loaded.
 
@@ -21817,7 +21817,10 @@ After the deploy, inside the same \`infra.apply\`, the deployer buys 120 s of br
 
 ~~~
 BRAIN/#view=C100(S100(MODULE,@tomlarkworthy/brain-shell))&verify=WORKER
+BRAIN/static/shell/verify.html#view=C100(S100(MODULE,@tomlarkworthy/brain-shell))&verify=WORKER
 ~~~
+
+The second while brain-static has the file \`shell/verify.html\`, the first when it has not. Before each run the deployer asks \`static.get?path=shell/verify.html\` through the core and reads the status alone: 200 is the file's address, and any other answer, or none, is the Brain's own page. \`shell/verify.html\` is the shell with brain-shell as its one boot main (\`build.ts\`), so the tests of the notebook's other tools are not computed beside the Worker's: 132 of them on the Brain's own page and 9, brain-shell's, on this one, measured locally on 2026-10-11 (\`plan/cloud-brain-deploy-verdict-from-a-shared-page.md\`). \`infra.shell?name=verify\` puts the file (the recovery key, as the shell; \`brain.ts shell\` sends both); \`static.delete { path: "shell/verify.html" }\` in the owner's session takes it away, and the next run opens the Brain's own page again with no deploy. The line \`deploy.verify\` has the address as \`run\`. The deployer does not check that the file is public or that it is a shell: one that is neither gives a run with no verdict. Written 2026-10-11 on a branch; not on a Brain until its owner installs this deployer.
 
 The page has no session. It loads that module and what it imports, runs its \`test_\` cells, and leaves \`{ worker, module, hash, ok, tests, failed: [{ name, message }], otherTestsRan, ms }\` at \`window.__brainVerdict\` (brain-shell, \`brainVerdict\`). The run waits for that value up to 100 s. brain-shell is in the layout beside the module because the cell that judges is there; no other module of the Brain is loaded.
 
@@ -21918,10 +21921,15 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
       else await rows.put(key, { ...value, stale: true });
     }
   };
+  // The two files an installer sends: the shell, and with ?name=verify the page of a deploy's test run (verifyDeploy).
+  // Both are put public: a browser with no session reads them.
+  const VERIFY_PAGE = "shell/verify.html";
   const shell = async (request) => {
+    const name = new URL(request.url).searchParams.get("name");
+    if (name !== null && name !== "verify") return new Response(text({ error: "InvalidRequest", message: 'name: "verify" for the page of a test run, or none for the shell' }), { status: 400, headers: jsonType });
     const core = await rows.get("worker/brain-core");
     if (!core || !core.hash) return new Response(text({ error: "NotReady", message: "the core is not deployed" }), { status: 503, headers: jsonType });
-    const query = new URLSearchParams({ path: "shell/index.html", public: "true", type: "text/html; charset=utf-8" });
+    const query = new URLSearchParams({ path: name ? VERIFY_PAGE : "shell/index.html", public: "true", type: "text/html; charset=utf-8" });
     const r = await call("brain-core", core.key, "/xrpc/com.lopecode.brain.static.put?" + query, { method: "POST", headers: { "content-type": "text/html; charset=utf-8" }, body: request.body, duplex: "half" });
     return new Response(r.body, { status: r.status, headers: { "content-type": r.headers.get("content-type") || "application/json", "access-control-allow-origin": "*" } });
   };
@@ -22662,10 +22670,23 @@ const _braindeployer_deployerOps = function _deployerOps(config,secrets,rows,log
   // run reads it. A pass ends the probation, a fail puts the version before back at once, and a run that gives no
   // verdict changes nothing: the limit of the probation then decides. Called with the Worker's row held.
   const RUN_SECONDS = 120;
+  // The page of the run: shell/verify.html, the shell with brain-shell as its one boot main, while brain-static has
+  // it (static.get answers 200), and the Brain's own page for any other answer or none. So putting the file turns
+  // the short page on, and static.delete of it turns it off, with no deploy.
+  const verifyPage = async () => {
+    try {
+      const core = await rows.get("worker/brain-core");
+      const r = core && core.hash ? await call("brain-core", core.key, "/xrpc/com.lopecode.brain.static.get?" + new URLSearchParams({ path: VERIFY_PAGE })) : null;
+      // Only the status is read; the file is not.
+      if (r && r.body) await r.body.cancel().catch(() => null);
+      if (r && r.status === 200) return "/static/" + VERIFY_PAGE;
+    } catch {}
+    return "/";
+  };
   const verifyDeploy = async (logical, module, hash) => {
     const t0 = Date.now();
     const none = (reason) => (say({ at: "deploy.verify.none", target: logical, hash, reason: String(reason).slice(0, 300) }), {});
-    const url = `${urlOf("brain")}/#view=C100(S100(${module},@tomlarkworthy/brain-shell))&verify=${logical}`;
+    const url = `${urlOf("brain")}${await verifyPage()}#view=C100(S100(${module},@tomlarkworthy/brain-shell))&verify=${logical}`;
     let v;
     try {
       // Time is bought before a browser is used, and a run needs as much as its timeout: the run asks for less.
@@ -23069,7 +23090,7 @@ const _braindeployer_deployerFn = function _deployerFn(deployerOps,Response,depl
     // Not for a sign-in link's token: it would keep its own deploy with no test run.
     if (method === "confirm" && request.method === "POST" && by) return json({ error: "Forbidden", message: "a sign-in link does not confirm a deploy: the owner's session or the recovery key" }, 403);
     if (method === "confirm" && request.method === "POST") return ((out) => json(out, out.error ? 400 : 200))(await deployerOps.confirmByHand(await request.json().catch(() => ({}))));
-    // An installer's shell, passed on to brain-static as it arrives. The deployer keeps none of it.
+    // An installer's shell, or with ?name=verify the page of a test run, passed on to brain-static as it arrives. The deployer keeps none of it.
     if (method === "shell" && request.method === "POST") return deployerOps.shell(request);
     if (method === "redistil" && request.method === "POST") return ((out) => json(out, out.error ? 400 : 200))(await deployerOps.redistil(await request.json().catch(() => ({})), { recovery, by }));
     // Answers what a source distils to. Deploys nothing.
@@ -23133,6 +23154,8 @@ const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return
   const scripts = new Map(), log = [], calls = [], unhealthy = new Set(), stored = {}, d1 = [], tokens = new Map(), apps = [], indexes = [];
   // What the Brain's browser answers the deployer, through the core. A test sets run to (body) => [status, data].
   const browser = { run: null, extend: null };
+  // What brain-static answers the deployer's static.get, through the core: (url) => [status, data]. With none set, 404: no such file.
+  const statics = { get: null };
   const account = ["com.cloudflare.api.account"];
   const groups = [
     { id: "g-obs-user", name: "Workers Observability Read", scopes: ["com.cloudflare.api.user"] },
@@ -23186,6 +23209,7 @@ const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return
         return Response.json({ ok: !!m && !unhealthy.has(h), hash: h });
       }
       for (const m of ["run", "extend"]) if (url.pathname.endsWith(".browser." + m) && browser[m]) return (([status, data]) => Response.json(data, { status }))(await browser[m](body, url));
+      if (url.pathname.endsWith(".static.get")) return (([status, data]) => Response.json(data, { status }))(statics.get ? await statics.get(url) : [404, { error: "NotFound", message: url.searchParams.get("path") }]);
       return Response.json({});
     }
     if (request.headers.get("authorization") !== "Bearer tok" && !url.pathname.endsWith("/assets/upload")) return bad(403, "bad token");
@@ -23267,7 +23291,7 @@ const _braindeployer_fakeCloudflare = function _fakeCloudflare(Response) {return
     const s = scripts.get(name);
     return s ? bindingOf(live(s), "BRAIN_INFO").json.hash : null;
   };
-  return { fetch, scripts, log, calls, unhealthy, stored, d1, tokens, apps, indexes, browser, running, live: (name) => live(scripts.get(name)) };
+  return { fetch, scripts, log, calls, unhealthy, stored, d1, tokens, apps, indexes, browser, static: statics, running, live: (name) => live(scripts.get(name)) };
 });};
 const _braindeployer_deployerRig = function _deployerRig(fakeCloudflare,simulate,deployer_service,partsHash,URLSearchParams) {return (async ({ acceptEmitted = true, config = {}, store } = {}) => {
   const fake = fakeCloudflare(), said = [];
@@ -23812,6 +23836,42 @@ const _braindeployer_test_deployer_starts_one_verify_run_per_deploy = async func
   expect(seen.length).toBe(1);
   return url;
 };
+const _braindeployer_test_deployer_opens_the_verify_page_while_static_has_it = async function _test_deployer_opens_the_verify_page_while_static_has_it(verifyRig,expect) {
+  const seen = [];
+  const t = await verifyRig({ run: (body) => (seen.push(body.url), t.verdict(hashes.shift())) });
+  const { rig, A, v2, v3 } = t;
+  const v4 = await t.version("four"), v5 = await t.version("five"), hashes = [v2, v3, v4, v5].map((v) => v.hash);
+  const view = "#view=C100(S100(@t/a,@tomlarkworthy/brain-shell))&verify=brain-x-a";
+  const page = "https://cb.sub.workers.dev/" + view, file = "https://cb.sub.workers.dev/static/shell/verify.html" + view;
+  const asked = () => rig.fake.calls.filter((c) => c.nsid === "static.get").map((c) => [c.worker, c.body, c.query]);
+  const deploy = async (v) => (await rig.saidIn(async () => expect((await rig.recover({ workers: [v] })).results[0].state).toBe("verified"))).filter((l) => l.at === "deploy.verify").map((l) => l.run);
+  // The rig's first version was run too, with nothing set: asked once.
+  const before = asked().length;
+  expect(before).toBe(1);
+  // The file is there: the run opens it, and the line of the run names it. The deployer asked once, with a GET, through the core.
+  rig.fake.static.get = () => [200, "<html>verify</html>"];
+  expect(await deploy(v2)).toEqual([file]);
+  expect(asked().slice(before)).toEqual([["brain-core", null, "?path=shell%2Fverify.html"]]);
+  // Not there, which is also what a rig with nothing set answers.
+  rig.fake.static.get = null;
+  expect(await deploy(v3)).toEqual([page]);
+  // brain-static answers 500, and the call to it throws: the Brain's own page, and the run is made.
+  rig.fake.static.get = () => [500, { error: "InternalServerError" }];
+  expect(await deploy(v4)).toEqual([page]);
+  rig.fake.static.get = () => { throw new Error("the core did not answer"); };
+  expect(await deploy(v5)).toEqual([page]);
+  expect(seen).toEqual([file, page, page, page]);
+  expect(asked().length).toBe(before + 4);
+  return file;
+};
+const _braindeployer_test_deployer_a_put_back_names_the_verify_page_it_ran = async function _test_deployer_a_put_back_names_the_verify_page_it_ran(verifyRig,expect) {
+  const t = await verifyRig({ run: () => t.verdict(t.v2.hash, { ok: false, failed: [{ name: "test_x", message: "expected 1" }] }) });
+  t.rig.fake.static.get = () => [200, "<html>verify</html>"];
+  expect((await t.rig.recover({ workers: [t.v2] })).results[0].state).toBe("put-back");
+  const run = JSON.parse(t.rig.fake.calls.find((c) => c.nsid === "issue.open").body.body).run;
+  expect(run).toBe("https://cb.sub.workers.dev/static/shell/verify.html#view=C100(S100(@t/a,@tomlarkworthy/brain-shell))&verify=brain-x-a");
+  return run;
+};
 const _braindeployer_test_deployer_drops_a_verdict_for_another_hash = async function _test_deployer_drops_a_verdict_for_another_hash(verifyRig,expect) {
   const t = await verifyRig({ run: () => t.verdict(t.v1.hash, { ok: false, failed: [{ name: "test_x", message: "of the version before" }] }) });
   const { rig, A, v1, v2, ks, running } = t;
@@ -24208,6 +24268,26 @@ const _braindeployer_test_the_shell_is_passed_on_to_static_and_needs_a_key = asy
   expect(passed.map((c) => [c.worker, c.body, new URLSearchParams(c.query).get("path"), new URLSearchParams(c.query).get("public")])).toEqual([["brain-core", "<html>shell</html>", "shell/index.html", "true"]]);
   return "passed on";
 };
+const _braindeployer_test_the_shell_takes_the_name_verify_and_no_other = async function _test_the_shell_takes_the_name_verify_and_no_other(deployerRig,URLSearchParams,expect) {
+  const rig = await deployerRig();
+  const U = "https://cb-deployer.sub.workers.dev/xrpc/com.lopecode.brain.infra.shell";
+  const send = (query, body, headers = { authorization: "Bearer rk" }) => rig.sim.fetch(U + query, { method: "POST", headers, body });
+  const put = () => rig.fake.calls.filter((c) => c.nsid === "static.put").map((c) => [c.worker, c.body, ...["path", "public", "type"].map((k) => new URLSearchParams(c.query).get(k))]);
+  expect((await send("?name=verify", "<html>verify</html>", {})).status).toBe(401);
+  expect((await send("?name=verify", "<html>verify</html>")).status).toBe(503);
+  await rig.recover({ workers: [await rig.made("brain-core", "core", "a")] });
+  expect((await send("?name=verify", "<html>verify</html>")).status).toBe(200);
+  expect((await send("", "<html>shell</html>")).status).toBe(200);
+  const html = "text/html; charset=utf-8";
+  expect(put()).toEqual([["brain-core", "<html>verify</html>", "shell/verify.html", "true", html], ["brain-core", "<html>shell</html>", "shell/index.html", "true", html]]);
+  // Refused before anything is passed on: another file's name, the shell's own, an empty one, a path.
+  for (const name of ["other", "index", "", "verify.html", "../verify", "verify&path=x"]) {
+    const r = await send("?name=" + encodeURIComponent(name), "<html>no</html>");
+    expect([name, r.status, (await r.json()).message]).toEqual([name, 400, 'name: "verify" for the page of a test run, or none for the shell']);
+  }
+  expect(put().length).toBe(2);
+  return "verify, none, 6 refused";
+};
 const _braindeployer_test_apply_takes_source_and_deploys_what_it_distils = async function _test_apply_takes_source_and_deploys_what_it_distils(deployerRig,expect,exportModuleJS,deployer_probe_service) {
   const rig = await deployerRig({ acceptEmitted: false });
   // Code made elsewhere is refused, whoever sends it.
@@ -24536,7 +24616,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_nextKernelState", "nextKernelState", ["probationDefaultMs"], _braindeployer_nextKernelState);
   $def("_braindeployer_anon_17200b265d", null, ["md"], _braindeployer_anon_17200b265d);
   $def("_braindeployer_anon_e12ce2a2f9", null, ["md"], _braindeployer_anon_e12ce2a2f9);
-  $def("_braindeployer_anon_de0f2070c3", null, ["md"], _braindeployer_anon_de0f2070c3);
+  $def("_braindeployer_anon_ca1f3feee0", null, ["md"], _braindeployer_anon_ca1f3feee0);
   $def("_braindeployer_deployerOps", "deployerOps", ["config","secrets","rows","log","Response","URLSearchParams","sha256","FormData","partsHash","deployerAllows","wrapperFlags","probationDefaultMs","deployerDistil","nextKernelState"], _braindeployer_deployerOps);
   $def("_braindeployer_anon_b5cfc17bdb", null, ["md"], _braindeployer_anon_b5cfc17bdb);
   $def("_braindeployer_deployerPage", "deployerPage", [], _braindeployer_deployerPage);
@@ -24571,6 +24651,8 @@ export default function define(runtime, observer) {
   $def("_braindeployer_test_deployer_unverified_worker_is_put_back_at_the_limit", "test_deployer_unverified_worker_is_put_back_at_the_limit", ["verifyRig","expect"], _braindeployer_test_deployer_unverified_worker_is_put_back_at_the_limit);
   $def("_braindeployer_test_deployer_refuses_a_deploy_over_an_unverified_one", "test_deployer_refuses_a_deploy_over_an_unverified_one", ["verifyRig","expect"], _braindeployer_test_deployer_refuses_a_deploy_over_an_unverified_one);
   $def("_braindeployer_test_deployer_starts_one_verify_run_per_deploy", "test_deployer_starts_one_verify_run_per_deploy", ["verifyRig","expect"], _braindeployer_test_deployer_starts_one_verify_run_per_deploy);
+  $def("_braindeployer_test_deployer_opens_the_verify_page_while_static_has_it", "test_deployer_opens_the_verify_page_while_static_has_it", ["verifyRig","expect"], _braindeployer_test_deployer_opens_the_verify_page_while_static_has_it);
+  $def("_braindeployer_test_deployer_a_put_back_names_the_verify_page_it_ran", "test_deployer_a_put_back_names_the_verify_page_it_ran", ["verifyRig","expect"], _braindeployer_test_deployer_a_put_back_names_the_verify_page_it_ran);
   $def("_braindeployer_test_deployer_drops_a_verdict_for_another_hash", "test_deployer_drops_a_verdict_for_another_hash", ["verifyRig","expect"], _braindeployer_test_deployer_drops_a_verdict_for_another_hash);
   $def("_braindeployer_test_deployer_pass_ends_probation", "test_deployer_pass_ends_probation", ["verifyRig","expect"], _braindeployer_test_deployer_pass_ends_probation);
   $def("_braindeployer_test_deployer_fail_puts_back_at_once", "test_deployer_fail_puts_back_at_once", ["verifyRig","expect"], _braindeployer_test_deployer_fail_puts_back_at_once);
@@ -24590,6 +24672,7 @@ export default function define(runtime, observer) {
   $def("_braindeployer_test_a_path_or_method_belongs_to_one_worker", "test_a_path_or_method_belongs_to_one_worker", ["deployerRig","expect"], _braindeployer_test_a_path_or_method_belongs_to_one_worker);
   $def("_braindeployer_test_distil_answers_the_tabs_hash_and_deploys_nothing", "test_distil_answers_the_tabs_hash_and_deploys_nothing", ["deployerRig","exportModuleJS","expect","deployer_probe_service"], _braindeployer_test_distil_answers_the_tabs_hash_and_deploys_nothing);
   $def("_braindeployer_test_the_shell_is_passed_on_to_static_and_needs_a_key", "test_the_shell_is_passed_on_to_static_and_needs_a_key", ["deployerRig","expect","URLSearchParams"], _braindeployer_test_the_shell_is_passed_on_to_static_and_needs_a_key);
+  $def("_braindeployer_test_the_shell_takes_the_name_verify_and_no_other", "test_the_shell_takes_the_name_verify_and_no_other", ["deployerRig","URLSearchParams","expect"], _braindeployer_test_the_shell_takes_the_name_verify_and_no_other);
   $def("_braindeployer_test_apply_takes_source_and_deploys_what_it_distils", "test_apply_takes_source_and_deploys_what_it_distils", ["deployerRig","expect","exportModuleJS","deployer_probe_service"], _braindeployer_test_apply_takes_source_and_deploys_what_it_distils);
   $def("_braindeployer_test_redistil_after_a_deployer_update_and_source_follows_a_put_back", "test_redistil_after_a_deployer_update_and_source_follows_a_put_back", ["deployerRig","exportModuleJS","expect"], _braindeployer_test_redistil_after_a_deployer_update_and_source_follows_a_put_back);
   $def("_braindeployer_anon_9b56d8b485", null, ["md"], _braindeployer_anon_9b56d8b485);
@@ -78477,7 +78560,7 @@ A new Brain:
 ```
 BRAIN_BASE=<base> bun tools/cloud-brain/brain.ts install-deployer   # <base>-deployer, a new recovery key in .emitted/<base>.json
 BRAIN_BASE=<base> bun tools/cloud-brain/brain.ts apply core.json --reason="why"   # refused with 400 without a reason, which the deployer logs; then kernel, db, static, inbox, the other services, page
-BRAIN_BASE=<base> bun tools/cloud-brain/brain.ts shell
+BRAIN_BASE=<base> bun tools/cloud-brain/brain.ts shell   # .emitted/verify.html (the page of a deploy's test run), then .emitted/shell.html
 BRAIN_BASE=<base> bun tools/cloud-brain/brain.ts confirm <worker>   # one Worker a call; `state` shows which are on probation
 ```
 
