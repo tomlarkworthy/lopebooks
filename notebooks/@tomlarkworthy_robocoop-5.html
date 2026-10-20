@@ -6172,6 +6172,7 @@ const _1fgn2a4 = function _openrouter_catalog(demoMode,gatewayBase,endpointBase)
   // FALLBACK when the live fetch is slow (>5s) or unreachable, so the picker stays fully populated offline.
   // The old 6-model curated fallback dropped almost everything on a timeout (e.g. xiaomi/mimo-v2.5-pro went
   // missing → empty model → OpenRouter 400). A leading "*" marks a vision-capable (image-input) model.
+  // Rechecked 2026-10-20 against openrouter.ai/api/v1/models: the 204 ids still listed agree; 51 are no longer listed.
   const SNAPSHOT = `
   *~anthropic/claude-fable-latest *~anthropic/claude-haiku-latest *~anthropic/claude-opus-latest
   *~anthropic/claude-sonnet-latest *~google/gemini-flash-latest *~google/gemini-pro-latest
@@ -6272,11 +6273,16 @@ const _1fgn2a4 = function _openrouter_catalog(demoMode,gatewayBase,endpointBase)
     timed
   ]);
 };
-const _12iwsf7 = function _openrouter_models(demoMode,openrouter_catalog)
-{
+const _rc5orderModels = function _openrouter_orderModels(){return(
+(catalog, demoMode) => {
   // Demo offers whatever the gateway advertises; the first entry is the default for a fresh visitor.
-  const ids = openrouter_catalog.ids;
+  const ids = catalog.ids;
+  // Prefer a default that sees images: the Cloud Brain dashboard (@tomlarkworthy/brain-dashboard) chat sends screenshots.
+  const sees = id => ids.includes(id) && catalog.vision.has(id);
   const DEMO_DEFAULT = [
+    'xiaomi/mimo-v2.5',
+    'xiaomi/mimo-v2.6-flash'
+  ].find(sees) || ids.find(sees) || [
     'xiaomi/mimo-v2.5-pro',
     'xiaomi/mimo-v2.6-flash'
   ].find(id => ids.includes(id));
@@ -6286,10 +6292,65 @@ const _12iwsf7 = function _openrouter_models(demoMode,openrouter_catalog)
     DEMO_DEFAULT,
     ...ids.filter(id => id !== DEMO_DEFAULT)
   ];
-};
+}
+)};
+const _12iwsf7 = function _openrouter_models(demoMode,openrouter_catalog,openrouter_orderModels){return(
+openrouter_orderModels(openrouter_catalog, demoMode)
+)};
 const _ycgtm0 = function _openrouter_vision(openrouter_catalog){return(
 openrouter_catalog.vision
 )};
+const _rc5modelEntries = function _openrouter_modelEntries(){return(
+(ids, vision, { vision: want } = {}) => ids.map(id => ({ id, vision: vision.has(id) })).filter(m => want === undefined || m.vision === want)
+)};
+const _rc5listModels = function _openrouter_listModels(openrouter_modelEntries,openrouter_models,openrouter_vision){return(
+// For an embedder that needs images (brain-dashboard): listModels({vision: true}) is the offered models that take images; no option = all, as {id, vision}.
+opts => openrouter_modelEntries(openrouter_models, openrouter_vision, opts)
+)};
+const _rc5e_fixture_catalog = function _openrouter_fixtureCatalog(){return(
+// The gateway's /v1/models on 2026-10-20: input_modalities has "image" for all but mimo-v2.5-pro.
+{
+  ids: ['xiaomi/mimo-v2.5', 'xiaomi/mimo-v2.5-pro', 'xiaomi/mimo-v2.6-flash', 'xiaomi/mimo-v2.6-pro', 'z-ai/glm-5.3-flash'],
+  vision: new Set(['xiaomi/mimo-v2.5', 'xiaomi/mimo-v2.6-flash', 'xiaomi/mimo-v2.6-pro', 'z-ai/glm-5.3-flash'])
+}
+)};
+const _rc5e_test_model_flag = function _test_model_vision_flag(openrouter_modelEntries,openrouter_fixtureCatalog)
+{
+  const c = openrouter_fixtureCatalog;
+  const all = openrouter_modelEntries(c.ids, c.vision);
+  if (!all.every(m => typeof m.vision === 'boolean')) throw new Error('every entry carries a boolean vision flag');
+  if (all.find(m => m.id === 'xiaomi/mimo-v2.5-pro').vision !== false) throw new Error('mimo-v2.5-pro is text only');
+  if (all.find(m => m.id === 'xiaomi/mimo-v2.5').vision !== true) throw new Error('mimo-v2.5 takes images');
+  return all.length + ' entries flagged';
+};
+const _rc5e_test_model_filter = function _test_model_vision_filter(openrouter_modelEntries,openrouter_fixtureCatalog)
+{
+  const c = openrouter_fixtureCatalog;
+  const seen = openrouter_modelEntries(c.ids, c.vision, { vision: true });
+  if (seen.length !== c.vision.size || !seen.every(m => m.vision && c.vision.has(m.id))) throw new Error('{vision: true} returns exactly the vision models');
+  const blind = openrouter_modelEntries(c.ids, c.vision, { vision: false });
+  if (blind.map(m => m.id).join() !== 'xiaomi/mimo-v2.5-pro') throw new Error('{vision: false} returns exactly the text-only models');
+  return seen.length + ' vision, ' + blind.length + ' text only';
+};
+const _rc5e_test_model_default = function _test_model_default_sees(openrouter_orderModels,openrouter_fixtureCatalog)
+{
+  const c = openrouter_fixtureCatalog;
+  const first = openrouter_orderModels(c, true)[0];
+  if (!c.vision.has(first)) throw new Error('demo default ' + first + ' is text only');
+  const noMimo = { ids: ['a/text', 'b/sees'], vision: new Set(['b/sees']) };
+  if (openrouter_orderModels(noMimo, true)[0] !== 'b/sees') throw new Error('with no preferred id the default is still a vision model');
+  return first;
+};
+const _rc5e_test_model_unfiltered = function _test_model_unfiltered_unchanged(openrouter_orderModels,openrouter_modelEntries,openrouter_fixtureCatalog)
+{
+  const c = openrouter_fixtureCatalog;
+  const same = (a, b) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
+  if (openrouter_orderModels(c, false).join() !== c.ids.join()) throw new Error('outside demo the order is the catalog order');
+  const demo = openrouter_orderModels(c, true);
+  if (!same(demo, c.ids)) throw new Error('demo reorders, never adds or drops');
+  if (openrouter_modelEntries(demo, c.vision).map(m => m.id).join() !== demo.join()) throw new Error('no filter returns every model in menu order');
+  return demo.length + ' models';
+};
 const _190jvha = function _model(localStorageView,demoMode,openrouter_models,Inputs,openrouter_vision,endpointBase,modelStorageKey)
 {
   // A custom endpoint serves only its own models, like demo mode.
@@ -7008,8 +7069,16 @@ export default function define(runtime, observer) {
   $def("_1n2587c", "demoMode", ["OPENROUTER_API_KEY","endpointBase"], _1n2587c);  
   $def("_gwbase", "gatewayBase", [], _gwbase);
   $def("_1fgn2a4", "openrouter_catalog", ["demoMode","gatewayBase","endpointBase"], _1fgn2a4);  
-  $def("_12iwsf7", "openrouter_models", ["demoMode","openrouter_catalog"], _12iwsf7);
+  $def("_rc5orderModels", "openrouter_orderModels", [], _rc5orderModels);
+  $def("_12iwsf7", "openrouter_models", ["demoMode","openrouter_catalog","openrouter_orderModels"], _12iwsf7);
   $def("_ycgtm0", "openrouter_vision", ["openrouter_catalog"], _ycgtm0);  
+  $def("_rc5modelEntries", "openrouter_modelEntries", [], _rc5modelEntries);
+  $def("_rc5listModels", "openrouter_listModels", ["openrouter_modelEntries","openrouter_models","openrouter_vision"], _rc5listModels);
+  $def("_rc5e_fixture_catalog", "openrouter_fixtureCatalog", [], _rc5e_fixture_catalog);
+  $def("_rc5e_test_model_flag", "test_model_vision_flag", ["openrouter_modelEntries","openrouter_fixtureCatalog"], _rc5e_test_model_flag);
+  $def("_rc5e_test_model_filter", "test_model_vision_filter", ["openrouter_modelEntries","openrouter_fixtureCatalog"], _rc5e_test_model_filter);
+  $def("_rc5e_test_model_default", "test_model_default_sees", ["openrouter_orderModels","openrouter_fixtureCatalog"], _rc5e_test_model_default);
+  $def("_rc5e_test_model_unfiltered", "test_model_unfiltered_unchanged", ["openrouter_orderModels","openrouter_modelEntries","openrouter_fixtureCatalog"], _rc5e_test_model_unfiltered);
   $def("_190jvha", "viewof model", ["localStorageView","demoMode","openrouter_models","Inputs","openrouter_vision","endpointBase","modelStorageKey"], _190jvha);  
   $def("_1870whr", "model", ["Generators","viewof model"], _1870whr);  
   $def("_1vg55o6", "viewof rc5_systemPrompt", ["runHook","hook_prompt","rule_prompt_role","rule_prompt_notebook_model","rule_prompt_reactive_dependencies","rule_prompt_literate_style","rule_prompt_tools_and_method","rule_prompt_situation","rule_prompt_environment","rule_prompt_wiki_index","wiki_index","Inputs"], _1vg55o6);
