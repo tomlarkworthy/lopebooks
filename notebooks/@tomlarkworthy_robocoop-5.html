@@ -41854,7 +41854,8 @@ md`### \`createOpenRouterClient({apiKey, fetch, referer, title, defaultModel})\`
 OpenRouter chat-completions client (OpenAI wire format). The request is streamed (SSE) and the
 deltas are assembled into one reply;
 returns \`{message, finish_reason, raw}\` with the assistant message **verbatim** incl. any
-\`tool_calls\`. \`fetch\`/key are pluggable; \`fetch\` defaults to \`globalThis.fetch\`.`
+\`tool_calls\`. \`fetch\`/key are pluggable; \`fetch\` defaults to \`globalThis.fetch\`.
+\`chat\` calls \`onReasoningToken(chunk)\` with each piece of reasoning and \`onTextToken(chunk)\` with each piece of visible text, as it reads them.`
 )};
 
 const _createOpenRouterClient = function _createOpenRouterClient(globalThis){return(
@@ -41902,7 +41903,7 @@ function createOpenRouterClient({
     // Sampling controls (temperature, seed, reasoning) are all opt-in: each is sent ONLY when non-null, so
     // an unset one leaves the provider default in place (sending `temperature: null` is a 400 on some
     // providers, and an explicit `reasoning` block changes what the endpoint reports back).
-    async function chat({ model = defaultModel, messages, tools, tool_choice = 'auto', temperature, seed, reasoning, max_tokens, signal, onReasoningToken } = {}) {
+    async function chat({ model = defaultModel, messages, tools, tool_choice = 'auto', temperature, seed, reasoning, max_tokens, signal, onReasoningToken, onTextToken } = {}) {
       if (!model) throw new Error('no model selected (the model picker is empty — wait for the model catalog to load, then pick a model)');
       // Explicit cache_control for providers that require it. Two breakpoints: the stable system prompt, and
       // a ROLLING one on the last message so the growing tool-use prefix is cached step-to-step (prompt tokens
@@ -42039,6 +42040,8 @@ function createOpenRouterClient({
                   if (timings.firstVisibleMs == null) timings.firstVisibleMs = Date.now() - t0;
                 }
                 if (typeof d.content === 'string') acc.content += d.content;
+                // Each piece of visible text as it is read, so a listener (a voice) can start before the reply is whole.
+                if (typeof d.content === 'string' && d.content && typeof onTextToken === 'function') { try { onTextToken(d.content); } catch (e) {} }
                 if (Array.isArray(d.tool_calls)) {
                   for (const tc of d.tool_calls) {
                     const i = tc.index ?? 0;
@@ -42222,7 +42225,10 @@ per \`tool_calls[]\` entry, defensive JSON arg parse, central [\`truncate\`](#) 
 LIVE CONTROL: \`steer(input)\` injects a user message into the RUNNING turn and aborts the in-flight model
 call so it is read on the next step (the model is re-read each step, so switching the model picker mid-turn
 applies on the next call); \`interrupt()\` aborts the in-flight call without injecting (used to apply a model
-switch immediately); \`abort()\` hard-stops the whole turn. Returns \`{messages, send, abort, reset, interrupt, steer}\`.`
+switch immediately); \`abort()\` hard-stops the whole turn. Returns \`{messages, send, abort, reset, interrupt, steer}\`.
+
+\`send(input, callbacks)\` calls \`onReasoningToken(chunk, step)\` and \`onTextToken(chunk, step)\` as it reads the stream.
+\`onText(content)\` gets the step's whole text once the step ends.`
 )};
 
 const _createAgentSession = function _createAgentSession(AbortController,truncate)
@@ -42503,6 +42509,7 @@ const _createAgentSession = function _createAgentSession(AbortController,truncat
             // Live reasoning stream (opt-in, additive): forwarded only when the caller actually wants it, so
             // a client stubbed in a test or written against the old signature sees an unchanged argument set.
             ...(typeof callbacks.onReasoningToken === 'function' ? { onReasoningToken: (chunk) => callbacks.onReasoningToken(chunk, step) } : {}),
+            ...(typeof callbacks.onTextToken === 'function' ? { onTextToken: (chunk) => callbacks.onTextToken(chunk, step) } : {}),
             signal: stepController.signal,
           });
         } catch (e) {
