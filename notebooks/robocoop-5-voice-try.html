@@ -56835,6 +56835,8 @@ is another module's.
 3. The agent's text arrives by \`onTextToken\`. The module cuts it at the end of each sentence, and the mouth speaks each
    sentence in order. A step whose text came with no \`onTextToken\` is spoken whole at its \`onText\`.
 4. \`onToolCall(id, name)\` queues the phrase of that tool, \`running NAME\`. The tool's result is spoken in the agent's next text.
+   The completion tool, \`task_complete\`, has no phrase. When the turn's last step spoke no text, the turn's last assistant
+   message, which robocoop-5 makes from \`task_complete\`'s summary, is spoken when the turn ends.
 5. Barge-in, each step on an event:
    - The detector's \`onSpeechStart\` while the mouth speaks pauses it. The queue and the playing sentence's position are kept; \`state\` is \`paused\`.
    - The first of the detector's \`onSpeechRealStart\` and the ears' \`StartOfTurn\` drops the queue and the playing sentence; \`state\` is \`listening\`.
@@ -56969,7 +56971,7 @@ function createVoiceSession({ controller, entry, ears, mouth, detector, config =
     set("listening");
   };
   const callbacks = {
-    onStep() { spokeTokens = false; },
+    onStep() { spokeTokens = false; saidText = false; },
     onTextToken(chunk) { spokeTokens = true; if (!muted) sayAll(cutter.push(chunk)); },
     onText(content) {
       if (muted) return;
@@ -57308,7 +57310,7 @@ with a fake model client. They need no microphone and make no call.`
 const _voiceRig = function _voiceRig(createVoiceSession,createAgentSession,defineTool){return(
 // A chat entry of robocoop-5's createAgentSession on a fake client, a controller that runs its send as rc5_controller
 // does (busy while the turn runs), and fake parts that record what was spoken and let a test fire their events.
-function voiceRig({ replies, tools = [] }) {
+function voiceRig({ replies, tools = [], completeToolName = null }) {
   const steps = replies.slice(), log = [];
   const client = {
     async chat({ onTextToken, signal }) {
@@ -57318,11 +57320,11 @@ function voiceRig({ replies, tools = [] }) {
       for (const piece of r.pieces ?? (r.text ? [r.text] : [])) onTextToken?.(piece);
       log.push("returned");
       const message = { role: "assistant", content: r.text ?? (r.pieces ?? []).join("") };
-      if (r.tool) message.tool_calls = [{ id: "c1", type: "function", function: { name: r.tool, arguments: "{}" } }];
+      if (r.tool) message.tool_calls = [{ id: "c1", type: "function", function: { name: r.tool, arguments: JSON.stringify(r.args ?? {}) } }];
       return { message, finish_reason: r.tool ? "tool_calls" : "stop" };
     }
   };
-  const session = createAgentSession({ client, tools: tools.map(defineTool), systemPrompt: "test", model: "m/x" });
+  const session = createAgentSession({ client, tools: tools.map(defineTool), systemPrompt: "test", model: "m/x", ...(completeToolName ? { completeToolName } : {}) });
   const entry = { session, busy: false };
   const controller = { sent: [], async send(e, input, callbacks) { controller.sent.push(input); e.busy = true; try { return await e.session.send(input, callbacks); } finally { e.busy = false; } } };
   const spoken = [], states = [], closed = [];
@@ -57382,6 +57384,26 @@ const _test_voice_r3_a_turn_is_sent_on_end_of_turn_and_on_nothing_else = async f
   expect(rig.controller.sent).toEqual(["is it on"]);
   expect(rig.spoken).toEqual(["Yes."]);
   return rig.controller.sent;
+};
+const _test_voice_a_summary_alone_is_spoken_at_the_end_of_the_turn = async function _test_voice_a_summary_alone_is_spoken_at_the_end_of_the_turn(voiceRig,expect){
+  const rig = voiceRig({ completeToolName: "task_complete", replies: [{ tool: "task_complete", args: { summary: "All done." } }] });
+  await rig.ready;
+  rig.ears.endOfTurn("are you there");
+  await rig.playAll();
+  expect(rig.spoken).toEqual(["All done."]);
+  return rig.spoken;
+};
+const _test_voice_a_summary_after_a_spoken_step_is_spoken = async function _test_voice_a_summary_after_a_spoken_step_is_spoken(voiceRig,expect){
+  const rig = voiceRig({
+    completeToolName: "task_complete",
+    replies: [{ text: "Let me look.", tool: "read_cell" }, { tool: "task_complete", args: { summary: "It holds 42." } }],
+    tools: [{ id: "read_cell", description: "reads a cell", parameters: { type: "object", properties: {} }, execute: async () => ({ output: "42" }) }]
+  });
+  await rig.ready;
+  rig.ears.endOfTurn("what does the cell hold");
+  await rig.playAll();
+  expect(rig.spoken).toEqual(["Let me look.", "running read cell", "It holds 42."]);
+  return rig.spoken;
 };
 const _test_voice_r5_a_tool_is_said_by_name_before_its_result = async function _test_voice_r5_a_tool_is_said_by_name_before_its_result(voiceRig,expect){
   const ran = [];
@@ -57578,6 +57600,8 @@ export default function define(runtime, observer) {
   $def("rc5v_test_r1", "test_voice_r1_transcript_is_user_message_and_spoken_text_is_the_tokens", ["voiceRig","expect"], _test_voice_r1_transcript_is_user_message_and_spoken_text_is_the_tokens);
   $def("rc5v_test_r3", "test_voice_r3_a_turn_is_sent_on_end_of_turn_and_on_nothing_else", ["voiceRig","expect"], _test_voice_r3_a_turn_is_sent_on_end_of_turn_and_on_nothing_else);
   $def("rc5v_test_r5", "test_voice_r5_a_tool_is_said_by_name_before_its_result", ["voiceRig","expect"], _test_voice_r5_a_tool_is_said_by_name_before_its_result);
+  $def("rc5v_test_summary_alone", "test_voice_a_summary_alone_is_spoken_at_the_end_of_the_turn", ["voiceRig","expect"], _test_voice_a_summary_alone_is_spoken_at_the_end_of_the_turn);
+  $def("rc5v_test_summary_after_step", "test_voice_a_summary_after_a_spoken_step_is_spoken", ["voiceRig","expect"], _test_voice_a_summary_after_a_spoken_step_is_spoken);
   $def("rc5v_test_barge", "test_voice_barge_in_pauses_drops_and_resumes_on_events", ["voiceRig","expect"], _test_voice_barge_in_pauses_drops_and_resumes_on_events);
   $def("rc5v_test_flux_drop", "test_voice_flux_start_of_turn_drops_the_mouth", ["voiceRig","expect"], _test_voice_flux_start_of_turn_drops_the_mouth);
   $def("rc5v_test_stop", "test_voice_stop_closes_the_ears_and_detector_and_the_turn_finishes_as_text", ["voiceRig","expect"], _test_voice_stop_closes_the_ears_and_detector_and_the_turn_finishes_as_text);
@@ -57644,11 +57668,13 @@ async function requestVoiceToken({ onAsk, onState } = {}) {
   if (asked.status >= 300 || !asked.json.id) throw new Error("token.request " + asked.status + ": " + (asked.json.message ?? JSON.stringify(asked.json).slice(0, 200)));
   const url = /^https?:/.test(asked.json.url ?? "") ? asked.json.url : voiceBrain + asked.json.url;
   onAsk?.({ url, code: asked.json.code, until: asked.json.until });
-  const end = asked.json.until ? Date.parse(asked.json.until) : Date.now() + 3600e3;
+  // The request itself lasts days; a page that asks waits an hour.
+  const end = Date.now() + 3600e3;
   for (;;) {
     const got = await call("token.requested", { id: asked.json.id });
     const state = String(got.json.state ?? got.json.status ?? "");
     if (state === "denied") throw new Error("the request was denied");
+    if (state === "taken" && !got.json.sealed) throw new Error("the answer was taken by another read; ask again");
     if (state === "expired" || got.status === 404 || Date.now() > end) throw new Error("the request ended with no answer");
     if (got.json.sealed) {
       let link = new TextDecoder().decode(await crypto.subtle.decrypt({ name: "RSA-OAEP" }, keys.privateKey, b64.to(String(got.json.sealed)))).trim();
@@ -57709,15 +57735,17 @@ const _voicePanel = function _voicePanel(html,voice,rc5_controller,voiceEntry,vo
     const entry = voiceEntry();
     if (!entry) { log("no chat session with an agent: send the chat one message first"); return; }
     try {
+      $("talk").disabled = true;
       session = await voice({
         controller: rc5_controller, entry,
         client: voiceTokenStore.has() ? { brain: voiceBrain, token: () => voiceTokenStore.get() } : {},
         onState: (s) => { $("state").textContent = s; },
         onEvent: (name, detail) => log(name + (detail === undefined ? "" : " " + (detail?.message ?? (typeof detail === "string" ? detail : JSON.stringify(detail)).slice(0, 160))))
       });
-      $("talk").textContent = "Stop";
+      $("talk").textContent = "Stop"; $("state").textContent = session.state;
       log("listening on \"" + entry.title + "\" (" + (voiceTokenStore.has() ? "brain: Flux + Aura" : "browser speech") + ")");
     } catch (e) { session = null; log("start: " + e.message); }
+    $("talk").disabled = false;
   };
   invalidation.then(() => session?.stop());
   return el;
