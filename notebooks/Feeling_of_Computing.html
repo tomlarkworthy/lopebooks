@@ -7210,17 +7210,21 @@ const _xxrbj = function _focMsgNode(parseByline,peopleById,channelsByRkey,focAva
   // Only a record in the signed-in member's own repo can be rewritten; a bridged
   // Slack post lives in the bot's repo and is edited in Slack.
   const mine = !!(currentSession && record.did && record.did === currentSession.did);
+  // One edit box per placement: a thread root is also a row of the channel list,
+  // and a shared box would be moved out of whichever row rendered first.
   const editing = focChatState.editing || (focChatState.editing = new Set());
+  const place = record.rkey + (opts.inThread ? ":t" : ":c");
   const openEditor = () => {
-    editing.add(record.rkey);
+    editing.add(place);
     const box = focComposer({
       edit: record,
-      onDone: () => { editing.delete(record.rkey); if (box.isConnected) box.replaceWith(text); }
+      key: "e:" + place,
+      onDone: () => { editing.delete(place); if (box.isConnected) box.replaceWith(text); }
     });
     text.replaceWith(box);
     return box;
   };
-  if (mine && editing.has(record.rkey)) openEditor();
+  if (mine && editing.has(place)) openEditor();
 
   for (const att of v.attachments || []) content.appendChild(focAttachmentNode(att));
 
@@ -7270,7 +7274,7 @@ const _xxrbj = function _focMsgNode(parseByline,peopleById,channelsByRkey,focAva
     edit.textContent = "edit";
     edit.title = "Edit this message in your repo";
     edit.onclick = () => {
-      if (editing.has(record.rkey) && !text.isConnected) return;
+      if (editing.has(place) && !text.isConnected) return;
       const box = openEditor();
       const pm = box.querySelector(".ProseMirror");
       if (pm) requestAnimationFrame(() => { if (pm.isConnected) pm.focus(); });
@@ -7835,6 +7839,24 @@ const _zn9s54 = function _focMoreCss(focStyle) {return (focStyle("foc-more-css",
 .foc-chat .fc-more-row .fc-more { margin: 0; }
 `));};
 
+const _focedtest = function _test_focPostToDoc_roundtrip(focPostToDoc,focDocToPost,editableSchema) {
+  const F = (k, s, e, extra = {}) => ({ index: { byteStart: s, byteEnd: e }, features: [{ $type: "social.colibri.richtext.facet#" + k, ...extra }] });
+  const cases = [
+    { text: "plain" , facets: [] },
+    { text: "hi \u{1F600} there", facets: [F("bold", 0, 7)] },
+    { text: "a \u{1F600}b\u{1F600} c", facets: [F("italic", 2, 11)] },
+    { text: "one\ntwo\n\nthree", facets: [F("code", 4, 7)] },
+    { text: "see example now", facets: [F("link", 4, 11, { uri: "https://example.com" })] },
+    { text: "\u{1F4CC} Projects \u203a \u201cq\u201d\nnote", facets: [F("link", 0, 21, { uri: "https://x.test/#a" })] }
+  ];
+  const key = (fs) => JSON.stringify(fs.map((f) => [f.index.byteStart, f.index.byteEnd, f.features[0].$type, f.features[0].uri || ""]).sort());
+  for (const c of cases) {
+    const back = focDocToPost(focPostToDoc({ value: c }, editableSchema));
+    if (back.text !== c.text) throw new Error("text: " + JSON.stringify([c.text, back.text]));
+    if (key(back.facets) !== key(c.facets)) throw new Error("facets of " + JSON.stringify(c.text) + ": " + key(back.facets) + " != " + key(c.facets));
+  }
+  return cases.length + " cases round-trip";
+};
 export default function define(runtime, observer) {
   const main = runtime.module();
   const $def = (pid, name, deps, fn) => {
@@ -7899,6 +7921,7 @@ export default function define(runtime, observer) {
   main.define("focPostMessage", ["module @tomlarkworthy/foc-data", "@variable"], (_, v) => v.import("focPostMessage", _));  
   main.define("focEditMessage", ["module @tomlarkworthy/foc-data", "@variable"], (_, v) => v.import("focEditMessage", _));  
   main.define("focPostToDoc", ["module @tomlarkworthy/foc-data", "@variable"], (_, v) => v.import("focPostToDoc", _));  
+  main.define("focDocToPost", ["module @tomlarkworthy/foc-data", "@variable"], (_, v) => v.import("focDocToPost", _));  
   main.define("currentSession", ["module @tomlarkworthy/foc-data", "@variable"], (_, v) => v.import("currentSession", _));  
   $def("_13s1lf3", "focComposerCss", ["focStyle","editor_theme_css"], _13s1lf3);  
   $def("_16iylcv", "focComposer", ["focComposerCss","prosemirror","editableSchema","currentSession","focPostMessage","focEditMessage","focPostToDoc","linkifyPastedUrl","invalidation"], _16iylcv);  
@@ -7907,7 +7930,8 @@ export default function define(runtime, observer) {
   $def("_i0s42i", "focChannelRows", ["focMoreCss","topLevelByChannel","archive","focFmt","focDaySeparator","focMsgSig","focMsgNode"], _i0s42i);  
   $def("_1xqjb87", "focThreadRows", ["repliesByParent","byRkey","focMsgSig","focMsgNode","channelsByRkey"], _1xqjb87);  
   $def("_gyesf1", "focSearchRows", ["search","focMsgSig","focMsgNode","channelsByRkey","focChatState","focWriteHash"], _gyesf1);  
-  $def("_zn9s54", "focMoreCss", ["focStyle"], _zn9s54);
+  $def("_zn9s54", "focMoreCss", ["focStyle"], _zn9s54);  
+  $def("_focedtest", "test_focPostToDoc_roundtrip", ["focPostToDoc","focDocToPost","editableSchema"], _focedtest);
   return main;
 }</script><!--/-->
 
@@ -15870,7 +15894,7 @@ const _focp2d = function _focPostToDoc() {
       byteAt[i] = b;
       const c = text.codePointAt(i);
       b += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
-      if (c > 0xffff) { byteAt[i + 1] = b; i += 2; } else i += 1;
+      if (c > 0xffff) { byteAt[i + 1] = byteAt[i]; i += 2; } else i += 1;
     }
     byteAt[text.length] = b;
     const spans = [];
@@ -15922,16 +15946,36 @@ const _focedit = function _focEditMessage(focDocToPost,ensureScopes,xrpc,focProf
     if (!record || record.did !== sess.did) throw new Error("Only messages in your own repo can be edited");
     const q = "repo=" + encodeURIComponent(sess.did) + "&collection=" + COLL + "&rkey=" + encodeURIComponent(record.rkey);
     const got = await xrpc(sess, "com.atproto.repo.getRecord?" + q);
+    const stale = () => new Error("This message was changed elsewhere since the editor opened; cancel and edit again");
     if (!got.ok) throw new Error("getRecord " + got.status + " " + (await got.text().catch(() => "")).slice(0, 300));
     const cur = await got.json();
-    const next = { ...cur.value, text: body.text, facets: body.facets, edited: true };
+    if (record.cid && cur.cid !== record.cid) throw stale();
+    // The editor only holds bold/italic/code/link. Any other facet (a mention, a
+    // channel link) is kept where its covered text still appears unchanged.
+    const enc = new window.TextEncoder(), dec = new window.TextDecoder();
+    const oldBytes = enc.encode(cur.value.text || ""), newText = body.text;
+    const MARKS = new Set(["bold", "italic", "code", "link"]);
+    const taken = new Set();
+    const kept = [];
+    for (const f of cur.value.facets || []) {
+      if ((f.features || []).every((x) => MARKS.has(String(x.$type || "").split("#")[1]))) continue;
+      const span = dec.decode(oldBytes.slice(f.index.byteStart, f.index.byteEnd));
+      let from = 0, at = -1;
+      while ((at = newText.indexOf(span, from)) >= 0 && taken.has(at)) from = at + 1;
+      if (!span || at < 0) continue;
+      taken.add(at);
+      const byteStart = enc.encode(newText.slice(0, at)).length;
+      kept.push({ ...f, index: { byteStart, byteEnd: byteStart + enc.encode(span).length } });
+    }
+    const next = { ...cur.value, text: body.text, facets: body.facets.concat(kept), edited: true };
     const res = await xrpc(sess, "com.atproto.repo.putRecord", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repo: sess.did, collection: COLL, rkey: record.rkey, record: next, swapRecord: cur.cid })
+      body: JSON.stringify({ repo: sess.did, collection: COLL, rkey: record.rkey, record: next, swapRecord: record.cid || cur.cid })
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
+      if (/InvalidSwap/.test(detail)) throw stale();
       throw new Error("putRecord " + res.status + " " + detail.slice(0, 300));
     }
     const out = await res.json();
