@@ -3216,7 +3216,7 @@ const _ss7_0 = function _raw_decompile(raw_mark) {return ((name, inputs, definit
   if (at < 0) return null;
   return `define(${name == null ? "null" : JSON.stringify(name)}, [${inputs.map((i) => JSON.stringify(i)).join(", ")}], ${text.slice(0, at) + text.slice(at + raw_mark.length)})`;
 });};
-const _ss8_0 = function _raw_language(raw_mark,langTag,raw_decompile,runtime,globalThis,raw_parse,raw_script_msg,raw_compile,realize,repositionSetElement,raw_lead,raw_highlight) {
+const _ss8_0 = function _raw_language(raw_mark,langTag,raw_decompile,runtime,globalThis,raw_parse,raw_script_msg,raw_compile,realize,repositionSetElement,raw_lead,raw_to_ojs,raw_from_ojs,raw_highlight) {
   const isRaw = (v) => typeof v?._definition === "function" && String(v._definition).includes(raw_mark) && langTag(v._definition) === "raw";
   const moduleOf = (variables, cell) => variables.find((v) => v?._module)?._module ?? cell?.module?.module;
   const decompile = async (variables) => {
@@ -3298,13 +3298,66 @@ const _ss8_0 = function _raw_language(raw_mark,langTag,raw_decompile,runtime,glo
     return { from: open + 1, to: pos, mode: "string", options: [...[...names].map((label) => ({ label, type: "variable" })), ...builtins.filter((n) => !names.has(n)).map((label) => ({ label, type: "constant" }))] };
   };
   const claimsSource = (source) => /^\s*define\s*\(/.test(source);
-  return { id: "raw", label: "raw", claimsSource, decompile, apply, lint, complete, highlight: (text) => raw_highlight(text), extension: (codemirror) => codemirror.javascript() };
+  // the editor's language picker: a raw cell as Observable JavaScript, and Observable JavaScript as a raw cell
+  const toBuiltin = (source, variables = [], cell, target = "ojs") => target === "ojs" ? raw_to_ojs(source) : { reason: "a raw cell translates to Observable JavaScript, not Notebook Kit JavaScript" };
+  const fromBuiltin = (source, variables = [], cell, { lang, compiled } = {}) => lang === "ojs" && compiled ? raw_from_ojs(compiled) : { reason: "only Observable JavaScript translates to a raw cell" };
+  return { id: "raw", label: "raw", claimsSource, decompile, apply, lint, complete, toBuiltin, fromBuiltin, highlight: (text) => raw_highlight(text), extension: (codemirror) => codemirror.javascript() };
 };
-const _ss9_0 = function _raw_registration(plugins,raw_language,invalidation,md) {
+const _ss9_0 = function _raw_body_uses() {return ((fn) => {
+  // what a function's body does at its own level: await and yield outside nested functions, and this
+  // outside nested non-arrow functions (an arrow sees the this of the function around it)
+  const seen = { await: false, yield: false, this: false };
+  const walk = (n, inArrow) => {
+    if (!n || typeof n.type !== "string") return;
+    if (!inArrow && (n.type === "AwaitExpression" || (n.type === "ForOfStatement" && n.await))) seen.await = true;
+    if (!inArrow && n.type === "YieldExpression") seen.yield = true;
+    if (n.type === "ThisExpression") seen.this = true;
+    if (n.type === "FunctionExpression" || n.type === "FunctionDeclaration") return;
+    const arrow = inArrow || n.type === "ArrowFunctionExpression";
+    for (const c of Object.values(n)) for (const k of Array.isArray(c) ? c : [c]) if (k && typeof k === "object") walk(k, arrow);
+  };
+  walk(fn.body, false);
+  return seen;
+});};
+const _ss10_0 = function _raw_to_ojs(raw_parse,acorn,raw_body_uses,compile) {return ((source) => {
+  // a raw cell as Observable JavaScript, name = body: {text}, or {reason} when the cell would not be the same
+  // cell (other inputs, async or a generator by other rules, another this)
+  const p = raw_parse(source);
+  if (p.error) return { reason: `the text is not a raw cell: ${p.error}` };
+  const comments = [];
+  const fn = acorn.parseExpressionAt(p.fn, 0, { ecmaVersion: "latest", onComment: comments });
+  const params = fn.params.map((x) => (x.type === "Identifier" ? x.name : "…"));
+  if (params.join(",") !== p.inputs.join(",")) return { reason: `the parameters (${params.join(", ")}) are not the inputs (${p.inputs.join(", ")}); an Observable JavaScript cell reads each input by its name` };
+  const uses = raw_body_uses(fn);
+  if (fn.async && !uses.await) return { reason: "the function is async and has no await of its own; an Observable JavaScript cell is async when its body awaits" };
+  if (fn.generator && !uses.yield) return { reason: "the function is a generator and has no yield of its own; an Observable JavaScript cell is a generator when its body yields" };
+  if (fn.type === "ArrowFunctionExpression" && uses.this) return { reason: "the arrow function reads this; in an Observable JavaScript cell this is the cell's previous value" };
+  // a block of one return, with no comment outside the returned value, is written as the value
+  const one = fn.body.type === "BlockStatement" && fn.body.body.length === 1 && fn.body.body[0].type === "ReturnStatement" ? fn.body.body[0].argument : null;
+  const bare = one && !comments.some((c) => c.start < one.start || c.end > one.end) ? one : fn.expression ? fn.body : null;
+  const body = bare ? p.fn.slice(bare.start, bare.end) : p.fn.slice(fn.body.start, fn.body.end);
+  const text = (p.name === null ? "" : `${p.name} = `) + (bare && ["ObjectExpression", "SequenceExpression"].includes(bare.type) ? `(${body})` : body);
+  let vars;
+  try { vars = compile(text); } catch (e) { return { reason: `as Observable JavaScript the text does not compile: ${e?.message ?? e}` }; }
+  const reads = vars.length === 1 ? [...vars[0]._inputs].sort().join(", ") : null;
+  if (vars.length !== 1 || (vars[0]._name ?? null) !== p.name) return { reason: `${p.name === null ? "an anonymous cell" : JSON.stringify(p.name)} is not a name an Observable JavaScript cell takes` };
+  if (reads !== [...p.inputs].sort().join(", ")) return { reason: `as Observable JavaScript the cell would read ${reads || "nothing"}, not its inputs ${p.inputs.join(", ") || "(none)"}` };
+  return { text };
+});};
+const _ss11_0 = function _raw_from_ojs(raw_parse) {return ((compiled) => {
+  // Observable JavaScript as a raw cell: its one compiled variable written out. {text} or {reason}. A compiled cell
+  // of another language (a SoundScript cell) is written out too; its language's tag comment stays in the function
+  if (compiled.length !== 1) return { reason: `this text makes ${compiled.length} variables (${compiled.map((v) => v.name ?? "anonymous").join(", ")}); a raw cell is one variable` };
+  const [v] = compiled;
+  const text = `define(${v.name == null ? "null" : JSON.stringify(v.name)}, [${v.inputs.map((i) => JSON.stringify(i)).join(", ")}], ${v.definition})`;
+  const p = raw_parse(text);
+  return p.error ? { reason: `written out, the text is not a raw cell: ${p.error}` } : { text };
+});};
+const _ss12_0 = function _raw_registration(plugins,raw_language,invalidation,md) {
   plugins.add("cell_languages", raw_language, { invalidation });
   return md`Raw cells are registered as the editor language \`${raw_language.id}\`.`;
 };
-const _ss10_0 = function _raw_highlight(codemirror,lezerhighlight) {
+const _ss13_0 = function _raw_highlight(codemirror,lezerhighlight) {
   // JavaScript colouring with the editor's own parser, as spans with CodeMirror's tok-* classes
   const lang = codemirror.javascript().language;
   return (text) => {
@@ -3322,9 +3375,9 @@ const _ss10_0 = function _raw_highlight(codemirror,lezerhighlight) {
     return out;
   };
 };
-const _ss11_0 = function _raw_module(thisModule) {return (thisModule());};
-const _ss11_1 = (G, _) => G.input(_);
-const _ss12_0 = async function _test_raw_roundtrip(raw_compile,langTag,realize,runtime,raw_decompile) {
+const _ss14_0 = function _raw_module(thisModule) {return (thisModule());};
+const _ss14_1 = (G, _) => G.input(_);
+const _ss15_0 = async function _test_raw_roundtrip(raw_compile,langTag,realize,runtime,raw_decompile) {
   const cases = [
     'define("area", ["width", "height"], function (width, height) { return width * height; })',
     'define(null, [], () => 1)',
@@ -3343,7 +3396,7 @@ const _ss12_0 = async function _test_raw_roundtrip(raw_compile,langTag,realize,r
   }
   return `${cases.length} sources decompile to themselves`;
 };
-const _ss13_0 = async function _test_raw_broken_keeps_text(raw_compile,realize,runtime,langTag,raw_decompile) {
+const _ss16_0 = async function _test_raw_broken_keeps_text(raw_compile,realize,runtime,langTag,raw_decompile) {
   const src = 'define("bad", ["a"], (a) => { return a + ; })\n// <\/script> in a comment';
   const d = raw_compile(src);
   const [fn] = await realize([d.definition], runtime);
@@ -3357,7 +3410,7 @@ const _ss13_0 = async function _test_raw_broken_keeps_text(raw_compile,realize,r
   if (!tag.error || raw_decompile(tag.name, tag.inputs, (await realize([tag.definition], runtime))[0]) !== 'define("s", [], () => "<\/script>")') throw new Error("a closing script tag in the body is not stored as an error with its text");
   return `${threw.message} | ${tag.error}`;
 };
-const _ss14_0 = function _test_raw_lint(raw_module,raw_language,runtime) {
+const _ss17_0 = function _test_raw_lint(raw_module,raw_language,runtime) {
   const m = raw_module;
   const msgs = (src) => raw_language.lint(src, [], { module: { module: m } }).map((d) => `${d.severity}: ${d.message}`);
   const a = msgs('define("a1", ["raw_mark"], () => 1)');
@@ -3382,12 +3435,31 @@ const _ss14_0 = function _test_raw_lint(raw_module,raw_language,runtime) {
   if (JSON.stringify(spans) !== JSON.stringify([`'it\\'s'`, '"ab_nope"', '"b_nope"'])) throw new Error(JSON.stringify(spans));
   return [a[0], b[0], c[0], d[0], f[0]].join(" | ");
 };
-const _ss15_0 = function _test_raw_complete(raw_language,raw_module) {
+const _ss18_0 = function _test_raw_complete(raw_language,raw_module) {
   const src = 'define("c1", ["raw_m", "x"], (a) => a)';
   const r = raw_language.complete(src, src.indexOf("raw_m") + 5, [], { module: { module: raw_module } });
   if (!r || r.from !== src.indexOf("raw_m") || !r.options.some((o) => o.label === "raw_mark")) throw new Error(JSON.stringify(r && { from: r.from, n: r.options.length }));
   if (raw_language.complete(src, src.indexOf("(a)") + 1, [], { module: { module: raw_module } }) !== null) throw new Error("completion outside the inputs array");
   return `${r.options.length} names offered inside the inputs array`;
+};
+const _ss19_0 = function _test_raw_translate(compile,raw_to_ojs,raw_from_ojs) {
+  // the language picker's translations, both ways, and the cells each refuses
+  const ojsOf = (text) => compile(text).map((v) => ({ name: v._name ?? null, inputs: v._inputs ?? [], definition: String(v._definition) }));
+  const to = [
+    ['define("area", ["width", "height"], function (width, height) { return width * height; })', "area = width * height"],
+    ['define("a", ["w"], function (w) {\n  // kept\n  return w;\n})', "a = {\n  // kept\n  return w;\n}"],
+    ['define(null, [], () => ({ a: 1 }))', "({ a: 1 })"],
+    ['define("g", [], async function* () { yield await 1; })', "g = { yield await 1; }"]
+  ];
+  for (const [raw, ojs] of to) if (raw_to_ojs(raw).text !== ojs) throw new Error(`${raw} gave ${JSON.stringify(raw_to_ojs(raw))}`);
+  const refused = ['define("k", ["a"], (b) => b)', 'define("x", [], async () => 1)', 'define("t", [], () => this)', 'define("u", ["a"], (a) => 1)', 'define("viewof v", [], () => 1)', 'define("k", ["a"], (a) => '];
+  for (const raw of refused) if (!raw_to_ojs(raw).reason) throw new Error(`${raw} was not refused: ${JSON.stringify(raw_to_ojs(raw))}`);
+  const back = raw_from_ojs(ojsOf("x = a + 1"));
+  if (!back.text || raw_to_ojs(back.text).text !== "x = a + 1") throw new Error(`x = a + 1 gave ${JSON.stringify(back)}`);
+  if (!raw_from_ojs(ojsOf("viewof v = 1")).reason) throw new Error("a viewof cell was not refused");
+  const tagged = raw_from_ojs([{ name: "h", inputs: [], definition: 'function _h(){return(/*{lang:"ss"}*/1)}' }]).text;
+  if (tagged !== 'define("h", [], function _h(){return(/*{lang:"ss"}*/1)})') throw new Error(`a tagged definition gave ${tagged}`);
+  return `${to.length} raw cells as Observable JavaScript, ${refused.length} refused; x = a + 1 there and back`;
 };
 
 export default function define(runtime, observer) {
@@ -3410,15 +3482,19 @@ export default function define(runtime, observer) {
   $def("_ss5_0", "raw_parse", ["raw_lead","acorn"], _ss5_0);
   $def("_ss6_0", "raw_compile", ["raw_parse","raw_mark","raw_escape","raw_script_msg","acorn"], _ss6_0);
   $def("_ss7_0", "raw_decompile", ["raw_mark"], _ss7_0);
-  $def("_ss8_0", "raw_language", ["raw_mark","langTag","raw_decompile","runtime","globalThis","raw_parse","raw_script_msg","raw_compile","realize","repositionSetElement","raw_lead","raw_highlight"], _ss8_0);
-  $def("_ss9_0", "raw_registration", ["plugins","raw_language","invalidation","md"], _ss9_0);
-  $def("_ss10_0", "raw_highlight", ["codemirror","lezerhighlight"], _ss10_0);
-  $def("_ss11_0", "viewof raw_module", ["thisModule"], _ss11_0);
-  $def("_ss11_1", "raw_module", ["Generators","viewof raw_module"], _ss11_1);
-  $def("_ss12_0", "test_raw_roundtrip", ["raw_compile","langTag","realize","runtime","raw_decompile"], _ss12_0);
-  $def("_ss13_0", "test_raw_broken_keeps_text", ["raw_compile","realize","runtime","langTag","raw_decompile"], _ss13_0);
-  $def("_ss14_0", "test_raw_lint", ["raw_module","raw_language","runtime"], _ss14_0);
-  $def("_ss15_0", "test_raw_complete", ["raw_language","raw_module"], _ss15_0);
+  $def("_ss8_0", "raw_language", ["raw_mark","langTag","raw_decompile","runtime","globalThis","raw_parse","raw_script_msg","raw_compile","realize","repositionSetElement","raw_lead","raw_to_ojs","raw_from_ojs","raw_highlight"], _ss8_0);
+  $def("_ss9_0", "raw_body_uses", [], _ss9_0);
+  $def("_ss10_0", "raw_to_ojs", ["raw_parse","acorn","raw_body_uses","compile"], _ss10_0);
+  $def("_ss11_0", "raw_from_ojs", ["raw_parse"], _ss11_0);
+  $def("_ss12_0", "raw_registration", ["plugins","raw_language","invalidation","md"], _ss12_0);
+  $def("_ss13_0", "raw_highlight", ["codemirror","lezerhighlight"], _ss13_0);
+  $def("_ss14_0", "viewof raw_module", ["thisModule"], _ss14_0);
+  $def("_ss14_1", "raw_module", ["Generators","viewof raw_module"], _ss14_1);
+  $def("_ss15_0", "test_raw_roundtrip", ["raw_compile","langTag","realize","runtime","raw_decompile"], _ss15_0);
+  $def("_ss16_0", "test_raw_broken_keeps_text", ["raw_compile","realize","runtime","langTag","raw_decompile"], _ss16_0);
+  $def("_ss17_0", "test_raw_lint", ["raw_module","raw_language","runtime"], _ss17_0);
+  $def("_ss18_0", "test_raw_complete", ["raw_language","raw_module"], _ss18_0);
+  $def("_ss19_0", "test_raw_translate", ["compile","raw_to_ojs","raw_from_ojs"], _ss19_0);
   main.define("module @tomlarkworthy/plugin-registry", [], async () => runtime.module((await import("/@tomlarkworthy/plugin-registry.js?v=4")).default));
   main.define("plugins", ["module @tomlarkworthy/plugin-registry","@variable"], (_, v) => v.import("plugins", _));
   main.define("module @tomlarkworthy/runtime-sdk", [], async () => runtime.module((await import("/@tomlarkworthy/runtime-sdk.js?v=4")).default));
@@ -3430,6 +3506,8 @@ export default function define(runtime, observer) {
   main.define("langTag", ["module @tomlarkworthy/cell-map","@variable"], (_, v) => v.import("langTag", _));
   main.define("module @tomlarkworthy/acorn-8-11-3", [], async () => runtime.module((await import("/@tomlarkworthy/acorn-8-11-3.js?v=4")).default));
   main.define("acorn", ["module @tomlarkworthy/acorn-8-11-3","@variable"], (_, v) => v.import("acorn", _));
+  main.define("module @tomlarkworthy/observablejs-toolchain", [], async () => runtime.module((await import("/@tomlarkworthy/observablejs-toolchain.js?v=4")).default));
+  main.define("compile", ["module @tomlarkworthy/observablejs-toolchain","@variable"], (_, v) => v.import("compile", _));
   main.define("module @tomlarkworthy/codemirror-6-v2", [], async () => runtime.module((await import("/@tomlarkworthy/codemirror-6-v2.js?v=4")).default));
   main.define("codemirror", ["module @tomlarkworthy/codemirror-6-v2","@variable"], (_, v) => v.import("codemirror", _));
   main.define("module @tomlarkworthy/observablehq-lezer", [], async () => runtime.module((await import("/@tomlarkworthy/observablehq-lezer.js?v=4")).default));
@@ -17951,14 +18029,20 @@ const maxIter = (): StateCell<number> => state(600);
 const y0 = () => 0;
 const y1 = () => 1;
 
+// The view: the point of the plane at the centre of the picture, and the width of the plane that the picture shows.
+type View = { readonly cx: number; readonly cy: number; readonly span: number };
+const home = () => (): View => ({ cx: -0.75, cy: 0, span: 3.5 });
+const view = (home: () => View): StateCell<View> => state<View>(home());
+
 // Escape-time Mandelbrot for rows y0 up to y1, four bytes (RGBA) per pixel. The smooth
 // iteration count goes through a cosine palette, dark indigo far out through steel blue to gold near the set; points that never escape are black.
-const rows = (width: number, height: number, maxIter: number, y0: number, y1: number) => {
+const rows = (width: number, height: number, maxIter: number, view: View, y0: number, y1: number) => {
   const out = new Uint8ClampedArray((y1 - y0) * width * 4);
+  const scale = view.span / width;
   for (let y = y0; y < y1; y++) {
-    const ci = (y - height / 2) * (3.5 / width);
+    const ci = view.cy + (y - height / 2) * scale;
     for (let x = 0; x < width; x++) {
-      const cr = (x / width) * 3.5 - 2.5;
+      const cr = view.cx + (x - width / 2) * scale;
       let zr = 0, zi = 0, i = 0;
       while (i < maxIter && zr * zr + zi * zi < 256) {
         const t = zr * zr - zi * zi + cr;
@@ -17983,10 +18067,10 @@ const rows = (width: number, height: number, maxIter: number, y0: number, y1: nu
 // compile turns the island into an ordinary async function. inputs become its argument, refs are
 // read from the graph whenever they change (a new function each time), outputs are its result.
 const inPool = (compile: Compile, pool: Pool) =>
-  compile({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter"], outputs: ["rows"], options: { runtime: pool } });
+  compile({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter", "view"], outputs: ["rows"], options: { runtime: pool } });
 // The same island, run on the main thread, for comparison.
 const onMain = (compile: Compile) =>
-  compile({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter"], outputs: ["rows"] });
+  compile({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter", "view"], outputs: ["rows"] });
 
 // Four bands of rows per worker; the pool runs the calls in parallel.
 const poolSize = (pool: Pool) => pool.size;
@@ -18007,10 +18091,25 @@ const image = async (inPool, bands, width: number, height: number) => {
 };
 
 const setMaxIter = (maxIter: State<number>) => action((s: string) => maxIter.set(Number(s)));
-const app = (maxIter: number, setMaxIter: Action<[string]>) => (
-  <label>
-    iterations <input type="range" min={50} max={3000} step={50} value={maxIter} onInput={setMaxIter} /> <output>{maxIter}</output>
-  </label>
+
+// A click on the picture zooms in two times; the point clicked becomes the centre. x and y are canvas pixels.
+const zoomIn = (view: State<View>, width: number, height: number) =>
+  action((p: PointerData) => view.update((v) => ({ cx: v.cx + (p.x - width / 2) * (v.span / width), cy: v.cy + (p.y - height / 2) * (v.span / width), span: v.span / 2 })));
+const zoomOut = (view: State<View>) => action(() => view.update((v) => ({ ...v, span: v.span * 2 })));
+const reset = (view: State<View>, home: () => View) => action(() => view.set(home()));
+
+// The picture is drawn by the page; this transparent canvas lies on it and takes the clicks.
+const clicks = (width: number, height: number, zoomIn: Action<[PointerData]>) => (
+  <canvas width={width} height={height} style="position:absolute;left:0;top:0;width:100%;height:100%;cursor:zoom-in" onPointerDown={zoomIn} />
+);
+const app = (maxIter: number, view: View, setMaxIter: Action<[string]>, zoomOut: Action<[]>, reset: Action<[]>) => (
+  <div>
+    <label>
+      iterations <input type="range" min={50} max={3000} step={50} value={maxIter} onInput={setMaxIter} /> <output>{maxIter}</output>
+    </label>{" "}
+    <button onClick={zoomOut}>zoom out</button> <button onClick={reset}>reset</button>{" "}
+    <output>{`zoom ${3.5 / view.span}×, centre ${view.cx.toFixed(8)} ${view.cy < 0 ? "−" : "+"} ${Math.abs(view.cy).toFixed(8)}i`}</output>
+  </div>
 );
 </script>
 <script id="@tomlarkworthy/soundscript-tutorial/08-reject-jsx.tsx" 
@@ -18332,25 +18431,29 @@ const _ss39_0 = function _anonymous(md) {return (md`## 7. Running cells on other
 
 A cell that uses only its inputs can run on any thread. \`compile\` takes a group of cells and returns an ordinary async function. With a worker pool, the function runs the cells off the main thread. The checker works out the type of the function from the cells that it names.
 
-A pool of workers computes this Mandelbrot set in bands. Move the slider to change the iteration count.`);};
+A pool of workers computes this Mandelbrot set in bands. Move the slider to change the iteration count. A click on the picture zooms in two times. The point clicked becomes the centre. **zoom out** halves the zoom. **reset** shows the whole set again. The workers compute each new picture.`);};
 const _ss40_0 = function _workers_view(framed,soundscript,workers_app) {return (framed(soundscript.mount(workers_app, this)));};
-const _ss41_0 = function _workers_picture(htl,workers_width,workers_height,workers_image) {
-  const canvas = this ?? htl.html`<canvas class="lite-mandel">`;
+const _ss41_0 = function _workers_picture(htl,workers_width,workers_height,workers_image,soundscript,workers_clicks) {
+  // the picture drawn from workers_image, with workers_clicks (a transparent canvas) on it to take the clicks
+  const box = this ?? htl.html`<div class="lite-mandel-box"><canvas class="lite-mandel"></canvas></div>`;
+  const canvas = box.firstChild;
   canvas.width = workers_width;
   canvas.height = workers_height;
   const data = new ImageData(workers_width, workers_height);
   data.data.set(workers_image);
   canvas.getContext("2d").putImageData(data, 0, 0);
-  return canvas;
+  const layer = soundscript.mount(workers_clicks, box.children[1] ?? null);
+  if (box.children[1] !== layer) box.replaceChildren(canvas, layer);
+  return box;
 };
-const _ss42_0 = function _workers_redraw(workers_picture,workers_maxIterAt,htl,workers_maxIter,workers_width,workers_height,workers_bands,workers_poolSize) {
-  // workers_maxIterAt runs when maxIter changes, before image is computed, so this is slider to picture.
+const _ss42_0 = function _workers_redraw(workers_picture,workers_changedAt,htl,workers_maxIter,workers_width,workers_height,workers_bands,workers_poolSize) {
+  // workers_changedAt runs when maxIter or view changes, before image is computed, so this is change to picture.
   // At boot the time includes loading the page, so none is shown.
   workers_picture;
-  const ms = (performance.now() - workers_maxIterAt.at).toFixed(0);
-  return htl.html`<div class="lite-readout">${workers_maxIter} iterations, ${workers_width}×${workers_height}: ${workers_maxIterAt.boot ? "move the slider to time a redraw" : `redrawn ${ms} ms after the slider moved (${workers_bands.length} bands in ${workers_poolSize} workers, then drawn on the canvas)`}</div>`;
+  const ms = (performance.now() - workers_changedAt.at).toFixed(0);
+  return htl.html`<div class="lite-readout">${workers_maxIter} iterations, ${workers_width}×${workers_height}: ${workers_changedAt.boot ? "move the slider or click the picture to time a redraw" : `redrawn ${ms} ms after the change (${workers_bands.length} bands in ${workers_poolSize} workers, then drawn on the canvas)`}</div>`;
 };
-const _ss43_0 = function _workers_maxIterAt(workers_maxIter) {return (workers_maxIter, { at: performance.now(), boot: this === undefined });};
+const _ss43_0 = function _workers_changedAt(workers_maxIter,workers_zoom) {return (workers_maxIter, workers_zoom, { at: performance.now(), boot: this === undefined });};
 const _ss44_0 = function _anonymous(md) {return (md`**Try it.** Press **measure again**. The table times the same cells on the main thread and in the pool. It also checks that both give the same bytes.`);};
 const _ss45_0 = function _remeasure(Inputs) {return (Inputs.button("measure again"));};
 const _ss45_1 = (G, _) => G.input(_);
@@ -18477,7 +18580,7 @@ const _ss76_0 = function _anonymous(ss_highlightCode,md) {return (ss_highlightCo
 const inPool = (compile: Compile, pool: Pool) =>
   compile({
     inputs: ["y0", "y1"],                  // the function's argument: { y0, y1 }
-    refs: ["width", "height", "maxIter"],  // read from the graph each time this cell runs
+    refs: ["width", "height", "maxIter", "view"],  // read from the graph each time this cell runs
     outputs: ["rows"],                     // the result: Promise<{ rows }>
     options: { runtime: pool },            // a worker pool; leave it out to run on the main thread
   });
@@ -18487,7 +18590,7 @@ The *island* is every cell upstream of the outputs. It stops at the inputs and r
 
 **The type.** The checker computes the type from the cell graph. \`inPool\` is \`(args: { y0: number; y1: number }) => Promise<{ rows: Uint8ClampedArray }>\` (see its type column in section 7). \`image\` uses it without an annotation. Let \`C\` be the map of the module from cell name to value type. Then the type is \`(args: Pick<C, Inputs>) => Promise<Pick<C, Outputs>>\`. TypeScript cannot check that without \`C\`. Thus the checker gives the call its type, and the reference checker built on TypeScript cannot compare it. The names must be literal strings. Any other form is \`unsupported\`.
 
-**The reactive link.** Each name in \`refs\` is a hidden input of the cell that calls \`compile\`, after its parameters. \`areaFn\` in section 6 takes \`scale\` this way. When you move the slider in section 7, \`maxIter\` changes. \`inPool\` runs again and returns a new function that contains the new value. \`image\` computes again because its input changed. The pool drops work that is still in the queue for the old function.
+**The reactive link.** Each name in \`refs\` is a hidden input of the cell that calls \`compile\`, after its parameters. \`areaFn\` in section 6 takes \`scale\` this way. When you move the slider in section 7, \`maxIter\` changes. \`inPool\` runs again and returns a new function that contains the new value. \`image\` computes again because its input changed. The pool drops work that is still in the queue for the old function. A click on the picture changes \`view\`. \`view\` is in \`refs\` too, so a click has the same effect.
 
 **The rules.** The fixtures of the checker test each of these rejections. A name must be a cell. An island cell must be accepted and synchronous, and must take no capability and no state cell (put the state cell in \`refs\`). Inputs, refs and outputs must survive \`structuredClone\` (no functions, state handles or actions). \`options.runtime\` must be a \`Pool\`. A call must agree with the computed argument type. \`compile\` does not run unless the checker accepts the calling cell and every island cell (\`test_compile_refuses_unchecked\`). There is no other guard. The code of the island runs in the worker with no sandbox, and only the checker keeps it to its inputs.
 
@@ -18809,31 +18912,20 @@ const _ss96_0 = function _anonymous(md) {return (md`These limits apply to all of
 - Two parts of the renderer are trusted code: the code that changes an event into data (\`PointerData\` from a \`PointerEvent\`, a string from an \`input\`), and the code that reads and writes the DOM.
 - A SoundScript cell can take a function from a cell in another language. The notebook checks each result of that function against its type. It does not check that the function gives equal results for equal arguments, that it ends, or that it writes nothing. The function is trusted for these.
 - The reference checker does not read JSX. Thus only this checker checks a \`.tsx\` source, the JSX rules and the \`compile\` rules.`);};
-const _ss97_0 = function _anonymous(md) {return (md`## Not built
-
-These items were discussed on 2026-11-14. None of them is in the checker or in this page.
-
-- **Effects as tagged libraries.** \`state\`, \`action\`, \`Events\` and \`on\` are special cases inside the checker. The proposal moves them into declaration files. Tags in those files (\`@write\`, \`@handle\`, \`@cell\`) tell the checker what each function can do. A new type of effect would then need a library and no change to the checker.
-- **Actors.** A library on those tags: an inbox cell, a post action, and the messages of the inbox as \`Events<M>\`. A \`mailbox\` primitive in the checker was proposed and rejected.
-- **Label, do not reject.** The checker would accept \`Math.random\` and label the cell *unsound*, and would not reject it. It would also label every cell that takes a capability from that cell. A \`sound(...)\` marker would change the label back into an error.
-- **Typed reflection.** A typed \`Variable\` and \`Module<C>\`. The checker would then check a cell that defines or redefines other cells, and a new definition would cause a check of the cells downstream. This needs \`keyof\`, bounds and indexed access, which the checker does not have.
-- **Results kept across a reload.** The saved file would store the result of a deterministic cell. The notebook would use the stored result when the inputs are the same.
-- **Export to ObservableHQ.** The compiled cells are ordinary JavaScript. The marker comments and the editor hook are only in this notebook.
-- **\`now\` and \`random\` per cell.** Every cell that takes \`now\` gets the same \`ss_now\` of the core. Every cell that takes \`random\` gets the same \`ss_random\`. A recorded or seeded source for each cell is not built.`);};
-const _ss98_0 = function _anonymous(md) {return (md`## Tests
+const _ss97_0 = function _anonymous(md) {return (md`## Tests
 
 The tests do not run until **run the tests** is on. Each test of this module takes \`tests_on\`, which stays pending until then. There are two exceptions, \`test_half\` and \`test_shop_total\`. They are part of the examples of sections 1 and 10, and they run when the page loads. The Breakout tests play a copy of the cells of section 9 (\`ss_instance\`), not the game on this page. \`test_ss_counter\` presses **add one** and **clear** on a copy of the counter of section 4. Thus the counter on the page keeps its count. The tests of the section modules (\`test_undo\`, \`test_replay\`) are fast and always run. The tests of the core are in the core tab, with their own switch.`);};
-const _ss99_0 = function _run_tests(Inputs) {
+const _ss98_0 = function _run_tests(Inputs) {
   const toggle = Inputs.toggle({ label: "run the tests" });
   toggle.classList.add("lite-tests-toggle");
   return toggle;
 };
-const _ss99_1 = (G, _) => G.input(_);
-const _ss100_0 = function _tests_on(run_tests,invalidation) {return (run_tests ? true : invalidation);};
-const _ss101_0 = function _testsView(testTable,tutorial_module,reducer_module,model_module,workers_module,breakout_module,invalidation) {return (testTable([["tutorial", tutorial_module], ["reducer", reducer_module], ["model", model_module], ["workers", workers_module], ["breakout", breakout_module]], invalidation));};
-const _ss102_0 = function _test_examples_check_as_expected(tests_on,soundscript,examples) {
+const _ss98_1 = (G, _) => G.input(_);
+const _ss99_0 = function _tests_on(run_tests,invalidation) {return (run_tests ? true : invalidation);};
+const _ss100_0 = function _testsView(testTable,tutorial_module,reducer_module,model_module,workers_module,breakout_module,invalidation) {return (testTable([["tutorial", tutorial_module], ["reducer", reducer_module], ["model", model_module], ["workers", workers_module], ["breakout", breakout_module]], invalidation));};
+const _ss101_0 = function _test_examples_check_as_expected(tests_on,soundscript,examples) {
   tests_on;
-  const want = { cells: [7, 0], errors: [8, 4], mut: [4, 0], counter: [6, 0], reducer: [10, 0], model: [10, 0], workers: [13, 0], rejectJsx: [17, 11], game: [21, 0] };
+  const want = { cells: [7, 0], errors: [8, 4], mut: [4, 0], counter: [6, 0], reducer: [10, 0], model: [10, 0], workers: [19, 0], rejectJsx: [17, 11], game: [21, 0] };
   const got = {};
   for (const [k, [n, rejected]] of Object.entries(want)) {
     const r = soundscript.checkSources({ cells: examples[k], tsx: k !== "cells" && k !== "errors" && k !== "mut" });
@@ -18843,28 +18935,28 @@ const _ss102_0 = function _test_examples_check_as_expected(tests_on,soundscript,
   }
   return got;
 };
-const _ss103_0 = async function _test_compile_pool_matches_main(tests_on,workers_image,workers_onMain,workers_height,workers_bands) {
+const _ss102_0 = async function _test_compile_pool_matches_main(tests_on,workers_image,workers_onMain,workers_height,workers_bands) {
   tests_on;
   const image = await workers_image;
   const main = await workers_onMain({ y0: 0, y1: workers_height });
   if (main.rows.length !== image.length || !main.rows.every((v, i) => v === image[i])) throw new Error("pool and main thread differ");
   return `${image.length} bytes from ${workers_bands.length} pool calls equal one main-thread call`;
 };
-const _ss104_0 = function _test_compile_refuses_unchecked(tests_on,examples,soundscript) {
+const _ss103_0 = function _test_compile_refuses_unchecked(tests_on,examples,soundscript) {
   tests_on;
   // the workers example with one island cell made to read Math.random, which the checker rejects
   const source = examples.workers.replace("out[at + 3] = 255;", "out[at + 3] = Math.random();");
   if (source === examples.workers) throw new Error("rows no longer writes out[at + 3] = 255; update this test");
   const c = soundscript.compiler(() => source);
   try {
-    c.for("inPool", { width: 8, height: 8, maxIter: 10 })({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter"], outputs: ["rows"] });
+    c.for("inPool", { width: 8, height: 8, maxIter: 10, view: { cx: -0.75, cy: 0, span: 3.5 } })({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter", "view"], outputs: ["rows"] });
   } catch (e) {
     if (!/^compile refused: (\w+, )*rows not ok/.test(e.message)) throw e;
     return e.message;
   }
   throw new Error("compile ran an island with a rejected cell");
 };
-const _ss105_0 = function _runsOf(observe) {
+const _ss104_0 = function _runsOf(observe) {
   // computations the runtime started for a variable since runsOf first saw it, the one it then held included:
   // the pending calls of an observer (runtime-sdk observe), one per computation and one on attaching
   const counts = new WeakMap();
@@ -18874,7 +18966,7 @@ const _ss105_0 = function _runsOf(observe) {
     return c.n;
   };
 };
-const _ss106_0 = async function _test_breakout_listener(tests_on,ss_instance,breakout_module,invalidation,soundscript) {
+const _ss105_0 = async function _test_breakout_listener(tests_on,ss_instance,breakout_module,invalidation,soundscript) {
   tests_on;
   // its own copy of section 9's cells: the game on the page is not played or reset
   const game = await ss_instance(breakout_module, invalidation);
@@ -18900,7 +18992,7 @@ const _ss106_0 = async function _test_breakout_listener(tests_on,ss_instance,bre
   if (listeners !== 1 || get("ticks") !== h0) throw new Error(`${listeners} listeners on ticks, same handle ${get("ticks") === h0}`);
   return `play: the clock runs and the ball moved ${w0.ball.y} -> ${w1.ball.y.toFixed(1)}; pause: it stops and the world stays the same object; ticks kept its handle, with one listener`;
 };
-const _ss107_0 = async function _test_breakout_memo(test_breakout_listener,ss_instance,breakout_module,invalidation,runsOf,observe,soundscript,MutationObserver) {
+const _ss106_0 = async function _test_breakout_memo(test_breakout_listener,ss_instance,breakout_module,invalidation,runsOf,observe,soundscript,MutationObserver) {
   test_breakout_listener; // both count clocks pulled, so they run one after the other
   const game = await ss_instance(breakout_module, invalidation);
   const get = (n) => game._scope.get(n)._value;
@@ -18944,17 +19036,17 @@ const _ss107_0 = async function _test_breakout_memo(test_breakout_listener,ss_in
   if ((muts.childList ?? 0) > broken) throw new Error(`${muts.childList} nodes added or removed for ${broken} broken bricks`);
   return { frames, worldChanges: changes, broken, runs: ran, domMutations: muts };
 };
-const _ss108_0 = function _anonymous(md) {return (md`## Appendix: the declarations JSX is checked against
+const _ss107_0 = function _anonymous(md) {return (md`## Appendix: the declarations JSX is checked against
 
 The checker's own declarations, as this page's bundle carries them. A tag not listed is an error (\`<blink>\` in section 8).`);};
-const _ss109_0 = function _anonymous(htl,soundscript) {return (htl.html`<pre class="lite-src">${soundscript.JSX_DECLS.trim()}</pre>`);};
-const _ss110_0 = function _anonymous(md) {return (md`## Appendix: this notebook's code
+const _ss108_0 = function _anonymous(htl,soundscript) {return (htl.html`<pre class="lite-src">${soundscript.JSX_DECLS.trim()}</pre>`);};
+const _ss109_0 = function _anonymous(md) {return (md`## Appendix: this notebook's code
 
 Compiled cells take what they use from \`@tomlarkworthy/soundscript-runtime\`, one input per cell used (\`ss_action\`, \`ss_ref\`): the library that live cells call (state, actions, events, the JSX renderer), as ordinary cells. The checker and the per-cell compiler are the object \`soundscript\` of \`@tomlarkworthy/soundscript-checker\`, also ordinary cells, which this module's listings and tests use. The build generates both modules from the TypeScript sources. Only the parser, a third-party library, is a gzipped attachment. The example sources are attachments of this module, and the boxes and \`test_examples_check_as_expected\` read them; the live cells were compiled from the same files when the notebook was built.
 
 Before each group of lesson cells is a \`sourceListing\` cell of this module. It shows the group's source, decompiled from the cells' live definitions and read again when the module's code changes, coloured with the editor's TypeScript parser (the core's \`ss_highlight\`). The lesson cells after it are shown as any cell is: a value with the normal Inspector, an action, a function, a listener, an events cell or a type as one line drawn by the core's \`ss_language.inspect\`, an element mounted, and a cell that does not check as its error.`);};
 const _raw_ss_bytes = function _ss_bytes() {return ({ raw: 234934, gz: 63930 });};
-const _ss112_0 = function _checkTime(soundscript,examples) {
+const _ss111_0 = function _checkTime(soundscript,examples) {
   const ts = [];
   for (let i = 0; i < 20; i++) {
     const t0 = performance.now();
@@ -18963,7 +19055,7 @@ const _ss112_0 = function _checkTime(soundscript,examples) {
   }
   return ts.sort((a, b) => a - b)[10];
 };
-const _ss113_0 = async function _examples(FileAttachment) {return ({
+const _ss112_0 = async function _examples(FileAttachment) {return ({
   cells: await FileAttachment("01-cells.ts").text(),
   errors: await FileAttachment("02-errors.ts").text(),
   mut: await FileAttachment("03-mut.ts").text(),
@@ -18974,15 +19066,15 @@ const _ss113_0 = async function _examples(FileAttachment) {return ({
   rejectJsx: await FileAttachment("08-reject-jsx.tsx").text(),
   game: await FileAttachment("09-breakout.tsx").text()
 });};
-const _ss114_0 = function _sourceListing(cellListing) {return ((module, invalidation, range) => {
+const _ss113_0 = function _sourceListing(cellListing) {return ((module, invalidation, range) => {
   // the core's language-agnostic cellListing, in this page's listing style
   const pre = cellListing(module, invalidation, range);
   pre.classList.add("lite-code", "lite-listing");
   return pre;
 });};
-const _ss115_0 = function _badge(htl) {return ((status, text = status) => htl.html`<span class=${"lite-badge lite-badge-" + status}>${text}</span>`);};
-const _ss116_0 = function _isStale() {return ((e) => typeof e === "function" && e.name === "variable_stale");};
-const _ss117_0 = function _fmt() {return ((v) => {
+const _ss114_0 = function _badge(htl) {return ((status, text = status) => htl.html`<span class=${"lite-badge lite-badge-" + status}>${text}</span>`);};
+const _ss115_0 = function _isStale() {return ((e) => typeof e === "function" && e.name === "variable_stale");};
+const _ss116_0 = function _fmt() {return ((v) => {
   if (typeof v === "function") return "ƒ";
   if (typeof v === "number") return Number.isNaN(v) ? "NaN" : String(v);
   if (v === undefined) return "undefined";
@@ -18992,17 +19084,17 @@ const _ss117_0 = function _fmt() {return ((v) => {
   try { s = JSON.stringify(v); } catch (e) { s = String(v); }
   return s === undefined ? String(v) : s.length > 90 ? s.slice(0, 87) + "..." : s;
 });};
-const _ss118_0 = function _sourceBox(Inputs) {return ((value, { rows } = {}) => {
+const _ss117_0 = function _sourceBox(Inputs) {return ((value, { rows } = {}) => {
   const box = Inputs.textarea({ value, rows: rows ?? value.split("\n").length + 1, monospace: true, spellcheck: false, width: "100%", resize: true });
   box.classList.add("lite-box");
   return box;
 });};
-const _ss119_0 = function _framed() {return ((node) => {
+const _ss118_0 = function _framed() {return ((node) => {
   // the renderer patches only the props it set, so a class added here stays
   node.classList?.add("lite-app");
   return node;
 });};
-const _ss120_0 = function _depGraph(htl,ss_check,innerWidth,onCodeChange,queueMicrotask,ResizeObserver) {return ((module, invalidation, { only = null } = {}) => {
+const _ss119_0 = function _depGraph(htl,ss_check,innerWidth,onCodeChange,queueMicrotask,ResizeObserver) {return ((module, invalidation, { only = null } = {}) => {
   // The module's cells as a graph drawn from the checker's facts: an arrow from each parameter's cell
   // to the cell that takes it. Redrawn when the module's code changes.
   const CAPS = new Set(["now", "random", "fetch", "log", "invalidation", "compile", "pool"]);
@@ -19147,7 +19239,7 @@ const _ss120_0 = function _depGraph(htl,ss_check,innerWidth,onCodeChange,queueMi
   draw();
   return holder;
 });};
-const _ss121_0 = function _testTable(htl,badge,runtime,observe,fmt,isStale,onCodeChange,queueMicrotask) {return ((modules, invalidation) => {
+const _ss120_0 = function _testTable(htl,badge,runtime,observe,fmt,isStale,onCodeChange,queueMicrotask) {return ((modules, invalidation) => {
   // every test_* variable of the given modules, with its state as it arrives; rebuilt when their code changes
   const body = htl.html`<tbody>`, summary = htl.html`<div class="lite-summary">`;
   let cancels = [], queued = false, generation = 0;
@@ -19185,7 +19277,7 @@ const _ss121_0 = function _testTable(htl,badge,runtime,observe,fmt,isStale,onCod
   invalidation.then(() => { off(); cancels.forEach((c) => c()); });
   return htl.html`<div class="lite-tests">${summary}<div class="lite-scroll"><table class="lite-panel"><thead><tr><th>module</th><th>test</th><th>state</th><th>value</th></tr></thead>${body}</table></div></div>`;
 });};
-const _ss122_0 = function _checkBox(soundscript,htl,badge) {return ((src, { tsx = false } = {}) => {
+const _ss121_0 = function _checkBox(soundscript,htl,badge) {return ((src, { tsx = false } = {}) => {
   let checked;
   try { checked = soundscript.checkSources({ cells: src, tsx }); }
   catch (e) { return htl.html`<div class="lite-panel lite-err">${e.message}</div>`; }
@@ -19202,7 +19294,7 @@ const _ss122_0 = function _checkBox(soundscript,htl,badge) {return ((src, { tsx 
   return htl.html`<div class="lite-lesson"><div class="lite-summary">${checked.cells.length} cells: ${count("ok")} ok, ${count("rejected")} rejected, ${count("unsupported")} unsupported, ${count("blocked")} blocked. Checked in ${checked.ms.toFixed(1)} ms.</div>${checked.module.map((e) => htl.html`<div class="lite-err">line ${e.line} <b>[${e.rule}]</b> ${e.msg}</div>`)}
 <div class="lite-scroll"><table class="lite-panel"><thead><tr><th>cell</th><th>check</th><th>type</th></tr></thead>${body}</table></div></div>`;
 });};
-const _ss123_0 = function _kindOf(soundscript) {return ((v) => {
+const _ss122_0 = function _kindOf(soundscript) {return ((v) => {
   const d = String(v._definition);
   if (v._name.startsWith("viewof ")) return "state cell: the handle";
   if (d === soundscript.STATE_VALUE) return "state cell: the value";
@@ -19215,7 +19307,7 @@ const _ss123_0 = function _kindOf(soundscript) {return ((v) => {
   const extra = k.refs.length ? ", compile refs as inputs" : k.callee === "apply" ? ", taking runtime cells (ss_<name>)" : "";
   return `cell: its function applied to its inputs${extra}`;
 });};
-const _ss124_0 = function _liveRows(htl,observe,isStale,queueMicrotask,onCodeChange) {return ((module, invalidation, { head, cells, row, cls = "" }) => {
+const _ss123_0 = function _liveRows(htl,observe,isStale,queueMicrotask,onCodeChange) {return ((module, invalidation, { head, cells, row, cls = "" }) => {
   // A table of module's SoundScript variables, drawn on change only: all rows when the module's code
   // changes (onCodeChange), one row's live part when its variable computes (observe).
   const body = htl.html`<tbody>`;
@@ -19235,7 +19327,7 @@ const _ss124_0 = function _liveRows(htl,observe,isStale,queueMicrotask,onCodeCha
   invalidation.then(() => { off(); cancels.forEach((c) => c()); });
   return htl.html`<div class="lite-scroll"><table class=${"lite-panel " + cls}>${head}${body}</table></div>`;
 });};
-const _ss125_0 = function _moduleTable(ss_check,liveRows,htl,ss_moduleCells,soundscript,fmt,runsOf,badge) {return ((module, invalidation) => {
+const _ss124_0 = function _moduleTable(ss_check,liveRows,htl,ss_moduleCells,soundscript,fmt,runsOf,badge) {return ((module, invalidation) => {
   // verdicts come from the module's source, checked again when its code changes
   const verdicts = () => ss_check(module).result;
   return liveRows(module, invalidation, {
@@ -19252,7 +19344,7 @@ const _ss125_0 = function _moduleTable(ss_check,liveRows,htl,ss_moduleCells,soun
     },
   });
 });};
-const _ss126_0 = function _variableTable(liveRows,htl,runtime,ss_isSs,runsOf,kindOf) {return ((module, invalidation) => liveRows(module, invalidation, {
+const _ss125_0 = function _variableTable(liveRows,htl,runtime,ss_isSs,runsOf,kindOf) {return ((module, invalidation) => liveRows(module, invalidation, {
   cls: "lite-vars",
   head: htl.html`<thead><tr><th>variable</th><th>inputs</th><th>kind</th><th>runs</th></tr></thead>`,
   cells: () => [...runtime._variables].filter((v) => v._module === module && typeof v._name === "string" && ss_isSs(v)).map((variable) => ({ variable })),
@@ -19263,7 +19355,7 @@ const _ss126_0 = function _variableTable(liveRows,htl,runtime,ss_isSs,runsOf,kin
     return { update, tr: htl.html`<tr><td><code>${v._name}</code></td><td><code>${v._inputs.map((i) => i._name).join(", ")}</code></td><td>${kindOf(v)}</td>${runs}</tr>` };
   },
 }));};
-const _ss127_0 = async function _benchmark(remeasure,workers_bands,workers_inPool,workers_onMain,workers_image,workers_poolSize) {
+const _ss126_0 = async function _benchmark(remeasure,workers_bands,workers_inPool,workers_onMain,workers_image,workers_poolSize) {
   remeasure;
   const bands = workers_bands, inPool = workers_inPool, onMain = workers_onMain;
   await workers_image;
@@ -19277,7 +19369,7 @@ const _ss127_0 = async function _benchmark(remeasure,workers_bands,workers_inPoo
   const median = (xs) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)];
   return { poolSize: workers_poolSize, hardware: navigator.hardwareConcurrency, bands: bands.length, runs, mainMs: median(main), poolMs: median(pool), same };
 };
-const _ss128_0 = function _style(htl,ss_hl_css) {return (htl.html`<style>
+const _ss127_0 = function _style(htl,ss_hl_css) {return (htl.html`<style>
 :root {
   --lite-ok: #2f9e44;
   --lite-bad: var(--theme-error, #d6336c);
@@ -19321,8 +19413,9 @@ ${ss_hl_css}
 .lite-summary, .lite-readout { font-size: 13px; margin: 6px 0; color: var(--lite-muted-text); }
 .lite-readout { font-family: var(--monospace, monospace); color: var(--theme-foreground); }
 .lite-game canvas { touch-action: none; }
-.observablehq[cell="workers_maxIterAt"], .observablehq[cell="workers_maxIterAt"] + div { display: none; }
-.lite-mandel { display: block; max-width: 100%; height: auto; margin: 6px 0; border-radius: 4px; }
+.observablehq[cell="workers_changedAt"], .observablehq[cell="workers_changedAt"] + div { display: none; }
+.lite-mandel-box { position: relative; width: fit-content; max-width: 100%; margin: 6px 0; }
+.lite-mandel { display: block; max-width: 100%; height: auto; border-radius: 4px; }
 .lite-vars { margin-top: 10px; }
 .lite-app { padding: 8px 10px; margin: 6px 0; border: 1px solid var(--theme-foreground-faint); border-radius: 6px; background: var(--theme-background-alt); }
 .lite-app output { font-variant-numeric: tabular-nums; }
@@ -19383,15 +19476,15 @@ ${ss_hl_css}
 .lp2-pane .observablehq pre, .lp2-pane .observablehq--inspect { overflow-x: auto; max-width: 100%; }
 .lp2-pane .observablehq--inspect { display: block; }
 </style>`);};
-const _ss129_0 = function _tutorial_module(thisModule) {return (thisModule());};
-const _ss129_1 = (G, _) => G.input(_);
-const _ss130_0 = function _test_ss_roundtrip(tests_on,ss_roundtrip,tutorial_module) {
+const _ss128_0 = function _tutorial_module(thisModule) {return (thisModule());};
+const _ss128_1 = (G, _) => G.input(_);
+const _ss129_0 = function _test_ss_roundtrip(tests_on,ss_roundtrip,tutorial_module) {
   tests_on;
   const n = ss_roundtrip(tutorial_module);
   if (n < 33) throw new Error(`only ${n} SoundScript variables found`);
   return `${n} variables recompile to the same text and inputs`;
 };
-const _ss131_0 = function _test_ss_module_checks(tests_on,ss_check,tutorial_module) {
+const _ss130_0 = function _test_ss_module_checks(tests_on,ss_check,tutorial_module) {
   tests_on;
   const { result } = ss_check(tutorial_module);
   const got = Object.fromEntries(result.cells.map((c) => [c.name, c.status]));
@@ -19483,9 +19576,9 @@ export default function define(runtime, observer) {
   $def("_ss38_0", null, ["md"], _ss38_0);
   $def("_ss39_0", null, ["md"], _ss39_0);
   $def("_ss40_0", "workers_view", ["framed","soundscript","workers_app"], _ss40_0);
-  $def("_ss41_0", "workers_picture", ["htl","workers_width","workers_height","workers_image"], _ss41_0);
-  $def("_ss42_0", "workers_redraw", ["workers_picture","workers_maxIterAt","htl","workers_maxIter","workers_width","workers_height","workers_bands","workers_poolSize"], _ss42_0);
-  $def("_ss43_0", "workers_maxIterAt", ["workers_maxIter"], _ss43_0);
+  $def("_ss41_0", "workers_picture", ["htl","workers_width","workers_height","workers_image","soundscript","workers_clicks"], _ss41_0);
+  $def("_ss42_0", "workers_redraw", ["workers_picture","workers_changedAt","htl","workers_maxIter","workers_width","workers_height","workers_bands","workers_poolSize"], _ss42_0);
+  $def("_ss43_0", "workers_changedAt", ["workers_maxIter","workers_zoom"], _ss43_0);
   $def("_ss44_0", null, ["md"], _ss44_0);
   $def("_ss45_0", "viewof remeasure", ["Inputs"], _ss45_0);
   $def("_ss45_1", "remeasure", ["Generators","viewof remeasure"], _ss45_1);
@@ -19562,42 +19655,41 @@ export default function define(runtime, observer) {
   $def("_ss95_0", "sizes", ["htl","ss_bytes","checkTime"], _ss95_0);
   $def("_ss96_0", null, ["md"], _ss96_0);
   $def("_ss97_0", null, ["md"], _ss97_0);
-  $def("_ss98_0", null, ["md"], _ss98_0);
-  $def("_ss99_0", "viewof run_tests", ["Inputs"], _ss99_0);
-  $def("_ss99_1", "run_tests", ["Generators","viewof run_tests"], _ss99_1);
-  $def("_ss100_0", "tests_on", ["run_tests","invalidation"], _ss100_0);
-  $def("_ss101_0", "testsView", ["testTable","tutorial_module","reducer_module","model_module","workers_module","breakout_module","invalidation"], _ss101_0);
-  $def("_ss102_0", "test_examples_check_as_expected", ["tests_on","soundscript","examples"], _ss102_0);
-  $def("_ss103_0", "test_compile_pool_matches_main", ["tests_on","workers_image","workers_onMain","workers_height","workers_bands"], _ss103_0);
-  $def("_ss104_0", "test_compile_refuses_unchecked", ["tests_on","examples","soundscript"], _ss104_0);
-  $def("_ss105_0", "runsOf", ["observe"], _ss105_0);
-  $def("_ss106_0", "test_breakout_listener", ["tests_on","ss_instance","breakout_module","invalidation","soundscript"], _ss106_0);
-  $def("_ss107_0", "test_breakout_memo", ["test_breakout_listener","ss_instance","breakout_module","invalidation","runsOf","observe","soundscript","MutationObserver"], _ss107_0);
-  $def("_ss108_0", null, ["md"], _ss108_0);
-  $def("_ss109_0", null, ["htl","soundscript"], _ss109_0);
-  $def("_ss110_0", null, ["md"], _ss110_0);
+  $def("_ss98_0", "viewof run_tests", ["Inputs"], _ss98_0);
+  $def("_ss98_1", "run_tests", ["Generators","viewof run_tests"], _ss98_1);
+  $def("_ss99_0", "tests_on", ["run_tests","invalidation"], _ss99_0);
+  $def("_ss100_0", "testsView", ["testTable","tutorial_module","reducer_module","model_module","workers_module","breakout_module","invalidation"], _ss100_0);
+  $def("_ss101_0", "test_examples_check_as_expected", ["tests_on","soundscript","examples"], _ss101_0);
+  $def("_ss102_0", "test_compile_pool_matches_main", ["tests_on","workers_image","workers_onMain","workers_height","workers_bands"], _ss102_0);
+  $def("_ss103_0", "test_compile_refuses_unchecked", ["tests_on","examples","soundscript"], _ss103_0);
+  $def("_ss104_0", "runsOf", ["observe"], _ss104_0);
+  $def("_ss105_0", "test_breakout_listener", ["tests_on","ss_instance","breakout_module","invalidation","soundscript"], _ss105_0);
+  $def("_ss106_0", "test_breakout_memo", ["test_breakout_listener","ss_instance","breakout_module","invalidation","runsOf","observe","soundscript","MutationObserver"], _ss106_0);
+  $def("_ss107_0", null, ["md"], _ss107_0);
+  $def("_ss108_0", null, ["htl","soundscript"], _ss108_0);
+  $def("_ss109_0", null, ["md"], _ss109_0);
   $def("_raw_ss_bytes", "ss_bytes", [], _raw_ss_bytes);
-  $def("_ss112_0", "checkTime", ["soundscript","examples"], _ss112_0);
-  $def("_ss113_0", "examples", ["FileAttachment"], _ss113_0);
-  $def("_ss114_0", "sourceListing", ["cellListing"], _ss114_0);
-  $def("_ss115_0", "badge", ["htl"], _ss115_0);
-  $def("_ss116_0", "isStale", [], _ss116_0);
-  $def("_ss117_0", "fmt", [], _ss117_0);
-  $def("_ss118_0", "sourceBox", ["Inputs"], _ss118_0);
-  $def("_ss119_0", "framed", [], _ss119_0);
-  $def("_ss120_0", "depGraph", ["htl","ss_check","innerWidth","onCodeChange","queueMicrotask","ResizeObserver"], _ss120_0);
-  $def("_ss121_0", "testTable", ["htl","badge","runtime","observe","fmt","isStale","onCodeChange","queueMicrotask"], _ss121_0);
-  $def("_ss122_0", "checkBox", ["soundscript","htl","badge"], _ss122_0);
-  $def("_ss123_0", "kindOf", ["soundscript"], _ss123_0);
-  $def("_ss124_0", "liveRows", ["htl","observe","isStale","queueMicrotask","onCodeChange"], _ss124_0);
-  $def("_ss125_0", "moduleTable", ["ss_check","liveRows","htl","ss_moduleCells","soundscript","fmt","runsOf","badge"], _ss125_0);
-  $def("_ss126_0", "variableTable", ["liveRows","htl","runtime","ss_isSs","runsOf","kindOf"], _ss126_0);
-  $def("_ss127_0", "benchmark", ["remeasure","workers_bands","workers_inPool","workers_onMain","workers_image","workers_poolSize"], _ss127_0);
-  $def("_ss128_0", "style", ["htl","ss_hl_css"], _ss128_0);
-  $def("_ss129_0", "viewof tutorial_module", ["thisModule"], _ss129_0);
-  $def("_ss129_1", "tutorial_module", ["Generators","viewof tutorial_module"], _ss129_1);
-  $def("_ss130_0", "test_ss_roundtrip", ["tests_on","ss_roundtrip","tutorial_module"], _ss130_0);
-  $def("_ss131_0", "test_ss_module_checks", ["tests_on","ss_check","tutorial_module"], _ss131_0);
+  $def("_ss111_0", "checkTime", ["soundscript","examples"], _ss111_0);
+  $def("_ss112_0", "examples", ["FileAttachment"], _ss112_0);
+  $def("_ss113_0", "sourceListing", ["cellListing"], _ss113_0);
+  $def("_ss114_0", "badge", ["htl"], _ss114_0);
+  $def("_ss115_0", "isStale", [], _ss115_0);
+  $def("_ss116_0", "fmt", [], _ss116_0);
+  $def("_ss117_0", "sourceBox", ["Inputs"], _ss117_0);
+  $def("_ss118_0", "framed", [], _ss118_0);
+  $def("_ss119_0", "depGraph", ["htl","ss_check","innerWidth","onCodeChange","queueMicrotask","ResizeObserver"], _ss119_0);
+  $def("_ss120_0", "testTable", ["htl","badge","runtime","observe","fmt","isStale","onCodeChange","queueMicrotask"], _ss120_0);
+  $def("_ss121_0", "checkBox", ["soundscript","htl","badge"], _ss121_0);
+  $def("_ss122_0", "kindOf", ["soundscript"], _ss122_0);
+  $def("_ss123_0", "liveRows", ["htl","observe","isStale","queueMicrotask","onCodeChange"], _ss123_0);
+  $def("_ss124_0", "moduleTable", ["ss_check","liveRows","htl","ss_moduleCells","soundscript","fmt","runsOf","badge"], _ss124_0);
+  $def("_ss125_0", "variableTable", ["liveRows","htl","runtime","ss_isSs","runsOf","kindOf"], _ss125_0);
+  $def("_ss126_0", "benchmark", ["remeasure","workers_bands","workers_inPool","workers_onMain","workers_image","workers_poolSize"], _ss126_0);
+  $def("_ss127_0", "style", ["htl","ss_hl_css"], _ss127_0);
+  $def("_ss128_0", "viewof tutorial_module", ["thisModule"], _ss128_0);
+  $def("_ss128_1", "tutorial_module", ["Generators","viewof tutorial_module"], _ss128_1);
+  $def("_ss129_0", "test_ss_roundtrip", ["tests_on","ss_roundtrip","tutorial_module"], _ss129_0);
+  $def("_ss130_0", "test_ss_module_checks", ["tests_on","ss_check","tutorial_module"], _ss130_0);
   $def("_raw_test_ss_counter", "test_ss_counter", ["tests_on","ss_instance","tutorial_module"], _raw_test_ss_counter);
   main.define("module @tomlarkworthy/soundscript", [], async () => runtime.module((await import("/@tomlarkworthy/soundscript.js?v=4")).default));
   main.define("soundscript", ["module @tomlarkworthy/soundscript","@variable"], (_, v) => v.import("soundscript", _));
@@ -19623,6 +19715,8 @@ export default function define(runtime, observer) {
   main.define("model_module", ["module @tomlarkworthy/soundscript-model","@variable"], (_, v) => v.import("model_module", _));
   main.define("module @tomlarkworthy/soundscript-mandelbrot", [], async () => runtime.module((await import("/@tomlarkworthy/soundscript-mandelbrot.js?v=4")).default));
   main.define("workers_app", ["module @tomlarkworthy/soundscript-mandelbrot","@variable"], (_, v) => v.import("app", "workers_app", _));
+  main.define("workers_clicks", ["module @tomlarkworthy/soundscript-mandelbrot","@variable"], (_, v) => v.import("clicks", "workers_clicks", _));
+  main.define("workers_zoom", ["module @tomlarkworthy/soundscript-mandelbrot","@variable"], (_, v) => v.import("view", "workers_zoom", _));
   main.define("workers_image", ["module @tomlarkworthy/soundscript-mandelbrot","@variable"], (_, v) => v.import("image", "workers_image", _));
   main.define("workers_width", ["module @tomlarkworthy/soundscript-mandelbrot","@variable"], (_, v) => v.import("width", "workers_width", _));
   main.define("workers_height", ["module @tomlarkworthy/soundscript-mandelbrot","@variable"], (_, v) => v.import("height", "workers_height", _));
@@ -19817,12 +19911,17 @@ const _ss_viewof_maxIter = function _maxIter(ss_state,ss_ref) { const state = ss
 const _ss_maxIter = (G, _) => G.input(_);
 const _ss_y0 = function _y0(ss_out) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const y0 = ","t":";"}*/() => 0)(), "y0", 1));};
 const _ss_y1 = function _y1(ss_out) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const y1 = ","t":";"}*/() => 1)(), "y1", 1));};
-const _ss_rows = function _rows(ss_out,width,height,maxIter,y0,y1) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// Escape-time Mandelbrot for rows y0 up to y1, four bytes (RGBA) per pixel. The smooth\n// iteration count goes through a cosine palette, dark indigo far out through steel blue to gold near the set; points that never escape are black.\nconst rows = ","t":";"}*/(width/*ss:: number*/, height/*ss:: number*/, maxIter/*ss:: number*/, y0/*ss:: number*/, y1/*ss:: number*/) => {
+const _ss_$ss$type$View = function _$ss$type$View() {return (void /*{lang:"ss"}*//*ss^{"d":"// The view: the point of the plane at the centre of the picture, and the width of the plane that the picture shows.\ntype View = { readonly cx: number; readonly cy: number; readonly span: number };"}*/0);};
+const _ss_home = function _home(ss_out) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const home = ","t":";"}*/() => ()/*ss:: View*/ => ({ cx: -0.75, cy: 0, span: 3.5 }))(), "home", 1));};
+const _ss_viewof_view = function _view(ss_state,ss_ref,home) { const state = ss_state; return ss_ref(this, "view", [home], /*{lang:"ss"}*//*ss^{"h":"const view = ","t":";"}*/(home/*ss:: () => View*/)/*ss:: StateCell<View>*/ => state/*ss:<View>*/(home())); };
+const _ss_view = (G, _) => G.input(_);
+const _ss_rows = function _rows(ss_out,width,height,maxIter,view,y0,y1) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// Escape-time Mandelbrot for rows y0 up to y1, four bytes (RGBA) per pixel. The smooth\n// iteration count goes through a cosine palette, dark indigo far out through steel blue to gold near the set; points that never escape are black.\nconst rows = ","t":";"}*/(width/*ss:: number*/, height/*ss:: number*/, maxIter/*ss:: number*/, view/*ss:: View*/, y0/*ss:: number*/, y1/*ss:: number*/) => {
   const out = new Uint8ClampedArray((y1 - y0) * width * 4);
+  const scale = view.span / width;
   for (let y = y0; y < y1; y++) {
-    const ci = (y - height / 2) * (3.5 / width);
+    const ci = view.cy + (y - height / 2) * scale;
     for (let x = 0; x < width; x++) {
-      const cr = (x / width) * 3.5 - 2.5;
+      const cr = view.cx + (x - width / 2) * scale;
       let zr = 0, zi = 0, i = 0;
       while (i < maxIter && zr * zr + zi * zi < 256) {
         const t = zr * zr - zi * zi + cr;
@@ -19842,11 +19941,11 @@ const _ss_rows = function _rows(ss_out,width,height,maxIter,y0,y1) {return (ss_o
     }
   }
   return out;
-})(width, height, maxIter, y0, y1), "rows", 1));};
-const _ss_inPool = function _inPool(ss_out,ss_compileFor,ss_compile,width,height,maxIter,ss_pool) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// compile turns the island into an ordinary async function. inputs become its argument, refs are\n// read from the graph whenever they change (a new function each time), outputs are its result.\nconst inPool = ","t":";"}*/(compile/*ss:: Compile*/, pool/*ss:: Pool*/) =>
-  compile({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter"], outputs: ["rows"], options: { runtime: pool } }))(ss_compileFor(ss_compile, "inPool", {"width": width, "height": height, "maxIter": maxIter}), ss_pool), "inPool"));};
-const _ss_onMain = function _onMain(ss_out,ss_compileFor,ss_compile,width,height,maxIter) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// The same island, run on the main thread, for comparison.\nconst onMain = ","t":";"}*/(compile/*ss:: Compile*/) =>
-  compile({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter"], outputs: ["rows"] }))(ss_compileFor(ss_compile, "onMain", {"width": width, "height": height, "maxIter": maxIter})), "onMain"));};
+})(width, height, maxIter, view, y0, y1), "rows", 1));};
+const _ss_inPool = function _inPool(ss_out,ss_compileFor,ss_compile,width,height,maxIter,view,ss_pool) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// compile turns the island into an ordinary async function. inputs become its argument, refs are\n// read from the graph whenever they change (a new function each time), outputs are its result.\nconst inPool = ","t":";"}*/(compile/*ss:: Compile*/, pool/*ss:: Pool*/) =>
+  compile({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter", "view"], outputs: ["rows"], options: { runtime: pool } }))(ss_compileFor(ss_compile, "inPool", {"width": width, "height": height, "maxIter": maxIter, "view": view}), ss_pool), "inPool"));};
+const _ss_onMain = function _onMain(ss_out,ss_compileFor,ss_compile,width,height,maxIter,view) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// The same island, run on the main thread, for comparison.\nconst onMain = ","t":";"}*/(compile/*ss:: Compile*/) =>
+  compile({ inputs: ["y0", "y1"], refs: ["width", "height", "maxIter", "view"], outputs: ["rows"] }))(ss_compileFor(ss_compile, "onMain", {"width": width, "height": height, "maxIter": maxIter, "view": view})), "onMain"));};
 const _ss_poolSize = function _poolSize(ss_out,ss_pool) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// Four bands of rows per worker; the pool runs the calls in parallel.\nconst poolSize = ","t":";"}*/(pool/*ss:: Pool*/) => pool.size)(ss_pool), "poolSize", 1));};
 const _ss_bands = function _bands(ss_out,ss_closure,height,poolSize) {return (ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const bands = ","t":";"}*/(height/*ss:: number*/, poolSize/*ss:: number*/) => {
   const n = poolSize * 4;
@@ -19863,18 +19962,28 @@ const _ss_image = function _image(ss_out,inPool,bands,width,height) {return (ss_
   return out;
 /*ss+*/} finally { ss_out.exit(ss_g); }/*ss-*/})(inPool, bands, width, height), "image", 3));};
 const _ss_setMaxIter = function _setMaxIter(ss_action,ss_out,$0) { const action = ss_action; return ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const setMaxIter = ","t":";"}*/(maxIter/*ss:: State<number>*/) => action((s/*ss:: string*/) => maxIter.set(Number(s))))($0), "setMaxIter", 1); };
-const _ss_app = function _app(ss_h,ss_out,maxIter,setMaxIter) { const h = ss_h; return ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const app = ","t":";"}*/(maxIter/*ss:: number*/, setMaxIter/*ss:: Action<[string]>*/) => (
-  /*ss<"<label>\n    iterations <input type=\"range\" min={50} max={3000} step={50} value={maxIter} onInput={setMaxIter} /> <output>{maxIter}</output>\n  </label>"*/h("label", {}, " iterations ", h("input", {"type": "range", "min": 50, "max": 3000, "step": 50, "value": maxIter, "onInput": setMaxIter}), " ", h("output", {}, maxIter))/*ss>*/
-))(maxIter, setMaxIter), "app", 1); };
-const _ss2_0 = function _picture(width,height,image) {
-  const canvas = this ?? document.createElement("canvas");
+const _ss_zoomIn = function _zoomIn(ss_action,ss_out,ss_closure,$0,width,height) { const action = ss_action; return ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// A click on the picture zooms in two times; the point clicked becomes the centre. x and y are canvas pixels.\nconst zoomIn = ","t":";"}*/(view/*ss:: State<View>*/, width/*ss:: number*/, height/*ss:: number*/) =>
+  action((p/*ss:: PointerData*/) => view.update(/*ss+*/ss_closure(/*ss-*/(v) => ({ cx: v.cx + (p.x - width / 2) * (v.span / width), cy: v.cy + (p.y - height / 2) * (v.span / width), span: v.span / 2 })/*ss+*/, (ss_i) => ss_i < 0 ? 1 : p)/*ss-*/)))($0, width, height), "zoomIn", 1); };
+const _ss_zoomOut = function _zoomOut(ss_action,ss_out,$0) { const action = ss_action; return ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const zoomOut = ","t":";"}*/(view/*ss:: State<View>*/) => action(() => view.update((v) => ({ ...v, span: v.span * 2 }))))($0), "zoomOut", 1); };
+const _ss_reset = function _reset(ss_action,ss_out,$0,home) { const action = ss_action; return ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const reset = ","t":";"}*/(view/*ss:: State<View>*/, home/*ss:: () => View*/) => action(() => view.set(home())))($0, home), "reset", 1); };
+const _ss_clicks = function _clicks(ss_h,ss_out,width,height,zoomIn) { const h = ss_h; return ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"// The picture is drawn by the page; this transparent canvas lies on it and takes the clicks.\nconst clicks = ","t":";"}*/(width/*ss:: number*/, height/*ss:: number*/, zoomIn/*ss:: Action<[PointerData]>*/) => (
+  /*ss<"<canvas width={width} height={height} style=\"position:absolute;left:0;top:0;width:100%;height:100%;cursor:zoom-in\" onPointerDown={zoomIn} />"*/h("canvas", {"width": width, "height": height, "style": "position:absolute;left:0;top:0;width:100%;height:100%;cursor:zoom-in", "onPointerDown": zoomIn})/*ss>*/
+))(width, height, zoomIn), "clicks", 1); };
+const _ss_app = function _app(ss_h,ss_out,maxIter,view,setMaxIter,zoomOut,reset) { const h = ss_h; return ss_out.cell(() => (/*{lang:"ss"}*//*ss^{"h":"const app = ","t":";"}*/(maxIter/*ss:: number*/, view/*ss:: View*/, setMaxIter/*ss:: Action<[string]>*/, zoomOut/*ss:: Action<[]>*/, reset/*ss:: Action<[]>*/) => (
+  /*ss<"<div>\n    <label>\n      iterations <input type=\"range\" min={50} max={3000} step={50} value={maxIter} onInput={setMaxIter} /> <output>{maxIter}</output>\n    </label>{\" \"}\n    <button onClick={zoomOut}>zoom out</button> <button onClick={reset}>reset</button>{\" \"}\n    <output>{`zoom ${3.5 / view.span}×, centre ${view.cx.toFixed(8)} ${view.cy < 0 ? \"−\" : \"+\"} ${Math.abs(view.cy).toFixed(8)}i`}</output>\n  </div>"*/h("div", {}, h("label", {}, " iterations ", h("input", {"type": "range", "min": 50, "max": 3000, "step": 50, "value": maxIter, "onInput": setMaxIter}), " ", h("output", {}, maxIter)), " ", h("button", {"onClick": zoomOut}, "zoom out"), " ", h("button", {"onClick": reset}, "reset"), " ", h("output", {}, `zoom ${3.5 / view.span}×, centre ${view.cx.toFixed(8)} ${view.cy < 0 ? "−" : "+"} ${Math.abs(view.cy).toFixed(8)}i`))/*ss>*/
+))(maxIter, view, setMaxIter, zoomOut, reset), "app", 1); };
+const _ss2_0 = function _picture(htl,width,height,image,soundscript,clicks) {
+  // the picture drawn from image, with clicks (a transparent canvas) on it to take the clicks
+  const box = this ?? htl.html`<div style="position: relative; width: fit-content; max-width: 100%"><canvas style="display: block; max-width: 100%; height: auto"></canvas></div>`;
+  const canvas = box.firstChild;
   canvas.width = width;
   canvas.height = height;
-  canvas.style.maxWidth = "100%";
   const data = new ImageData(width, height);
   data.data.set(image);
   canvas.getContext("2d").putImageData(data, 0, 0);
-  return canvas;
+  const layer = soundscript.mount(clicks, box.children[1] ?? null);
+  if (box.children[1] !== layer) box.replaceChildren(canvas, layer);
+  return box;
 };
 const _ss3_0 = function _ss_compile(soundscript,ss_source,workers_module) {return (soundscript.compiler(() => ss_source(workers_module)));};
 const _ss4_0 = function _workers_module(thisModule) {return (thisModule());};
@@ -19899,15 +20008,23 @@ export default function define(runtime, observer) {
   $def("_ss_maxIter", "maxIter", ["Generators","viewof maxIter"], _ss_maxIter);
   $def("_ss_y0", "y0", ["ss_out"], _ss_y0);
   $def("_ss_y1", "y1", ["ss_out"], _ss_y1);
-  $def("_ss_rows", "rows", ["ss_out","width","height","maxIter","y0","y1"], _ss_rows);
-  $def("_ss_inPool", "inPool", ["ss_out","ss_compileFor","ss_compile","width","height","maxIter","ss_pool"], _ss_inPool);
-  $def("_ss_onMain", "onMain", ["ss_out","ss_compileFor","ss_compile","width","height","maxIter"], _ss_onMain);
+  $def("_ss_$ss$type$View", "$ss$type$View", [], _ss_$ss$type$View);
+  $def("_ss_home", "home", ["ss_out"], _ss_home);
+  $def("_ss_viewof_view", "viewof view", ["ss_state","ss_ref","home"], _ss_viewof_view);
+  $def("_ss_view", "view", ["Generators","viewof view"], _ss_view);
+  $def("_ss_rows", "rows", ["ss_out","width","height","maxIter","view","y0","y1"], _ss_rows);
+  $def("_ss_inPool", "inPool", ["ss_out","ss_compileFor","ss_compile","width","height","maxIter","view","ss_pool"], _ss_inPool);
+  $def("_ss_onMain", "onMain", ["ss_out","ss_compileFor","ss_compile","width","height","maxIter","view"], _ss_onMain);
   $def("_ss_poolSize", "poolSize", ["ss_out","ss_pool"], _ss_poolSize);
   $def("_ss_bands", "bands", ["ss_out","ss_closure","height","poolSize"], _ss_bands);
   $def("_ss_image", "image", ["ss_out","inPool","bands","width","height"], _ss_image);
   $def("_ss_setMaxIter", "setMaxIter", ["ss_action","ss_out","viewof maxIter"], _ss_setMaxIter);
-  $def("_ss_app", "app", ["ss_h","ss_out","maxIter","setMaxIter"], _ss_app);
-  $def("_ss2_0", "picture", ["width","height","image"], _ss2_0);
+  $def("_ss_zoomIn", "zoomIn", ["ss_action","ss_out","ss_closure","viewof view","width","height"], _ss_zoomIn);
+  $def("_ss_zoomOut", "zoomOut", ["ss_action","ss_out","viewof view"], _ss_zoomOut);
+  $def("_ss_reset", "reset", ["ss_action","ss_out","viewof view","home"], _ss_reset);
+  $def("_ss_clicks", "clicks", ["ss_h","ss_out","width","height","zoomIn"], _ss_clicks);
+  $def("_ss_app", "app", ["ss_h","ss_out","maxIter","view","setMaxIter","zoomOut","reset"], _ss_app);
+  $def("_ss2_0", "picture", ["htl","width","height","image","soundscript","clicks"], _ss2_0);
   $def("_ss3_0", "ss_compile", ["soundscript","ss_source","workers_module"], _ss3_0);
   $def("_ss4_0", "viewof workers_module", ["thisModule"], _ss4_0);
   $def("_ss4_1", "workers_module", ["Generators","viewof workers_module"], _ss4_1);
@@ -30597,13 +30714,16 @@ const _e6pick = function _languagePicker(cellLanguagesRef,cellLanguage,languageC
   const builtin = (id) => id === "ojs" || id === "js";
   const registered = (id) => cellLanguagesRef.current.find((l) => l.id === id) ?? null;
   // The text in language from, rewritten in language to: {text}, {reason}, or {} to keep the text as it is
-  // (the {} a new cell is made with, ojs <-> js, or a language without toBuiltin/fromBuiltin).
+  // (the {} a new cell is made with, ojs <-> js, or text of a language not loaded, which the editor shows as the
+  // built-in decompilation). A loaded language without toBuiltin/fromBuiltin gives a reason.
   // Registered languages translate through Observable JavaScript.
   const translate = (text, from, to) => {
     if (from === to || text.trim() === "{}" || (builtin(from) && builtin(to))) return {};
     const src = registered(from), dst = registered(to);
-    if (!builtin(from) && !src?.toBuiltin) return {};
-    if (!builtin(to) && !dst?.fromBuiltin) return {};
+    const label = (id) => select.querySelector(`option[value="${id}"]`)?.textContent ?? id;
+    if (!builtin(from) && !src) return {};
+    if (!builtin(from) && !src.toBuiltin) return { reason: `${label(from)} text has no translation to another language` };
+    if (!builtin(to) && !dst?.fromBuiltin) return { reason: `no other language translates to ${label(to)}` };
     const ask = (f) => { try { return f() ?? { reason: "no answer" }; } catch (e) { console.error(e); return { reason: String(e?.message ?? e) }; } };
     let mid = { text }, lang = from;
     if (!builtin(from)) {
